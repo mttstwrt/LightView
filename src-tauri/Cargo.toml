@@ -1,0 +1,67 @@
+[package]
+name = "lightview"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, plugin-extensible media gallery"
+
+[lib]
+name = "lightview_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+image = "0.25"
+sha2 = "0.10"
+rayon = "1.10"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+notify = "6"
+walkdir = "2"
+bytes = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+sysinfo = "0.30"
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+base64 = "0.22"
+futures = "0.3"
+fast_image_resize = "6"
+jpeg-decoder = "0.3"
+intel_tex_2 = "0.5"
+memmap2 = "0.9"
+bincode = "1"
+percent-encoding = "2"
+bytemuck = { version = "1", features = ["derive"] }
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.4", optional = true }
+
+# Optimize dependencies even in dev builds — image codecs, SIMD resize,
+# BC7 encoding, and SQLite are unusably slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
+[features]
+default = ["custom-protocol", "gpu"]
+custom-protocol = ["tauri/custom-protocol"]
+gpu = ["dep:wgpu", "dep:pollster"]
+# Legacy alias
+gpu-resize = ["gpu"]
+
+[profile.release]
+incremental = false # Disable incremental builds for a "cleaner" optimization
+opt-level = 3       # Maximize speed (default for release, but good to be explicit)
+lto = "thin"        # Link Time Optimization (massively improves cross-crate speed)
+codegen-units = 1   # Reduces parallel compilation to allow deeper optimization
+panic = "abort"     # Removes stack unwinding code, making the binary smaller and faster
+strip = true        # Removes symbols to shrink the file size

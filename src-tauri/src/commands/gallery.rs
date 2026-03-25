@@ -1,0 +1,263 @@
+use serde::Serialize;
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::cache::atlas::ThumbAtlas;
+use crate::cache::db::CacheDb;
+use crate::companion::schema::MediaType;
+use crate::provider::local::LocalProvider;
+use crate::provider::{FileEntry, FileProvider, ProviderType};
+use crate::AppState;
+
+#[derive(Debug, Serialize)]
+pub struct GalleryOpenResult {
+    pub path: String,
+    pub total_media: usize,
+    pub provider_type: ProviderType,
+}
+
+/// Populate the media_meta table from scanned file entries.
+fn populate_media_meta(
+    db: &CacheDb,
+    entries: &[FileEntry],
+) -> Result<(), String> {
+    let conn = db.conn();
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, width, height, duration)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL)",
+            )
+            .map_err(|e| e.to_string())?;
+
+        for entry in entries {
+            if entry.is_dir {
+                continue;
+            }
+            let ext = Path::new(&entry.name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let media_type = match MediaType::from_extension(ext) {
+                Some(mt) => mt.as_str().to_string(),
+                None => continue,
+            };
+            stmt.execute(rusqlite::params![
+                entry.path,
+                entry.mtime as i64,
+                entry.size as i64,
+                media_type,
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Open a gallery directory. Initializes the provider, cache DB,
+/// and begins the background scan/thumbnail/index pipeline.
+#[tauri::command]
+pub async fn open_gallery(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<GalleryOpenResult, String> {
+    // Create the local provider
+    let provider = Arc::new(LocalProvider::new(&path));
+
+    // Register it
+    {
+        let mut reg = state.providers.write().await;
+        reg.register(path.clone(), provider.clone());
+    }
+
+    // Open (or create) the cache database
+    let cache_db = CacheDb::open(std::path::Path::new(&path))
+        .map_err(|e| format!("Failed to open cache: {}", e))?;
+
+    // Quick directory scan to count media files
+    let entries: Vec<crate::provider::FileEntry> = provider
+        .list_dir(&path)
+        .await
+        .map_err(|e| format!("Failed to list directory: {}", e))?;
+
+    let media_entries: Vec<&FileEntry> = entries.iter().filter(|e| !e.is_dir).collect();
+    let media_count = media_entries.len();
+
+    // Populate media_meta table so sorting works immediately
+    populate_media_meta(&cache_db, &entries)?;
+
+    // Load existing tag counts into autocomplete engine before storing the DB,
+    // so suggestions work immediately on re-open without a manual reindex.
+    if let Ok(counts) = cache_db.query_all_tag_counts() {
+        if !counts.is_empty() {
+            log::info!("Loaded {} unique tags into autocomplete", counts.len());
+            state.autocomplete.refresh(counts).await;
+        }
+    }
+
+    // Restore thumbnail settings from gallery_meta if present
+    if let Ok(Some(json)) = cache_db.get_gallery_meta("thumbnail_settings") {
+        if let Ok(thumb_settings) = serde_json::from_str::<crate::pipeline::thumbnailer::ThumbnailSettings>(&json) {
+            log::info!(
+                "Restored thumbnail settings: format={:?}, {}x{}, filter={:?}",
+                thumb_settings.format,
+                thumb_settings.width,
+                thumb_settings.height,
+                thumb_settings.resize_filter,
+            );
+            let mut ts = state.thumbnail_settings.write().await;
+            *ts = thumb_settings;
+        }
+    }
+
+    // Open a second read-only connection for the thumbnail protocol handler.
+    // SQLite WAL mode supports concurrent readers.
+    {
+        let db_path = std::path::Path::new(&path).join(".lightview").join("cache.db");
+        match rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => {
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                let _ = conn.execute_batch("PRAGMA cache_size=-16000;"); // 16MB read cache
+                let mut proto_db = state.thumb_protocol_db.lock().unwrap();
+                *proto_db = Some(conn);
+            }
+            Err(e) => {
+                log::warn!("Failed to open read-only DB for protocol handler: {}", e);
+            }
+        }
+    }
+
+    // Store the cache DB
+    {
+        let mut db = state.cache_db.lock().await;
+        *db = Some(cache_db);
+    }
+
+    // Initialize BC7 atlas if hardware supports it
+    let lightview_dir = std::path::Path::new(&path).join(".lightview");
+    if state.should_use_bc7() {
+        match ThumbAtlas::open(&lightview_dir) {
+            Ok(atlas) => {
+                log::info!(
+                    "BC7 atlas opened with {} thumbnails",
+                    atlas.len()
+                );
+                let mut a = state.thumb_atlas.lock().await;
+                *a = Some(atlas);
+                state
+                    .use_bc7_atlas
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                log::warn!("Failed to open BC7 atlas, falling back to JPEG: {}", e);
+                state
+                    .use_bc7_atlas
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    } else {
+        state
+            .use_bc7_atlas
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Store current gallery path
+    {
+        let mut current = state.current_gallery.write().await;
+        *current = Some(path.clone());
+    }
+
+    // Track as recently opened
+    state.add_recent_gallery(&path).await;
+
+    Ok(GalleryOpenResult {
+        path,
+        total_media: media_count,
+        provider_type: ProviderType::Local,
+    })
+}
+
+/// Close the current gallery and release resources.
+#[tauri::command]
+pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let gallery_path = {
+        let current = state.current_gallery.read().await;
+        current.clone()
+    };
+
+    if let Some(path) = gallery_path {
+        // Remove provider
+        let mut reg = state.providers.write().await;
+        reg.remove(&path);
+    }
+
+    // Flush and close BC7 atlas
+    {
+        let mut atlas = state.thumb_atlas.lock().await;
+        if let Some(ref mut a) = *atlas {
+            let _ = a.sync();
+        }
+        *atlas = None;
+        state
+            .use_bc7_atlas
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Close cache DB
+    {
+        let mut db = state.cache_db.lock().await;
+        *db = None;
+    }
+
+    // Close protocol handler DB
+    {
+        let mut proto_db = state.thumb_protocol_db.lock().unwrap();
+        *proto_db = None;
+    }
+
+    // Clear current gallery
+    {
+        let mut current = state.current_gallery.write().await;
+        *current = None;
+    }
+
+    Ok(())
+}
+
+/// Get information about the currently open gallery.
+#[tauri::command]
+pub async fn get_gallery_info(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<GalleryOpenResult>, String> {
+    let current = state.current_gallery.read().await;
+    match current.as_ref() {
+        Some(path) => {
+            let reg = state.providers.read().await;
+            match reg.get(path) {
+                Some(provider) => {
+                    let entries = provider
+                        .list_dir(path)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let media_count = entries.iter().filter(|e| !e.is_dir).count();
+                    Ok(Some(GalleryOpenResult {
+                        path: path.clone(),
+                        total_media: media_count,
+                        provider_type: provider.provider_type(),
+                    }))
+                }
+                None => Ok(None),
+            }
+        }
+        None => Ok(None),
+    }
+}

@@ -1,0 +1,30 @@
+# --- Rust/Cargo ---
+/src-tauri/target/
+**/*.rs.bk
+Cargo.lock
+
+# --- Node/Frontend ---
+node_modules/
+dist/
+dist-tauri/
+.env
+.env.*
+.DS_Store
+
+# --- Tauri Bundler ---
+src-tauri/binaries/
+src-tauri/gen/
+*.AppImage
+*.deb
+*.msi
+*.exe
+
+# --- Log files ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Editor Specific ---
+.vscode/
+.idea/
+*.swp
