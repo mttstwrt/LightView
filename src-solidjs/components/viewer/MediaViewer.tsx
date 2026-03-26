@@ -1,8 +1,8 @@
 import { Show, For, createSignal, createEffect, on } from "solid-js";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
-import { getFullMedia, getTransformedMedia, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
-import type { ImageTransform, CachedThumbnailInfo } from "../../lib/ipc";
+import { getFullMedia, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
+import type { CachedThumbnailInfo } from "../../lib/ipc";
 
 interface MediaViewerProps {
   paths: string[];
@@ -15,46 +15,6 @@ interface MediaViewerProps {
 export function MediaViewer(props: MediaViewerProps) {
   const [mediaSrc, setMediaSrc] = createSignal<string>("");
   const [loaded, setLoaded] = createSignal(false);
-  const [showControls, setShowControls] = createSignal(false);
-
-  // Transform state
-  const [rotation, setRotation] = createSignal(0);
-  const [exposure, setExposure] = createSignal(0);
-  const [saturation, setSaturation] = createSignal(1);
-  const [contrast, setContrast] = createSignal(1);
-  const [transforming, setTransforming] = createSignal(false);
-
-  const hasTransform = () =>
-    rotation() !== 0 || exposure() !== 0 || saturation() !== 1 || contrast() !== 1;
-
-  const currentTransform = (): ImageTransform => ({
-    rotation_degrees: rotation(),
-    exposure: exposure(),
-    saturation: saturation(),
-    contrast: contrast(),
-  });
-
-  const resetTransforms = () => {
-    setRotation(0);
-    setExposure(0);
-    setSaturation(1);
-    setContrast(1);
-  };
-
-  const applyTransform = async () => {
-    const path = currentPath();
-    if (!path || isVideo()) return;
-    setTransforming(true);
-    try {
-      const dataUri = await getTransformedMedia(path, currentTransform());
-      setMediaSrc(dataUri);
-      setLoaded(true);
-    } catch (err) {
-      console.error("Transform failed:", err);
-    } finally {
-      setTransforming(false);
-    }
-  };
 
   const currentPath = () => props.paths[props.currentIndex] || "";
 
@@ -83,7 +43,6 @@ export function MediaViewer(props: MediaViewerProps) {
         if (!path) return;
 
         setLoaded(false);
-        resetTransforms();
 
         const e = path.split(".").pop()?.toLowerCase() ?? "";
         const videoExts = ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"];
@@ -160,112 +119,6 @@ export function MediaViewer(props: MediaViewerProps) {
       >
         <span class="text-white/60 text-2xl">&rsaquo;</span>
       </button>
-
-      {/* Transform controls toggle */}
-      <Show when={!isVideo()}>
-        <button
-          class="absolute top-4 left-4 text-white/40 hover:text-white/80 text-sm cursor-pointer transition-colors z-10"
-          onClick={() => setShowControls((v) => !v)}
-          title="Toggle edit controls"
-        >
-          &#9881; Edit
-        </button>
-      </Show>
-
-      {/* Transform controls panel */}
-      <Show when={showControls() && !isVideo()}>
-        <div
-          class="absolute bottom-16 left-1/2 -translate-x-1/2 flex items-center gap-4 px-4 py-3 rounded-lg z-20"
-          style={{
-            background: "rgba(10, 10, 10, 0.85)",
-            "backdrop-filter": "blur(8px)",
-            border: "1px solid rgba(255,255,255,0.08)",
-          }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {/* Rotation */}
-          <div class="flex items-center gap-1">
-            <span class="text-neutral-500 text-xs mr-1">Rotate</span>
-            <button
-              class="px-1.5 py-0.5 text-xs text-neutral-300 bg-neutral-800 hover:bg-neutral-700 rounded cursor-pointer"
-              onClick={() => { setRotation((r) => (r - 90 + 360) % 360); applyTransform(); }}
-            >
-              &#8634;
-            </button>
-            <button
-              class="px-1.5 py-0.5 text-xs text-neutral-300 bg-neutral-800 hover:bg-neutral-700 rounded cursor-pointer"
-              onClick={() => { setRotation((r) => (r + 90) % 360); applyTransform(); }}
-            >
-              &#8635;
-            </button>
-          </div>
-
-          <div class="w-px h-6 bg-neutral-700" />
-
-          {/* Exposure */}
-          <TransformSlider
-            label="Exposure"
-            value={exposure()}
-            min={-3}
-            max={3}
-            step={0.1}
-            default={0}
-            onChange={(v) => setExposure(v)}
-            onCommit={applyTransform}
-          />
-
-          <div class="w-px h-6 bg-neutral-700" />
-
-          {/* Saturation */}
-          <TransformSlider
-            label="Saturation"
-            value={saturation()}
-            min={0}
-            max={3}
-            step={0.05}
-            default={1}
-            onChange={(v) => setSaturation(v)}
-            onCommit={applyTransform}
-          />
-
-          <div class="w-px h-6 bg-neutral-700" />
-
-          {/* Contrast */}
-          <TransformSlider
-            label="Contrast"
-            value={contrast()}
-            min={0}
-            max={3}
-            step={0.05}
-            default={1}
-            onChange={(v) => setContrast(v)}
-            onCommit={applyTransform}
-          />
-
-          <div class="w-px h-6 bg-neutral-700" />
-
-          {/* Reset */}
-          <Show when={hasTransform()}>
-            <button
-              class="px-2 py-1 text-xs text-neutral-400 hover:text-neutral-200 bg-neutral-800 hover:bg-neutral-700 rounded cursor-pointer transition-colors"
-              onClick={async () => {
-                resetTransforms();
-                const path = currentPath();
-                if (path) {
-                  const dataUri = await getFullMedia(path);
-                  setMediaSrc(dataUri);
-                }
-              }}
-            >
-              Reset
-            </button>
-          </Show>
-
-          <Show when={transforming()}>
-            <span class="text-neutral-500 text-xs">Processing...</span>
-          </Show>
-        </div>
-      </Show>
 
       {/* Bottom info bar */}
       <div class="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/40 text-xs font-mono">
@@ -526,41 +379,3 @@ function InfoRow(props: { label: string; value: string; breakAll?: boolean }) {
   );
 }
 
-function TransformSlider(props: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  default: number;
-  onChange: (v: number) => void;
-  onCommit: () => void;
-}) {
-  return (
-    <div class="flex items-center gap-2">
-      <span class="text-neutral-500 text-xs w-16">{props.label}</span>
-      <input
-        type="range"
-        min={props.min}
-        max={props.max}
-        step={props.step}
-        value={props.value}
-        onInput={(e) => props.onChange(parseFloat(e.currentTarget.value))}
-        onChange={() => props.onCommit()}
-        class="w-24 accent-neutral-500"
-      />
-      <span class="text-neutral-400 text-xs w-8 text-right">
-        {props.value.toFixed(1)}
-      </span>
-      <Show when={props.value !== props.default}>
-        <button
-          class="text-neutral-600 hover:text-neutral-400 text-xs cursor-pointer"
-          onClick={() => { props.onChange(props.default); props.onCommit(); }}
-          title={`Reset to ${props.default}`}
-        >
-          &#x21ba;
-        </button>
-      </Show>
-    </div>
-  );
-}

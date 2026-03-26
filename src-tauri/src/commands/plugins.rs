@@ -28,10 +28,7 @@ pub struct PluginRunResult {
 }
 
 fn plugin_dir() -> std::path::PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-        .join("gallery-app")
-        .join("plugins")
+    crate::util::paths::data_dir().join("plugins")
 }
 
 /// List all discovered plugins.
@@ -126,7 +123,10 @@ pub async fn run_plugin(
     })
 }
 
-/// Run a plugin on a batch of media files.
+/// Maximum number of plugin subprocesses to run concurrently in a batch.
+const PLUGIN_BATCH_CONCURRENCY: usize = 8;
+
+/// Run a plugin on a batch of media files (up to PLUGIN_BATCH_CONCURRENCY in parallel).
 #[tauri::command]
 pub async fn run_plugin_batch(
     state: tauri::State<'_, AppState>,
@@ -134,23 +134,43 @@ pub async fn run_plugin_batch(
     media_paths: Vec<String>,
     action: String,
 ) -> Result<Vec<PluginRunResult>, String> {
+    use futures::stream::{self, StreamExt};
+
     let dir = plugin_dir();
     let (manifest, plugin_path) =
         runner::find_plugin(&dir, &plugin_name).map_err(|e| e.to_string())?;
 
-    let mut results = Vec::with_capacity(media_paths.len());
+    // Run plugin subprocesses concurrently, collecting (path, Result) pairs.
+    let subprocess_results: Vec<(String, Result<runner::PluginOutput, String>)> = stream::iter(
+        media_paths.into_iter().map(|media_path| {
+            let manifest = &manifest;
+            let plugin_path = &plugin_path;
+            let action = &action;
+            async move {
+                let res = runner::run_cli_plugin(manifest, plugin_path, &media_path, action)
+                    .await
+                    .map_err(|e| e.to_string());
+                (media_path, res)
+            }
+        }),
+    )
+    .buffer_unordered(PLUGIN_BATCH_CONCURRENCY)
+    .collect()
+    .await;
 
-    for media_path in &media_paths {
-        let media = Path::new(media_path);
+    // Apply results sequentially: companion I/O and DB writes are fast and need no concurrency.
+    let mut results = Vec::with_capacity(subprocess_results.len());
 
-        match runner::run_cli_plugin(&manifest, &plugin_path, media_path, &action).await {
+    for (media_path, res) in subprocess_results {
+        match res {
             Ok(output) => {
-                // App handles all companion file I/O
+                let media = Path::new(&media_path);
+
                 let mut companion = match get_or_create_companion(media) {
                     Ok(c) => c,
                     Err(e) => {
                         results.push(PluginRunResult {
-                            path: media_path.clone(),
+                            path: media_path,
                             tags_added: vec![],
                             success: false,
                             error: Some(e),
@@ -162,7 +182,7 @@ pub async fn run_plugin_batch(
 
                 if let Err(e) = writer::write_companion(media, &mut companion) {
                     results.push(PluginRunResult {
-                        path: media_path.clone(),
+                        path: media_path,
                         tags_added: vec![],
                         success: false,
                         error: Some(e.to_string()),
@@ -173,12 +193,12 @@ pub async fn run_plugin_batch(
                 // Update tag index
                 let db = state.cache_db.lock().await;
                 if let Some(db) = db.as_ref() {
-                    let _ = db.reindex_tags_for_file(media_path, &companion);
+                    let _ = db.reindex_tags_for_file(&media_path, &companion);
                 }
 
                 let tags_added = output.tags.clone();
                 results.push(PluginRunResult {
-                    path: media_path.clone(),
+                    path: media_path,
                     tags_added,
                     success: true,
                     error: None,
@@ -186,7 +206,7 @@ pub async fn run_plugin_batch(
             }
             Err(e) => {
                 results.push(PluginRunResult {
-                    path: media_path.clone(),
+                    path: media_path,
                     tags_added: vec![],
                     success: false,
                     error: Some(e.to_string()),

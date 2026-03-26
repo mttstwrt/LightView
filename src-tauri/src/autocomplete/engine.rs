@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -46,17 +47,31 @@ impl AutocompleteEngine {
         let tags = self.tags.read().await;
         let input_lower = input.to_lowercase();
 
-        let mut results: Vec<TagSuggestion> = tags
-            .iter()
-            .filter(|e| namespace.map_or(true, |ns| e.namespace == ns))
-            .filter_map(|e| {
-                let tag_lower = e.tag.to_lowercase();
-                fuzzy_score(&tag_lower, &input_lower).map(|score| TagSuggestion {
-                    namespace: e.namespace.clone(),
-                    tag: e.tag.clone(),
-                    count: e.count,
-                    score,
-                })
+        // Deduplicate tags across namespaces, summing counts and keeping
+        // the best score. Tags are namespace-agnostic in autocomplete;
+        // users can narrow with the namespace::tag syntax if needed.
+        let mut merged: HashMap<String, (u32, i64)> = HashMap::new();
+        for e in tags.iter() {
+            if namespace.map_or(false, |ns| e.namespace != ns) {
+                continue;
+            }
+            let tag_lower = e.tag.to_lowercase();
+            if let Some(score) = fuzzy_score(&tag_lower, &input_lower) {
+                let entry = merged.entry(e.tag.clone()).or_insert((0, 0));
+                entry.0 += e.count;
+                if score > entry.1 {
+                    entry.1 = score;
+                }
+            }
+        }
+
+        let mut results: Vec<TagSuggestion> = merged
+            .into_iter()
+            .map(|(tag, (count, score))| TagSuggestion {
+                namespace: String::new(),
+                tag,
+                count,
+                score,
             })
             .collect();
 

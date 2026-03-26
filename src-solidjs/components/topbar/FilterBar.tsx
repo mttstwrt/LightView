@@ -4,16 +4,27 @@ import {
   acSuggestions, setAcSuggestions,
   acOpen, setAcOpen,
   acSelectedIndex, setAcSelectedIndex,
-  filterPills, addPill, removePill, clearPills,
+  filterQuery, setFilterQuery,
   ratingFilter, setRatingFilter,
   buildFilterQuery,
+  clearAllFilters,
 } from "../../stores/filterStore";
 import { setDisplayPaths } from "../../stores/galleryStore";
 import { sortField, sortOrder, groupBy } from "../../stores/settingsStore";
 import { autocompleteTags, applyFilter, clearFilter, getSortedItems } from "../../lib/ipc";
 
 export function FilterBar() {
+  let inputRef: HTMLInputElement | undefined;
   let debounceTimer: number | undefined;
+
+  // Extract the last "word" being typed (the token after the last space/operator)
+  const getCurrentToken = (value: string, cursorPos: number): { token: string; start: number } => {
+    const before = value.slice(0, cursorPos);
+    // Split on spaces to find the current token
+    const match = before.match(/(\S+)$/);
+    if (!match) return { token: "", start: cursorPos };
+    return { token: match[1], start: cursorPos - match[1].length };
+  };
 
   const handleInput = (value: string) => {
     setAcQuery(value);
@@ -21,42 +32,101 @@ export function FilterBar() {
 
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = window.setTimeout(async () => {
-      if (value.trim().length > 0) {
-        try {
-          const suggestions = await autocompleteTags(value.trim());
-          setAcSuggestions(suggestions);
-          setAcOpen(suggestions.length > 0);
-        } catch {
-          setAcSuggestions([]);
-        }
-      } else {
+      const cursorPos = inputRef?.selectionStart ?? value.length;
+      const { token } = getCurrentToken(value, cursorPos);
+
+      // Skip autocomplete for operators and empty tokens
+      const upper = token.toUpperCase();
+      if (!token || upper === "AND" || upper === "OR" || upper === "NOT") {
         setAcSuggestions([]);
         setAcOpen(false);
+        return;
+      }
+
+      // Strip leading NOT/namespace prefix for autocomplete lookup
+      const lookupToken = token.includes("::") ? token.split("::").pop()! : token;
+      if (!lookupToken) {
+        setAcSuggestions([]);
+        setAcOpen(false);
+        return;
+      }
+
+      try {
+        const suggestions = await autocompleteTags(lookupToken);
+        setAcSuggestions(suggestions);
+        setAcOpen(suggestions.length > 0);
+      } catch {
+        setAcSuggestions([]);
       }
     }, 150);
   };
 
-  const selectSuggestion = async (namespace: string, tag: string) => {
-    addPill(namespace, tag);
-    setAcQuery("");
+  const insertSuggestion = (suggestion: { namespace: string; tag: string }) => {
+    const value = acQuery();
+    const cursorPos = inputRef?.selectionStart ?? value.length;
+    const { start } = getCurrentToken(value, cursorPos);
+
+    // Both namespace and tag suggestions insert the bare value.
+    // Namespace suggestions insert e.g. "plugin.wd", tag suggestions
+    // insert the bare tag name. Users can manually type namespace::tag
+    // to narrow to a specific namespace.
+    const replacement = suggestion.tag;
+
+    const before = value.slice(0, start);
+    const after = value.slice(cursorPos);
+    const newValue = before + replacement + (after.startsWith(" ") ? "" : " ") + after;
+
+    setAcQuery(newValue);
     setAcOpen(false);
     setAcSuggestions([]);
-    await applyCurrentFilter();
+
+    // Apply the filter
+    setFilterQuery(newValue.trim());
+    applyCurrentFilter();
+
+    // Restore focus and cursor
+    requestAnimationFrame(() => {
+      if (inputRef) {
+        inputRef.focus();
+        const pos = before.length + replacement.length + 1;
+        inputRef.setSelectionRange(pos, pos);
+      }
+    });
   };
 
-  const handleRemovePill = async (index: number) => {
-    removePill(index);
-    await applyCurrentFilter();
-  };
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (acOpen()) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setAcSelectedIndex((i) => Math.min(i + 1, acSuggestions().length - 1));
+        return;
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setAcSelectedIndex((i) => Math.max(i - 1, 0));
+        return;
+      } else if (e.key === "Tab") {
+        e.preventDefault();
+        const suggestions = acSuggestions();
+        const idx = acSelectedIndex();
+        if (suggestions[idx]) {
+          insertSuggestion(suggestions[idx]);
+        }
+        return;
+      } else if (e.key === "Escape") {
+        setAcOpen(false);
+        return;
+      }
+    }
 
-  const handleClear = async () => {
-    clearPills();
-    setAcQuery("");
-    try {
-      const paths = await clearFilter();
-      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
-      setDisplayPaths(sorted.items.map((item) => item.path));
-    } catch {}
+    // Enter without autocomplete open → apply filter
+    if (e.key === "Enter") {
+      e.preventDefault();
+      setFilterQuery(acQuery().trim());
+      setAcOpen(false);
+      applyCurrentFilter();
+    } else if (e.key === "Escape") {
+      (e.target as HTMLInputElement).blur();
+    }
   };
 
   const applyCurrentFilter = async () => {
@@ -75,28 +145,17 @@ export function FilterBar() {
     }
   };
 
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setAcSelectedIndex((i) => Math.min(i + 1, acSuggestions().length - 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setAcSelectedIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const suggestions = acSuggestions();
-      const idx = acSelectedIndex();
-      if (suggestions[idx]) {
-        selectSuggestion(suggestions[idx].namespace, suggestions[idx].tag);
-      }
-    } else if (e.key === "Escape") {
-      setAcOpen(false);
-    }
+  const handleClear = async () => {
+    clearAllFilters();
+    try {
+      await clearFilter();
+      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
+      setDisplayPaths(sorted.items.map((item) => item.path));
+    } catch {}
   };
 
   const handleSetRatingFilter = async (value: number) => {
     if (ratingFilter()?.value === value && ratingFilter()?.op === ">=") {
-      // Clicking the same star clears the filter
       setRatingFilter(null);
     } else {
       setRatingFilter({ op: ">=", value });
@@ -112,22 +171,6 @@ export function FilterBar() {
   return (
     <div class="flex-1 relative">
       <div class="flex items-center gap-1 bg-neutral-800/60 rounded px-2 py-1 border border-neutral-700/40">
-        {/* Active filter pills */}
-        <For each={filterPills()}>
-          {(pill, index) => (
-            <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-neutral-700 text-neutral-200">
-              <span class="text-teal-400/70">{pill.namespace}:</span>
-              {pill.tag}
-              <button
-                class="text-neutral-400 hover:text-neutral-200 cursor-pointer ml-0.5"
-                onClick={() => handleRemovePill(index())}
-              >
-                &times;
-              </button>
-            </span>
-          )}
-        </For>
-
         {/* Rating filter pill */}
         <Show when={ratingFilter()}>
           <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-amber-900/40 text-amber-300">
@@ -160,6 +203,7 @@ export function FilterBar() {
         </div>
 
         <input
+          ref={inputRef}
           type="text"
           value={acQuery()}
           onInput={(e) => handleInput(e.currentTarget.value)}
@@ -168,14 +212,13 @@ export function FilterBar() {
             if (acSuggestions().length > 0) setAcOpen(true);
           }}
           onBlur={() => {
-            // Delay to allow click on suggestions
             setTimeout(() => setAcOpen(false), 200);
           }}
-          placeholder={filterPills().length > 0 ? "" : "Filter..."}
+          placeholder="Filter... (e.g. user AND example, NOT auto::indoor)"
           class="flex-1 bg-transparent border-none outline-none text-sm text-neutral-200 placeholder-neutral-500 min-w-[80px]"
         />
 
-        <Show when={filterPills().length > 0 || ratingFilter()}>
+        <Show when={filterQuery() || ratingFilter()}>
           <button
             class="text-neutral-500 hover:text-neutral-300 text-xs cursor-pointer"
             onClick={handleClear}
@@ -205,13 +248,15 @@ export function FilterBar() {
                 onMouseEnter={() => setAcSelectedIndex(index())}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  selectSuggestion(suggestion.namespace, suggestion.tag);
+                  insertSuggestion(suggestion);
                 }}
               >
                 <div class="flex items-center gap-2">
-                  <span class="px-1.5 py-0.5 text-xs rounded bg-teal-800/40 text-teal-300/80">
-                    {suggestion.namespace}
-                  </span>
+                  <Show when={suggestion.namespace === "_namespace"}>
+                    <span class="px-1.5 py-0.5 text-xs rounded bg-violet-800/40 text-violet-300/80">
+                      source
+                    </span>
+                  </Show>
                   <span class="text-neutral-200">{suggestion.tag}</span>
                 </div>
                 <span class="text-neutral-500 text-xs">{suggestion.count}</span>

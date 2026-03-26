@@ -1,7 +1,7 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
 import { sortField, setSortField, sortOrder, setSortOrder, groupBy } from "../../stores/settingsStore";
 import { setDisplayPaths } from "../../stores/galleryStore";
-import { filterPills, buildFilterQuery } from "../../stores/filterStore";
+import { buildFilterQuery } from "../../stores/filterStore";
 import { getSortedItems, applyFilter } from "../../lib/ipc";
 import type { SortField, SortOrder } from "../../lib/types";
 

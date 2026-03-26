@@ -5,6 +5,7 @@ import type {
   GroupBy,
   HardwareProfile,
   PluginInfo,
+  PluginRunResult,
   SortField,
   SortOrder,
   SortedResult,
@@ -162,7 +163,16 @@ export const runPlugin = (
   pluginName: string,
   mediaPath: string,
   action: string
-) => invoke<string>("run_plugin", { pluginName, mediaPath, action });
+) => invoke<PluginRunResult>("run_plugin", { pluginName, mediaPath, action });
+
+export const runPluginBatch = (
+  pluginName: string,
+  mediaPaths: string[],
+  action: string
+) => invoke<PluginRunResult[]>("run_plugin_batch", { pluginName, mediaPaths, action });
+
+export const installPlugin = (path: string) =>
+  invoke<PluginInfo>("install_plugin", { path });
 
 // ---------------------------------------------------------------------------
 // Settings / Maintenance
@@ -199,6 +209,9 @@ export const getRecentGalleries = () =>
 
 export const removeRecentGallery = (path: string) =>
   invoke<void>("remove_recent_gallery", { path });
+
+export const openWith = (command: string, args: string[]) =>
+  invoke<void>("open_with", { command, args });
 
 export interface DebugInfo {
   storage_type: string;

@@ -195,14 +195,12 @@ impl AppState {
 // Recent galleries persistence
 // ---------------------------------------------------------------------------
 
-fn recent_galleries_path() -> Option<std::path::PathBuf> {
-    dirs::data_dir().map(|d| d.join("lightview").join("recent.json"))
+fn recent_galleries_path() -> std::path::PathBuf {
+    util::paths::data_dir().join("recent.json")
 }
 
 fn load_recent_galleries() -> Vec<RecentGallery> {
-    let Some(path) = recent_galleries_path() else {
-        return Vec::new();
-    };
+    let path = recent_galleries_path();
     match std::fs::read_to_string(&path) {
         Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -210,9 +208,7 @@ fn load_recent_galleries() -> Vec<RecentGallery> {
 }
 
 fn save_recent_galleries(recents: &[RecentGallery]) {
-    let Some(path) = recent_galleries_path() else {
-        return;
-    };
+    let path = recent_galleries_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

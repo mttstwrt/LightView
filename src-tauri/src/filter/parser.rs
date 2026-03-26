@@ -17,15 +17,15 @@ pub enum ParseError {
 ///
 /// Syntax examples:
 ///   vacation                                    → search all namespaces
-///   user:vacation                               → specific namespace
-///   plugin.face-recognition:person:alice        → plugin namespace
-///   user:vacation AND user:family               → boolean AND
-///   user:vacation OR user:travel                → boolean OR
+///   user::vacation                              → specific namespace
+///   plugin.face-recognition::person:alice       → plugin namespace
+///   user::vacation AND user::family             → boolean AND
+///   user::vacation OR user::travel              → boolean OR
 ///   NOT auto:indoor                             → boolean NOT
 ///   rating>=4                                   → rating filter
 ///   type:video                                  → media type filter
-///   has:user                                    → namespace existence
-///   (user:a OR user:b) AND NOT auto:indoor      → grouped expression
+///   has::user                                   → namespace existence
+///   (user::a OR user::b) AND NOT auto::indoor   → grouped expression
 pub fn parse_filter(input: &str) -> Result<FilterExpr, ParseError> {
     let tokens = tokenize(input);
     if tokens.is_empty() {
@@ -45,14 +45,34 @@ pub fn parse_filter(input: &str) -> Result<FilterExpr, ParseError> {
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let chars: Vec<char> = input.chars().collect();
 
-    for ch in input.chars() {
+    for (_i, &ch) in chars.iter().enumerate() {
         match ch {
-            '(' | ')' => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
+            '(' => {
+                // Only treat as grouping when it starts a new token
+                // (i.e., current is empty — preceded by whitespace or start of input).
+                // Otherwise it's part of a tag like "hatsune_miku_(vocaloid)".
+                if current.is_empty() {
+                    tokens.push(ch.to_string());
+                } else {
+                    current.push(ch);
                 }
-                tokens.push(ch.to_string());
+            }
+            ')' => {
+                // Grouping close when current is empty (e.g. `) AND ...`) or
+                // when the current token does NOT contain an opening paren
+                // (meaning this `)` isn't balancing an in-tag `(`).
+                // e.g. "travel)" → grouping close, but "vocaloid)" after
+                // "miku_(" → part of the tag.
+                if current.is_empty() || !current.contains('(') {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    tokens.push(ch.to_string());
+                } else {
+                    current.push(ch);
+                }
             }
             ' ' | '\t' => {
                 if !current.is_empty() {
@@ -130,7 +150,7 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     let rest = &tokens[1..];
 
     // Rating filter: rating>=4, rating<=2, rating=5
-    if token.starts_with("rating") {
+    if token.starts_with("rating>=") || token.starts_with("rating<=") || token.starts_with("rating=") {
         return parse_rating(token, rest);
     }
 
@@ -155,16 +175,16 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
         ));
     }
 
-    // Has namespace: has:user, has:plugin.geo
-    if let Some(ns) = token.strip_prefix("has:") {
+    // Has namespace: has::user, has::plugin.geo
+    if let Some(ns) = token.strip_prefix("has::") {
         let namespace = parse_namespace(ns);
         return Ok((FilterExpr::HasNamespace { namespace }, rest));
     }
 
-    // Namespaced tag: user:vacation, plugin.face-recognition:person:alice
-    if let Some(colon_pos) = token.find(':') {
-        let ns_str = &token[..colon_pos];
-        let tag_val = &token[colon_pos + 1..];
+    // Namespaced tag: user::vacation, plugin.face-recognition::rating:general
+    if let Some(dcolon_pos) = token.find("::") {
+        let ns_str = &token[..dcolon_pos];
+        let tag_val = &token[dcolon_pos + 2..];
         let namespace = parse_namespace(ns_str);
         return Ok((
             FilterExpr::Tag {
@@ -249,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_namespaced_tag() {
-        let expr = parse_filter("user:vacation").unwrap();
+        let expr = parse_filter("user::vacation").unwrap();
         match expr {
             FilterExpr::Tag { namespace, value } => {
                 assert_eq!(namespace, TagNamespace::User);
@@ -261,13 +281,13 @@ mod tests {
 
     #[test]
     fn test_and() {
-        let expr = parse_filter("user:vacation AND user:family").unwrap();
+        let expr = parse_filter("user::vacation AND user::family").unwrap();
         assert!(matches!(expr, FilterExpr::And { .. }));
     }
 
     #[test]
     fn test_not() {
-        let expr = parse_filter("NOT auto:indoor").unwrap();
+        let expr = parse_filter("NOT auto::indoor").unwrap();
         assert!(matches!(expr, FilterExpr::Not { .. }));
     }
 
@@ -291,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_complex() {
-        let expr = parse_filter("(user:vacation OR user:travel) AND NOT auto:indoor").unwrap();
+        let expr = parse_filter("(user::vacation OR user::travel) AND NOT auto::indoor").unwrap();
         assert!(matches!(expr, FilterExpr::And { .. }));
     }
 
@@ -335,5 +355,74 @@ mod tests {
         // "example AND user" → tag "example" across all ns AND all user-tagged images
         let expr = parse_filter("example AND user").unwrap();
         assert!(matches!(expr, FilterExpr::And { .. }));
+    }
+
+    #[test]
+    fn test_tag_with_colon_in_value() {
+        // Tags like "rating:general" should work — colon is part of the tag value
+        let expr = parse_filter("rating:general").unwrap();
+        // Without a namespace (no ::), this should be parsed contextually.
+        // "rating:general" doesn't start with "rating>=" etc., so it falls through
+        // to bare tag matching.
+        match expr {
+            FilterExpr::Tag { namespace, value } => {
+                assert_eq!(namespace, TagNamespace::Any);
+                assert_eq!(value, "rating:general");
+            }
+            _ => panic!("Expected bare Tag, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_namespaced_tag_with_colon_in_value() {
+        // plugin.wd::rating:general — namespace is plugin.wd, tag value is "rating:general"
+        let expr = parse_filter("plugin.wd::rating:general").unwrap();
+        match expr {
+            FilterExpr::Tag { namespace, value } => {
+                assert_eq!(namespace, TagNamespace::Plugin("wd".to_string()));
+                assert_eq!(value, "rating:general");
+            }
+            _ => panic!("Expected Tag, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_tag_with_parentheses() {
+        // Danbooru-style tags like "hatsune_miku_(vocaloid)" should not be
+        // split by the tokenizer.
+        let expr = parse_filter("hatsune_miku_(vocaloid)").unwrap();
+        match expr {
+            FilterExpr::Tag { namespace, value } => {
+                assert_eq!(namespace, TagNamespace::Any);
+                assert_eq!(value, "hatsune_miku_(vocaloid)");
+            }
+            _ => panic!("Expected Tag, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_grouping_parens_still_work() {
+        // Grouping parentheses (space-separated) should still work.
+        let expr = parse_filter("(vacation OR travel) AND family").unwrap();
+        assert!(matches!(expr, FilterExpr::And { .. }));
+    }
+
+    #[test]
+    fn test_tag_with_parens_in_expression() {
+        // Tag with parens combined with boolean operators.
+        let expr = parse_filter("hatsune_miku_(vocaloid) AND 1girl").unwrap();
+        match &expr {
+            FilterExpr::And { left, right } => {
+                match left.as_ref() {
+                    FilterExpr::Tag { value, .. } => assert_eq!(value, "hatsune_miku_(vocaloid)"),
+                    _ => panic!("Expected Tag on left"),
+                }
+                match right.as_ref() {
+                    FilterExpr::Tag { value, .. } => assert_eq!(value, "1girl"),
+                    _ => panic!("Expected Tag on right"),
+                }
+            }
+            _ => panic!("Expected And, got {:?}", expr),
+        }
     }
 }

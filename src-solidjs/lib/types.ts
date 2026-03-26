@@ -195,6 +195,14 @@ export interface PluginInfo {
   display_name: string;
   version: string;
   description: string;
+  tag_prefix: string;
+}
+
+export interface PluginRunResult {
+  path: string;
+  tags_added: string[];
+  success: boolean;
+  error: string | null;
 }
 
 export interface GalleryStats {

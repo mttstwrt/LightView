@@ -151,7 +151,7 @@ pub fn apply_plugin_output(
 
     // Replace tags entirely (plugin is authoritative for its namespace)
     entry.version = manifest.version.clone();
-    entry.tags = output.tags.clone();
+    entry.tags = output.tags.iter().map(|t| t.replace(' ', "_")).collect();
 
     // Store plugin metadata if provided
     if let Some(meta) = &output.meta {

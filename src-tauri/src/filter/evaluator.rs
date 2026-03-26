@@ -167,27 +167,27 @@ mod tests {
     #[test]
     fn test_eval_simple_tag() {
         let c = make_companion(&["vacation", "family"]);
-        let expr = parse_filter("user:vacation").unwrap();
+        let expr = parse_filter("user::vacation").unwrap();
         assert!(evaluate(&expr, &c));
 
-        let expr2 = parse_filter("user:work").unwrap();
+        let expr2 = parse_filter("user::work").unwrap();
         assert!(!evaluate(&expr2, &c));
     }
 
     #[test]
     fn test_eval_and() {
         let c = make_companion(&["vacation", "family"]);
-        let expr = parse_filter("user:vacation AND user:family").unwrap();
+        let expr = parse_filter("user::vacation AND user::family").unwrap();
         assert!(evaluate(&expr, &c));
 
-        let expr2 = parse_filter("user:vacation AND user:work").unwrap();
+        let expr2 = parse_filter("user::vacation AND user::work").unwrap();
         assert!(!evaluate(&expr2, &c));
     }
 
     #[test]
     fn test_eval_not() {
         let c = make_companion(&["vacation"]);
-        let expr = parse_filter("NOT user:work").unwrap();
+        let expr = parse_filter("NOT user::work").unwrap();
         assert!(evaluate(&expr, &c));
     }
 
@@ -221,12 +221,12 @@ mod tests {
         let expr = parse_filter("example").unwrap();
         assert!(evaluate(&expr, &c));
 
-        // "user:example" should NOT match (it's a plugin tag, not user)
-        let expr2 = parse_filter("user:example").unwrap();
+        // "user::example" should NOT match (it's a plugin tag, not user)
+        let expr2 = parse_filter("user::example").unwrap();
         assert!(!evaluate(&expr2, &c));
 
-        // "plugin.tagger:example" should match
-        let expr3 = parse_filter("plugin.tagger:example").unwrap();
+        // "plugin.tagger::example" should match
+        let expr3 = parse_filter("plugin.tagger::example").unwrap();
         assert!(evaluate(&expr3, &c));
     }
 

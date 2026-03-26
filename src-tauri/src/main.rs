@@ -1,6 +1,6 @@
 use lightview_lib::AppState;
 use lightview_lib::commands;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// Create a BMP image from raw RGBA pixels.
 /// Uses top-down row order (negative height) to avoid row flipping.
@@ -133,7 +133,24 @@ fn main() {
                 }
             }
         })
-        .setup(|_app| {
+        .setup(|app| {
+            // If a directory path was passed as a CLI argument, emit it to the frontend
+            let args: Vec<String> = std::env::args().collect();
+            if let Some(dir) = args.get(1) {
+                let path = std::path::PathBuf::from(dir);
+                if path.is_dir() {
+                    let handle = app.handle().clone();
+                    let dir = path.canonicalize()
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
+                    tauri::async_runtime::spawn(async move {
+                        // Brief delay so the webview has time to set up its event listener
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        let _ = handle.emit("open-directory", dir);
+                    });
+                }
+            }
             Ok(())
         })
         .manage(AppState::new())

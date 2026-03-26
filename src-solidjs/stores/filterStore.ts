@@ -1,12 +1,10 @@
 import { createSignal } from "solid-js";
 import type { TagSuggestion } from "../lib/types";
 
-// Active filter pills (accumulated tag/rating selections)
-const [filterPills, setFilterPills] = createSignal<
-  { namespace: string; tag: string }[]
->([]);
+// The raw filter query string (e.g. "user AND example OR rating>=3")
+const [filterQuery, setFilterQuery] = createSignal("");
 
-// Rating filter (0 = no rating filter)
+// Rating filter (0 = no rating filter) — appended to query on apply
 const [ratingFilter, setRatingFilter] = createSignal<{ op: string; value: number } | null>(null);
 
 // Autocomplete state
@@ -14,27 +12,23 @@ const [acQuery, setAcQuery] = createSignal("");
 const [acSuggestions, setAcSuggestions] = createSignal<TagSuggestion[]>([]);
 const [acSelectedIndex, setAcSelectedIndex] = createSignal(0);
 const [acOpen, setAcOpen] = createSignal(false);
-const [recentTags, setRecentTags] = createSignal<string[]>([]);
 
 export {
-  filterPills, setFilterPills,
+  filterQuery, setFilterQuery,
   ratingFilter, setRatingFilter,
   acQuery, setAcQuery,
   acSuggestions, setAcSuggestions,
   acSelectedIndex, setAcSelectedIndex,
   acOpen, setAcOpen,
-  recentTags, setRecentTags,
 };
 
-/// Build the filter query string from the current pills and rating filter.
+/// Build the full filter query from the text input and rating filter.
 export function buildFilterQuery(): string {
   const parts: string[] = [];
 
-  const pills = filterPills();
-  if (pills.length > 0) {
-    parts.push(
-      pills.map((p) => `${p.namespace}:${p.tag}`).join(" AND ")
-    );
+  const q = filterQuery().trim();
+  if (q) {
+    parts.push(q);
   }
 
   const rf = ratingFilter();
@@ -45,20 +39,11 @@ export function buildFilterQuery(): string {
   return parts.join(" AND ");
 }
 
-export function addPill(namespace: string, tag: string) {
-  setFilterPills((prev) => {
-    if (prev.some((p) => p.namespace === namespace && p.tag === tag)) {
-      return prev;
-    }
-    return [...prev, { namespace, tag }];
-  });
-}
-
-export function removePill(index: number) {
-  setFilterPills((prev) => prev.filter((_, i) => i !== index));
-}
-
-export function clearPills() {
-  setFilterPills([]);
+/// Clear all filter state.
+export function clearAllFilters() {
+  setFilterQuery("");
   setRatingFilter(null);
+  setAcQuery("");
+  setAcSuggestions([]);
+  setAcOpen(false);
 }

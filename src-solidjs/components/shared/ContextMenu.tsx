@@ -1,7 +1,9 @@
-import { Show, For, createSignal, createEffect, on, onCleanup } from "solid-js";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch } from "../../lib/ipc";
+import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, openWith } from "../../lib/ipc";
+import { pluginStarted, pluginFinished, pluginFailed } from "../../stores/pluginStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
+import type { PluginInfo } from "../../lib/types";
 
 export interface ContextMenuState {
   x: number;
@@ -17,11 +19,13 @@ interface ContextMenuProps {
   selectedPaths?: Set<string>;
 }
 
-type SubMenu = "tag" | "rating" | "openWith" | null;
+type SubMenu = "tag" | "rating" | "openWith" | "plugins" | null;
 
 export function ContextMenu(props: ContextMenuProps) {
   const [subMenu, setSubMenu] = createSignal<SubMenu>(null);
   const [tagInput, setTagInput] = createSignal("");
+  const [plugins, setPlugins] = createSignal<PluginInfo[]>([]);
+  const [pluginBusy, setPluginBusy] = createSignal(false);
 
   // Close on click outside or Escape
   const handleKeyDown = (e: KeyboardEvent) => {
@@ -42,6 +46,7 @@ export function ContextMenu(props: ContextMenuProps) {
     if (props.state) {
       setSubMenu(null);
       setTagInput("");
+      listPlugins().then(setPlugins).catch(() => setPlugins([]));
       window.addEventListener("keydown", handleKeyDown);
       // Delay to avoid closing from the same right-click event
       setTimeout(() => window.addEventListener("click", handleClickOutside), 0);
@@ -106,6 +111,41 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
   };
 
+  const handleRunPlugin = async (pluginName: string) => {
+    if (!props.state || pluginBusy()) return;
+    const plugin = plugins().find((p) => p.name === pluginName);
+    const displayName = plugin?.display_name ?? pluginName;
+    const isBatch = isBatchContext();
+    const paths = isBatch ? batchPaths() : [props.state.path];
+    setPluginBusy(true);
+    props.onClose();
+    try {
+      if (isBatch) {
+        pluginStarted(pluginName, displayName, `Running on ${paths.length} files...`);
+        const results = await runPluginBatch(pluginName, paths, "tag");
+        const failed = results.filter((r) => !r.success);
+        if (failed.length > 0) {
+          pluginFailed(`${results.length - failed.length} tagged, ${failed.length} failed`);
+        } else {
+          pluginFinished(`Tagged ${results.length} files`);
+        }
+      } else {
+        pluginStarted(pluginName, displayName, "Running...");
+        const result = await runPlugin(pluginName, paths[0], "tag");
+        if (result.success) {
+          pluginFinished("Done");
+        } else {
+          pluginFailed(result.error ?? "Failed");
+        }
+      }
+    } catch (err) {
+      console.error("Plugin execution failed:", err);
+      pluginFailed("Execution failed");
+    } finally {
+      setPluginBusy(false);
+    }
+  };
+
   const handleRegenerateThumbnail = async () => {
     if (!props.state) return;
     try {
@@ -118,10 +158,9 @@ export function ContextMenu(props: ContextMenuProps) {
 
   const handleOpenWith = async (command: string, args: string[]) => {
     if (!props.state) return;
-    const { Command } = await import("@tauri-apps/plugin-shell");
     const resolvedArgs = args.map((a) => a.replace("{file}", props.state!.path));
     try {
-      await Command.create(command, resolvedArgs).spawn();
+      await openWith(command, resolvedArgs);
     } catch (err) {
       console.error("Failed to open with external app:", err);
     }
@@ -182,6 +221,10 @@ export function ContextMenu(props: ContextMenuProps) {
               <MenuItem label="Regenerate Thumbnail" onClick={handleRegenerateThumbnail} />
             </Show>
             <MenuItem label="Copy Path" onClick={handleCopyPath} />
+            <MenuItem
+              label={isBatchContext() ? `Run Plugin on ${props.selectedPaths!.size}...` : "Run Plugin..."}
+              onClick={() => setSubMenu("plugins")}
+            />
             <Show when={settings().external_apps.length > 0}>
               <MenuItem label="Open With..." onClick={() => setSubMenu("openWith")} />
             </Show>
@@ -222,6 +265,25 @@ export function ContextMenu(props: ContextMenuProps) {
               )}
             </For>
             <MenuItem label="Clear Rating" onClick={() => handleSetRating(0)} />
+            <Divider />
+            <MenuItem label="Back" onClick={() => setSubMenu(null)} />
+          </Show>
+
+          {/* Plugins sub-menu */}
+          <Show when={subMenu() === "plugins"}>
+            <div class="px-3 py-2 text-neutral-500">Run Plugin</div>
+            <Show when={plugins().length > 0} fallback={
+              <div class="px-3 py-1.5 text-neutral-600 text-xs">No plugins installed</div>
+            }>
+              <For each={plugins()}>
+                {(plugin) => (
+                  <MenuItem
+                    label={pluginBusy() ? `${plugin.display_name} (running...)` : plugin.display_name}
+                    onClick={() => handleRunPlugin(plugin.name)}
+                  />
+                )}
+              </For>
+            </Show>
             <Divider />
             <MenuItem label="Back" onClick={() => setSubMenu(null)} />
           </Show>

@@ -1,8 +1,11 @@
-import { createSignal, Show, onCleanup, onMount } from "solid-js";
+import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { settings, setSettings } from "../../stores/settingsStore";
-import type { AppSettings, ResizeFilter, CompanionLocation } from "../../lib/types";
-import { rebuildThumbnails, getThumbnailSettings, updateThumbnailSettings } from "../../lib/ipc";
+import { displayPaths } from "../../stores/galleryStore";
+import type { AppSettings, ResizeFilter, CompanionLocation, PluginInfo } from "../../lib/types";
+import { rebuildThumbnails, getThumbnailSettings, updateThumbnailSettings, listPlugins, installPlugin, runPluginBatch } from "../../lib/ipc";
+import { pluginStarted, pluginFinished, pluginFailed } from "../../stores/pluginStore";
 import type { ThumbnailSettings, ThumbFormat } from "../../lib/ipc";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 const THUMB_PRESETS = [
   { label: "S", value: 120 },
@@ -98,12 +101,92 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
     setRebuilding(true);
     try {
       await rebuildThumbnails();
-      // Signal the gallery grid to re-fetch all thumbnails
       window.dispatchEvent(new CustomEvent("lightview:thumbnails-invalidated"));
     } catch (e) {
       console.error("Rebuild failed:", e);
     }
     setRebuilding(false);
+  };
+
+  // ── Plugins ──
+  const [plugins, setPlugins] = createSignal<PluginInfo[]>([]);
+  const [pluginRunning, setPluginRunning] = createSignal<string | null>(null);
+  const [pluginStatus, setPluginStatus] = createSignal("");
+
+  const refreshPlugins = async () => {
+    try {
+      setPlugins(await listPlugins());
+    } catch {}
+  };
+
+  onMount(refreshPlugins);
+
+  const handleAddPlugin = async () => {
+    const selected = await openDialog({
+      title: "Select plugin Python file",
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Python Plugin", extensions: ["py"] }],
+    });
+    if (!selected) return;
+    try {
+      await installPlugin(selected as string);
+      await refreshPlugins();
+      setPluginStatus("Plugin installed");
+      setTimeout(() => setPluginStatus(""), 3000);
+    } catch (e) {
+      console.error("Install failed:", e);
+      setPluginStatus("Install failed");
+      setTimeout(() => setPluginStatus(""), 3000);
+    }
+  };
+
+  const handleAddPluginDir = async () => {
+    const selected = await openDialog({
+      title: "Select plugin directory",
+      directory: true,
+      multiple: false,
+    });
+    if (!selected) return;
+    try {
+      await installPlugin(selected as string);
+      await refreshPlugins();
+      setPluginStatus("Plugin installed");
+      setTimeout(() => setPluginStatus(""), 3000);
+    } catch (e) {
+      console.error("Install failed:", e);
+      setPluginStatus("Install failed");
+      setTimeout(() => setPluginStatus(""), 3000);
+    }
+  };
+
+  const handleRunOnAll = async (pluginName: string) => {
+    const paths = displayPaths();
+    if (paths.length === 0) return;
+    const plugin = plugins().find((p) => p.name === pluginName);
+    const displayName = plugin?.display_name ?? pluginName;
+    setPluginRunning(pluginName);
+    setPluginStatus(`Running on ${paths.length} photos...`);
+    pluginStarted(pluginName, displayName, `Running on ${paths.length} photos...`);
+    try {
+      const results = await runPluginBatch(pluginName, paths, "tag");
+      const succeeded = results.filter((r) => r.success).length;
+      const failed = results.length - succeeded;
+      const msg = failed > 0 ? `Done: ${succeeded} tagged, ${failed} failed` : `Tagged ${succeeded} photos`;
+      setPluginStatus(msg);
+      if (failed > 0) {
+        pluginFailed(msg);
+      } else {
+        pluginFinished(msg);
+      }
+    } catch (e) {
+      console.error("Plugin run failed:", e);
+      setPluginStatus("Run failed");
+      pluginFailed("Run failed");
+    } finally {
+      setPluginRunning(null);
+      setTimeout(() => setPluginStatus(""), 5000);
+    }
   };
 
   return (
@@ -312,6 +395,49 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
                   ))}
                 </div>
               </Field>
+            </Section>
+
+            {/* ── Plugins ── */}
+            <Section label="Plugins">
+              <div class="flex flex-col gap-2">
+                <For each={plugins()}>
+                  {(plugin) => (
+                    <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-neutral-800/50">
+                      <div class="flex flex-col min-w-0">
+                        <span class="text-xs text-neutral-300 truncate">{plugin.display_name}</span>
+                        <span class="text-[10px] text-neutral-500 truncate">{plugin.description}</span>
+                      </div>
+                      <button
+                        disabled={pluginRunning() !== null}
+                        onClick={() => handleRunOnAll(plugin.name)}
+                        class="shrink-0 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors bg-neutral-700 text-neutral-300 hover:bg-neutral-600 hover:text-neutral-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {pluginRunning() === plugin.name ? "Running..." : "Run All"}
+                      </button>
+                    </div>
+                  )}
+                </For>
+                <Show when={plugins().length === 0}>
+                  <span class="text-xs text-neutral-600">No plugins installed</span>
+                </Show>
+              </div>
+              <Show when={pluginStatus()}>
+                <span class="text-xs text-neutral-400">{pluginStatus()}</span>
+              </Show>
+              <div class="flex gap-1">
+                <button
+                  onClick={handleAddPlugin}
+                  class="flex-1 px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+                >
+                  Add .py File...
+                </button>
+                <button
+                  onClick={handleAddPluginDir}
+                  class="flex-1 px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+                >
+                  Add Folder...
+                </button>
+              </div>
             </Section>
 
             {/* ── Gallery ── */}

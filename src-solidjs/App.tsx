@@ -1,5 +1,6 @@
 import { Show, createSignal, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
@@ -9,6 +10,7 @@ import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
 import { ContextMenu, type ContextMenuState } from "./components/shared/ContextMenu";
 import { SelectionBar } from "./components/gallery/SelectionBar";
+import { pluginActivity } from "./stores/pluginStore";
 
 function DebugOverlay() {
   const [info, setInfo] = createSignal<DebugInfo | null>(null);
@@ -72,6 +74,12 @@ export function App() {
       setLoading(false);
     }
   };
+
+  // Listen for directory passed via CLI argument
+  const unlisten = listen<string>("open-directory", (event) => {
+    openPath(event.payload);
+  });
+  onCleanup(() => { unlisten.then((fn) => fn()); });
 
   const handleOpenFolder = async () => {
     try {
@@ -161,6 +169,55 @@ export function App() {
       <Show when={debugOpen()}>
         <DebugOverlay />
       </Show>
+      <Show when={pluginActivity()}>
+        <PluginToast />
+      </Show>
+    </div>
+  );
+}
+
+function PluginToast() {
+  const activity = () => pluginActivity()!;
+  const statusColor = () => {
+    switch (activity().status) {
+      case "running": return "text-teal-400";
+      case "done": return "text-green-400";
+      case "error": return "text-red-400";
+    }
+  };
+  const borderColor = () => {
+    switch (activity().status) {
+      case "running": return "border-teal-500/30";
+      case "done": return "border-green-500/30";
+      case "error": return "border-red-500/30";
+    }
+  };
+
+  return (
+    <div
+      class={`fixed bottom-4 right-4 z-[150] flex items-center gap-3 px-4 py-2.5 rounded-lg border ${borderColor()}`}
+      style={{
+        background: "rgba(18, 18, 18, 0.95)",
+        "backdrop-filter": "blur(12px)",
+      }}
+    >
+      <Show when={activity().status === "running"}>
+        <div class="w-3.5 h-3.5 border-2 border-teal-400 border-t-transparent rounded-full animate-spin" />
+      </Show>
+      <Show when={activity().status === "done"}>
+        <svg class="w-3.5 h-3.5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
+        </svg>
+      </Show>
+      <Show when={activity().status === "error"}>
+        <svg class="w-3.5 h-3.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12" />
+        </svg>
+      </Show>
+      <div class="flex flex-col">
+        <span class={`text-xs font-medium ${statusColor()}`}>{activity().displayName}</span>
+        <span class="text-[11px] text-neutral-400">{activity().message}</span>
+      </div>
     </div>
   );
 }
