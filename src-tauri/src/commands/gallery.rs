@@ -60,6 +60,69 @@ fn populate_media_meta(
     Ok(())
 }
 
+/// Walk all companion files in the gallery and index their tags into the
+/// cache DB.  Rebuilds `tag_counts` from `tag_index` at the end so that
+/// autocomplete and filter reflect every tag on disk — including those
+/// written by plugins or carried over from previous sessions.
+fn index_companions(db: &CacheDb, gallery_path: &str) {
+    let ext = crate::companion::schema::COMPANION_EXTENSION;
+    let mut indexed = 0u64;
+
+    for entry in walkdir::WalkDir::new(gallery_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        let path_str = path.to_string_lossy();
+        if !path_str.ends_with(ext) {
+            continue;
+        }
+
+        // Reconstruct the media file path from the companion path.
+        let companion_str = path_str.to_string();
+        let base = companion_str.strip_suffix(ext).unwrap_or(&companion_str);
+
+        let media_path_str = if let Some(parent) = path.parent() {
+            let parent_name = parent
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if parent_name == "companions" {
+                // .lightview/companions/photo.jpg.lightview.json → ../../photo.jpg
+                if let Some(lightview_dir) = parent.parent() {
+                    if let Some(gallery_dir) = lightview_dir.parent() {
+                        let filename = std::path::Path::new(base)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(base);
+                        gallery_dir.join(filename).to_string_lossy().to_string()
+                    } else {
+                        base.to_string()
+                    }
+                } else {
+                    base.to_string()
+                }
+            } else {
+                base.to_string()
+            }
+        } else {
+            base.to_string()
+        };
+
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Ok(companion) = crate::companion::reader::parse_companion(&contents) {
+                let _ = db.reindex_tags_for_file(&media_path_str, &companion);
+                indexed += 1;
+            }
+        }
+    }
+
+    if indexed > 0 {
+        let _ = db.rebuild_tag_counts();
+        log::info!("Indexed tags from {} companion files", indexed);
+    }
+}
+
 /// Open a gallery directory. Initializes the provider, cache DB,
 /// and begins the background scan/thumbnail/index pipeline.
 #[tauri::command]
@@ -92,8 +155,11 @@ pub async fn open_gallery(
     // Populate media_meta table so sorting works immediately
     populate_media_meta(&cache_db, &entries)?;
 
-    // Load existing tag counts into autocomplete engine before storing the DB,
-    // so suggestions work immediately on re-open without a manual reindex.
+    // Re-index all companion files so the tag_index and tag_counts tables
+    // reflect what's on disk.  This makes tags from previous sessions (and
+    // from plugins) available for filtering and autocomplete immediately.
+    index_companions(&cache_db, &path);
+
     if let Ok(counts) = cache_db.query_all_tag_counts() {
         if !counts.is_empty() {
             log::info!("Loaded {} unique tags into autocomplete", counts.len());

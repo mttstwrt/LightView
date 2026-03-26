@@ -200,4 +200,68 @@ mod tests {
         let expr2 = parse_filter("type:video").unwrap();
         assert!(!evaluate(&expr2, &c));
     }
+
+    #[test]
+    fn test_eval_bare_tag_cross_namespace() {
+        use crate::companion::schema::PluginTagEntry;
+        use std::collections::HashMap;
+
+        // Image with only a plugin tag "example"
+        let mut c = CompanionFile::new("a.jpg", MT::Image);
+        c.tags.plugins.insert(
+            "tagger".to_string(),
+            PluginTagEntry {
+                version: "1.0.0".to_string(),
+                tags: vec!["example".to_string()],
+                extra: HashMap::new(),
+            },
+        );
+
+        // Bare "example" should match across namespaces
+        let expr = parse_filter("example").unwrap();
+        assert!(evaluate(&expr, &c));
+
+        // "user:example" should NOT match (it's a plugin tag, not user)
+        let expr2 = parse_filter("user:example").unwrap();
+        assert!(!evaluate(&expr2, &c));
+
+        // "plugin.tagger:example" should match
+        let expr3 = parse_filter("plugin.tagger:example").unwrap();
+        assert!(evaluate(&expr3, &c));
+    }
+
+    #[test]
+    fn test_eval_bare_namespace() {
+        let c = make_companion(&["vacation"]);
+        // "user" should match (image has user tags)
+        let expr = parse_filter("user").unwrap();
+        assert!(evaluate(&expr, &c));
+
+        // "auto" should NOT match (no auto tags)
+        let expr2 = parse_filter("auto").unwrap();
+        assert!(!evaluate(&expr2, &c));
+    }
+
+    #[test]
+    fn test_eval_example_and_user() {
+        // "example AND user" should find images that have "example" in any
+        // namespace AND have at least one user tag.
+        let c = make_companion(&["example"]);
+        let expr = parse_filter("example AND user").unwrap();
+        assert!(evaluate(&expr, &c));
+
+        // Image with plugin tag "example" but no user tags → should NOT match
+        use crate::companion::schema::PluginTagEntry;
+        use std::collections::HashMap;
+        let mut c2 = CompanionFile::new("b.jpg", MT::Image);
+        c2.tags.plugins.insert(
+            "tagger".to_string(),
+            PluginTagEntry {
+                version: "1.0.0".to_string(),
+                tags: vec!["example".to_string()],
+                extra: HashMap::new(),
+            },
+        );
+        assert!(!evaluate(&expr, &c2));
+    }
 }

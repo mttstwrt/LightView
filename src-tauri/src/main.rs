@@ -179,6 +179,7 @@ fn main() {
             commands::plugins::list_plugins,
             commands::plugins::run_plugin,
             commands::plugins::run_plugin_batch,
+            commands::plugins::install_plugin,
 
             // Viewer commands (GPU-accelerated transforms)
             commands::viewer::get_transformed_media,
@@ -199,6 +200,7 @@ fn main() {
             commands::settings::load_gallery_settings,
             commands::settings::get_recent_galleries,
             commands::settings::remove_recent_gallery,
+            commands::settings::open_with,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

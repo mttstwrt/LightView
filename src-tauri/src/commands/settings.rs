@@ -397,3 +397,21 @@ pub async fn remove_recent_gallery(
     crate::save_recent_galleries(&recents);
     Ok(())
 }
+
+/// Open a file with an external application.
+/// Spawns the command as a detached process — does not wait for it to exit.
+#[tauri::command]
+pub async fn open_with(
+    _state: tauri::State<'_, AppState>,
+    command: String,
+    args: Vec<String>,
+) -> Result<(), String> {
+    tokio::process::Command::new(&command)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to launch '{}': {}", command, e))?;
+    Ok(())
+}

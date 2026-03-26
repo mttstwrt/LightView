@@ -34,6 +34,9 @@ impl AutocompleteEngine {
 
     /// Query tags with fuzzy substring matching.
     /// Returns up to `limit` results sorted by match quality then frequency.
+    ///
+    /// Also returns namespace suggestions (user, auto, plugin.*) when the
+    /// input matches a known namespace name.
     pub async fn query(
         &self,
         input: &str,
@@ -57,6 +60,29 @@ impl AutocompleteEngine {
             })
             .collect();
 
+        // Add namespace suggestions when input matches a namespace name.
+        // These use a special namespace marker "_namespace" so the frontend
+        // can distinguish them from regular tag suggestions.
+        if namespace.is_none() {
+            let ns_names = self.unique_namespaces(&tags);
+            for ns in &ns_names {
+                if let Some(score) = fuzzy_score(&ns.to_lowercase(), &input_lower) {
+                    // Count how many tags exist in this namespace
+                    let ns_count: u32 = tags
+                        .iter()
+                        .filter(|e| e.namespace == *ns)
+                        .map(|e| e.count)
+                        .sum();
+                    results.push(TagSuggestion {
+                        namespace: "_namespace".to_string(),
+                        tag: ns.clone(),
+                        count: ns_count,
+                        score: score + 50, // Boost namespace suggestions slightly
+                    });
+                }
+            }
+        }
+
         // Sort by score descending, then count descending as tiebreaker
         results.sort_by(|a, b| {
             b.score
@@ -65,6 +91,18 @@ impl AutocompleteEngine {
         });
         results.truncate(limit);
         results
+    }
+
+    /// Extract unique namespace names from the tag cache.
+    fn unique_namespaces(&self, tags: &[TagCount]) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for tc in tags {
+            if seen.insert(tc.namespace.clone()) {
+                names.push(tc.namespace.clone());
+            }
+        }
+        names
     }
 
     /// Get the total number of unique tags in the cache.

@@ -175,6 +175,14 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
         ));
     }
 
+    // Bare namespace name → show all images tagged in that namespace.
+    // "user" → all user-tagged images, "plugin.tagger" → all images
+    // tagged by that plugin.
+    if is_namespace_name(token) {
+        let namespace = parse_namespace(token);
+        return Ok((FilterExpr::HasNamespace { namespace }, rest));
+    }
+
     // Bare tag: search all namespaces
     Ok((
         FilterExpr::Tag {
@@ -201,6 +209,11 @@ fn parse_rating<'a>(token: &str, rest: &'a [String]) -> ParseResult<'a> {
         .map_err(|_| ParseError::InvalidRating(val_str.to_string()))?;
 
     Ok((FilterExpr::Rating { op, value }, rest))
+}
+
+/// Check if a bare token is a namespace name rather than a tag value.
+fn is_namespace_name(s: &str) -> bool {
+    matches!(s, "user" | "auto") || s.starts_with("plugin.")
 }
 
 fn parse_namespace(s: &str) -> TagNamespace {
@@ -279,6 +292,48 @@ mod tests {
     #[test]
     fn test_complex() {
         let expr = parse_filter("(user:vacation OR user:travel) AND NOT auto:indoor").unwrap();
+        assert!(matches!(expr, FilterExpr::And { .. }));
+    }
+
+    #[test]
+    fn test_bare_namespace_user() {
+        let expr = parse_filter("user").unwrap();
+        match expr {
+            FilterExpr::HasNamespace { namespace } => {
+                assert_eq!(namespace, TagNamespace::User);
+            }
+            _ => panic!("Expected HasNamespace, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_bare_namespace_plugin() {
+        let expr = parse_filter("plugin.tagger").unwrap();
+        match expr {
+            FilterExpr::HasNamespace { namespace } => {
+                assert_eq!(namespace, TagNamespace::Plugin("tagger".to_string()));
+            }
+            _ => panic!("Expected HasNamespace, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_bare_tag_cross_namespace() {
+        // A word that is NOT a namespace name should still search all namespaces
+        let expr = parse_filter("example").unwrap();
+        match expr {
+            FilterExpr::Tag { namespace, value } => {
+                assert_eq!(namespace, TagNamespace::Any);
+                assert_eq!(value, "example");
+            }
+            _ => panic!("Expected Tag, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_tag_and_namespace() {
+        // "example AND user" → tag "example" across all ns AND all user-tagged images
+        let expr = parse_filter("example AND user").unwrap();
         assert!(matches!(expr, FilterExpr::And { .. }));
     }
 }

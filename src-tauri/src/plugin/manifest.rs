@@ -30,14 +30,15 @@ pub enum ExecutionConfig {
     },
 }
 
+/// What the plugin needs from the host app.
+/// These are declarations of intent — the app enforces them, not the plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    ReadCompanion,
-    WriteCompanion,
+    /// Plugin will receive the media file path and can read the image bytes.
     ReadImage,
+    /// Plugin may make network requests (informational — not sandboxed yet).
     NetworkAccess,
-    BatchProcess,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
