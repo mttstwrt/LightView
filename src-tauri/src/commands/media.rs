@@ -694,6 +694,18 @@ pub async fn get_full_media(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+
+    // HEIC/HEIF: transcode to JPEG since browsers can't render HEIC natively
+    if ext == "heic" || ext == "heif" {
+        let src_path = std::path::Path::new(&path);
+        let (rgba, w, h, _, _) = crate::pipeline::thumbnailer::decode_heic_to_rgba(src_path)
+            .map_err(|e| format!("HEIC decode failed: {}", e))?;
+        let jpeg_data = crate::pipeline::thumbnailer::encode_rgba_to_jpeg(&rgba, w, h)
+            .map_err(|e| format!("JPEG encode failed: {}", e))?;
+        let b64 = encode_b64(&jpeg_data);
+        return Ok(format!("data:image/jpeg;base64,{}", b64));
+    }
+
     let mime = match ext.as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",

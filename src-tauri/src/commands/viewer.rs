@@ -51,12 +51,24 @@ pub async fn get_transformed_media(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Decode image to RGBA
-    let img = image::load_from_memory(&data)
-        .map_err(|e| format!("Image decode failed: {}", e))?;
-    let (src_w, src_h) = (img.width(), img.height());
-    let rgba = img.to_rgba8();
-    let rgba_data = rgba.into_raw();
+    // Decode image to RGBA (HEIC uses libheif, others use image crate)
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let (rgba_data, src_w, src_h) = if ext == "heic" || ext == "heif" {
+        let (rgba, w, h, _, _) = crate::pipeline::thumbnailer::decode_heic_to_rgba(std::path::Path::new(&path))
+            .map_err(|e| format!("HEIC decode failed: {}", e))?;
+        (rgba, w, h)
+    } else {
+        let img = image::load_from_memory(&data)
+            .map_err(|e| format!("Image decode failed: {}", e))?;
+        let (w, h) = (img.width(), img.height());
+        let rgba = img.to_rgba8();
+        (rgba.into_raw(), w, h)
+    };
 
     // Compute output dimensions (account for rotation)
     let rotation_rad = transform.rotation_degrees.to_radians();

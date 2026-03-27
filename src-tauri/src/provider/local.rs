@@ -24,6 +24,71 @@ impl LocalProvider {
             self.root.join(path)
         }
     }
+
+    /// Recursively discover all media files under `path`, skipping hidden
+    /// directories and `.lightview` metadata folders.
+    pub fn list_dir_recursive(&self, path: &str) -> Result<Vec<FileEntry>, ProviderError> {
+        let dir = self.resolve(path);
+        let mut entries = Vec::new();
+
+        for entry in walkdir::WalkDir::new(&dir)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                // Skip hidden dirs and .lightview metadata
+                !name.starts_with('.')
+            })
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if entry.file_type().is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip companion files
+            if name.ends_with(crate::companion::schema::COMPANION_EXTENSION) {
+                continue;
+            }
+
+            // Skip non-media files
+            let ext = entry.path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if MediaType::from_extension(ext).is_none() {
+                continue;
+            }
+
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            entries.push(FileEntry {
+                name,
+                path: entry.path().to_string_lossy().to_string(),
+                is_dir: false,
+                size: metadata.len(),
+                mtime,
+                mime_type: Some(mime_from_ext(ext)),
+            });
+        }
+
+        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(entries)
+    }
 }
 
 #[async_trait]

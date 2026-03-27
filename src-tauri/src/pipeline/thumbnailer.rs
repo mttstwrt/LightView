@@ -268,6 +268,45 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
     })
 }
 
+/// Generate a thumbnail for a HEIC/HEIF file using libheif.
+fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
+    let (rgba_buf, _dw, _dh, src_w, src_h) = decode_heic_to_rgba(path)?;
+    let dw = _dw;
+    let dh = _dh;
+    let (cx, cy, side) = center_crop_square(dw, dh);
+
+    let final_data = match format {
+        ThumbFormat::Jpeg => {
+            // Convert RGBA→RGB for JPEG path
+            let mut rgb = Vec::with_capacity((dw * dh * 3) as usize);
+            for chunk in rgba_buf.chunks_exact(4) {
+                rgb.push(chunk[0]);
+                rgb.push(chunk[1]);
+                rgb.push(chunk[2]);
+            }
+            let cropped = crop_rgb(&rgb, dw, cx, cy, side, side);
+            resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
+        }
+        ThumbFormat::Rgba => {
+            let cropped = crop_rgba(&rgba_buf, dw, cx, cy, side, side);
+            resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
+        }
+    };
+
+    let data = encode_output(&final_data, thumb_w, thumb_h, format)?;
+
+    Ok(ThumbResult {
+        path: path.to_string_lossy().to_string(),
+        width: thumb_w,
+        height: thumb_h,
+        data,
+        media_type: "image".to_string(),
+        src_width: src_w,
+        src_height: src_h,
+        format,
+    })
+}
+
 /// Resize RGB (U8x3) pixels to target dimensions.
 fn resize_rgb(sw: u32, sh: u32, src: &[u8], tw: u32, th: u32, filter: ResizeFilter) -> Result<Vec<u8>, ThumbError> {
     if sw == tw && sh == th {
@@ -376,6 +415,7 @@ pub fn generate_image_thumbnail(path: &Path, filter: ResizeFilter, format: Thumb
 
     match ext.as_str() {
         "jpg" | "jpeg" => generate_jpeg_thumbnail(path, filter, format, thumb_w, thumb_h),
+        "heic" | "heif" => generate_heic_thumbnail(path, filter, format, thumb_w, thumb_h),
         _ => generate_generic_thumbnail(path, filter, format, thumb_w, thumb_h),
     }
 }
@@ -487,6 +527,7 @@ pub fn decode_and_crop(path: &Path) -> Result<DecodedCrop, ThumbError> {
     // Decode to RGBA
     let (rgba_buf, dw, dh, src_w, src_h) = match ext.as_str() {
         "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
+        "heic" | "heif" => decode_heic_to_rgba(path)?,
         _ => decode_generic_to_rgba(path)?,
     };
 
@@ -544,6 +585,7 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
 
     let (rgba_buf, dw, dh, src_w, src_h) = match ext.as_str() {
         "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
+        "heic" | "heif" => decode_heic_to_rgba(path)?,
         _ => decode_generic_to_rgba(path)?,
     };
 
@@ -610,6 +652,39 @@ fn decode_jpeg_to_rgba_inner(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32
     };
 
     Ok((rgba, dw, dh, src_w, src_h))
+}
+
+/// Decode a HEIC/HEIF image to RGBA pixels using libheif.
+pub fn decode_heic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+    let lib_heif = libheif_rs::LibHeif::new();
+    let ctx = libheif_rs::HeifContext::read_from_file(path.to_str().unwrap_or(""))
+        .map_err(|e| ThumbError::Decode(format!("HEIC open failed: {}", e)))?;
+    let handle = ctx
+        .primary_image_handle()
+        .map_err(|e| ThumbError::Decode(format!("HEIC handle failed: {}", e)))?;
+    let src_w = handle.width();
+    let src_h = handle.height();
+    let img = lib_heif
+        .decode(&handle, libheif_rs::ColorSpace::Rgb(libheif_rs::RgbChroma::Rgba), None)
+        .map_err(|e| ThumbError::Decode(format!("HEIC decode failed: {}", e)))?;
+    let plane = img
+        .planes()
+        .interleaved
+        .ok_or_else(|| ThumbError::Decode("HEIC: no interleaved plane".to_string()))?;
+
+    let stride = plane.stride;
+    let w = img.width();
+    let h = img.height();
+
+    // Copy row-by-row to strip any padding from the stride
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h {
+        let start = (row as usize) * stride;
+        let end = start + (w as usize) * 4;
+        rgba.extend_from_slice(&plane.data[start..end]);
+    }
+
+    Ok((rgba, w, h, src_w, src_h))
 }
 
 /// Decode a non-JPEG image to RGBA pixels.

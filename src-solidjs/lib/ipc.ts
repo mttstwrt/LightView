@@ -175,6 +175,38 @@ export const installPlugin = (path: string) =>
   invoke<PluginInfo>("install_plugin", { path });
 
 // ---------------------------------------------------------------------------
+// File Operations (Copy / Move)
+// ---------------------------------------------------------------------------
+
+export interface FileOpResult {
+  succeeded: string[];
+  failed: { path: string; error: string }[];
+}
+
+export const copyFiles = (paths: string[], destination: string) =>
+  invoke<FileOpResult>("copy_files", { paths, destination });
+
+export const moveFiles = (paths: string[], destination: string) =>
+  invoke<FileOpResult>("move_files", { paths, destination });
+
+// ---------------------------------------------------------------------------
+// Duplicate Detection
+// ---------------------------------------------------------------------------
+
+export interface DuplicateGroup {
+  paths: string[];
+  hash: number;
+}
+
+export interface FindDuplicatesResult {
+  hashes_computed: number;
+  groups: DuplicateGroup[];
+}
+
+export const findDuplicates = (threshold?: number) =>
+  invoke<FindDuplicatesResult>("find_duplicates", { threshold });
+
+// ---------------------------------------------------------------------------
 // Settings / Maintenance
 // ---------------------------------------------------------------------------
 

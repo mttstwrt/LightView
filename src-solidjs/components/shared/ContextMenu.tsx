@@ -1,5 +1,6 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, openWith } from "../../lib/ipc";
+import { open } from "@tauri-apps/plugin-dialog";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, openWith, copyFiles, moveFiles } from "../../lib/ipc";
 import { pluginStarted, pluginFinished, pluginFailed } from "../../stores/pluginStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
@@ -17,6 +18,7 @@ interface ContextMenuProps {
   onClose: () => void;
   paths: string[];
   selectedPaths?: Set<string>;
+  onFilesRemoved?: (removed: string[]) => void;
 }
 
 type SubMenu = "tag" | "rating" | "openWith" | "plugins" | null;
@@ -167,6 +169,41 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
   };
 
+  const handleCopyTo = async () => {
+    if (!props.state) return;
+    const dest = await open({ directory: true, multiple: false });
+    if (!dest) return;
+    const paths = isBatchContext() ? batchPaths() : [props.state.path];
+    props.onClose();
+    try {
+      const result = await copyFiles(paths, dest as string);
+      if (result.failed.length > 0) {
+        console.error("Copy failures:", result.failed);
+      }
+    } catch (err) {
+      console.error("Copy failed:", err);
+    }
+  };
+
+  const handleMoveTo = async () => {
+    if (!props.state) return;
+    const dest = await open({ directory: true, multiple: false });
+    if (!dest) return;
+    const paths = isBatchContext() ? batchPaths() : [props.state.path];
+    props.onClose();
+    try {
+      const result = await moveFiles(paths, dest as string);
+      if (result.succeeded.length > 0) {
+        props.onFilesRemoved?.(result.succeeded);
+      }
+      if (result.failed.length > 0) {
+        console.error("Move failures:", result.failed);
+      }
+    } catch (err) {
+      console.error("Move failed:", err);
+    }
+  };
+
   // Ensure menu stays within viewport
   const menuStyle = () => {
     if (!props.state) return {};
@@ -221,6 +258,16 @@ export function ContextMenu(props: ContextMenuProps) {
               <MenuItem label="Regenerate Thumbnail" onClick={handleRegenerateThumbnail} />
             </Show>
             <MenuItem label="Copy Path" onClick={handleCopyPath} />
+            <Divider />
+            <MenuItem
+              label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to...` : "Copy to..."}
+              onClick={handleCopyTo}
+            />
+            <MenuItem
+              label={isBatchContext() ? `Move ${props.selectedPaths!.size} to...` : "Move to..."}
+              onClick={handleMoveTo}
+            />
+            <Divider />
             <MenuItem
               label={isBatchContext() ? `Run Plugin on ${props.selectedPaths!.size}...` : "Run Plugin..."}
               onClick={() => setSubMenu("plugins")}

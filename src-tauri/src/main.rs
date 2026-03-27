@@ -204,6 +204,13 @@ fn main() {
             // GPU capability notification
             lightview_lib::pipeline::gpu::notify_gpu_capabilities,
 
+            // File operations (copy/move)
+            commands::files::copy_files,
+            commands::files::move_files,
+
+            // Duplicate detection
+            commands::duplicates::find_duplicates,
+
             // Settings / maintenance commands
             commands::settings::get_hardware_profile,
             commands::settings::reindex_gallery,

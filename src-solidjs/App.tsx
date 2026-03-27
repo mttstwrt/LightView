@@ -155,6 +155,12 @@ export function App() {
           onClose={() => setContextMenu(null)}
           paths={displayPaths()}
           selectedPaths={selectedPaths()}
+          onFilesRemoved={(removed) => {
+            const removedSet = new Set(removed);
+            setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+            clearSelection();
+            setTotalCount((c) => Math.max(0, c - removed.length));
+          }}
         />
         <Show when={viewerOpen()}>
           <MediaViewer

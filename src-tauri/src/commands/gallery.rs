@@ -6,7 +6,7 @@ use crate::cache::atlas::ThumbAtlas;
 use crate::cache::db::CacheDb;
 use crate::companion::schema::MediaType;
 use crate::provider::local::LocalProvider;
-use crate::provider::{FileEntry, FileProvider, ProviderType};
+use crate::provider::{FileEntry, ProviderType};
 use crate::AppState;
 
 #[derive(Debug, Serialize)]
@@ -143,14 +143,12 @@ pub async fn open_gallery(
     let cache_db = CacheDb::open(std::path::Path::new(&path))
         .map_err(|e| format!("Failed to open cache: {}", e))?;
 
-    // Quick directory scan to count media files
+    // Recursively scan for all media files in the directory tree
     let entries: Vec<crate::provider::FileEntry> = provider
-        .list_dir(&path)
-        .await
-        .map_err(|e| format!("Failed to list directory: {}", e))?;
+        .list_dir_recursive(&path)
+        .map_err(|e| format!("Failed to scan directory: {}", e))?;
 
-    let media_entries: Vec<&FileEntry> = entries.iter().filter(|e| !e.is_dir).collect();
-    let media_count = media_entries.len();
+    let media_count = entries.len();
 
     // Populate media_meta table so sorting works immediately
     populate_media_meta(&cache_db, &entries)?;
@@ -309,16 +307,21 @@ pub async fn get_gallery_info(
         Some(path) => {
             let reg = state.providers.read().await;
             match reg.get(path) {
-                Some(provider) => {
-                    let entries = provider
-                        .list_dir(path)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let media_count = entries.iter().filter(|e| !e.is_dir).count();
+                Some(_provider) => {
+                    // Use the media_meta table for count — it was populated
+                    // from the recursive scan during open_gallery.
+                    let db = state.cache_db.lock().await;
+                    let media_count = if let Some(db) = db.as_ref() {
+                        db.conn()
+                            .query_row("SELECT COUNT(*) FROM media_meta", [], |r| r.get::<_, usize>(0))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
                     Ok(Some(GalleryOpenResult {
                         path: path.clone(),
                         total_media: media_count,
-                        provider_type: provider.provider_type(),
+                        provider_type: _provider.provider_type(),
                     }))
                 }
                 None => Ok(None),

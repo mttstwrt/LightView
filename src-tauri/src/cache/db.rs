@@ -101,6 +101,10 @@ impl CacheDb {
         let _ = conn.execute_batch(
             "ALTER TABLE thumbnails ADD COLUMN resize_filter TEXT NOT NULL DEFAULT 'nearest'",
         );
+        // Migrate: add perceptual hash column for duplicate detection
+        let _ = conn.execute_batch(
+            "ALTER TABLE thumbnails ADD COLUMN phash INTEGER",
+        );
 
         Ok(Self { conn })
     }
