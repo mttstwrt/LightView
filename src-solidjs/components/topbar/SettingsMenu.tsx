@@ -2,8 +2,9 @@ import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths } from "../../stores/galleryStore";
 import type { AppSettings, ResizeFilter, CompanionLocation, PluginInfo } from "../../lib/types";
-import { rebuildThumbnails, getThumbnailSettings, updateThumbnailSettings, listPlugins, installPlugin, runPluginBatch } from "../../lib/ipc";
-import { pluginStarted, pluginFinished, pluginFailed } from "../../stores/pluginStore";
+import { rebuildThumbnails, getThumbnailSettings, updateThumbnailSettings, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch } from "../../lib/ipc";
+import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
+import { listen } from "@tauri-apps/api/event";
 import type { ThumbnailSettings, ThumbFormat } from "../../lib/ipc";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -63,6 +64,16 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
     }));
   };
 
+  const updatePlugins = <K extends keyof AppSettings["plugins"]>(
+    key: K,
+    value: AppSettings["plugins"][K],
+  ) => {
+    setSettings((prev) => ({
+      ...prev,
+      plugins: { ...prev.plugins, [key]: value },
+    }));
+  };
+
   const updateStorage = <K extends keyof AppSettings["storage"]>(
     key: K,
     value: AppSettings["storage"][K],
@@ -89,8 +100,8 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
     setThumbSettings(updated);
     try {
       await updateThumbnailSettings(updated);
-      // Invalidate cached thumbnails so the grid re-fetches in the new format/dimensions
-      window.dispatchEvent(new CustomEvent("lightview:thumbnails-invalidated"));
+      // New settings apply only to newly generated thumbnails.
+      // Use "Rebuild All" to regenerate existing thumbnails with the new settings.
     } catch (e) {
       console.error("Failed to update thumbnail settings:", e);
     }
@@ -167,25 +178,57 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
     const displayName = plugin?.display_name ?? pluginName;
     setPluginRunning(pluginName);
     setPluginStatus(`Running on ${paths.length} photos...`);
-    pluginStarted(pluginName, displayName, `Running on ${paths.length} photos...`);
-    try {
-      const results = await runPluginBatch(pluginName, paths, "tag");
-      const succeeded = results.filter((r) => r.success).length;
-      const failed = results.length - succeeded;
-      const msg = failed > 0 ? `Done: ${succeeded} tagged, ${failed} failed` : `Tagged ${succeeded} photos`;
-      setPluginStatus(msg);
-      if (failed > 0) {
+    pluginStarted(pluginName, displayName, paths.length);
+
+    // Listen for per-file progress and completion events from the background task
+    const unlistenProgress = await listen<{
+      completed: number;
+      total: number;
+    }>("plugin:progress", (event) => {
+      pluginProgress(event.payload.completed, event.payload.total);
+    });
+
+    const unlistenDone = await listen<{
+      succeeded: number;
+      failed: number;
+      cancelled: boolean;
+    }>("plugin:done", (event) => {
+      const { succeeded, failed, cancelled } = event.payload;
+      if (cancelled) {
+        pluginCancelled();
+      } else if (failed > 0) {
+        const msg = `Done: ${succeeded} tagged, ${failed} failed`;
+        setPluginStatus(msg);
         pluginFailed(msg);
       } else {
+        const msg = `Tagged ${succeeded} photos`;
+        setPluginStatus(msg);
         pluginFinished(msg);
       }
-    } catch (e) {
-      console.error("Plugin run failed:", e);
-      setPluginStatus("Run failed");
-      pluginFailed("Run failed");
-    } finally {
+      cleanup();
+    });
+
+    const cleanup = () => {
+      unlistenProgress();
+      unlistenDone();
       setPluginRunning(null);
       setTimeout(() => setPluginStatus(""), 5000);
+    };
+
+    // Fire-and-forget — the backend runs the batch in a background task
+    // and reports progress/completion via events.
+    try {
+      const s = settings();
+      await runPluginBatch(
+        pluginName, paths, "tag",
+        s.plugins.max_concurrent,
+        s.plugins.onnx_threads,
+      );
+    } catch (e) {
+      console.error("Plugin batch launch failed:", e);
+      setPluginStatus("Run failed");
+      pluginFailed("Run failed");
+      cleanup();
     }
   };
 
@@ -424,6 +467,39 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
               <Show when={pluginStatus()}>
                 <span class="text-xs text-neutral-400">{pluginStatus()}</span>
               </Show>
+
+              {/* Resource limits */}
+              <Field label="Max concurrent processes">
+                <div class="flex items-center gap-2">
+                  <input
+                    type="range"
+                    min="1"
+                    max="16"
+                    value={settings().plugins.max_concurrent}
+                    onInput={(e) => updatePlugins("max_concurrent", parseInt(e.currentTarget.value))}
+                    class="flex-1 h-1 accent-teal-500"
+                  />
+                  <span class="text-xs text-neutral-400 w-5 text-right font-mono">
+                    {settings().plugins.max_concurrent}
+                  </span>
+                </div>
+              </Field>
+              <Field label="ONNX threads per process">
+                <div class="flex items-center gap-2">
+                  <input
+                    type="range"
+                    min="1"
+                    max="8"
+                    value={settings().plugins.onnx_threads}
+                    onInput={(e) => updatePlugins("onnx_threads", parseInt(e.currentTarget.value))}
+                    class="flex-1 h-1 accent-teal-500"
+                  />
+                  <span class="text-xs text-neutral-400 w-5 text-right font-mono">
+                    {settings().plugins.onnx_threads}
+                  </span>
+                </div>
+              </Field>
+
               <div class="flex gap-1">
                 <button
                   onClick={handleAddPlugin}

@@ -10,7 +10,9 @@ import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
 import { ContextMenu, type ContextMenuState } from "./components/shared/ContextMenu";
 import { SelectionBar } from "./components/gallery/SelectionBar";
-import { pluginActivity } from "./stores/pluginStore";
+import { pluginActivity, type PluginActivity } from "./stores/pluginStore";
+import { cancelPluginBatch } from "./lib/ipc";
+import { thumbGenActivity } from "./stores/thumbnailProgressStore";
 
 function DebugOverlay() {
   const [info, setInfo] = createSignal<DebugInfo | null>(null);
@@ -178,6 +180,9 @@ export function App() {
       <Show when={pluginActivity()}>
         <PluginToast />
       </Show>
+      <Show when={thumbGenActivity()}>
+        <ThumbnailToast />
+      </Show>
     </div>
   );
 }
@@ -189,6 +194,7 @@ function PluginToast() {
       case "running": return "text-teal-400";
       case "done": return "text-green-400";
       case "error": return "text-red-400";
+      case "cancelled": return "text-yellow-400";
     }
   };
   const borderColor = () => {
@@ -196,19 +202,101 @@ function PluginToast() {
       case "running": return "border-teal-500/30";
       case "done": return "border-green-500/30";
       case "error": return "border-red-500/30";
+      case "cancelled": return "border-yellow-500/30";
     }
+  };
+  const progress = () => {
+    const a = activity();
+    if (a.total === 0) return 0;
+    return Math.round((a.completed / a.total) * 100);
   };
 
   return (
     <div
-      class={`fixed bottom-4 right-4 z-[150] flex items-center gap-3 px-4 py-2.5 rounded-lg border ${borderColor()}`}
+      class={`fixed bottom-4 right-4 z-[150] flex flex-col gap-2 px-4 py-2.5 rounded-lg border ${borderColor()}`}
+      style={{
+        background: "rgba(18, 18, 18, 0.95)",
+        "backdrop-filter": "blur(12px)",
+        "min-width": "240px",
+      }}
+    >
+      <div class="flex items-center gap-3">
+        <Show when={activity().status === "running"}>
+          <div class="w-3.5 h-3.5 shrink-0 border-2 border-teal-400 border-t-transparent rounded-full animate-spin" />
+        </Show>
+        <Show when={activity().status === "done"}>
+          <svg class="w-3.5 h-3.5 shrink-0 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
+          </svg>
+        </Show>
+        <Show when={activity().status === "error"}>
+          <svg class="w-3.5 h-3.5 shrink-0 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </Show>
+        <Show when={activity().status === "cancelled"}>
+          <svg class="w-3.5 h-3.5 shrink-0 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </Show>
+        <div class="flex flex-col flex-1 min-w-0">
+          <span class={`text-xs font-medium ${statusColor()}`}>{activity().displayName}</span>
+          <span class="text-[11px] text-neutral-400">{activity().message}</span>
+        </div>
+        <Show when={activity().status === "running"}>
+          <button
+            onClick={() => cancelPluginBatch()}
+            class="shrink-0 px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-700 text-neutral-400 hover:bg-neutral-600 hover:text-neutral-200"
+            title="Cancel"
+          >
+            Cancel
+          </button>
+        </Show>
+      </div>
+      <Show when={activity().status === "running" && activity().total > 0}>
+        <div class="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
+          <div
+            class="h-full bg-teal-500 rounded-full transition-all duration-300"
+            style={{ width: `${progress()}%` }}
+          />
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+function ThumbnailToast() {
+  const activity = () => thumbGenActivity()!;
+  const statusColor = () => {
+    switch (activity().status) {
+      case "generating": return "text-blue-400";
+      case "done": return "text-green-400";
+      case "error": return "text-red-400";
+    }
+  };
+  const borderColor = () => {
+    switch (activity().status) {
+      case "generating": return "border-blue-500/30";
+      case "done": return "border-green-500/30";
+      case "error": return "border-red-500/30";
+    }
+  };
+  const progress = () => {
+    const a = activity();
+    if (a.total === 0) return 0;
+    return Math.round((a.generated / a.total) * 100);
+  };
+
+  return (
+    <div
+      class={`fixed bottom-14 right-4 z-[150] flex items-center gap-3 px-4 py-2.5 rounded-lg border ${borderColor()}`}
       style={{
         background: "rgba(18, 18, 18, 0.95)",
         "backdrop-filter": "blur(12px)",
       }}
     >
-      <Show when={activity().status === "running"}>
-        <div class="w-3.5 h-3.5 border-2 border-teal-400 border-t-transparent rounded-full animate-spin" />
+      <Show when={activity().status === "generating"}>
+        <div class="w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
       </Show>
       <Show when={activity().status === "done"}>
         <svg class="w-3.5 h-3.5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -221,7 +309,9 @@ function PluginToast() {
         </svg>
       </Show>
       <div class="flex flex-col">
-        <span class={`text-xs font-medium ${statusColor()}`}>{activity().displayName}</span>
+        <span class={`text-xs font-medium ${statusColor()}`}>
+          Thumbnails{activity().status === "generating" ? ` ${progress()}%` : ""}
+        </span>
         <span class="text-[11px] text-neutral-400">{activity().message}</span>
       </div>
     </div>

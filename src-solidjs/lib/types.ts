@@ -174,6 +174,10 @@ export interface AppSettings {
     thumbnail_quality: number;
     thumbnail_resize_filter: ResizeFilter;
   };
+  plugins: {
+    max_concurrent: number;
+    onnx_threads: number;
+  };
   storage: {
     companion_location: CompanionLocation;
   };

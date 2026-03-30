@@ -434,7 +434,7 @@ pub fn generate_for_path(path: &Path, filter: ResizeFilter, format: ThumbFormat,
             r
         }),
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            Err(ThumbError::Decode("Video thumbnails not yet supported".to_string()))
+            generate_video_placeholder(path, format, thumb_w, thumb_h)
         }
         _ => generate_image_thumbnail(path, filter, format, thumb_w, thumb_h),
     }
@@ -518,9 +518,7 @@ pub fn decode_and_crop(path: &Path) -> Result<DecodedCrop, ThumbError> {
 
     let media_type = match ext.as_str() {
         "gif" => "gif",
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            return Err(ThumbError::Decode("Video thumbnails not yet supported".into()));
-        }
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => "video",
         _ => "image",
     };
 
@@ -528,6 +526,10 @@ pub fn decode_and_crop(path: &Path) -> Result<DecodedCrop, ThumbError> {
     let (rgba_buf, dw, dh, src_w, src_h) = match ext.as_str() {
         "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
         "heic" | "heif" => decode_heic_to_rgba(path)?,
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
+            // Placeholder: 1x1 grey pixel, crop/resize will scale it
+            (vec![0x3A, 0x3A, 0x3A, 0xFF], 1, 1, 0, 0)
+        }
         _ => decode_generic_to_rgba(path)?,
     };
 
@@ -577,15 +579,17 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
 
     let media_type = match ext.as_str() {
         "gif" => "gif",
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            return Err(ThumbError::Decode("Video thumbnails not yet supported".into()));
-        }
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => "video",
         _ => "image",
     };
 
     let (rgba_buf, dw, dh, src_w, src_h) = match ext.as_str() {
         "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
         "heic" | "heif" => decode_heic_to_rgba(path)?,
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
+            // Placeholder: 1x1 grey pixel, crop/resize will scale it
+            (vec![0x3A, 0x3A, 0x3A, 0xFF], 1, 1, 0, 0)
+        }
         _ => decode_generic_to_rgba(path)?,
     };
 
@@ -685,6 +689,46 @@ pub fn decode_heic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32),
     }
 
     Ok((rgba, w, h, src_w, src_h))
+}
+
+// TODO: Generate real video thumbnails by extracting the first frame via ffmpeg.
+// For now, returns a solid grey placeholder so video files don't block thumbnail generation.
+fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
+    let pixel_count = (thumb_w * thumb_h) as usize;
+    let grey: u8 = 0x3A; // neutral dark grey
+
+    let data = match format {
+        ThumbFormat::Rgba => {
+            let mut buf = vec![0u8; pixel_count * 4];
+            for pixel in buf.chunks_exact_mut(4) {
+                pixel[0] = grey;
+                pixel[1] = grey;
+                pixel[2] = grey;
+                pixel[3] = 255;
+            }
+            buf
+        }
+        ThumbFormat::Jpeg => {
+            let rgb = vec![grey; pixel_count * 3];
+            let mut cursor = std::io::Cursor::new(Vec::with_capacity(4096));
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 80);
+            encoder
+                .encode(&rgb, thumb_w, thumb_h, image::ExtendedColorType::Rgb8)
+                .map_err(|e| ThumbError::Encode(e.to_string()))?;
+            cursor.into_inner()
+        }
+    };
+
+    Ok(ThumbResult {
+        path: path.to_string_lossy().to_string(),
+        width: thumb_w,
+        height: thumb_h,
+        data,
+        media_type: "video".to_string(),
+        src_width: 0,
+        src_height: 0,
+        format,
+    })
 }
 
 /// Decode a non-JPEG image to RGBA pixels.

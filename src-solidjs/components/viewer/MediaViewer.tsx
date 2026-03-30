@@ -1,5 +1,5 @@
 import { Show, For, createSignal, createEffect, on } from "solid-js";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
 import { getFullMedia, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
 import type { CachedThumbnailInfo } from "../../lib/ipc";
@@ -32,9 +32,15 @@ export function MediaViewer(props: MediaViewerProps) {
   const isVideo = () =>
     ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"].includes(ext());
 
+  const openVideoInPlayer = () => {
+    const path = currentPath();
+    if (!path) return;
+    invoke("open_with", { command: "xdg-open", args: [path] }).catch((err) =>
+      console.error("Failed to open video:", err)
+    );
+  };
+
   // Load full media when index changes.
-  // Videos use Tauri's asset protocol for streaming (data URIs crash WebKitGTK
-  // on large files). Images use the existing data URI path.
   createEffect(
     on(
       () => props.currentIndex,
@@ -43,14 +49,9 @@ export function MediaViewer(props: MediaViewerProps) {
         if (!path) return;
 
         setLoaded(false);
+        setMediaSrc("");
 
-        const e = path.split(".").pop()?.toLowerCase() ?? "";
-        const videoExts = ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"];
-
-        if (videoExts.includes(e)) {
-          // Stream video directly from disk via Tauri's asset protocol.
-          setMediaSrc(convertFileSrc(path));
-        } else {
+        if (!isVideo()) {
           try {
             const dataUri = await getFullMedia(path);
             setMediaSrc(dataUri);
@@ -84,16 +85,17 @@ export function MediaViewer(props: MediaViewerProps) {
 
       {/* Media display */}
       <div class="max-w-[90vw] max-h-[90vh] flex items-center justify-center">
-        <Show when={isVideo() && mediaSrc()}>
-          <video
-            src={mediaSrc()}
-            controls
-            autoplay
-            class="max-w-[90vw] max-h-[90vh] object-contain"
-            style={{ outline: "none" }}
-            onError={(e) => console.error("Video playback error:", (e.target as HTMLVideoElement).error)}
-            onLoadedData={() => setLoaded(true)}
-          />
+        <Show when={isVideo()}>
+          <div class="text-neutral-400 text-sm text-center">
+            <button
+              class="w-20 h-20 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer transition-colors mb-4"
+              onClick={(e) => { e.stopPropagation(); openVideoInPlayer(); }}
+            >
+              <span class="text-white/80 text-3xl ml-1">&#9654;</span>
+            </button>
+            <div>Open in video player</div>
+            <div class="text-neutral-600 mt-1">{filename()}</div>
+          </div>
         </Show>
 
         <Show when={!isVideo() && mediaSrc()}>
@@ -107,7 +109,7 @@ export function MediaViewer(props: MediaViewerProps) {
           />
         </Show>
 
-        <Show when={!mediaSrc()}>
+        <Show when={!isVideo() && !mediaSrc()}>
           <div class="text-neutral-500 text-sm">Loading...</div>
         </Show>
       </div>

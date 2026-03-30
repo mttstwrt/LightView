@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=LightView
+Comment=Fast, plugin-extensible media gallery viewer
+Exec=lightview %f
+Icon=lightview
+Type=Application
+Categories=Graphics;Viewer;Photography;
+MimeType=inode/directory;
+Terminal=false

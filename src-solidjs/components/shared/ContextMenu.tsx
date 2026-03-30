@@ -1,7 +1,8 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, openWith, copyFiles, moveFiles } from "../../lib/ipc";
-import { pluginStarted, pluginFinished, pluginFailed } from "../../stores/pluginStore";
+import { listen } from "@tauri-apps/api/event";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles } from "../../lib/ipc";
+import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
 import type { PluginInfo } from "../../lib/types";
@@ -123,16 +124,40 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
     try {
       if (isBatch) {
-        pluginStarted(pluginName, displayName, `Running on ${paths.length} files...`);
-        const results = await runPluginBatch(pluginName, paths, "tag");
-        const failed = results.filter((r) => !r.success);
-        if (failed.length > 0) {
-          pluginFailed(`${results.length - failed.length} tagged, ${failed.length} failed`);
-        } else {
-          pluginFinished(`Tagged ${results.length} files`);
-        }
+        pluginStarted(pluginName, displayName, paths.length);
+
+        const unlistenProgress = await listen<{ completed: number; total: number; failed: number }>(
+          "plugin:progress",
+          (event) => pluginProgress(event.payload.completed, event.payload.total),
+        );
+        const unlistenDone = await listen<{ total: number; failed: number; cancelled: boolean }>(
+          "plugin:done",
+          (event) => {
+            unlistenProgress();
+            unlistenDone();
+            const { total, failed, cancelled } = event.payload;
+            if (cancelled) {
+              pluginCancelled();
+            } else if (failed > 0) {
+              pluginFailed(`${total - failed} tagged, ${failed} failed`);
+            } else {
+              pluginFinished(`Tagged ${total} files`);
+            }
+            setPluginBusy(false);
+          },
+        );
+
+        const { max_concurrent, onnx_threads } = settings().plugins;
+        runPluginBatch(pluginName, paths, "tag", max_concurrent, onnx_threads).catch((err) => {
+          console.error("Plugin batch failed to start:", err);
+          unlistenProgress();
+          unlistenDone();
+          pluginFailed("Failed to start batch");
+          setPluginBusy(false);
+        });
+        return; // pluginBusy cleared by event listener
       } else {
-        pluginStarted(pluginName, displayName, "Running...");
+        pluginStarted(pluginName, displayName, 1);
         const result = await runPlugin(pluginName, paths[0], "tag");
         if (result.success) {
           pluginFinished("Done");

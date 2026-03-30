@@ -196,6 +196,7 @@ fn main() {
             commands::plugins::list_plugins,
             commands::plugins::run_plugin,
             commands::plugins::run_plugin_batch,
+            commands::plugins::cancel_plugin_batch,
             commands::plugins::install_plugin,
 
             // Viewer commands (GPU-accelerated transforms)

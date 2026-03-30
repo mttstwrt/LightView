@@ -2,6 +2,7 @@ import { Index, Show, createSignal, createEffect, on, onMount, onCleanup, batch,
 import { createStore, reconcile } from "solid-js/store";
 import { settings } from "../../stores/settingsStore";
 import { getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbnailResult } from "../../lib/ipc";
+import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
 import { ThumbnailCell } from "./ThumbnailCell";
 
@@ -33,12 +34,6 @@ const FETCH_INTERVAL_MS = 80;
 
 // How many paths to send per background precache call.
 const BG_BATCH_SIZE = 15;
-
-// Maximum number of retry attempts for failed thumbnails.
-const MAX_RETRIES = 3;
-
-// Delay (ms) before retrying failed thumbnails.
-const RETRY_DELAY_MS = 2000;
 
 // Rows beyond the visible+buffer range before thumbnails are evicted from memory.
 const EVICT_ROWS = 15;
@@ -164,27 +159,33 @@ export function GalleryGrid(props: GalleryGridProps) {
 
   /** Paths that currently have a protocol URL in thumbMap. */
   const assignedSet = new Set<string>();
-  /** Paths pre-generated on backend via background precache IPC. */
-  const precachedSet = new Set<string>();
   /** Paths where the protocol handler returned 404 — need IPC generation. */
-  const generationQueue = new Set<string>();
-  /** Paths currently in-flight for IPC generation (prevents duplicates). */
-  const generatingSet = new Set<string>();
+  const needsGeneration = new Set<string>();
+  /** Paths currently in-flight for IPC generation. */
+  const inFlightSet = new Set<string>();
+  /** Paths that permanently failed (won't be retried). */
+  const failedSet = new Set<string>();
   /** Cache-bust version per path — incremented after IPC generation. */
   const urlVersions = new Map<string, number>();
   /** Reverse index: path → position in props.paths for O(1) eviction lookups. */
   const pathToIndex = new Map<string, number>();
 
-  const retryCount = new Map<string, number>();
-  /** Paths awaiting retry, mapped to the earliest timestamp they can be retried. */
-  const pendingRetries = new Map<string, number>();
-  let bgCursor = 0;                           // Background scan position
+  let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
+
+  // Thumbnail generation progress tracking
+  let thumbGenTotal = 0;
+  let thumbGenDone = 0;
 
   /** Called by ThumbnailCell when the protocol handler returns 404. */
   const handleThumbError = (path: string) => {
-    if (!generatingSet.has(path)) {
-      generationQueue.add(path);
+    if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path)) return;
+    needsGeneration.add(path);
+    thumbGenTotal++;
+    if (thumbGenTotal === 1) {
+      thumbGenStarted(thumbGenTotal);
+    } else {
+      thumbGenProgress(thumbGenDone, thumbGenTotal);
     }
   };
 
@@ -336,10 +337,12 @@ export function GalleryGrid(props: GalleryGridProps) {
         if (dy > window.innerHeight * JUMP_FACTOR) {
           setGeneration((g) => g + 1);
           assignedSet.clear();
-          precachedSet.clear();
-          generationQueue.clear();
-          generatingSet.clear();
+          needsGeneration.clear();
+          inFlightSet.clear();
+          failedSet.clear();
           bgCursor = 0;
+          thumbGenTotal = 0;
+          thumbGenDone = 0;
         }
 
         lastScrollY = y;
@@ -390,17 +393,6 @@ export function GalleryGrid(props: GalleryGridProps) {
     let fetchAbort = false;
     let inFlightFetch: Promise<void> | null = null;
 
-    /** Mark a path as failed, scheduling it for retry if under the limit. */
-    const markFailed = (p: string) => {
-      const attempts = (retryCount.get(p) ?? 0) + 1;
-      retryCount.set(p, attempts);
-      if (attempts < MAX_RETRIES) {
-        generatingSet.delete(p);
-        generationQueue.delete(p);
-        pendingRetries.set(p, Date.now() + RETRY_DELAY_MS);
-      }
-    };
-
     /** Remove thumbMap entries for paths far from the current viewport. */
     const evictFaraway = () => {
       const sr = startRow();
@@ -430,71 +422,78 @@ export function GalleryGrid(props: GalleryGridProps) {
     const scheduleFetch = () => {
       if (inFlightFetch) return;
 
-      // Decay velocity to zero when no scroll events arrive.
-      // lastTimestamp is updated on every scroll RAF — if it's stale, user stopped.
       const now = performance.now();
-      if (now - lastTimestamp > 150) {
-        currentVelocity = 0;
-      }
-
-      // Settle detection: wait briefly after fast scrolling ends before fetching.
-      // lastFastScrollTime is ONLY set in the scroll handler, not here.
-      if (currentVelocity > VELOCITY_FAST) {
-        return;
-      }
-      if (now - lastFastScrollTime < SETTLE_MS) {
-        return;
-      }
+      if (now - lastTimestamp > 150) currentVelocity = 0;
+      if (currentVelocity > VELOCITY_FAST) return;
+      if (now - lastFastScrollTime < SETTLE_MS) return;
 
       const gen = generation();
 
-      // Phase 1: Process generation queue (paths that 404'd on optimistic load)
-      if (generationQueue.size > 0) {
-        const toGenerate: string[] = [];
-        for (const p of generationQueue) {
-          if (toGenerate.length >= BATCH_SIZE) break;
-          // Only generate paths still near the viewport
+      // Phase 1: Generate thumbnails that 404'd.
+      // Prioritize near-viewport, then fill with off-screen paths.
+      if (needsGeneration.size > 0) {
+        const nearViewport: string[] = [];
+        const farAway: string[] = [];
+        const sr = startRow();
+        const er = endRow();
+        const c = cols();
+        const nearStart = Math.max(0, (sr - EVICT_ROWS)) * c;
+        const nearEnd = Math.min(props.paths.length, (er + EVICT_ROWS) * c);
+
+        for (const p of needsGeneration) {
+          if (nearViewport.length >= BATCH_SIZE) break;
           const idx = pathToIndex.get(p);
-          const sr = startRow();
-          const er = endRow();
-          const c = cols();
-          const nearStart = Math.max(0, (sr - EVICT_ROWS)) * c;
-          const nearEnd = Math.min(props.paths.length, (er + EVICT_ROWS) * c);
           if (idx !== undefined && idx >= nearStart && idx < nearEnd) {
-            toGenerate.push(p);
+            nearViewport.push(p);
+          } else if (farAway.length < BATCH_SIZE) {
+            farAway.push(p);
           }
-          generationQueue.delete(p);
-          generatingSet.add(p);
         }
 
+        // Near-viewport first, then fill remaining slots with off-screen paths
+        const toGenerate = nearViewport.slice(0, BATCH_SIZE);
+        const remaining = BATCH_SIZE - toGenerate.length;
+        if (remaining > 0) toGenerate.push(...farAway.slice(0, remaining));
+
         if (toGenerate.length > 0) {
+          for (const p of toGenerate) {
+            needsGeneration.delete(p);
+            inFlightSet.add(p);
+          }
+
           inFlightFetch = (async () => {
             try {
               const results = await getThumbnailsBatch(toGenerate);
               if (fetchAbort || generation() !== gen) return;
 
-              // Bump URL versions for successfully generated paths
               const resultPaths = new Set(results.map((r) => r.path));
               batch(() => {
                 for (const r of results) {
-                  generatingSet.delete(r.path);
                   const v = (urlVersions.get(r.path) ?? 0) + 1;
                   urlVersions.set(r.path, v);
                   setThumbMap(r.path, `${thumbUrl(r.path)}?v=${v}`);
                 }
               });
 
+              thumbGenDone += results.length;
               for (const p of toGenerate) {
-                if (!resultPaths.has(p)) {
-                  generatingSet.delete(p);
-                  markFailed(p);
-                }
+                inFlightSet.delete(p);
+                if (!resultPaths.has(p)) failedSet.add(p);
+              }
+
+              // Report progress or completion
+              if (needsGeneration.size === 0 && inFlightSet.size === 0) {
+                thumbGenFinished(thumbGenDone);
+                thumbGenTotal = 0;
+                thumbGenDone = 0;
+              } else {
+                thumbGenProgress(thumbGenDone, thumbGenTotal);
               }
             } catch (e) {
               console.error("Thumbnail generation batch failed:", e);
               for (const p of toGenerate) {
-                generatingSet.delete(p);
-                markFailed(p);
+                inFlightSet.delete(p);
+                failedSet.add(p);
               }
             }
             inFlightFetch = null;
@@ -503,36 +502,14 @@ export function GalleryGrid(props: GalleryGridProps) {
         }
       }
 
-      // Phase 2: Background prefetch (only when viewport is satisfied and scroll is slow)
-      if (currentVelocity < VELOCITY_SLOW) {
+      // Phase 2: Background prefetch (silent, no progress tracking)
+      if (currentVelocity < VELOCITY_SLOW && bgCursor < props.paths.length) {
         const bgNeeded: string[] = [];
-
-        // 2a. Drain pending retries that are past their delay
-        const now = Date.now();
-        for (const [p, retryAt] of pendingRetries) {
-          if (bgNeeded.length >= BG_BATCH_SIZE) break;
-          if (now < retryAt) continue;
-          if (retryCount.get(p)! >= MAX_RETRIES) {
-            pendingRetries.delete(p);
-            continue;
-          }
-          if (!precachedSet.has(p)) {
-            precachedSet.add(p);
-            bgNeeded.push(p);
-          }
-          pendingRetries.delete(p);
-        }
-
-        // 2b. Scan forward from bgCursor for uncached paths
         const total = props.paths.length;
-        let scanned = 0;
-        while (bgNeeded.length < BG_BATCH_SIZE && scanned < total) {
-          if (bgCursor >= total) bgCursor = 0;
+        while (bgNeeded.length < BG_BATCH_SIZE && bgCursor < total) {
           const p = props.paths[bgCursor];
           bgCursor++;
-          scanned++;
-          if (p && !assignedSet.has(p) && !precachedSet.has(p)) {
-            precachedSet.add(p);
+          if (p && !assignedSet.has(p) && !failedSet.has(p)) {
             bgNeeded.push(p);
           }
         }
@@ -540,14 +517,9 @@ export function GalleryGrid(props: GalleryGridProps) {
         if (bgNeeded.length > 0) {
           inFlightFetch = (async () => {
             try {
-              const result = await precacheThumbnails(bgNeeded);
-              if (fetchAbort || generation() !== gen) return;
-              for (const failedPath of result.failed) {
-                markFailed(failedPath);
-              }
+              await precacheThumbnails(bgNeeded);
             } catch (e) {
               console.error("Background precache failed:", e);
-              for (const p of bgNeeded) markFailed(p);
             }
             inFlightFetch = null;
           })();
@@ -555,7 +527,7 @@ export function GalleryGrid(props: GalleryGridProps) {
         }
       }
 
-      // Phase 3: Eviction — run when no other work to do
+      // Phase 3: Eviction
       evictFaraway();
     };
 
@@ -567,17 +539,17 @@ export function GalleryGrid(props: GalleryGridProps) {
       }),
     );
 
-    // Listen for thumbnail invalidation (e.g. after rebuild or settings change)
+    // Listen for thumbnail invalidation (e.g. after rebuild)
     const onInvalidate = () => {
       setThumbMap(reconcile({}));
       assignedSet.clear();
-      precachedSet.clear();
-      generationQueue.clear();
-      generatingSet.clear();
+      needsGeneration.clear();
+      inFlightSet.clear();
+      failedSet.clear();
       urlVersions.clear();
-      retryCount.clear();
-      pendingRetries.clear();
       bgCursor = 0;
+      thumbGenTotal = 0;
+      thumbGenDone = 0;
       setGeneration((g) => g + 1);
     };
     window.addEventListener("lightview:thumbnails-invalidated", onInvalidate);
@@ -601,22 +573,20 @@ export function GalleryGrid(props: GalleryGridProps) {
       (paths) => {
         setThumbMap(reconcile({}));
         assignedSet.clear();
-        precachedSet.clear();
-        generationQueue.clear();
-        generatingSet.clear();
+        needsGeneration.clear();
+        inFlightSet.clear();
+        failedSet.clear();
         urlVersions.clear();
-        retryCount.clear();
-        pendingRetries.clear();
         bgCursor = 0;
+        thumbGenTotal = 0;
+        thumbGenDone = 0;
 
-        // Rebuild reverse index for O(1) eviction lookups
         pathToIndex.clear();
         for (let i = 0; i < paths.length; i++) {
           pathToIndex.set(paths[i], i);
         }
 
         setGeneration((g) => g + 1);
-        // Recompute visible range now that paths exist.
         recalcRange?.();
       },
     ),

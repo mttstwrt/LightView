@@ -17,6 +17,10 @@ const DEFAULT_SETTINGS: AppSettings = {
     thumbnail_quality: 80,
     thumbnail_resize_filter: "bilinear",
   },
+  plugins: {
+    max_concurrent: 4,
+    onnx_threads: 2,
+  },
   storage: {
     companion_location: "lightview_folder",
   },

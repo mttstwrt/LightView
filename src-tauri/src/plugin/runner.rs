@@ -58,11 +58,15 @@ pub fn find_plugin(plugin_dir: &Path, name: &str) -> Result<(PluginManifest, Pat
 /// The plugin receives only the action and media path — it returns tags
 /// and optional metadata. The app is responsible for writing results
 /// to the companion file and updating the index.
+///
+/// `extra_env` allows the caller to inject environment variables into the
+/// plugin process (e.g. ONNX_THREADS for thread-count control).
 pub async fn run_cli_plugin(
     manifest: &PluginManifest,
     plugin_dir: &Path,
     media_path: &str,
     action: &str,
+    extra_env: &[(String, String)],
 ) -> Result<PluginOutput, RunError> {
     let (command, args, timeout_secs) = match &manifest.execution {
         ExecutionConfig::Cli {
@@ -86,13 +90,16 @@ pub async fn run_cli_plugin(
         .map(|a| a.replace("{plugin_dir}", &plugin_dir.display().to_string()))
         .collect();
 
-    let mut child = Command::new(&resolved_command)
-        .args(&resolved_args)
+    let mut cmd = Command::new(&resolved_command);
+    cmd.args(&resolved_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(plugin_dir)
-        .spawn()
+        .current_dir(plugin_dir);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn()
         .map_err(|e| RunError::Exec(format!("Failed to spawn '{}': {}", command, e)))?;
 
     // Write input to stdin

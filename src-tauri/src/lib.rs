@@ -72,6 +72,9 @@ pub struct AppState {
     /// Recently opened gallery paths, persisted to disk.
     pub recent_galleries: Arc<Mutex<Vec<RecentGallery>>>,
 
+    /// Cancellation flag for plugin batch runs.
+    pub plugin_cancelled: Arc<std::sync::atomic::AtomicBool>,
+
     /// Read-only SQLite connection for the thumbnail protocol handler.
     /// Uses std::sync::Mutex (not tokio) because protocol handlers are synchronous.
     pub thumb_protocol_db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
@@ -133,6 +136,7 @@ impl AppState {
             use_bc7_atlas: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thumbnail_settings: Arc::new(RwLock::new(ThumbnailSettings::default())),
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
+            plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thumb_protocol_db: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "gpu")]
             gpu_pipeline,
