@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
 import { getFullMedia, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
 import type { CachedThumbnailInfo } from "../../lib/ipc";
+import { ScrollBar } from "../shared/ScrollBar";
 
 interface MediaViewerProps {
   paths: string[];
@@ -252,9 +253,11 @@ function InfoPanel(props: { path: string; filename: string }) {
   const userTags = () => tags().filter((t) => t.namespace === "user");
   const otherTags = () => tags().filter((t) => t.namespace !== "user");
 
+  let panelRef: HTMLDivElement | undefined;
+
   return (
     <div
-      class="absolute right-0 top-0 h-full w-80 p-4 overflow-y-auto"
+      class="absolute right-0 top-0 h-full w-80 relative"
       style={{
         background: "rgba(10, 10, 10, 0.9)",
         "backdrop-filter": "blur(12px)",
@@ -262,110 +265,121 @@ function InfoPanel(props: { path: string; filename: string }) {
       }}
       onClick={(e) => e.stopPropagation()}
     >
-      <h3 class="text-sm font-medium text-neutral-300 mb-4">Info</h3>
-      <div class="text-xs text-neutral-400 space-y-3">
-        <InfoRow label="File" value={props.filename} breakAll />
-        <InfoRow label="Path" value={props.path} breakAll />
+      <div
+        ref={panelRef}
+        class="h-full w-full p-4 overflow-y-auto hide-scrollbar"
+      >
+        <h3 class="text-sm font-medium text-neutral-300 mb-4">Info</h3>
+        <div class="text-xs text-neutral-400 space-y-3">
+          <InfoRow label="File" value={props.filename} breakAll />
+          <InfoRow label="Path" value={props.path} breakAll />
 
-        <Show when={meta()}>
-          <div class="border-t border-neutral-800 pt-3 mt-3 space-y-3">
-            <InfoRow label="Type" value={meta()!.media_type.toUpperCase()} />
-            <InfoRow label="Size" value={formatBytes(meta()!.file_size)} />
+          <Show when={meta()}>
+            <div class="border-t border-neutral-800 pt-3 mt-3 space-y-3">
+              <InfoRow label="Type" value={meta()!.media_type.toUpperCase()} />
+              <InfoRow label="Size" value={formatBytes(meta()!.file_size)} />
 
-            <Show when={meta()!.width && meta()!.height}>
-              <InfoRow
-                label="Dimensions"
-                value={`${meta()!.width} × ${meta()!.height}`}
-              />
-            </Show>
+              <Show when={meta()!.width && meta()!.height}>
+                <InfoRow
+                  label="Dimensions"
+                  value={`${meta()!.width} × ${meta()!.height}`}
+                />
+              </Show>
 
-            <Show when={meta()!.date_taken}>
-              <InfoRow label="Date" value={formatDate(meta()!.date_taken!)} />
-            </Show>
+              <Show when={meta()!.date_taken}>
+                <InfoRow label="Date" value={formatDate(meta()!.date_taken!)} />
+              </Show>
 
-            <Show when={meta()!.duration_seconds}>
-              <InfoRow
-                label="Duration"
-                value={`${meta()!.duration_seconds!.toFixed(1)}s`}
-              />
-            </Show>
-          </div>
-        </Show>
+              <Show when={meta()!.duration_seconds}>
+                <InfoRow
+                  label="Duration"
+                  value={`${meta()!.duration_seconds!.toFixed(1)}s`}
+                />
+              </Show>
+            </div>
+          </Show>
 
-        {/* Thumbnail */}
-        <Show when={thumbInfo()}>
-          <div class="border-t border-neutral-800 pt-3 mt-3 space-y-3">
-            <span class="text-neutral-500 font-medium">Thumbnail</span>
-            <InfoRow label="Dimensions" value={`${thumbInfo()!.width} × ${thumbInfo()!.height}`} />
-            <InfoRow label="Format" value={thumbInfo()!.format.toUpperCase()} />
-            <InfoRow label="Resize" value={thumbInfo()!.resize_filter.charAt(0).toUpperCase() + thumbInfo()!.resize_filter.slice(1)} />
-            <InfoRow label="Cache size" value={formatBytes(thumbInfo()!.size_bytes)} />
-          </div>
-        </Show>
+          {/* Thumbnail */}
+          <Show when={thumbInfo()}>
+            <div class="border-t border-neutral-800 pt-3 mt-3 space-y-3">
+              <span class="text-neutral-500 font-medium">Thumbnail</span>
+              <InfoRow label="Dimensions" value={`${thumbInfo()!.width} × ${thumbInfo()!.height}`} />
+              <InfoRow label="Format" value={thumbInfo()!.format.toUpperCase()} />
+              <InfoRow label="Resize" value={thumbInfo()!.resize_filter.charAt(0).toUpperCase() + thumbInfo()!.resize_filter.slice(1)} />
+              <InfoRow label="Cache size" value={formatBytes(thumbInfo()!.size_bytes)} />
+            </div>
+          </Show>
 
-        {/* Rating */}
-        <div class="border-t border-neutral-800 pt-3 mt-3">
-          <span class="text-neutral-500">Rating:</span>
-          <div class="flex gap-1 mt-1">
-            <For each={[1, 2, 3, 4, 5]}>
-              {(star) => (
-                <button
-                  class="cursor-pointer text-base transition-colors"
-                  style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
-                  onClick={() => handleSetRating(star)}
-                >
-                  &#9733;
-                </button>
-              )}
-            </For>
-          </div>
-        </div>
-
-        {/* Tags */}
-        <div class="border-t border-neutral-800 pt-3 mt-3">
-          <span class="text-neutral-500">Tags:</span>
-          <div class="flex flex-wrap gap-1 mt-1">
-            <For each={userTags()}>
-              {(t) => (
-                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-300 bg-neutral-800">
-                  {t.tag}
+          {/* Rating */}
+          <div class="border-t border-neutral-800 pt-3 mt-3">
+            <span class="text-neutral-500">Rating:</span>
+            <div class="flex gap-1 mt-1">
+              <For each={[1, 2, 3, 4, 5]}>
+                {(star) => (
                   <button
-                    class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
-                    onClick={() => handleRemoveTag(t.tag)}
+                    class="cursor-pointer text-base transition-colors"
+                    style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
+                    onClick={() => handleSetRating(star)}
                   >
-                    &times;
+                    &#9733;
                   </button>
-                </span>
-              )}
-            </For>
-            <Show when={otherTags().length > 0}>
-              <For each={otherTags()}>
+                )}
+              </For>
+            </div>
+          </div>
+
+          {/* Tags */}
+          <div class="border-t border-neutral-800 pt-3 mt-3">
+            <span class="text-neutral-500">Tags:</span>
+            <div class="flex flex-wrap gap-1 mt-1">
+              <For each={userTags()}>
                 {(t) => (
-                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-400 bg-neutral-800/50">
-                    <span class="text-neutral-600">{t.namespace}:</span>
+                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-300 bg-neutral-800">
                     {t.tag}
+                    <button
+                      class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
+                      onClick={() => handleRemoveTag(t.tag)}
+                    >
+                      &times;
+                    </button>
                   </span>
                 )}
               </For>
-            </Show>
+              <Show when={otherTags().length > 0}>
+                <For each={otherTags()}>
+                  {(t) => (
+                    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-400 bg-neutral-800/50">
+                      <span class="text-neutral-600">{t.namespace}:</span>
+                      {t.tag}
+                    </span>
+                  )}
+                </For>
+              </Show>
+            </div>
+            <form onSubmit={handleAddTag} class="flex gap-1 mt-2">
+              <input
+                type="text"
+                value={newTag()}
+                onInput={(e) => setNewTag(e.currentTarget.value)}
+                placeholder="Add tag..."
+                class="flex-1 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
+              />
+              <button
+                type="submit"
+                class="px-2 py-1 bg-neutral-700 hover:bg-neutral-600 text-neutral-300 rounded text-xs cursor-pointer transition-colors"
+              >
+                +
+              </button>
+            </form>
           </div>
-          <form onSubmit={handleAddTag} class="flex gap-1 mt-2">
-            <input
-              type="text"
-              value={newTag()}
-              onInput={(e) => setNewTag(e.currentTarget.value)}
-              placeholder="Add tag..."
-              class="flex-1 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
-            />
-            <button
-              type="submit"
-              class="px-2 py-1 bg-neutral-700 hover:bg-neutral-600 text-neutral-300 rounded text-xs cursor-pointer transition-colors"
-            >
-              +
-            </button>
-          </form>
         </div>
       </div>
+      <Show when={panelRef}>
+        <ScrollBar
+          container={panelRef!}
+          class="absolute right-0 top-0 bottom-0 z-[10]"
+        />
+      </Show>
     </div>
   );
 }

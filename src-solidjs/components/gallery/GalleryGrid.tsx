@@ -14,6 +14,7 @@ interface GalleryGridProps {
   selectedPaths: Set<string>;
   onItemContextMenu?: (e: MouseEvent, path: string, index: number) => void;
   loading: boolean;
+  onContentHeight?: (height: number) => void;
 }
 
 // Rows of buffer above and below the viewport to pre-render.
@@ -596,6 +597,13 @@ export function GalleryGrid(props: GalleryGridProps) {
   createEffect(
     on(containerWidth, () => {
       recalcRange?.();
+    }),
+  );
+
+  // Report content height to parent for custom scrollbar
+  createEffect(
+    on(totalHeight, (h) => {
+      props.onContentHeight?.(h);
     }),
   );
 

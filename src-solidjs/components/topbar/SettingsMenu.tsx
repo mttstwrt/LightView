@@ -272,7 +272,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
             <span class="text-sm font-medium text-neutral-200">Settings</span>
           </div>
 
-          <div class="px-4 py-3 flex flex-col gap-4 max-h-[70vh] overflow-y-auto">
+          <div class="px-4 py-3 flex flex-col gap-4 max-h-[70vh] overflow-y-auto hide-scrollbar">
             {/* ── Display ── */}
             <Section label="Display">
               {/* Thumbnail size */}

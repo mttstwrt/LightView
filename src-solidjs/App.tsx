@@ -13,6 +13,7 @@ import { SelectionBar } from "./components/gallery/SelectionBar";
 import { pluginActivity, type PluginActivity } from "./stores/pluginStore";
 import { cancelPluginBatch } from "./lib/ipc";
 import { thumbGenActivity } from "./stores/thumbnailProgressStore";
+import { ScrollBar } from "./components/shared/ScrollBar";
 
 function DebugOverlay() {
   const [info, setInfo] = createSignal<DebugInfo | null>(null);
@@ -58,6 +59,7 @@ function DebugOverlay() {
 export function App() {
   const [debugOpen, setDebugOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
+  const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
   const openPath = async (path: string) => {
     setLoading(true);
     try {
@@ -145,7 +147,9 @@ export function App() {
             setContextMenu({ x: e.clientX, y: e.clientY, path, index });
           }}
           loading={loading()}
+          onContentHeight={setGalleryContentHeight}
         />
+        <ScrollBar contentHeight={galleryContentHeight()} />
         <Show when={selectedPaths().size > 0}>
           <SelectionBar
             selectedPaths={selectedPaths()}

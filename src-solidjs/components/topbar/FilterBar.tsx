@@ -231,7 +231,7 @@ export function FilterBar() {
       {/* Autocomplete dropdown */}
       <Show when={acOpen()}>
         <div
-          class="absolute top-full left-0 right-0 mt-1 rounded overflow-hidden shadow-lg z-50 max-h-64 overflow-y-auto"
+          class="absolute top-full left-0 right-0 mt-1 rounded overflow-hidden shadow-lg z-50 max-h-64 overflow-y-auto hide-scrollbar"
           style={{
             background: "rgba(20, 20, 20, 0.95)",
             "backdrop-filter": "blur(12px)",
