@@ -1,12 +1,13 @@
 use base64::Engine;
 use serde::Serialize;
+use tauri::Emitter;
 
 use crate::pipeline::thumbnailer::{ResizeFilter, ThumbFormat};
 use crate::AppState;
 
 /// Thumbnail metadata returned over IPC. No pixel data — the frontend
 /// fetches actual image bytes via the `lightview://thumb/` protocol.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThumbnailResult {
     pub path: String,
     pub width: u32,
@@ -125,8 +126,10 @@ pub async fn get_thumbnail(
 
 /// Get thumbnails for a batch of paths. Uses BC7 atlas when available,
 /// falls back to SQLite cache, then generates missing thumbnails.
+/// Emits `thumb:streamed` events as individual thumbnails complete.
 #[tauri::command]
 pub async fn get_thumbnails_batch(
+    app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
     resize_filter: Option<ResizeFilter>,
@@ -217,16 +220,31 @@ pub async fn get_thumbnails_batch(
     let (generated_thumbs, gpu_bc7_data) = if let Some(gpu_result) = gpu_generated {
         (gpu_result.thumbs, gpu_result.bc7_items)
     } else {
-        // CPU fallback path
-        let mut handles = Vec::with_capacity(uncached_paths.len());
+        // CPU fallback path — stream results as each thumbnail completes
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut futures_set = FuturesUnordered::new();
         for path in uncached_paths {
-            handles.push(dispatch_thumbnail(&state.thumb_pool, path, filter, format, thumb_w, thumb_h));
+            futures_set.push(dispatch_thumbnail(&state.thumb_pool, path, filter, format, thumb_w, thumb_h));
         }
-        let cpu_results = futures::future::join_all(handles).await;
-        let thumbs: Vec<_> = cpu_results
-            .into_iter()
-            .filter_map(|r| r.ok().and_then(|r| r.ok()))
-            .collect();
+        let mut thumbs = Vec::new();
+        while let Some(result) = futures_set.next().await {
+            if let Ok(Ok(ref thumb)) = result {
+                // Emit streamed event immediately so frontend can update
+                let _ = app_handle.emit("thumb:streamed", ThumbnailResult {
+                    path: thumb.path.clone(),
+                    width: thumb.width,
+                    height: thumb.height,
+                    media_type: thumb.media_type.clone(),
+                    format: match thumb.format {
+                        ThumbFormat::Rgba => "rgba".to_string(),
+                        ThumbFormat::Jpeg => "jpeg".to_string(),
+                    },
+                });
+            }
+            if let Ok(Ok(thumb)) = result {
+                thumbs.push(thumb);
+            }
+        }
         (thumbs, Vec::new())
     };
 

@@ -1,7 +1,7 @@
 import { Show, For, createSignal, createEffect, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
-import { getFullMedia, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
+import { mediaUrl, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
 import type { CachedThumbnailInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
 
@@ -53,12 +53,8 @@ export function MediaViewer(props: MediaViewerProps) {
         setMediaSrc("");
 
         if (!isVideo()) {
-          try {
-            const dataUri = await getFullMedia(path);
-            setMediaSrc(dataUri);
-          } catch (err) {
-            console.error("Failed to load media:", err);
-          }
+          // Use binary protocol URL — no Base64/JSON overhead
+          setMediaSrc(mediaUrl(path));
         }
       },
     ),

@@ -2,39 +2,171 @@ use lightview_lib::AppState;
 use lightview_lib::commands;
 use tauri::{Emitter, Manager};
 
-/// Create a BMP image from raw RGBA pixels.
-/// Uses top-down row order (negative height) to avoid row flipping.
-/// Swaps R↔B channels since BMP uses BGRA.
-fn rgba_to_bmp(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let pixel_data_size = (width * height * 4) as usize;
-    let file_size = 54 + pixel_data_size;
-    let mut bmp = Vec::with_capacity(file_size);
 
-    // File header (14 bytes)
-    bmp.extend_from_slice(b"BM");
-    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&[0u8; 4]); // reserved
-    bmp.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
+enum Route {
+    Thumb,
+    Media,
+    Unknown,
+}
 
-    // BITMAPINFOHEADER (40 bytes)
-    bmp.extend_from_slice(&40u32.to_le_bytes()); // header size
-    bmp.extend_from_slice(&(width as i32).to_le_bytes());
-    bmp.extend_from_slice(&(-(height as i32)).to_le_bytes()); // negative = top-down
-    bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
-    bmp.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
-    bmp.extend_from_slice(&0u32.to_le_bytes()); // compression (BI_RGB)
-    bmp.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&[0u8; 16]); // ppm x, ppm y, colors used, colors important
+/// Parse the URI into a route and the remaining path portion.
+fn extract_route(uri: &str) -> (Route, &str) {
+    // Try each prefix variant (cross-platform)
+    for prefix_base in &[
+        "lightview://",
+        "lightview://localhost/",
+        "http://lightview.localhost/",
+    ] {
+        if let Some(rest) = uri.strip_prefix(prefix_base) {
+            if let Some(p) = rest.strip_prefix("thumb/") {
+                return (Route::Thumb, p);
+            }
+            if let Some(p) = rest.strip_prefix("media/") {
+                return (Route::Media, p);
+            }
+        }
+    }
+    (Route::Unknown, "")
+}
 
-    // Pixel data: RGBA → BGRA
-    for chunk in rgba.chunks_exact(4) {
-        bmp.push(chunk[2]); // B
-        bmp.push(chunk[1]); // G
-        bmp.push(chunk[0]); // R
-        bmp.push(chunk[3]); // A
+/// Serve a cached thumbnail from SQLite.
+fn serve_thumbnail(
+    ctx: &tauri::UriSchemeContext<'_, tauri::Wry>,
+    path: &str,
+) -> tauri::http::Response<Vec<u8>> {
+    let state = ctx.app_handle().state::<AppState>();
+    let proto_db = state.thumb_protocol_db.lock().unwrap();
+    let conn = match proto_db.as_ref() {
+        Some(c) => c,
+        None => {
+            return tauri::http::Response::builder()
+                .status(503)
+                .body(Vec::new())
+                .unwrap();
+        }
+    };
+
+    let result: Result<(Vec<u8>, u32, u32, String), rusqlite::Error> = conn
+        .prepare_cached(
+            "SELECT thumbnail, width, height, format FROM thumbnails WHERE path = ?1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(rusqlite::params![path], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+        });
+
+    match result {
+        Ok((data, width, height, format)) => {
+            if format == "rgba" {
+                // Transcode RGBA→JPEG on-the-fly instead of serving raw pixels
+                match lightview_lib::pipeline::thumbnailer::encode_rgba_to_jpeg(&data, width, height) {
+                    Ok(jpeg) => tauri::http::Response::builder()
+                        .status(200)
+                        .header("Content-Type", "image/jpeg")
+                        .header("Cache-Control", "no-cache")
+                        .body(jpeg)
+                        .unwrap(),
+                    Err(_) => tauri::http::Response::builder()
+                        .status(500)
+                        .body(Vec::new())
+                        .unwrap(),
+                }
+            } else {
+                tauri::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "image/jpeg")
+                    .header("Cache-Control", "no-cache")
+                    .body(data)
+                    .unwrap()
+            }
+        }
+        Err(_) => {
+            // Not cached yet — 404, frontend queues for generation
+            tauri::http::Response::builder()
+                .status(404)
+                .header("Cache-Control", "no-store")
+                .body(Vec::new())
+                .unwrap()
+        }
+    }
+}
+
+/// Serve full-resolution media directly as binary. HEIC/HEIF are transcoded to JPEG.
+fn serve_full_media(
+    path: &str,
+) -> tauri::http::Response<Vec<u8>> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // HEIC/HEIF: transcode to JPEG since browsers can't render natively
+    if ext == "heic" || ext == "heif" {
+        let src_path = std::path::Path::new(path);
+        match lightview_lib::pipeline::thumbnailer::decode_heic_to_rgba(src_path) {
+            Ok((rgba, w, h, _, _)) => {
+                match lightview_lib::pipeline::thumbnailer::encode_rgba_to_jpeg(&rgba, w, h) {
+                    Ok(jpeg_data) => {
+                        return tauri::http::Response::builder()
+                            .status(200)
+                            .header("Content-Type", "image/jpeg")
+                            .header("Cache-Control", "no-cache")
+                            .body(jpeg_data)
+                            .unwrap();
+                    }
+                    Err(e) => {
+                        log::error!("HEIC→JPEG encode failed for {}: {}", path, e);
+                        return tauri::http::Response::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap();
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("HEIC decode failed for {}: {}", path, e);
+                return tauri::http::Response::builder()
+                    .status(500)
+                    .body(Vec::new())
+                    .unwrap();
+            }
+        }
     }
 
-    bmp
+    // All other formats: read and serve directly
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        "tiff" | "tif" => "image/tiff",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    };
+
+    match std::fs::read(path) {
+        Ok(data) => tauri::http::Response::builder()
+            .status(200)
+            .header("Content-Type", mime)
+            .header("Cache-Control", "no-cache")
+            .body(data)
+            .unwrap(),
+        Err(e) => {
+            log::error!("Failed to read media file {}: {}", path, e);
+            tauri::http::Response::builder()
+                .status(404)
+                .body(Vec::new())
+                .unwrap()
+        }
+    }
 }
 
 fn main() {
@@ -60,18 +192,14 @@ fn main() {
         .register_uri_scheme_protocol("lightview", |ctx, request| {
             let uri = request.uri().to_string();
 
-            // Expected: lightview://thumb/<url-encoded-path>
+            // Route: lightview://thumb/<path> or lightview://media/<path>
             // On Linux: lightview://localhost/thumb/<path>
             // On Windows: http://lightview.localhost/thumb/<path>
-            let path_part = uri
-                .strip_prefix("lightview://thumb/")
-                .or_else(|| uri.strip_prefix("lightview://localhost/thumb/"))
-                .or_else(|| uri.strip_prefix("http://lightview.localhost/thumb/"))
-                .unwrap_or("");
+            let (route, raw_path) = extract_route(&uri);
+
             // Strip query string (e.g. ?v=1 cache-buster) before decoding.
-            // Safe before percent-decode: literal '?' in paths is encoded as %3F.
-            let path_part = path_part.split('?').next().unwrap_or(path_part);
-            let path = percent_encoding::percent_decode_str(path_part)
+            let raw_path = raw_path.split('?').next().unwrap_or(raw_path);
+            let path = percent_encoding::percent_decode_str(raw_path)
                 .decode_utf8_lossy()
                 .to_string();
 
@@ -82,55 +210,13 @@ fn main() {
                     .unwrap();
             }
 
-            let state = ctx.app_handle().state::<AppState>();
-            let proto_db = state.thumb_protocol_db.lock().unwrap();
-            let conn = match proto_db.as_ref() {
-                Some(c) => c,
-                None => {
-                    return tauri::http::Response::builder()
-                        .status(503)
-                        .body(Vec::new())
-                        .unwrap();
-                }
-            };
-
-            let result: Result<(Vec<u8>, u32, u32, String), rusqlite::Error> = conn
-                .prepare_cached(
-                    "SELECT thumbnail, width, height, format FROM thumbnails WHERE path = ?1",
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_row(rusqlite::params![path], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                    })
-                });
-
-            match result {
-                Ok((data, width, height, format)) => {
-                    if format == "rgba" {
-                        let bmp = rgba_to_bmp(&data, width, height);
-                        tauri::http::Response::builder()
-                            .status(200)
-                            .header("Content-Type", "image/bmp")
-                            .header("Cache-Control", "no-cache")
-                            .body(bmp)
-                            .unwrap()
-                    } else {
-                        tauri::http::Response::builder()
-                            .status(200)
-                            .header("Content-Type", "image/jpeg")
-                            .header("Cache-Control", "no-cache")
-                            .body(data)
-                            .unwrap()
-                    }
-                }
-                Err(_) => {
-                    // Not cached yet — 404, frontend queues for generation
-                    tauri::http::Response::builder()
-                        .status(404)
-                        .header("Cache-Control", "no-store")
-                        .body(Vec::new())
-                        .unwrap()
-                }
+            match route {
+                Route::Thumb => serve_thumbnail(&ctx, &path),
+                Route::Media => serve_full_media(&path),
+                Route::Unknown => tauri::http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap(),
             }
         })
         .setup(|app| {

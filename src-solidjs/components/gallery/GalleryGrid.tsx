@@ -1,5 +1,6 @@
 import { Index, Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { settings } from "../../stores/settingsStore";
 import { getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
@@ -21,7 +22,7 @@ interface GalleryGridProps {
 const BUFFER_ROWS = 3;
 
 // How many paths to send per IPC batch call.
-const BATCH_SIZE = 30;
+const BATCH_SIZE = 128;
 
 // Velocity thresholds (px/s)
 const VELOCITY_SLOW = 500;
@@ -30,17 +31,17 @@ const VELOCITY_FAST = 3000;
 // Jump detection: scroll delta > 2x viewport height triggers generation bump.
 const JUMP_FACTOR = 2;
 
-// How often (ms) to schedule thumbnail fetches while scrolling.
-const FETCH_INTERVAL_MS = 80;
-
 // How many paths to send per background precache call.
-const BG_BATCH_SIZE = 15;
+const BG_BATCH_SIZE = 64;
 
 // Rows beyond the visible+buffer range before thumbnails are evicted from memory.
 const EVICT_ROWS = 15;
 
 // How long (ms) to wait after fast scroll ends before resuming fetches.
-const SETTLE_MS = 120;
+const SETTLE_MS = 150;
+
+// Debounce delay (ms) for scroll-driven metadata requests.
+const SCROLL_DEBOUNCE_MS = 50;
 
 export function GalleryGrid(props: GalleryGridProps) {
   const thumbSize = () => settings().display.thumbnail_size;
@@ -166,6 +167,8 @@ export function GalleryGrid(props: GalleryGridProps) {
   const inFlightSet = new Set<string>();
   /** Paths that permanently failed (won't be retried). */
   const failedSet = new Set<string>();
+  /** Coalesced paths: accumulated during in-flight fetch, merged into next batch. */
+  const coalescedPaths = new Set<string>();
   /** Cache-bust version per path — incremented after IPC generation. */
   const urlVersions = new Map<string, number>();
   /** Reverse index: path → position in props.paths for O(1) eviction lookups. */
@@ -180,8 +183,11 @@ export function GalleryGrid(props: GalleryGridProps) {
 
   /** Called by ThumbnailCell when the protocol handler returns 404. */
   const handleThumbError = (path: string) => {
-    if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path)) return;
+    if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path) || coalescedPaths.has(path)) return;
+    // If a fetch is in-flight, coalesce into the next batch instead of needsGeneration
+    // to allow merging with other pending requests.
     needsGeneration.add(path);
+    coalescedPaths.add(path);
     thumbGenTotal++;
     if (thumbGenTotal === 1) {
       thumbGenStarted(thumbGenTotal);
@@ -194,6 +200,22 @@ export function GalleryGrid(props: GalleryGridProps) {
   onMount(() => {
     initGPU();
   });
+
+  // Listen for streamed thumbnail results — update URLs as each arrives
+  // rather than waiting for the full batch to complete.
+  let unlistenStreamed: UnlistenFn | undefined;
+  onMount(() => {
+    listen<ThumbnailResult>("thumb:streamed", (event) => {
+      const r = event.payload;
+      if (!inFlightSet.has(r.path)) return;
+      const v = (urlVersions.get(r.path) ?? 0) + 1;
+      urlVersions.set(r.path, v);
+      setThumbMap(r.path, `${thumbUrl(r.path)}?v=${v}`);
+    }).then((fn) => {
+      unlistenStreamed = fn;
+    });
+  });
+  onCleanup(() => unlistenStreamed?.());
 
   // -----------------------------------------------------------------------
   // Grid geometry — derived from container width, thumb size, gap
@@ -339,6 +361,7 @@ export function GalleryGrid(props: GalleryGridProps) {
           setGeneration((g) => g + 1);
           assignedSet.clear();
           needsGeneration.clear();
+          coalescedPaths.clear();
           inFlightSet.clear();
           failedSet.clear();
           bgCursor = 0;
@@ -350,6 +373,7 @@ export function GalleryGrid(props: GalleryGridProps) {
         lastTimestamp = now;
 
         recalcRange?.();
+        debouncedFetch();
         rafId = 0;
       });
     };
@@ -428,10 +452,14 @@ export function GalleryGrid(props: GalleryGridProps) {
       if (currentVelocity > VELOCITY_FAST) return;
       if (now - lastFastScrollTime < SETTLE_MS) return;
 
+      // Drain coalesced paths into needsGeneration (they're already there,
+      // but clear the coalesced set so new items can accumulate during next fetch).
+      coalescedPaths.clear();
+
       const gen = generation();
 
       // Phase 1: Generate thumbnails that 404'd.
-      // Prioritize near-viewport, then fill with off-screen paths.
+      // Prioritize near-viewport, drop far-away items to prevent redundant work.
       if (needsGeneration.size > 0) {
         const nearViewport: string[] = [];
         const farAway: string[] = [];
@@ -442,12 +470,14 @@ export function GalleryGrid(props: GalleryGridProps) {
         const nearEnd = Math.min(props.paths.length, (er + EVICT_ROWS) * c);
 
         for (const p of needsGeneration) {
-          if (nearViewport.length >= BATCH_SIZE) break;
           const idx = pathToIndex.get(p);
           if (idx !== undefined && idx >= nearStart && idx < nearEnd) {
-            nearViewport.push(p);
-          } else if (farAway.length < BATCH_SIZE) {
-            farAway.push(p);
+            if (nearViewport.length < BATCH_SIZE) nearViewport.push(p);
+          } else {
+            // Drop out-of-range items from needsGeneration — they were
+            // queued during a scroll that has since moved past them.
+            // They'll re-queue if the user scrolls back.
+            if (farAway.length < BATCH_SIZE) farAway.push(p);
           }
         }
 
@@ -532,7 +562,18 @@ export function GalleryGrid(props: GalleryGridProps) {
       evictFaraway();
     };
 
-    const fetchTimerId = setInterval(scheduleFetch, FETCH_INTERVAL_MS);
+    // Debounced fetch: fires 50ms after the last scroll event, plus a
+    // slower background interval for precache when idle.
+    let scrollDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedFetch = () => {
+      if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
+      scrollDebounceTimer = setTimeout(scheduleFetch, SCROLL_DEBOUNCE_MS);
+    };
+    // Background interval for precache/eviction when not actively scrolling.
+    const bgIntervalId = setInterval(() => {
+      if (!inFlightFetch) scheduleFetch();
+    }, 500);
+
     // Also fire immediately on generation change (jump/path change)
     createEffect(
       on(generation, () => {
@@ -562,7 +603,8 @@ export function GalleryGrid(props: GalleryGridProps) {
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
-      clearInterval(fetchTimerId);
+      if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
+      clearInterval(bgIntervalId);
       fetchAbort = true;
     });
   });

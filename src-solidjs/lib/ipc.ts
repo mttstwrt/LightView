@@ -45,6 +45,12 @@ export function thumbUrl(path: string): string {
   return `lightview://thumb/${encodeURIComponent(path)}`;
 }
 
+/** Build a protocol URL for full-resolution media. The `lightview://media/` protocol
+ *  serves binary image data directly — no Base64/JSON overhead. */
+export function mediaUrl(path: string): string {
+  return `lightview://media/${encodeURIComponent(path)}`;
+}
+
 export const getThumbnail = (path: string, resizeFilter?: ResizeFilter) =>
   invoke<ThumbnailResult | null>(
     "get_thumbnail",
@@ -275,7 +281,7 @@ export const getDebugInfo = () =>
 // Thumbnail Settings
 // ---------------------------------------------------------------------------
 
-export type ThumbFormat = "rgba" | "jpeg";
+export type ThumbFormat = "jpeg";
 
 export interface ThumbnailSettings {
   /** Output format: "rgba" (no CPU decode, default) or "jpeg" (compressed). */

@@ -5,7 +5,7 @@ import type { AppSettings, ResizeFilter, CompanionLocation, PluginInfo } from ".
 import { rebuildThumbnails, getThumbnailSettings, updateThumbnailSettings, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch } from "../../lib/ipc";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
 import { listen } from "@tauri-apps/api/event";
-import type { ThumbnailSettings, ThumbFormat } from "../../lib/ipc";
+import type { ThumbnailSettings } from "../../lib/ipc";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 const THUMB_PRESETS = [
@@ -367,24 +367,9 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
                 </Field>
 
                 <Field label="Format">
-                  <div class="flex gap-1">
-                    {([
-                      { value: "rgba" as ThumbFormat, label: "RGBA", hint: "Fast" },
-                      { value: "jpeg" as ThumbFormat, label: "JPEG", hint: "Compact" },
-                    ]).map((f) => (
-                      <button
-                        class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                          thumbSettings()!.format === f.value
-                            ? "bg-teal-700/60 text-teal-200"
-                            : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                        }`}
-                        onClick={() => updateThumb({ format: f.value })}
-                        title={f.hint}
-                      >
-                        {f.label}
-                      </button>
-                    ))}
-                  </div>
+                  <span class="px-2 py-0.5 text-xs rounded bg-teal-700/60 text-teal-200" title="Compressed JPEG (10–50 KB per thumbnail)">
+                    JPEG
+                  </span>
                 </Field>
 
                 <Field label="Resize algorithm">

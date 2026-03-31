@@ -16,10 +16,10 @@ pub const DEFAULT_THUMB_HEIGHT: u32 = 400;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThumbFormat {
-    /// JPEG encoded (compressed, requires CPU decode on load).
-    Jpeg,
-    /// Raw RGBA8 pixels (no CPU decode when loading — zero-copy display path).
+    /// JPEG encoded (compressed, 10–50 KB per thumbnail).
     #[default]
+    Jpeg,
+    /// Raw RGBA8 pixels (internal use for GPU/BC7 atlas pipeline only).
     Rgba,
 }
 
@@ -39,7 +39,7 @@ pub struct ThumbnailSettings {
 impl Default for ThumbnailSettings {
     fn default() -> Self {
         Self {
-            format: ThumbFormat::Rgba,
+            format: ThumbFormat::Jpeg,
             width: DEFAULT_THUMB_WIDTH,
             height: DEFAULT_THUMB_HEIGHT,
             resize_filter: ResizeFilter::default(),
