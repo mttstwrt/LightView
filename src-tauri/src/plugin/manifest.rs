@@ -22,6 +22,11 @@ pub enum ExecutionConfig {
         command: String,
         args: Vec<String>,
         timeout_seconds: Option<u64>,
+        /// When true, the plugin supports `--daemon` mode: launched once, kept
+        /// resident, and communicated with via NDJSON on stdin/stdout.
+        /// This eliminates per-image process startup and model loading overhead.
+        #[serde(default)]
+        daemon: bool,
     },
     #[serde(rename = "wasm")]
     Wasm {

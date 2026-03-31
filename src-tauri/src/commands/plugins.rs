@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::Emitter;
@@ -7,7 +8,8 @@ use tauri::Emitter;
 use crate::companion::reader;
 use crate::companion::schema::{CompanionFile, MediaType};
 use crate::companion::writer;
-use crate::plugin::manifest::PluginManifest;
+use crate::plugin::daemon::PluginDaemon;
+use crate::plugin::manifest::{ExecutionConfig, PluginManifest};
 use crate::plugin::runner;
 use crate::AppState;
 
@@ -125,6 +127,47 @@ pub async fn run_plugin(
     })
 }
 
+/// Process a single plugin result: write companion file, reindex tags, track stats.
+/// Returns (path, tags_added, success, error) for progress reporting.
+async fn handle_plugin_result(
+    media_path: &str,
+    res: Result<runner::PluginOutput, String>,
+    manifest: &PluginManifest,
+    cache_db: &Arc<tokio::sync::Mutex<Option<crate::cache::db::CacheDb>>>,
+    succeeded: &mut usize,
+    failed: &mut usize,
+) -> (String, Vec<String>, bool, Option<String>) {
+    match res {
+        Ok(output) => {
+            let media = Path::new(media_path);
+            let companion_result = get_or_create_companion(media).and_then(|mut companion| {
+                runner::apply_plugin_output(&mut companion, manifest, &output);
+                writer::write_companion(media, &mut companion).map_err(|e| e.to_string())?;
+                Ok((output.tags.clone(), companion))
+            });
+
+            match companion_result {
+                Ok((tags, companion)) => {
+                    let db = cache_db.lock().await;
+                    if let Some(db) = db.as_ref() {
+                        let _ = db.reindex_tags_for_file(media_path, &companion);
+                    }
+                    *succeeded += 1;
+                    (media_path.to_string(), tags, true, None)
+                }
+                Err(e) => {
+                    *failed += 1;
+                    (media_path.to_string(), vec![], false, Some(e))
+                }
+            }
+        }
+        Err(e) => {
+            *failed += 1;
+            (media_path.to_string(), vec![], false, Some(e))
+        }
+    }
+}
+
 /// Default maximum number of plugin subprocesses to run concurrently in a batch.
 const DEFAULT_PLUGIN_BATCH_CONCURRENCY: usize = 4;
 
@@ -198,6 +241,13 @@ pub async fn run_plugin_batch(
     let cancelled = state.plugin_cancelled.clone();
     let cache_db = state.cache_db.clone();
     let autocomplete = state.autocomplete.clone();
+    let plugin_daemons = state.plugin_daemons.clone();
+
+    // Check if the plugin supports daemon mode
+    let supports_daemon = matches!(
+        &manifest.execution,
+        ExecutionConfig::Cli { daemon: true, .. }
+    );
 
     // Spawn the batch as a separate async task so events are delivered in real-time.
     tauri::async_runtime::spawn(async move {
@@ -209,73 +259,112 @@ pub async fn run_plugin_batch(
         let mut failed: usize = 0;
         let mut was_cancelled = false;
 
-        let mut result_stream = stream::iter(media_paths.into_iter().map(|media_path| {
-            let manifest = &manifest;
-            let plugin_path = &plugin_path;
-            let action = &action;
-            let extra_env = &extra_env;
-            async move {
-                let res =
-                    runner::run_cli_plugin(manifest, plugin_path, &media_path, action, extra_env)
-                        .await
-                        .map_err(|e| e.to_string());
-                (media_path, res)
-            }
-        }))
-        .buffer_unordered(concurrency);
-
-        while let Some((media_path, res)) = result_stream.next().await {
-            if cancelled.load(Ordering::Relaxed) {
-                was_cancelled = true;
-                break;
-            }
-
-            completed += 1;
-
-            let (progress_path, progress_tags, progress_ok, progress_err) = match res {
-                Ok(output) => {
-                    let media = Path::new(&media_path);
-
-                    let companion_result = get_or_create_companion(media)
-                        .and_then(|mut companion| {
-                            runner::apply_plugin_output(&mut companion, &manifest, &output);
-                            writer::write_companion(media, &mut companion)
-                                .map_err(|e| e.to_string())?;
-                            Ok((output.tags.clone(), companion))
-                        });
-
-                    match companion_result {
-                        Ok((tags, companion)) => {
-                            let db = cache_db.lock().await;
-                            if let Some(db) = db.as_ref() {
-                                let _ = db.reindex_tags_for_file(&media_path, &companion);
-                            }
-                            succeeded += 1;
-                            (media_path, tags, true, None)
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            (media_path, vec![], false, Some(e))
-                        }
+        // If daemon mode is supported, start or reuse the daemon.
+        let daemon: Option<Arc<PluginDaemon>> = if supports_daemon {
+            let mut daemons = plugin_daemons.lock().await;
+            if let Some(existing) = daemons.get(&manifest.name) {
+                Some(existing.clone())
+            } else {
+                match PluginDaemon::start(&manifest, &plugin_path, &extra_env).await {
+                    Ok(d) => {
+                        let arc = Arc::new(d);
+                        daemons.insert(manifest.name.clone(), arc.clone());
+                        Some(arc)
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to start daemon for {}, falling back to CLI: {}", manifest.name, e);
+                        None
                     }
                 }
-                Err(e) => {
-                    failed += 1;
-                    (media_path, vec![], false, Some(e))
-                }
-            };
+            }
+        } else {
+            None
+        };
 
-            let _ = app_handle.emit(
-                "plugin:progress",
-                PluginProgressEvent {
-                    completed,
-                    total,
-                    path: progress_path,
-                    tags_added: progress_tags,
-                    success: progress_ok,
-                    error: progress_err,
-                },
-            );
+        // Two execution paths: daemon (sequential, single-inference-thread)
+        // or legacy CLI (concurrent subprocesses).
+        if let Some(ref daemon) = daemon {
+            // Daemon path: send requests sequentially (concurrency gating)
+            for media_path in media_paths {
+                if cancelled.load(Ordering::Relaxed) {
+                    was_cancelled = true;
+                    break;
+                }
+
+                let res = daemon.request(&media_path).await.map_err(|e| e.to_string());
+                completed += 1;
+
+                let (progress_path, progress_tags, progress_ok, progress_err) =
+                    handle_plugin_result(
+                        &media_path,
+                        res,
+                        &manifest,
+                        &cache_db,
+                        &mut succeeded,
+                        &mut failed,
+                    )
+                    .await;
+
+                let _ = app_handle.emit(
+                    "plugin:progress",
+                    PluginProgressEvent {
+                        completed,
+                        total,
+                        path: progress_path,
+                        tags_added: progress_tags,
+                        success: progress_ok,
+                        error: progress_err,
+                    },
+                );
+            }
+        } else {
+            // Legacy CLI path: concurrent subprocesses
+            let mut result_stream = stream::iter(media_paths.into_iter().map(|media_path| {
+                let manifest = &manifest;
+                let plugin_path = &plugin_path;
+                let action = &action;
+                let extra_env = &extra_env;
+                async move {
+                    let res =
+                        runner::run_cli_plugin(manifest, plugin_path, &media_path, action, extra_env)
+                            .await
+                            .map_err(|e| e.to_string());
+                    (media_path, res)
+                }
+            }))
+            .buffer_unordered(concurrency);
+
+            while let Some((media_path, res)) = result_stream.next().await {
+                if cancelled.load(Ordering::Relaxed) {
+                    was_cancelled = true;
+                    break;
+                }
+
+                completed += 1;
+
+                let (progress_path, progress_tags, progress_ok, progress_err) =
+                    handle_plugin_result(
+                        &media_path,
+                        res,
+                        &manifest,
+                        &cache_db,
+                        &mut succeeded,
+                        &mut failed,
+                    )
+                    .await;
+
+                let _ = app_handle.emit(
+                    "plugin:progress",
+                    PluginProgressEvent {
+                        completed,
+                        total,
+                        path: progress_path,
+                        tags_added: progress_tags,
+                        success: progress_ok,
+                        error: progress_err,
+                    },
+                );
+            }
         }
 
         // Rebuild tag counts once after all files processed

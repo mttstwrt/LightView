@@ -79,6 +79,10 @@ pub struct AppState {
     /// Uses std::sync::Mutex (not tokio) because protocol handlers are synchronous.
     pub thumb_protocol_db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
 
+    /// Registry of active plugin daemons, keyed by plugin name.
+    /// Daemons are started on first use and kept resident for the session.
+    pub plugin_daemons: Arc<Mutex<std::collections::HashMap<String, Arc<plugin::daemon::PluginDaemon>>>>,
+
     /// Unified GPU pipeline for accelerated thumbnail generation and image transforms.
     /// None when no suitable GPU adapter was found at startup.
     #[cfg(feature = "gpu")]
@@ -137,6 +141,7 @@ impl AppState {
             thumbnail_settings: Arc::new(RwLock::new(ThumbnailSettings::default())),
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
             plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            plugin_daemons: Arc::new(Mutex::new(std::collections::HashMap::new())),
             thumb_protocol_db: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "gpu")]
             gpu_pipeline,

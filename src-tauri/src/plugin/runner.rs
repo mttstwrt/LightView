@@ -73,6 +73,7 @@ pub async fn run_cli_plugin(
             command,
             args,
             timeout_seconds,
+            ..
         } => (command, args, timeout_seconds.unwrap_or(60)),
         ExecutionConfig::Wasm { .. } => return Err(RunError::WasmNotSupported),
     };
