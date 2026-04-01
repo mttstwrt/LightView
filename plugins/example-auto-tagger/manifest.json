@@ -1,0 +1,26 @@
+{
+  "name": "example-image-tagger",
+  "display_name": "Example Auto-Tagger",
+  "version": "1.0.0",
+  "description": "Returns an 'example' tag — demonstrates the LightView plugin protocol.",
+  "author": "LightView",
+  "license": "MIT",
+  "execution": {
+    "type": "cli",
+    "command": "python3",
+    "args": ["{plugin_dir}/tagger.py"],
+    "timeout_seconds": 30
+  },
+  "capabilities": ["read_image"],
+  "tag_prefix": "example",
+  "ui": {
+    "settings_schema": null,
+    "context_menu_items": [
+      {
+        "label": "Run Example Tagger",
+        "action": "tag",
+        "icon": null
+      }
+    ]
+  }
+}
