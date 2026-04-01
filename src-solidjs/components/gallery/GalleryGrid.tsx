@@ -5,6 +5,7 @@ import { settings } from "../../stores/settingsStore";
 import { getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
+import { recordCacheMiss } from "../../lib/perfMonitor";
 import { ThumbnailCell } from "./ThumbnailCell";
 
 interface GalleryGridProps {
@@ -184,6 +185,7 @@ export function GalleryGrid(props: GalleryGridProps) {
   /** Called by ThumbnailCell when the protocol handler returns 404. */
   const handleThumbError = (path: string) => {
     if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path) || coalescedPaths.has(path)) return;
+    recordCacheMiss();
     // If a fetch is in-flight, coalesce into the next batch instead of needsGeneration
     // to allow merging with other pending requests.
     needsGeneration.add(path);

@@ -166,6 +166,7 @@ export interface AppSettings {
     background_color: string;
     video_hover_preview: boolean;
     gif_autoplay_grid: boolean;
+    scroll_blur: boolean;
   };
   performance: {
     preload_count: number;

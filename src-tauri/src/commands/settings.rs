@@ -377,6 +377,80 @@ pub async fn get_gallery_stats(
     })
 }
 
+/// Lightweight performance snapshot for the debug overlay.
+/// Reads /proc/self/io for disk bandwidth and queries cache stats.
+#[derive(Debug, Serialize)]
+pub struct PerfSnapshot {
+    /// Bytes read from disk since process start (from /proc/self/io).
+    pub disk_read_bytes: u64,
+    /// Bytes written to disk since process start (from /proc/self/io).
+    pub disk_write_bytes: u64,
+    /// Number of cached thumbnails in SQLite.
+    pub cached_thumbnails: u64,
+    /// Total byte size of cached thumbnail data.
+    pub cache_size_bytes: u64,
+    /// Number of entries in the BC7 atlas (0 if inactive).
+    pub atlas_entries: usize,
+    /// Current rayon thread pool active thread count (approximate).
+    pub thumb_pool_active_threads: usize,
+}
+
+/// Read /proc/self/io counters (Linux-only, returns 0 on other platforms).
+fn read_proc_io() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/self/io") {
+            let mut read_bytes = 0u64;
+            let mut write_bytes = 0u64;
+            for line in contents.lines() {
+                if let Some(val) = line.strip_prefix("read_bytes: ") {
+                    read_bytes = val.trim().parse().unwrap_or(0);
+                } else if let Some(val) = line.strip_prefix("write_bytes: ") {
+                    write_bytes = val.trim().parse().unwrap_or(0);
+                }
+            }
+            return (read_bytes, write_bytes);
+        }
+    }
+    (0, 0)
+}
+
+#[tauri::command]
+pub async fn get_perf_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Result<PerfSnapshot, String> {
+    let (disk_read_bytes, disk_write_bytes) = read_proc_io();
+
+    let (cached_thumbnails, cache_size_bytes) = {
+        let db = state.cache_db.lock().await;
+        if let Some(db) = db.as_ref() {
+            let count: u64 = db.conn()
+                .query_row("SELECT COUNT(*) FROM thumbnails", [], |row| row.get(0))
+                .unwrap_or(0);
+            let size: u64 = db.conn()
+                .query_row("SELECT COALESCE(SUM(LENGTH(thumbnail)), 0) FROM thumbnails", [], |row| row.get(0))
+                .unwrap_or(0);
+            (count, size)
+        } else {
+            (0, 0)
+        }
+    };
+
+    let atlas_entries = {
+        let atlas = state.thumb_atlas.lock().await;
+        atlas.as_ref().map(|a| a.len()).unwrap_or(0)
+    };
+
+    Ok(PerfSnapshot {
+        disk_read_bytes,
+        disk_write_bytes,
+        cached_thumbnails,
+        cache_size_bytes,
+        atlas_entries,
+        thumb_pool_active_threads: state.hardware.thumbnail_threads(),
+    })
+}
+
 /// Get the list of recently opened galleries (most recent first).
 #[tauri::command]
 pub async fn get_recent_galleries(

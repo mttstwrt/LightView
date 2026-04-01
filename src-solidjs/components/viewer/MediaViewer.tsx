@@ -99,15 +99,29 @@ export function MediaViewer(props: MediaViewerProps) {
           <img
             src={mediaSrc()}
             alt={filename()}
-            class="max-w-[90vw] max-h-[90vh] object-contain transition-opacity duration-150"
-            style={{ opacity: loaded() ? "1" : "0" }}
+            class="max-w-[90vw] max-h-[90vh] object-contain"
+            style={{ opacity: loaded() ? "1" : "0", position: loaded() ? "relative" : "absolute" }}
             onLoad={() => setLoaded(true)}
             draggable={false}
           />
         </Show>
 
-        <Show when={!isVideo() && !mediaSrc()}>
-          <div class="text-neutral-500 text-sm">Loading...</div>
+        <Show when={!isVideo() && !loaded()}>
+          <svg
+            width="48"
+            height="48"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="text-white/20"
+          >
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+            <circle cx="8.5" cy="8.5" r="1.5" />
+            <polyline points="21 15 16 10 5 21" />
+          </svg>
         </Show>
       </div>
 

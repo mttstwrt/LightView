@@ -1,4 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as _rawInvoke } from "@tauri-apps/api/core";
+import { isActive as isPerfActive, recordIpcCall } from "./perfMonitor";
 import type {
   GalleryOpenResult,
   GalleryStats,
@@ -12,6 +13,23 @@ import type {
   TagSuggestion,
   TimelineEntry,
 } from "./types";
+
+// ---------------------------------------------------------------------------
+// Instrumented invoke — records IPC metrics when perf monitor is active
+// ---------------------------------------------------------------------------
+
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (!isPerfActive()) {
+    return _rawInvoke<T>(cmd, args);
+  }
+  const argStr = args ? JSON.stringify(args) : "";
+  const start = performance.now();
+  const result = await _rawInvoke<T>(cmd, args);
+  const elapsed = performance.now() - start;
+  const resStr = result !== undefined && result !== null ? JSON.stringify(result) : "";
+  recordIpcCall(cmd, argStr.length, resStr.length, elapsed);
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // Gallery
@@ -331,3 +349,19 @@ export const getTransformedMedia = (path: string, transform: ImageTransform) =>
 
 export const notifyGpuCapabilities = (gpuCompute: boolean, bc7Supported: boolean) =>
   invoke<void>("notify_gpu_capabilities", { gpuCompute, bc7Supported });
+
+// ---------------------------------------------------------------------------
+// Performance Snapshot (debug overlay)
+// ---------------------------------------------------------------------------
+
+export interface PerfSnapshot {
+  disk_read_bytes: number;
+  disk_write_bytes: number;
+  cached_thumbnails: number;
+  cache_size_bytes: number;
+  atlas_entries: number;
+  thumb_pool_active_threads: number;
+}
+
+export const getPerfSnapshot = () =>
+  _rawInvoke<PerfSnapshot>("get_perf_snapshot");

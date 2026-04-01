@@ -2,6 +2,7 @@ import { createSignal } from "solid-js";
 import type {
   GalleryMediaItem,
   GroupHeader,
+  SortedItem,
   TimelineEntry,
 } from "../lib/types";
 
@@ -17,6 +18,9 @@ const [loading, setLoading] = createSignal(false);
 
 // Sorted + filtered items (paths in display order)
 const [displayPaths, setDisplayPaths] = createSignal<string[]>([]);
+
+// Full sorted item metadata (for scrollbar indicators, etc.)
+const [sortedItems, setSortedItems] = createSignal<SortedItem[]>([]);
 
 // Group headers for the current sort/group
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
@@ -37,6 +41,7 @@ export {
   indexingProgress, setIndexingProgress,
   loading, setLoading,
   displayPaths, setDisplayPaths,
+  sortedItems, setSortedItems,
   groups, setGroups,
   timeline, setTimeline,
   activeFilterQuery, setActiveFilterQuery,

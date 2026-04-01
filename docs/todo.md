@@ -1,9 +1,17 @@
 
-- Add blur effect when scrolling, might help with the smooth feeling UI. 
-- Implement scroll bar
-- wd image tagger GPU offload, why run an ml model on the CPU when theres a perfectly good GPU right there?
-- Still need better performance when scrolling
-- get rid of fade transition when opening/switching images
-- Add cancel button to running batch
-- future: Complete frontend overhaul using Vulkan instead of a solidJS front end... We want MAXIMUM PERFORMANCE. Also need to address perfromance concerns already present in the code.
-- Create system diagram, ensure system is as simple as possible
+- wd-tagger currently is not outputting tags...
+
+- Improve scroll bar date label placement, larger labels for start of each year, smaller labels for each month?
+
+- Abstract ALL constants into a defined file, settings should be able to control some of these
+
+- phase 7
+
+- phase 3
+
+- phase 4
+
+- phase 5
+
+- phase 6 
+

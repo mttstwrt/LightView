@@ -1,4 +1,5 @@
 import { Show, createSignal, createEffect, on } from "solid-js";
+import { settings } from "../../stores/settingsStore";
 
 interface ThumbnailCellProps {
   path: string;
@@ -12,6 +13,10 @@ interface ThumbnailCellProps {
   /** Called when the protocol handler returns 404 (thumbnail not cached). */
   onError?: (path: string) => void;
 }
+
+// Module-level set of URLs that have already been loaded at least once.
+// Survives cell recycling so a revisited thumbnail won't re-fade.
+const loadedUrls = new Set<string>();
 
 export function ThumbnailCell(props: ThumbnailCellProps) {
   const [errored, setErrored] = createSignal(false);
@@ -34,13 +39,20 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
 
   const isGif = () => ext() === "gif";
 
-  // Clear error state when a new URL is provided (e.g. after generation + cache-bust).
-  createEffect(on(() => props.thumbSrc, () => {
+  // Whether this cell's current image has finished loading (for fade-in).
+  // Starts true if the URL was already seen, so recycled cells don't re-fade.
+  const [loaded, setLoaded] = createSignal(false);
+
+  // Clear error/loaded state when a new URL is provided (e.g. after generation + cache-bust).
+  createEffect(on(() => props.thumbSrc, (url) => {
     setErrored(false);
+    setLoaded(url ? loadedUrls.has(url) : false);
   }));
 
   // Whether we have a valid URL to attempt loading.
   const hasUrl = () => !!props.thumbSrc && !errored();
+
+  const fadeEnabled = () => settings().display.scroll_blur;
 
   return (
     <div
@@ -81,8 +93,16 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           src={props.thumbSrc!}
           alt={filename()}
           class="w-full h-full object-cover"
+          style={{
+            opacity: fadeEnabled() && !loaded() ? "0" : "1",
+            transition: fadeEnabled() ? "opacity 0.15s ease-in" : "none",
+          }}
           decoding="async"
           draggable={false}
+          onLoad={() => {
+            if (props.thumbSrc) loadedUrls.add(props.thumbSrc);
+            setLoaded(true);
+          }}
           onError={() => {
             setErrored(true);
             props.onError?.(props.path);

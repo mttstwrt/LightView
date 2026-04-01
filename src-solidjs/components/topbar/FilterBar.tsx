@@ -9,7 +9,7 @@ import {
   buildFilterQuery,
   clearAllFilters,
 } from "../../stores/filterStore";
-import { setDisplayPaths } from "../../stores/galleryStore";
+import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
 import { sortField, sortOrder, groupBy } from "../../stores/settingsStore";
 import { autocompleteTags, applyFilter, clearFilter, getSortedItems } from "../../lib/ipc";
 
@@ -135,9 +135,11 @@ export function FilterBar() {
       if (query) {
         const filteredPaths = await applyFilter(query);
         const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filteredPaths);
+        setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       } else {
         const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
+        setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       }
     } catch (e) {
@@ -150,6 +152,7 @@ export function FilterBar() {
     try {
       await clearFilter();
       const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
+      setSortedItems(sorted.items);
       setDisplayPaths(sorted.items.map((item) => item.path));
     } catch {}
   };

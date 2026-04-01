@@ -103,6 +103,20 @@ pub async fn run_plugin(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Check if the plugin reported an error via meta
+    if output.tags.is_empty() {
+        if let Some(ref meta) = output.meta {
+            if let Some(err) = meta.get("error").and_then(|v| v.as_str()) {
+                return Ok(PluginRunResult {
+                    path: media_path,
+                    tags_added: vec![],
+                    success: false,
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+    }
+
     // App handles all companion file I/O
     let mut companion = get_or_create_companion(media)?;
     runner::apply_plugin_output(&mut companion, &manifest, &output);
@@ -139,6 +153,17 @@ async fn handle_plugin_result(
 ) -> (String, Vec<String>, bool, Option<String>) {
     match res {
         Ok(output) => {
+            // Check if the plugin reported an error via meta (returns empty tags
+            // with error details buried in meta instead of failing outright).
+            if output.tags.is_empty() {
+                if let Some(ref meta) = output.meta {
+                    if let Some(err) = meta.get("error").and_then(|v| v.as_str()) {
+                        *failed += 1;
+                        return (media_path.to_string(), vec![], false, Some(err.to_string()));
+                    }
+                }
+            }
+
             let media = Path::new(media_path);
             let companion_result = get_or_create_companion(media).and_then(|mut companion| {
                 runner::apply_plugin_output(&mut companion, manifest, &output);

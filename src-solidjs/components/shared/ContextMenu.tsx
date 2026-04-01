@@ -130,18 +130,18 @@ export function ContextMenu(props: ContextMenuProps) {
           "plugin:progress",
           (event) => pluginProgress(event.payload.completed, event.payload.total),
         );
-        const unlistenDone = await listen<{ total: number; failed: number; cancelled: boolean }>(
+        const unlistenDone = await listen<{ succeeded: number; failed: number; cancelled: boolean }>(
           "plugin:done",
           (event) => {
             unlistenProgress();
             unlistenDone();
-            const { total, failed, cancelled } = event.payload;
+            const { succeeded, failed, cancelled } = event.payload;
             if (cancelled) {
               pluginCancelled();
             } else if (failed > 0) {
-              pluginFailed(`${total - failed} tagged, ${failed} failed`);
+              pluginFailed(`${succeeded} tagged, ${failed} failed`);
             } else {
-              pluginFinished(`Tagged ${total} files`);
+              pluginFinished(`Tagged ${succeeded} files`);
             }
             setPluginBusy(false);
           },

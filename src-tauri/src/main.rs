@@ -305,6 +305,7 @@ fn main() {
             commands::settings::clear_cache,
             commands::settings::get_gallery_stats,
             commands::settings::get_debug_info,
+            commands::settings::get_perf_snapshot,
             commands::settings::get_thumbnail_settings,
             commands::settings::update_thumbnail_settings,
             commands::settings::save_gallery_settings,

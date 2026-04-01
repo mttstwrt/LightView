@@ -1,6 +1,6 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
 import { sortField, setSortField, sortOrder, setSortOrder, groupBy } from "../../stores/settingsStore";
-import { setDisplayPaths } from "../../stores/galleryStore";
+import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
 import { buildFilterQuery } from "../../stores/filterStore";
 import { getSortedItems, applyFilter } from "../../lib/ipc";
 import type { SortField, SortOrder } from "../../lib/types";
@@ -35,9 +35,11 @@ export function SortMenu() {
       if (query) {
         const filteredPaths = await applyFilter(query);
         const sorted = await getSortedItems(field, order, groupBy(), filteredPaths);
+        setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       } else {
         const sorted = await getSortedItems(field, order, groupBy());
+        setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       }
     } catch (e) {

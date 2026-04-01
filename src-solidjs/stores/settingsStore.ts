@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     background_color: "#0a0a0a",
     video_hover_preview: false,
     gif_autoplay_grid: false,
+    scroll_blur: false,
   },
   performance: {
     preload_count: 3,

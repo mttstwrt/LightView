@@ -1,10 +1,10 @@
 import { Show, createSignal, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
-import { openGallery, getSortedItems, getDebugInfo, getRecentGalleries, removeRecentGallery, type DebugInfo, type RecentGallery } from "./lib/ipc";
+import { openGallery, getSortedItems, getRecentGalleries, removeRecentGallery, type RecentGallery } from "./lib/ipc";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
@@ -13,53 +13,156 @@ import { SelectionBar } from "./components/gallery/SelectionBar";
 import { pluginActivity, type PluginActivity } from "./stores/pluginStore";
 import { cancelPluginBatch } from "./lib/ipc";
 import { thumbGenActivity } from "./stores/thumbnailProgressStore";
-import { ScrollBar } from "./components/shared/ScrollBar";
+import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
+import { DebugOverlay } from "./components/debug/DebugOverlay";
+import type { SortedItem, SortField } from "./lib/types";
 
-function DebugOverlay() {
-  const [info, setInfo] = createSignal<DebugInfo | null>(null);
+// ---------------------------------------------------------------------------
+// Scrollbar indicator helpers
+// ---------------------------------------------------------------------------
 
-  const load = async () => {
-    try {
-      setInfo(await getDebugInfo());
-    } catch (e) {
-      console.error("Debug info failed:", e);
+function buildScrollIndicators(items: SortedItem[], field: SortField): ScrollIndicator[] {
+  if (items.length === 0) return [];
+
+  switch (field) {
+    case "date":
+      return buildDateIndicators(items);
+    case "name":
+      return buildNameIndicators(items);
+    case "size":
+      return buildSizeIndicators(items);
+    case "rating":
+      return buildRatingIndicators(items);
+    default:
+      return [];
+  }
+}
+
+function buildDateIndicators(items: SortedItem[]): ScrollIndicator[] {
+  const indicators: ScrollIndicator[] = [];
+  let lastLabel = "";
+  for (let i = 0; i < items.length; i++) {
+    const ts = items[i].date_taken;
+    if (!ts) continue;
+    const d = new Date(ts * 1000);
+    const label = d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+    if (label !== lastLabel) {
+      indicators.push({ position: i / items.length, label });
+      lastLabel = label;
     }
-  };
+  }
+  return dedupeIndicators(indicators);
+}
 
-  load();
+function buildNameIndicators(items: SortedItem[]): ScrollIndicator[] {
+  const indicators: ScrollIndicator[] = [];
+  let lastChar = "";
+  for (let i = 0; i < items.length; i++) {
+    const name = items[i].path.split("/").pop() ?? "";
+    const ch = name.charAt(0).toUpperCase();
+    if (ch && ch !== lastChar) {
+      indicators.push({ position: i / items.length, label: ch });
+      lastChar = ch;
+    }
+  }
+  return dedupeIndicators(indicators);
+}
 
-  return (
-    <div
-      class="fixed bottom-4 left-4 z-[100] p-3 rounded text-xs font-mono text-neutral-300 max-w-sm"
-      style={{ background: "rgba(0,0,0,0.85)", "backdrop-filter": "blur(8px)", border: "1px solid rgba(255,255,255,0.1)" }}
-    >
-      <div class="text-neutral-500 mb-2">Hardware Debug</div>
-      <Show when={info()} fallback={<div class="text-neutral-500">Loading...</div>}>
-        <div class="space-y-0.5">
-          <div>Storage: <span class="text-neutral-100">{info()!.storage_type}</span></div>
-          <div>Filesystem: <span class="text-neutral-100">{info()!.filesystem}</span></div>
-          <div>CPU: <span class="text-neutral-100">{info()!.cpu_cores} cores</span></div>
-          <div>RAM: <span class="text-neutral-100">{info()!.total_ram_mb} MB</span></div>
-          <div>GPU compute: <span class={info()!.gpu_compute ? "text-green-400" : "text-red-400"}>{info()!.gpu_compute ? "yes" : "no"}</span></div>
-          <div>GPU resize: <span class={info()!.gpu_resize_active ? "text-green-400" : "text-neutral-500"}>{info()!.gpu_resize_active ? "active" : "inactive"}</span></div>
-          <div>Thumb format: <span class="text-neutral-100">{info()!.thumb_format}</span></div>
-          <div>BC7 atlas: <span class={info()!.bc7_atlas_active ? "text-green-400" : "text-neutral-500"}>{info()!.bc7_atlas_active ? `active (${info()!.atlas_entry_count} entries)` : "inactive"}</span></div>
-          <div>SQLite thumbs: <span class="text-neutral-100">{info()!.sqlite_thumbnail_count}</span></div>
-          <div>Thumb threads: <span class="text-neutral-100">{info()!.thumbnail_threads}</span></div>
-          <div>Prefetch: <span class="text-neutral-100">{info()!.prefetch_count}</span></div>
-          <div>LRU cache: <span class="text-neutral-100">{info()!.lru_cache_size}</span></div>
-          <div>Reflink: <span class={info()!.supports_reflink ? "text-green-400" : "text-neutral-500"}>{info()!.supports_reflink ? "yes" : "no"}</span></div>
-        </div>
-      </Show>
-      <button class="mt-2 text-neutral-500 hover:text-neutral-300 cursor-pointer" onClick={load}>refresh</button>
-    </div>
-  );
+function formatSizeShort(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function buildSizeIndicators(items: SortedItem[]): ScrollIndicator[] {
+  // Place indicators at size order-of-magnitude boundaries
+  const thresholds = [
+    100 * 1024,        // 100 KB
+    500 * 1024,        // 500 KB
+    1024 * 1024,       // 1 MB
+    5 * 1024 * 1024,   // 5 MB
+    10 * 1024 * 1024,  // 10 MB
+    50 * 1024 * 1024,  // 50 MB
+    100 * 1024 * 1024, // 100 MB
+  ];
+  const indicators: ScrollIndicator[] = [];
+  let tIdx = 0;
+  // Determine sort direction from first vs last
+  const ascending = items.length > 1 && items[0].file_size <= items[items.length - 1].file_size;
+
+  for (let i = 0; i < items.length && tIdx < thresholds.length; i++) {
+    const size = items[i].file_size;
+    const threshold = thresholds[ascending ? tIdx : thresholds.length - 1 - tIdx];
+    const crossed = ascending ? size >= threshold : size <= threshold;
+    if (crossed) {
+      indicators.push({ position: i / items.length, label: formatSizeShort(threshold) });
+      tIdx++;
+    }
+  }
+  return dedupeIndicators(indicators);
+}
+
+function buildRatingIndicators(items: SortedItem[]): ScrollIndicator[] {
+  const indicators: ScrollIndicator[] = [];
+  let lastRating = -1;
+  for (let i = 0; i < items.length; i++) {
+    const r = items[i].rating ?? 0;
+    if (r !== lastRating) {
+      indicators.push({ position: i / items.length, label: r === 0 ? "Unrated" : "\u2605".repeat(r) });
+      lastRating = r;
+    }
+  }
+  return dedupeIndicators(indicators);
+}
+
+/** Thin out indicators so they don't overlap — keep at most ~15, evenly spaced. */
+function dedupeIndicators(indicators: ScrollIndicator[]): ScrollIndicator[] {
+  if (indicators.length <= 15) return indicators;
+  const step = Math.ceil(indicators.length / 15);
+  const result: ScrollIndicator[] = [];
+  for (let i = 0; i < indicators.length; i += step) {
+    result.push(indicators[i]);
+  }
+  return result;
+}
+
+function getThumbLabelForItems(items: SortedItem[], field: SortField, fraction: number): string {
+  if (items.length === 0) return "";
+  const idx = Math.min(Math.floor(fraction * items.length), items.length - 1);
+  const item = items[idx];
+
+  switch (field) {
+    case "date": {
+      const ts = item.date_taken;
+      if (!ts) return "No date";
+      const d = new Date(ts * 1000);
+      return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+    }
+    case "name": {
+      const name = item.path.split("/").pop() ?? "";
+      return name.length > 20 ? name.slice(0, 20) + "\u2026" : name;
+    }
+    case "size":
+      return formatSizeShort(item.file_size);
+    case "rating": {
+      const r = item.rating ?? 0;
+      return r === 0 ? "Unrated" : "\u2605".repeat(r);
+    }
+    default:
+      return "";
+  }
 }
 
 export function App() {
   const [debugOpen, setDebugOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
+
+  // Scrollbar sort indicators
+  const scrollIndicators = () => buildScrollIndicators(sortedItems(), sortField());
+  const thumbLabel = (fraction: number) => getThumbLabelForItems(sortedItems(), sortField(), fraction);
+
   const openPath = async (path: string) => {
     setLoading(true);
     try {
@@ -71,6 +174,7 @@ export function App() {
       await loadSettingsFromGallery();
 
       const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
+      setSortedItems(sorted.items);
       setDisplayPaths(sorted.items.map((item) => item.path));
     } catch (e) {
       console.error("Failed to open gallery:", e);
@@ -149,7 +253,11 @@ export function App() {
           loading={loading()}
           onContentHeight={setGalleryContentHeight}
         />
-        <ScrollBar contentHeight={galleryContentHeight()} />
+        <ScrollBar
+          contentHeight={galleryContentHeight()}
+          indicators={scrollIndicators()}
+          getThumbLabel={thumbLabel}
+        />
         <Show when={selectedPaths().size > 0}>
           <SelectionBar
             selectedPaths={selectedPaths()}

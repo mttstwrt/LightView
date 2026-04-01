@@ -344,6 +344,11 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
                 checked={settings().display.video_hover_preview}
                 onChange={(v) => updateDisplay("video_hover_preview", v)}
               />
+              <Toggle
+                label="Thumbnail fade-in"
+                checked={settings().display.scroll_blur}
+                onChange={(v) => updateDisplay("scroll_blur", v)}
+              />
             </Section>
 
             {/* ── Thumbnails ── */}
