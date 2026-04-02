@@ -65,10 +65,12 @@ fn serve_thumbnail(
                         .status(200)
                         .header("Content-Type", "image/jpeg")
                         .header("Cache-Control", "no-cache")
+                        .header("Access-Control-Allow-Origin", "*")
                         .body(jpeg)
                         .unwrap(),
                     Err(_) => tauri::http::Response::builder()
                         .status(500)
+                        .header("Access-Control-Allow-Origin", "*")
                         .body(Vec::new())
                         .unwrap(),
                 }
@@ -77,6 +79,7 @@ fn serve_thumbnail(
                     .status(200)
                     .header("Content-Type", "image/jpeg")
                     .header("Cache-Control", "no-cache")
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(data)
                     .unwrap()
             }
@@ -86,6 +89,7 @@ fn serve_thumbnail(
             tauri::http::Response::builder()
                 .status(404)
                 .header("Cache-Control", "no-store")
+                .header("Access-Control-Allow-Origin", "*")
                 .body(Vec::new())
                 .unwrap()
         }
@@ -113,6 +117,7 @@ fn serve_full_media(
                             .status(200)
                             .header("Content-Type", "image/jpeg")
                             .header("Cache-Control", "no-cache")
+                            .header("Access-Control-Allow-Origin", "*")
                             .body(jpeg_data)
                             .unwrap();
                     }
@@ -120,6 +125,7 @@ fn serve_full_media(
                         log::error!("HEIC→JPEG encode failed for {}: {}", path, e);
                         return tauri::http::Response::builder()
                             .status(500)
+                            .header("Access-Control-Allow-Origin", "*")
                             .body(Vec::new())
                             .unwrap();
                     }
@@ -129,6 +135,7 @@ fn serve_full_media(
                 log::error!("HEIC decode failed for {}: {}", path, e);
                 return tauri::http::Response::builder()
                     .status(500)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(Vec::new())
                     .unwrap();
             }
@@ -157,12 +164,14 @@ fn serve_full_media(
             .status(200)
             .header("Content-Type", mime)
             .header("Cache-Control", "no-cache")
+            .header("Access-Control-Allow-Origin", "*")
             .body(data)
             .unwrap(),
         Err(e) => {
             log::error!("Failed to read media file {}: {}", path, e);
             tauri::http::Response::builder()
                 .status(404)
+                .header("Access-Control-Allow-Origin", "*")
                 .body(Vec::new())
                 .unwrap()
         }
@@ -206,6 +215,7 @@ fn main() {
             if path.is_empty() {
                 return tauri::http::Response::builder()
                     .status(400)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(Vec::new())
                     .unwrap();
             }
@@ -215,6 +225,7 @@ fn main() {
                 Route::Media => serve_full_media(&path),
                 Route::Unknown => tauri::http::Response::builder()
                     .status(404)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(Vec::new())
                     .unwrap(),
             }

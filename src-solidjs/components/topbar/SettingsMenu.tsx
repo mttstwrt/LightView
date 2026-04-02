@@ -1,7 +1,7 @@
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths } from "../../stores/galleryStore";
-import type { AppSettings, ResizeFilter, CompanionLocation, PluginInfo } from "../../lib/types";
+import type { AppSettings, ResizeFilter, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
 import { rebuildThumbnails, getThumbnailSettings, updateThumbnailSettings, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch } from "../../lib/ipc";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
 import { listen } from "@tauri-apps/api/event";
@@ -349,6 +349,28 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
                 checked={settings().display.scroll_blur}
                 onChange={(v) => updateDisplay("scroll_blur", v)}
               />
+
+              {/* Renderer mode */}
+              <Field label="Renderer">
+                <div class="flex gap-1">
+                  {([
+                    { value: "dom" as RendererMode, label: "DOM" },
+                    { value: "canvas" as RendererMode, label: "Canvas" },
+                    { value: "webgl" as RendererMode, label: "WebGL" },
+                  ]).map((opt) => (
+                    <button
+                      class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
+                        (settings().display.renderer_mode ?? "dom") === opt.value
+                          ? "bg-teal-700/60 text-teal-200"
+                          : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+                      }`}
+                      onClick={() => updateDisplay("renderer_mode", opt.value)}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </Field>
             </Section>
 
             {/* ── Thumbnails ── */}

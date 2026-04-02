@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     video_hover_preview: false,
     gif_autoplay_grid: false,
     scroll_blur: false,
+    renderer_mode: "canvas",
   },
   performance: {
     preload_count: 3,

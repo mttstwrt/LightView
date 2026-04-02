@@ -158,6 +158,7 @@ export interface HardwareProfile {
 
 export type ResizeFilter = "nearest" | "bilinear" | "lanczos3";
 export type CompanionLocation = "lightview_folder" | "alongside";
+export type RendererMode = "dom" | "canvas" | "webgl";
 
 export interface AppSettings {
   display: {
@@ -167,6 +168,7 @@ export interface AppSettings {
     video_hover_preview: boolean;
     gif_autoplay_grid: boolean;
     scroll_blur: boolean;
+    renderer_mode: RendererMode;
   };
   performance: {
     preload_count: number;

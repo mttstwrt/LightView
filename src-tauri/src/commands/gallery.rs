@@ -67,6 +67,7 @@ fn populate_media_meta(
 fn index_companions(db: &CacheDb, gallery_path: &str) {
     let ext = crate::companion::schema::COMPANION_EXTENSION;
     let mut indexed = 0u64;
+    let mut skipped = 0u64;
 
     for entry in walkdir::WalkDir::new(gallery_path)
         .into_iter()
@@ -109,9 +110,27 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
             base.to_string()
         };
 
+        // Skip unchanged companions — use mtime to avoid re-indexing files
+        // that haven't been modified since last open.
+        let companion_mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if companion_mtime > 0 {
+            if let Ok(false) = db.needs_reindex(&media_path_str, companion_mtime) {
+                skipped += 1;
+                continue;
+            }
+        }
+
         if let Ok(contents) = std::fs::read_to_string(path) {
             if let Ok(companion) = crate::companion::reader::parse_companion(&contents) {
                 let _ = db.reindex_tags_for_file(&media_path_str, &companion);
+                let _ = db.set_index_state(&media_path_str, companion_mtime);
                 indexed += 1;
             }
         }
@@ -119,7 +138,13 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
 
     if indexed > 0 {
         let _ = db.rebuild_tag_counts();
-        log::info!("Indexed tags from {} companion files", indexed);
+    }
+    if indexed > 0 || skipped > 0 {
+        log::info!(
+            "Companion indexing: {} indexed, {} unchanged (skipped)",
+            indexed,
+            skipped
+        );
     }
 }
 
@@ -156,7 +181,15 @@ pub async fn open_gallery(
     // Re-index all companion files so the tag_index and tag_counts tables
     // reflect what's on disk.  This makes tags from previous sessions (and
     // from plugins) available for filtering and autocomplete immediately.
+    // Only re-indexes companions whose mtime changed since last open.
     index_companions(&cache_db, &path);
+
+    // Checkpoint WAL after bulk writes to keep the WAL file small.
+    // This runs before opening the read-only protocol connection so there's
+    // no reader blocking the checkpoint.
+    if let Err(e) = cache_db.checkpoint() {
+        log::warn!("WAL checkpoint after indexing failed: {}", e);
+    }
 
     if let Ok(counts) = cache_db.query_all_tag_counts() {
         if !counts.is_empty() {
@@ -276,16 +309,22 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Close cache DB
-    {
-        let mut db = state.cache_db.lock().await;
-        *db = None;
-    }
-
-    // Close protocol handler DB
+    // Close protocol handler DB FIRST — the read-only connection blocks
+    // WAL checkpointing, so it must be dropped before we checkpoint.
     {
         let mut proto_db = state.thumb_protocol_db.lock().unwrap();
         *proto_db = None;
+    }
+
+    // Checkpoint and close cache DB
+    {
+        let mut db = state.cache_db.lock().await;
+        if let Some(ref cache_db) = *db {
+            if let Err(e) = cache_db.checkpoint() {
+                log::warn!("WAL checkpoint on close failed: {}", e);
+            }
+        }
+        *db = None;
     }
 
     // Clear current gallery

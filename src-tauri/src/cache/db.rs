@@ -114,6 +114,14 @@ impl CacheDb {
         &self.conn
     }
 
+    /// Run a WAL checkpoint to consolidate the WAL file back into the main database.
+    /// Uses TRUNCATE mode to reclaim disk space from the WAL file.
+    pub fn checkpoint(&self) -> Result<(), CacheError> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     /// Begin a transaction for batch operations.
     pub fn transaction(&mut self) -> Result<rusqlite::Transaction<'_>, CacheError> {
         Ok(self.conn.transaction()?)

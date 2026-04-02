@@ -1,15 +1,25 @@
-import { Index, Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
+// ---------------------------------------------------------------------------
+// CanvasGrid — replaces DOM grid with a canvas-based renderer (Phase 7)
+// ---------------------------------------------------------------------------
+//
+// Wraps a Canvas2D or WebGL GridRenderer inside a SolidJS component.
+// Handles: image loading pipeline, mouse events via hit-testing,
+// scroll-driven repaints, and selection overlays.
+
+import { Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { settings } from "../../stores/settingsStore";
 import { getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
 import { recordCacheMiss } from "../../lib/perfMonitor";
-import { ThumbnailCell } from "./ThumbnailCell";
-import { CanvasGrid } from "./CanvasGrid";
+import { Canvas2DRenderer } from "../../lib/renderer/Canvas2DRenderer";
+import { WebGLRenderer } from "../../lib/renderer/WebGLRenderer";
+import { ImageLoader } from "../../lib/renderer/ImageLoader";
+import type { GridRenderer, GridLayout, GridItem } from "../../lib/renderer/types";
+import type { RendererMode } from "../../lib/types";
 
-interface GalleryGridProps {
+interface CanvasGridProps {
   paths: string[];
   onItemClick: (index: number) => void;
   onItemSelect: (path: string) => void;
@@ -18,86 +28,72 @@ interface GalleryGridProps {
   onItemContextMenu?: (e: MouseEvent, path: string, index: number) => void;
   loading: boolean;
   onContentHeight?: (height: number) => void;
+  rendererMode: RendererMode;
 }
 
-// Rows of buffer above and below the viewport to pre-render.
+// --- Constants (same as GalleryGrid) ---
 const BUFFER_ROWS = 3;
-
-// How many paths to send per IPC batch call.
 const BATCH_SIZE = 128;
-
-// Velocity thresholds (px/s)
 const VELOCITY_SLOW = 500;
 const VELOCITY_FAST = 3000;
-
-// Jump detection: scroll delta > 2x viewport height triggers generation bump.
 const JUMP_FACTOR = 2;
-
-// How many paths to send per background precache call.
 const BG_BATCH_SIZE = 64;
-
-// Rows beyond the visible+buffer range before thumbnails are evicted from memory.
 const EVICT_ROWS = 15;
-
-// How long (ms) to wait after fast scroll ends before resuming fetches.
 const SETTLE_MS = 150;
-
-// Debounce delay (ms) for scroll-driven metadata requests.
 const SCROLL_DEBOUNCE_MS = 50;
 
-export function GalleryGrid(props: GalleryGridProps) {
-  const mode = () => settings().display.renderer_mode ?? "dom";
+const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"]);
 
-  return (
-    <Show
-      when={mode() === "dom"}
-      fallback={
-        <CanvasGrid
-          paths={props.paths}
-          onItemClick={props.onItemClick}
-          onItemSelect={props.onItemSelect}
-          onDragSelect={props.onDragSelect}
-          selectedPaths={props.selectedPaths}
-          onItemContextMenu={props.onItemContextMenu}
-          loading={props.loading}
-          onContentHeight={props.onContentHeight}
-          rendererMode={mode()}
-        />
-      }
-    >
-      <DOMGrid {...props} />
-    </Show>
-  );
+function getExt(path: string): string {
+  const dot = path.lastIndexOf(".");
+  return dot >= 0 ? path.slice(dot + 1).toLowerCase() : "";
 }
 
-function DOMGrid(props: GalleryGridProps) {
+function getBadge(path: string): "VID" | "GIF" | null {
+  const ext = getExt(path);
+  if (VIDEO_EXTS.has(ext)) return "VID";
+  if (ext === "gif") return "GIF";
+  return null;
+}
+
+export function CanvasGrid(props: CanvasGridProps) {
   const thumbSize = () => settings().display.thumbnail_size;
   const gap = () => settings().display.grid_gap;
 
-  // Measured container width (updated by ResizeObserver).
   const [containerWidth, setContainerWidth] = createSignal(0);
-
-  // Visible row range — only updated when it actually changes.
   const [startRow, setStartRow] = createSignal(0);
   const [endRow, setEndRow] = createSignal(0);
-
-  // Generation counter — incremented on large jumps or path changes.
   const [generation, setGeneration] = createSignal(0);
 
-  // Store for protocol URLs (lightview://thumb/...).
-  const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
+  // Track which paths have been assigned URLs (for optimistic loading)
+  const assignedSet = new Set<string>();
+  // Track URL versions for cache busting
+  const urlVersions = new Map<string, number>();
+  // Current assigned URL per path
+  const urlMap = new Map<string, string>();
 
   let containerRef: HTMLDivElement | undefined;
+  let canvasWrapperRef: HTMLDivElement | undefined;
+  let renderer: GridRenderer | null = null;
+  let imageLoader: ImageLoader | null = null;
+  let rafPending = false;
+  let recalcRange: (() => void) | undefined;
 
-  // -----------------------------------------------------------------------
+  // Thumbnail generation state
+  const needsGeneration = new Set<string>();
+  const inFlightSet = new Set<string>();
+  const failedSet = new Set<string>();
+  const coalescedPaths = new Set<string>();
+  const pathToIndex = new Map<string, number>();
+  let bgCursor = 0;
+  let thumbGenTotal = 0;
+  let thumbGenDone = 0;
+
   // Drag-to-select state
-  // -----------------------------------------------------------------------
   const [isDragging, setIsDragging] = createSignal(false);
   const [dragStartIndex, setDragStartIndex] = createSignal(-1);
   const [dragCurrentIndex, setDragCurrentIndex] = createSignal(-1);
-  // Snapshot of selection when drag started (for additive Ctrl+drag)
   let dragBaseSelection = new Set<string>();
-  // Suppress the next click after a multi-item drag completes
   let suppressClick = false;
 
   const dragSelectedPaths = () => {
@@ -113,67 +109,6 @@ function DOMGrid(props: GalleryGridProps) {
     return paths;
   };
 
-  const handleDragStart = (index: number, e: MouseEvent) => {
-    // Only left mouse button
-    if (e.button !== 0) return;
-    e.preventDefault(); // Prevent text selection during drag
-    dragBaseSelection = e.ctrlKey || e.metaKey ? new Set(props.selectedPaths) : new Set<string>();
-    setIsDragging(true);
-    setDragStartIndex(index);
-    setDragCurrentIndex(index);
-  };
-
-  const handleDragEnter = (index: number) => {
-    if (!isDragging()) return;
-    setDragCurrentIndex(index);
-  };
-
-  const handleItemClick = (item: { path: string; index: number }, e: MouseEvent) => {
-    if (suppressClick) {
-      suppressClick = false;
-      return;
-    }
-    if (e.ctrlKey || e.metaKey) {
-      props.onItemSelect(item.path);
-    } else {
-      props.onItemClick(item.index);
-    }
-  };
-
-  // Global mouseup to end drag
-  onMount(() => {
-    const onMouseUp = () => {
-      if (!isDragging()) return;
-      const dragged = dragSelectedPaths();
-      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex() || dragBaseSelection.size > 0;
-      setIsDragging(false);
-
-      if (!wasMultiDrag) {
-        // Single click (no real drag) — let onClick handle it
-        setDragStartIndex(-1);
-        setDragCurrentIndex(-1);
-        return;
-      }
-
-      // Suppress the click event that fires after mouseup
-      suppressClick = true;
-
-      // Merge base selection with drag selection
-      const merged = new Set(dragBaseSelection);
-      for (const p of dragged) merged.add(p);
-
-      if (props.onDragSelect) {
-        props.onDragSelect([...merged]);
-      }
-      setDragStartIndex(-1);
-      setDragCurrentIndex(-1);
-    };
-
-    window.addEventListener("mouseup", onMouseUp);
-    onCleanup(() => window.removeEventListener("mouseup", onMouseUp));
-  });
-
-  // Compute effective selection (base + drag range) for display during drag
   const effectiveSelected = () => {
     if (!isDragging()) return props.selectedPaths;
     const dragged = dragSelectedPaths();
@@ -183,70 +118,7 @@ function DOMGrid(props: GalleryGridProps) {
   };
 
   // -----------------------------------------------------------------------
-  // Thumbnail streaming state
-  // -----------------------------------------------------------------------
-
-  /** Paths that currently have a protocol URL in thumbMap. */
-  const assignedSet = new Set<string>();
-  /** Paths where the protocol handler returned 404 — need IPC generation. */
-  const needsGeneration = new Set<string>();
-  /** Paths currently in-flight for IPC generation. */
-  const inFlightSet = new Set<string>();
-  /** Paths that permanently failed (won't be retried). */
-  const failedSet = new Set<string>();
-  /** Coalesced paths: accumulated during in-flight fetch, merged into next batch. */
-  const coalescedPaths = new Set<string>();
-  /** Cache-bust version per path — incremented after IPC generation. */
-  const urlVersions = new Map<string, number>();
-  /** Reverse index: path → position in props.paths for O(1) eviction lookups. */
-  const pathToIndex = new Map<string, number>();
-
-  let bgCursor = 0;
-  let recalcRange: (() => void) | undefined;
-
-  // Thumbnail generation progress tracking
-  let thumbGenTotal = 0;
-  let thumbGenDone = 0;
-
-  /** Called by ThumbnailCell when the protocol handler returns 404. */
-  const handleThumbError = (path: string) => {
-    if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path) || coalescedPaths.has(path)) return;
-    recordCacheMiss();
-    // If a fetch is in-flight, coalesce into the next batch instead of needsGeneration
-    // to allow merging with other pending requests.
-    needsGeneration.add(path);
-    coalescedPaths.add(path);
-    thumbGenTotal++;
-    if (thumbGenTotal === 1) {
-      thumbGenStarted(thumbGenTotal);
-    } else {
-      thumbGenProgress(thumbGenDone, thumbGenTotal);
-    }
-  };
-
-  // Initialize WebGPU on mount (non-blocking, caches result).
-  onMount(() => {
-    initGPU();
-  });
-
-  // Listen for streamed thumbnail results — update URLs as each arrives
-  // rather than waiting for the full batch to complete.
-  let unlistenStreamed: UnlistenFn | undefined;
-  onMount(() => {
-    listen<ThumbnailResult>("thumb:streamed", (event) => {
-      const r = event.payload;
-      if (!inFlightSet.has(r.path)) return;
-      const v = (urlVersions.get(r.path) ?? 0) + 1;
-      urlVersions.set(r.path, v);
-      setThumbMap(r.path, `${thumbUrl(r.path)}?v=${v}`);
-    }).then((fn) => {
-      unlistenStreamed = fn;
-    });
-  });
-  onCleanup(() => unlistenStreamed?.());
-
-  // -----------------------------------------------------------------------
-  // Grid geometry — derived from container width, thumb size, gap
+  // Grid geometry
   // -----------------------------------------------------------------------
 
   const cols = () => {
@@ -268,7 +140,6 @@ function DOMGrid(props: GalleryGridProps) {
 
   const totalRows = () => Math.ceil(props.paths.length / cols());
 
-  // Total height of the virtual content area.
   const totalHeight = () => {
     const rows = totalRows();
     if (rows === 0) return 0;
@@ -276,55 +147,133 @@ function DOMGrid(props: GalleryGridProps) {
   };
 
   // -----------------------------------------------------------------------
-  // Visible items — derived from startRow/endRow signals (stable references)
+  // Visible items
   // -----------------------------------------------------------------------
 
-  const visibleItems = () => {
+  const visibleItems = (): GridItem[] => {
     const sr = startRow();
     const er = endRow();
     const c = cols();
     const startIdx = sr * c;
     const endIdx = Math.min(er * c, props.paths.length);
-    const items: { path: string; index: number }[] = [];
+    const sel = effectiveSelected();
+    const items: GridItem[] = [];
     for (let i = startIdx; i < endIdx; i++) {
-      items.push({ path: props.paths[i], index: i });
+      const path = props.paths[i];
+      items.push({
+        index: i,
+        path,
+        thumbUrl: urlMap.get(path) ?? null,
+        selected: sel.has(path),
+        badge: getBadge(path),
+      });
     }
     return items;
   };
 
-  // Y offset for the rendered slice of cells.
+  /** Height of the visible rendered area (for canvas sizing). */
+  const renderedHeight = () => {
+    const sr = startRow();
+    const er = endRow();
+    const rows = er - sr;
+    if (rows <= 0) return 0;
+    return rows * cellSize() + (rows - 1) * gap();
+  };
+
   const sliceOffsetY = () => startRow() * rowHeight();
 
   // -----------------------------------------------------------------------
-  // Optimistic URL assignment: set protocol URLs as soon as items are visible.
-  // Cached thumbnails load instantly via the protocol handler (no IPC delay).
-  // Uncached ones 404 → onerror → queued for IPC generation.
+  // Renderer + image loader setup
   // -----------------------------------------------------------------------
 
-  createEffect(on(visibleItems, (items) => {
-    const updates: [string, string][] = [];
-    for (const item of items) {
-      if (!assignedSet.has(item.path)) {
-        assignedSet.add(item.path);
-        const v = urlVersions.get(item.path);
-        const url = v ? `${thumbUrl(item.path)}?v=${v}` : thumbUrl(item.path);
-        updates.push([item.path, url]);
+  function createRenderer(mode: RendererMode): GridRenderer {
+    if (mode === "webgl") {
+      try {
+        return new WebGLRenderer();
+      } catch {
+        console.warn("WebGL unavailable, falling back to Canvas2D");
       }
     }
-    if (updates.length > 0) {
-      batch(() => {
-        for (const [path, url] of updates) {
-          setThumbMap(path, url);
-        }
-      });
-    }
-  }));
+    return new Canvas2DRenderer();
+  }
+
+  function scheduleRepaint() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      repaint();
+    });
+  }
+
+  function repaint() {
+    if (!renderer || !canvasWrapperRef) return;
+
+    const w = containerWidth() - gap() * 2; // account for left/right padding
+    const h = renderedHeight();
+    if (w <= 0 || h <= 0) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    renderer.resize(w, h, dpr);
+
+    const layout: GridLayout = {
+      cols: cols(),
+      cellSize: cellSize(),
+      gap: gap(),
+      totalItems: props.paths.length,
+      scrollOffsetY: sliceOffsetY(),
+      startRow: startRow(),
+      endRow: endRow(),
+    };
+
+    renderer.render(layout, visibleItems());
+  }
 
   // -----------------------------------------------------------------------
-  // Scroll + resize: compute visible range, update signals only when changed
+  // Thumbnail error handler (for 404s from protocol handler)
+  // -----------------------------------------------------------------------
+
+  const handleThumbError = (path: string) => {
+    if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path) || coalescedPaths.has(path)) return;
+    recordCacheMiss();
+    needsGeneration.add(path);
+    coalescedPaths.add(path);
+    thumbGenTotal++;
+    if (thumbGenTotal === 1) {
+      thumbGenStarted(thumbGenTotal);
+    } else {
+      thumbGenProgress(thumbGenDone, thumbGenTotal);
+    }
+  };
+
+  // -----------------------------------------------------------------------
+  // Mount: create renderer, image loader, scroll/resize handlers
   // -----------------------------------------------------------------------
 
   onMount(() => {
+    initGPU();
+
+    renderer = createRenderer(props.rendererMode);
+
+    // Attach the canvas to the wrapper now that the renderer exists.
+    // The ref callback runs during render (before onMount), so `renderer`
+    // was still null at that point — we must attach here.
+    if (canvasWrapperRef && renderer && !canvasWrapperRef.contains(renderer.canvas)) {
+      canvasWrapperRef.appendChild(renderer.canvas);
+    }
+
+    imageLoader = new ImageLoader(
+      // onReady: image decoded, hand to renderer
+      (path, img) => {
+        renderer?.imageLoaded(path, img);
+        scheduleRepaint();
+      },
+      // onError: thumbnail not cached, request generation
+      (path) => {
+        handleThumbError(path);
+      },
+    );
+
     if (containerRef) {
       setContainerWidth(containerRef.clientWidth);
     }
@@ -336,14 +285,13 @@ function DOMGrid(props: GalleryGridProps) {
     });
     if (containerRef) ro.observe(containerRef);
 
-    // Scroll state (raw, not reactive — avoids triggering effects on every pixel)
+    // Scroll state
     let currentScrollY = window.scrollY;
     let currentVelocity = 0;
     let lastScrollY = window.scrollY;
     let lastTimestamp = performance.now();
     let lastFastScrollTime = 0;
 
-    /** Recompute the visible row range from raw scroll state and update signals if changed. */
     recalcRange = () => {
       const sy = currentScrollY;
       const vh = window.innerHeight;
@@ -358,8 +306,6 @@ function DOMGrid(props: GalleryGridProps) {
       const newStart = Math.max(0, Math.floor(relativeTop / rh) - BUFFER_ROWS);
       const newEnd = Math.min(totalRows(), Math.ceil(relativeBottom / rh) + BUFFER_ROWS);
 
-      // Only update signals when the range actually changes — this is the key
-      // optimization that prevents reactive recomputation on every scroll pixel.
       if (newStart !== untrack(startRow) || newEnd !== untrack(endRow)) {
         batch(() => {
           setStartRow(newStart);
@@ -379,12 +325,10 @@ function DOMGrid(props: GalleryGridProps) {
         currentVelocity = dt > 0 ? dy / dt : 0;
         currentScrollY = y;
 
-        // Track fast scroll time for settle detection
         if (currentVelocity > VELOCITY_FAST) {
           lastFastScrollTime = now;
         }
 
-        // Jump detection
         if (dy > window.innerHeight * JUMP_FACTOR) {
           setGeneration((g) => g + 1);
           assignedSet.clear();
@@ -395,6 +339,7 @@ function DOMGrid(props: GalleryGridProps) {
           bgCursor = 0;
           thumbGenTotal = 0;
           thumbGenDone = 0;
+          imageLoader?.cancelAll();
         }
 
         lastScrollY = y;
@@ -408,9 +353,7 @@ function DOMGrid(props: GalleryGridProps) {
 
     window.addEventListener("scroll", onScroll, { passive: true });
 
-    // WebKitGTK doesn't propagate wheel events to window scroll natively.
-    // Intercept wheel events and translate them into window.scrollBy calls
-    // with momentum-like smoothing for a natural feel.
+    // WebKitGTK wheel handling
     let wheelAccumulator = 0;
     let wheelRafId = 0;
     const WHEEL_DECAY = 0.85;
@@ -437,16 +380,15 @@ function DOMGrid(props: GalleryGridProps) {
     };
     window.addEventListener("wheel", onWheel, { passive: false });
 
-    recalcRange(); // initial
+    recalcRange();
 
-    // -----------------------------------------------------------------------
-    // Thumbnail fetch loop — generation, background precache, and eviction
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // Thumbnail fetch loop (same as GalleryGrid)
+    // -------------------------------------------------------------------
 
     let fetchAbort = false;
     let inFlightFetch: Promise<void> | null = null;
 
-    /** Remove thumbMap entries for paths far from the current viewport. */
     const evictFaraway = () => {
       const sr = startRow();
       const er = endRow();
@@ -462,13 +404,11 @@ function DOMGrid(props: GalleryGridProps) {
         }
       }
 
-      if (toEvict.length > 0) {
-        batch(() => {
-          for (const p of toEvict) {
-            setThumbMap(p, undefined as any);
-            assignedSet.delete(p);
-          }
-        });
+      for (const p of toEvict) {
+        assignedSet.delete(p);
+        urlMap.delete(p);
+        renderer?.evictImage(p);
+        imageLoader?.evict(p);
       }
     };
 
@@ -480,14 +420,10 @@ function DOMGrid(props: GalleryGridProps) {
       if (currentVelocity > VELOCITY_FAST) return;
       if (now - lastFastScrollTime < SETTLE_MS) return;
 
-      // Drain coalesced paths into needsGeneration (they're already there,
-      // but clear the coalesced set so new items can accumulate during next fetch).
       coalescedPaths.clear();
-
       const gen = generation();
 
-      // Phase 1: Generate thumbnails that 404'd.
-      // Prioritize near-viewport, drop far-away items to prevent redundant work.
+      // Phase 1: Generate thumbnails that 404'd
       if (needsGeneration.size > 0) {
         const nearViewport: string[] = [];
         const farAway: string[] = [];
@@ -502,14 +438,10 @@ function DOMGrid(props: GalleryGridProps) {
           if (idx !== undefined && idx >= nearStart && idx < nearEnd) {
             if (nearViewport.length < BATCH_SIZE) nearViewport.push(p);
           } else {
-            // Drop out-of-range items from needsGeneration — they were
-            // queued during a scroll that has since moved past them.
-            // They'll re-queue if the user scrolls back.
             if (farAway.length < BATCH_SIZE) farAway.push(p);
           }
         }
 
-        // Near-viewport first, then fill remaining slots with off-screen paths
         const toGenerate = nearViewport.slice(0, BATCH_SIZE);
         const remaining = BATCH_SIZE - toGenerate.length;
         if (remaining > 0) toGenerate.push(...farAway.slice(0, remaining));
@@ -526,13 +458,15 @@ function DOMGrid(props: GalleryGridProps) {
               if (fetchAbort || generation() !== gen) return;
 
               const resultPaths = new Set(results.map((r) => r.path));
-              batch(() => {
-                for (const r of results) {
-                  const v = (urlVersions.get(r.path) ?? 0) + 1;
-                  urlVersions.set(r.path, v);
-                  setThumbMap(r.path, `${thumbUrl(r.path)}?v=${v}`);
-                }
-              });
+              for (const r of results) {
+                const v = (urlVersions.get(r.path) ?? 0) + 1;
+                urlVersions.set(r.path, v);
+                const url = `${thumbUrl(r.path)}?v=${v}`;
+                urlMap.set(r.path, url);
+                // Re-request the image with the new URL
+                imageLoader?.evict(r.path);
+                imageLoader?.request(r.path, url);
+              }
 
               thumbGenDone += results.length;
               for (const p of toGenerate) {
@@ -540,7 +474,6 @@ function DOMGrid(props: GalleryGridProps) {
                 if (!resultPaths.has(p)) failedSet.add(p);
               }
 
-              // Report progress or completion
               if (needsGeneration.size === 0 && inFlightSet.size === 0) {
                 thumbGenFinished(thumbGenDone);
                 thumbGenTotal = 0;
@@ -561,7 +494,7 @@ function DOMGrid(props: GalleryGridProps) {
         }
       }
 
-      // Phase 2: Background prefetch (silent, no progress tracking)
+      // Phase 2: Background prefetch
       if (currentVelocity < VELOCITY_SLOW && bgCursor < props.paths.length) {
         const bgNeeded: string[] = [];
         const total = props.paths.length;
@@ -590,92 +523,230 @@ function DOMGrid(props: GalleryGridProps) {
       evictFaraway();
     };
 
-    // Debounced fetch: fires 50ms after the last scroll event, plus a
-    // slower background interval for precache when idle.
     let scrollDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     const debouncedFetch = () => {
       if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
       scrollDebounceTimer = setTimeout(scheduleFetch, SCROLL_DEBOUNCE_MS);
     };
-    // Background interval for precache/eviction when not actively scrolling.
     const bgIntervalId = setInterval(() => {
       if (!inFlightFetch) scheduleFetch();
     }, 500);
 
-    // Also fire immediately on generation change (jump/path change)
-    createEffect(
-      on(generation, () => {
-        scheduleFetch();
-      }),
-    );
+    createEffect(on(generation, () => {
+      scheduleFetch();
+    }));
 
-    // Listen for thumbnail invalidation (e.g. after rebuild)
+    // -------------------------------------------------------------------
+    // Listen for streamed thumbnail results
+    // -------------------------------------------------------------------
+
+    let unlistenStreamed: UnlistenFn | undefined;
+    listen<ThumbnailResult>("thumb:streamed", (event) => {
+      const r = event.payload;
+      if (!inFlightSet.has(r.path)) return;
+      const v = (urlVersions.get(r.path) ?? 0) + 1;
+      urlVersions.set(r.path, v);
+      const url = `${thumbUrl(r.path)}?v=${v}`;
+      urlMap.set(r.path, url);
+      imageLoader?.evict(r.path);
+      imageLoader?.request(r.path, url);
+    }).then((fn) => {
+      unlistenStreamed = fn;
+    });
+
+    // Thumbnail invalidation
     const onInvalidate = () => {
-      setThumbMap(reconcile({}));
       assignedSet.clear();
       needsGeneration.clear();
       inFlightSet.clear();
       failedSet.clear();
       urlVersions.clear();
+      urlMap.clear();
       bgCursor = 0;
       thumbGenTotal = 0;
       thumbGenDone = 0;
+      imageLoader?.cancelAll();
       setGeneration((g) => g + 1);
     };
     window.addEventListener("lightview:thumbnails-invalidated", onInvalidate);
+
+    // -------------------------------------------------------------------
+    // Mouse event handling via hit-testing
+    // -------------------------------------------------------------------
+
+    const canvasToLocal = (e: MouseEvent): { x: number; y: number } => {
+      const rect = renderer!.canvas.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    };
+
+    const hitTestAt = (e: MouseEvent) => {
+      if (!renderer) return { index: -1, path: null };
+      const { x, y } = canvasToLocal(e);
+      const layout: GridLayout = {
+        cols: cols(),
+        cellSize: cellSize(),
+        gap: gap(),
+        totalItems: props.paths.length,
+        scrollOffsetY: sliceOffsetY(),
+        startRow: startRow(),
+        endRow: endRow(),
+      };
+      return renderer.hitTest(x, y, layout, visibleItems());
+    };
+
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      const hit = hitTestAt(e);
+      if (hit.index < 0) return;
+      e.preventDefault();
+      dragBaseSelection = e.ctrlKey || e.metaKey ? new Set(props.selectedPaths) : new Set<string>();
+      setIsDragging(true);
+      setDragStartIndex(hit.index);
+      setDragCurrentIndex(hit.index);
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isDragging()) return;
+      const hit = hitTestAt(e);
+      if (hit.index >= 0) {
+        setDragCurrentIndex(hit.index);
+        scheduleRepaint();
+      }
+    };
+
+    const onMouseUp = () => {
+      if (!isDragging()) return;
+      const dragged = dragSelectedPaths();
+      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex() || dragBaseSelection.size > 0;
+      setIsDragging(false);
+
+      if (!wasMultiDrag) {
+        setDragStartIndex(-1);
+        setDragCurrentIndex(-1);
+        return;
+      }
+
+      suppressClick = true;
+      const merged = new Set(dragBaseSelection);
+      for (const p of dragged) merged.add(p);
+      if (props.onDragSelect) {
+        props.onDragSelect([...merged]);
+      }
+      setDragStartIndex(-1);
+      setDragCurrentIndex(-1);
+      scheduleRepaint();
+    };
+
+    const onClick = (e: MouseEvent) => {
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
+      const hit = hitTestAt(e);
+      if (hit.index < 0) return;
+      if (e.ctrlKey || e.metaKey) {
+        props.onItemSelect(hit.path!);
+      } else {
+        props.onItemClick(hit.index);
+      }
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      if (!props.onItemContextMenu) return;
+      const hit = hitTestAt(e);
+      if (hit.index < 0) return;
+      e.preventDefault();
+      props.onItemContextMenu(e, hit.path!, hit.index);
+    };
+
+    const canvas = renderer.canvas;
+    canvas.addEventListener("mousedown", onMouseDown);
+    canvas.addEventListener("mousemove", onMouseMove);
+    canvas.addEventListener("click", onClick);
+    canvas.addEventListener("contextmenu", onContextMenu);
+    window.addEventListener("mouseup", onMouseUp);
+
+    // -------------------------------------------------------------------
+    // Cleanup
+    // -------------------------------------------------------------------
 
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
+      canvas.removeEventListener("mousedown", onMouseDown);
+      canvas.removeEventListener("mousemove", onMouseMove);
+      canvas.removeEventListener("click", onClick);
+      canvas.removeEventListener("contextmenu", onContextMenu);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
       if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
+      unlistenStreamed?.();
+      renderer?.destroy();
+      imageLoader?.destroy();
     });
   });
 
-  // Reset state when paths change
-  createEffect(
-    on(
-      () => props.paths,
-      (paths) => {
-        setThumbMap(reconcile({}));
-        assignedSet.clear();
-        needsGeneration.clear();
-        inFlightSet.clear();
-        failedSet.clear();
-        urlVersions.clear();
-        bgCursor = 0;
-        thumbGenTotal = 0;
-        thumbGenDone = 0;
+  // -----------------------------------------------------------------------
+  // Optimistic URL assignment: request images as soon as items are visible
+  // -----------------------------------------------------------------------
 
-        pathToIndex.clear();
-        for (let i = 0; i < paths.length; i++) {
-          pathToIndex.set(paths[i], i);
-        }
+  createEffect(on(visibleItems, (items) => {
+    for (const item of items) {
+      if (!assignedSet.has(item.path)) {
+        assignedSet.add(item.path);
+        const v = urlVersions.get(item.path);
+        const url = v ? `${thumbUrl(item.path)}?v=${v}` : thumbUrl(item.path);
+        urlMap.set(item.path, url);
+        imageLoader?.request(item.path, url);
+      }
+    }
+  }));
 
-        setGeneration((g) => g + 1);
-        recalcRange?.();
-      },
-    ),
-  );
+  // Repaint when visible items or selection changes
+  createEffect(on(
+    () => [visibleItems(), effectiveSelected()] as const,
+    () => scheduleRepaint(),
+  ));
 
-  // Also recalc when container width changes (e.g. resize, initial measure).
-  createEffect(
-    on(containerWidth, () => {
+  // Reset state on path changes
+  createEffect(on(
+    () => props.paths,
+    (paths) => {
+      assignedSet.clear();
+      needsGeneration.clear();
+      inFlightSet.clear();
+      failedSet.clear();
+      urlVersions.clear();
+      urlMap.clear();
+      bgCursor = 0;
+      thumbGenTotal = 0;
+      thumbGenDone = 0;
+      imageLoader?.cancelAll();
+
+      pathToIndex.clear();
+      for (let i = 0; i < paths.length; i++) {
+        pathToIndex.set(paths[i], i);
+      }
+
+      setGeneration((g) => g + 1);
       recalcRange?.();
-    }),
-  );
+    },
+  ));
 
-  // Report content height to parent for custom scrollbar
-  createEffect(
-    on(totalHeight, (h) => {
-      props.onContentHeight?.(h);
-    }),
-  );
+  // Recalc on container width change
+  createEffect(on(containerWidth, () => {
+    recalcRange?.();
+  }));
+
+  // Report content height
+  createEffect(on(totalHeight, (h) => {
+    props.onContentHeight?.(h);
+  }));
 
   // -----------------------------------------------------------------------
   // Render
@@ -706,6 +777,13 @@ function DOMGrid(props: GalleryGridProps) {
         >
           {/* Inner: positioned at the offset of the first visible row */}
           <div
+            ref={(el) => {
+              canvasWrapperRef = el;
+              if (renderer && el && !el.contains(renderer.canvas)) {
+                el.appendChild(renderer.canvas);
+                scheduleRepaint();
+              }
+            }}
             style={{
               position: "absolute",
               top: "0",
@@ -714,30 +792,7 @@ function DOMGrid(props: GalleryGridProps) {
               transform: `translateY(${sliceOffsetY()}px)`,
               "will-change": "transform",
             }}
-          >
-            <div
-              style={{
-                display: "grid",
-                "grid-template-columns": `repeat(${cols()}, 1fr)`,
-                gap: `${gap()}px`,
-              }}
-            >
-              <Index each={visibleItems()}>
-                {(item) => (
-                  <ThumbnailCell
-                    path={item().path}
-                    thumbSrc={thumbMap[item().path] ?? null}
-                    selected={effectiveSelected().has(item().path)}
-                    onClick={(e: MouseEvent) => handleItemClick(item(), e)}
-                    onMouseDown={(e: MouseEvent) => handleDragStart(item().index, e)}
-                    onMouseEnter={() => handleDragEnter(item().index)}
-                    onContextMenu={(e) => props.onItemContextMenu?.(e, item().path, item().index)}
-                    onError={handleThumbError}
-                  />
-                )}
-              </Index>
-            </div>
-          </div>
+          />
         </div>
       </Show>
     </div>
