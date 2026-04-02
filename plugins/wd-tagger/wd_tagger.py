@@ -14,10 +14,44 @@ Protocol:
   - Writes JSON to stdout: {"tags": [...], "meta": {...}}
 """
 
+import ctypes
+import glob as _glob
 import json
 import shutil
 import sys
 import os
+
+# Pre-load CUDA 12 shared libraries from pip-installed nvidia packages so
+# that onnxruntime's C++ dlopen() calls can find them.  Simply setting
+# LD_LIBRARY_PATH after process start is not sufficient — we need the
+# libraries in the linker's namespace before onnxruntime tries to load
+# its CUDA provider.
+_site = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "lib")
+_nvidia_lib_dirs = sorted(_glob.glob(
+    os.path.join(_site, "python*", "site-packages", "nvidia", "*", "lib")
+))
+# Load order: runtime first, then libs that depend on it.
+_CUDA_PRELOAD = [
+    "libcudart.so*",
+    "libnvrtc.so*",
+    "libnvJitLink.so*",
+    "libcublas.so*",
+    "libcublasLt.so*",
+    "libcufft.so*",
+    "libcurand.so*",
+    "libcudnn.so*",
+]
+for _pattern in _CUDA_PRELOAD:
+    for _d in _nvidia_lib_dirs:
+        _matches = sorted(_glob.glob(os.path.join(_d, _pattern)))
+        for _path in _matches:
+            # Skip static archives and symlinks-to-self; load the real .so
+            if _path.endswith(".a"):
+                continue
+            try:
+                ctypes.CDLL(_path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
 
 import huggingface_hub
 import numpy as np
@@ -101,8 +135,12 @@ class Tagger:
         providers = []
         available = rt.get_available_providers()
         if "CUDAExecutionProvider" in available:
-            providers.append("CUDAExecutionProvider")
-        providers.append("CPUExecutionProvider")
+            providers.append(("CUDAExecutionProvider", {
+                "device_id": int(os.environ.get("CUDA_DEVICE", "0")),
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_algo_search": "DEFAULT",
+            }))
+        providers.append(("CPUExecutionProvider", {}))
 
         sess_options = rt.SessionOptions()
         # Limit to single inference thread to avoid VRAM contention with the
@@ -124,6 +162,11 @@ class Tagger:
         finally:
             os.dup2(saved_fd, 1)
             os.close(saved_fd)
+
+        active_providers = self.model.get_providers()
+        self.using_gpu = "CUDAExecutionProvider" in active_providers
+        sys.stderr.write(f"wd-tagger: active providers = {active_providers}\n")
+        sys.stderr.flush()
 
         _, height, width, _ = self.model.get_inputs()[0].shape
         self.target_size = height

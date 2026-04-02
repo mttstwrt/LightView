@@ -8,7 +8,7 @@ use tauri::Emitter;
 use crate::companion::reader;
 use crate::companion::schema::{CompanionFile, MediaType};
 use crate::companion::writer;
-use crate::plugin::daemon::PluginDaemon;
+use crate::plugin::daemon::DaemonPool;
 use crate::plugin::manifest::{ExecutionConfig, PluginManifest};
 use crate::plugin::runner;
 use crate::AppState;
@@ -266,7 +266,6 @@ pub async fn run_plugin_batch(
     let cancelled = state.plugin_cancelled.clone();
     let cache_db = state.cache_db.clone();
     let autocomplete = state.autocomplete.clone();
-    let plugin_daemons = state.plugin_daemons.clone();
 
     // Check if the plugin supports daemon mode
     let supports_daemon = matches!(
@@ -284,39 +283,48 @@ pub async fn run_plugin_batch(
         let mut failed: usize = 0;
         let mut was_cancelled = false;
 
-        // If daemon mode is supported, start or reuse the daemon.
-        let daemon: Option<Arc<PluginDaemon>> = if supports_daemon {
-            let mut daemons = plugin_daemons.lock().await;
-            if let Some(existing) = daemons.get(&manifest.name) {
-                Some(existing.clone())
-            } else {
-                match PluginDaemon::start(&manifest, &plugin_path, &extra_env).await {
-                    Ok(d) => {
-                        let arc = Arc::new(d);
-                        daemons.insert(manifest.name.clone(), arc.clone());
-                        Some(arc)
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to start daemon for {}, falling back to CLI: {}", manifest.name, e);
-                        None
-                    }
+        // If daemon mode is supported, start a pool of daemon instances.
+        // The pool size is controlled by the concurrency parameter — each
+        // daemon instance holds its own copy of the ONNX model in VRAM,
+        // enabling true parallel inference across CUDA streams.
+        // The pool is dropped when the batch completes, which closes stdin
+        // on each subprocess and lets the Python processes exit cleanly.
+        let pool: Option<DaemonPool> = if supports_daemon {
+            match DaemonPool::start(&manifest, &plugin_path, &extra_env, concurrency).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!("Failed to start daemon pool for {}, falling back to CLI: {}", manifest.name, e);
+                    None
                 }
             }
         } else {
             None
         };
 
-        // Two execution paths: daemon (sequential, single-inference-thread)
+        // Two execution paths: daemon pool (concurrent round-robin)
         // or legacy CLI (concurrent subprocesses).
-        if let Some(ref daemon) = daemon {
-            // Daemon path: send requests sequentially (concurrency gating)
-            for media_path in media_paths {
+        if let Some(pool) = pool {
+            // Daemon pool path: fan out requests across pool instances.
+            // buffer_unordered ensures at most pool.size() requests in flight,
+            // matching the number of daemon processes available.
+            let pool_concurrency = pool.size();
+            let pool = Arc::new(pool);
+            let pool_ref = pool.clone();
+            let mut result_stream = stream::iter(media_paths.into_iter().map(move |media_path| {
+                let pool = pool_ref.clone();
+                async move {
+                    let res = pool.request(&media_path).await.map_err(|e| e.to_string());
+                    (media_path, res)
+                }
+            }))
+            .buffer_unordered(pool_concurrency);
+
+            while let Some((media_path, res)) = result_stream.next().await {
                 if cancelled.load(Ordering::Relaxed) {
                     was_cancelled = true;
                     break;
                 }
 
-                let res = daemon.request(&media_path).await.map_err(|e| e.to_string());
                 completed += 1;
 
                 let (progress_path, progress_tags, progress_ok, progress_err) =

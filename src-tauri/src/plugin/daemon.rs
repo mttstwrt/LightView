@@ -1,10 +1,15 @@
-//! Resident plugin daemon — keeps a plugin subprocess alive across requests.
+//! Plugin daemon pool — spawns plugin subprocesses for the duration of a batch.
 //!
 //! Instead of spawning a new process per image (paying Python startup + ONNX model
-//! loading each time), the daemon starts the plugin once with `--daemon` and
-//! communicates via newline-delimited JSON on stdin/stdout.
+//! loading each time), a [`DaemonPool`] starts one or more plugin processes with
+//! `--daemon` and distributes requests across them via round-robin. Each process
+//! holds its own copy of the model, enabling true parallel inference.
 //!
-//! Protocol:
+//! Lifecycle: pools are created at the start of a batch and dropped when the batch
+//! completes. Dropping closes stdin on each subprocess, causing the Python processes
+//! to exit their `for line in sys.stdin` loop and terminate cleanly.
+//!
+//! Protocol (newline-delimited JSON):
 //!   Request:  `{"id": "<uuid>", "path": "/media/img.jpg"}\n`
 //!   Response: `{"id": "<uuid>", "tags": [...], "meta": {...}}\n`
 
@@ -47,10 +52,9 @@ struct PendingRequest {
 
 /// Manages a long-running plugin subprocess.
 ///
-/// Concurrency model: requests are serialized through the daemon (one at a time)
-/// because the Python worker runs a single inference thread to avoid VRAM
-/// contention (Phase 2.3). The Rust side queues incoming requests via an mpsc
-/// channel and dispatches them sequentially.
+/// Each `PluginDaemon` wraps a single subprocess that processes requests
+/// sequentially. For parallel inference, use [`DaemonPool`] which manages
+/// multiple daemon instances with round-robin dispatch.
 pub struct PluginDaemon {
     /// Channel to send requests to the writer task.
     tx: mpsc::Sender<PendingRequest>,
@@ -236,5 +240,74 @@ impl PluginDaemon {
             .await
             .map_err(|_| RunError::Timeout(120))?
             .map_err(|_| RunError::Exec("Daemon response channel dropped".to_string()))?
+    }
+}
+
+/// A pool of daemon instances that distributes requests via round-robin.
+///
+/// Each daemon is an independent subprocess with its own ONNX model loaded in
+/// VRAM. With sufficient GPU memory, multiple instances achieve true parallel
+/// inference since each gets its own CUDA stream.
+pub struct DaemonPool {
+    daemons: Vec<Arc<PluginDaemon>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl DaemonPool {
+    /// Start a pool of `size` daemon instances for the given plugin.
+    ///
+    /// Daemons are started sequentially to avoid thundering-herd VRAM allocation.
+    /// If any daemon fails to start, the pool is still usable with however many
+    /// succeeded (minimum 1).
+    pub async fn start(
+        manifest: &PluginManifest,
+        plugin_dir: &Path,
+        extra_env: &[(String, String)],
+        size: usize,
+    ) -> Result<Self, RunError> {
+        let size = size.max(1);
+        let mut daemons = Vec::with_capacity(size);
+
+        for i in 0..size {
+            match PluginDaemon::start(manifest, plugin_dir, extra_env).await {
+                Ok(d) => {
+                    log::info!("Daemon pool: instance {}/{} ready for {}", i + 1, size, manifest.name);
+                    daemons.push(Arc::new(d));
+                }
+                Err(e) => {
+                    if daemons.is_empty() {
+                        // Can't run with zero daemons — propagate the error
+                        return Err(e);
+                    }
+                    log::warn!(
+                        "Daemon pool: instance {}/{} failed for {} ({}), continuing with {}",
+                        i + 1, size, manifest.name, e, daemons.len()
+                    );
+                    break;
+                }
+            }
+        }
+
+        log::info!(
+            "Daemon pool ready: {} instances for {}",
+            daemons.len(),
+            manifest.name
+        );
+
+        Ok(Self {
+            daemons,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Send a request to the next daemon in the pool (round-robin).
+    pub async fn request(&self, path: &str) -> Result<PluginOutput, RunError> {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.daemons.len();
+        self.daemons[idx].request(path).await
+    }
+
+    /// Number of active daemon instances in the pool.
+    pub fn size(&self) -> usize {
+        self.daemons.len()
     }
 }

@@ -236,7 +236,7 @@ export function ScrollBar(props: ScrollBarProps) {
             background: dragging() || hovering()
               ? "rgba(255, 255, 255, 0.55)"
               : "rgba(255, 255, 255, 0.35)",
-            "box-shadow": "0 0 2px rgba(0, 0, 0, 0.6), inset 0 0 0 0.5px rgba(255, 255, 255, 0.15)",
+            "box-shadow": "0 0 2px rgba(0, 0, 0, 0.6), inset 0 0 0 0.5px rgba(255, 255, 255, 0.40)",
             transition: dragging() ? "none" : "background 0.15s ease",
             cursor: "grab",
           }}
