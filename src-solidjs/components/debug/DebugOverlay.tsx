@@ -13,7 +13,8 @@ import {
   domNodes,
   diskReadRate,
   diskWriteRate,
-  thumbsCached,
+  visibleImages,
+  cachedImages,
   jsHeapUsed,
 } from "../../lib/perfMonitor";
 import { Sparkline } from "./Sparkline";
@@ -143,10 +144,16 @@ export function DebugOverlay() {
             color="#f97316"
           />
           <MetricRow
-            label="Thumbs Cached"
-            value={() => fmtInt(thumbsCached.last)}
-            data={() => { void tick(); return thumbsCached.toArray(); }}
+            label="Visible Imgs"
+            value={() => fmtInt(visibleImages.last)}
+            data={() => { void tick(); return visibleImages.toArray(); }}
             color="#2dd4bf"
+          />
+          <MetricRow
+            label="Cached Imgs"
+            value={() => fmtInt(cachedImages.last)}
+            data={() => { void tick(); return cachedImages.toArray(); }}
+            color="#14b8a6"
           />
           <MetricRow
             label="Cache Misses"

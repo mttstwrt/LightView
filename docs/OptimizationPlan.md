@@ -100,7 +100,7 @@ Rules:
 
 ## Phase 6 — Measurement & Validation
   - **Frame Budget:**
-    - Target **< 8ms** per frame < 4 ms when scrolling.
+    - Target **< 8ms** per frame.
   - **Telemetry:**
     - Log `IPC_Bridge_Wait_Time` to identify if the Rust backend or the Webview is the bottleneck.
     - Monitor `VRAM_Resident_Set_Size` (if available via system APIs) to ensure the Python tagger and the UI are not fighting for GPU memory.

@@ -5,6 +5,7 @@ import type {
   GalleryStats,
   GroupBy,
   HardwareProfile,
+  MemoryStatus,
   PluginInfo,
   PluginRunResult,
   SortField,
@@ -240,6 +241,9 @@ export const findDuplicates = (threshold?: number) =>
 
 export const getHardwareProfile = () =>
   invoke<HardwareProfile>("get_hardware_profile");
+
+export const getMemoryStatus = () =>
+  invoke<MemoryStatus>("get_memory_status");
 
 export const reindexGallery = () => invoke<number>("reindex_gallery");
 

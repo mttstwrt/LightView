@@ -152,6 +152,11 @@ export interface HardwareProfile {
   total_ram_mb: number;
 }
 
+export interface MemoryStatus {
+  total_ram_mb: number;
+  available_ram_mb: number;
+}
+
 // ---------------------------------------------------------------------------
 // Settings types
 // ---------------------------------------------------------------------------

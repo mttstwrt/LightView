@@ -10,6 +10,26 @@ pub struct HardwareProfile {
     pub total_ram_mb: u64,
 }
 
+/// Snapshot of current memory status for pressure-aware cache management.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryStatus {
+    pub total_ram_mb: u64,
+    pub available_ram_mb: u64,
+}
+
+impl MemoryStatus {
+    /// Sample current memory status from the OS.
+    pub fn sample() -> Self {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        Self {
+            total_ram_mb: sys.total_memory() / (1024 * 1024),
+            available_ram_mb: sys.available_memory() / (1024 * 1024),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageType {

@@ -1,92 +1,205 @@
 // ---------------------------------------------------------------------------
-// Image loader — fetches thumbnail URLs and decodes into Image objects
+// Image loader — off-thread decoding via Web Worker (Phase 5)
 // ---------------------------------------------------------------------------
 //
-// Shared between Canvas2D and WebGL renderers. Manages an LRU cache of
-// decoded images so the renderer can draw immediately without waiting
+// Shared between Canvas2D and WebGL renderers. Manages a pressure-aware LRU
+// cache of decoded images so the renderer can draw immediately without waiting
 // for async loads.
+//
+// Phase 3 enhancements:
+//   - Dynamic cache capacity driven by MemoryPressureMonitor
+//   - ImageBitmap.close() called on eviction to release GPU memory immediately
+//   - Viewport-distance + recency hybrid eviction scoring
+//
+// Phase 5 enhancements:
+//   - All fetch + decode moved to a Dedicated Web Worker
+//   - Main thread only receives already-decoded ImageBitmap objects
+//   - Priority tiers (viewport=0, buffer=1, background=2) respected by worker
+//   - Zero-copy ImageBitmap transfer via postMessage transferables
 
-export type ImageReadyCallback = (path: string, img: HTMLImageElement) => void;
+import type {
+  WorkerRequest,
+  WorkerResponse,
+  DecodeRequest,
+} from "./imageDecodeWorker";
+
+export type DecodePriority = 0 | 1 | 2;
+export type ImageReadyCallback = (path: string, img: ImageBitmap) => void;
 
 const MAX_CONCURRENT_LOADS = 12;
+const DEFAULT_CACHE_SIZE = 300;
+
+interface CacheEntry {
+  img: ImageBitmap;
+  /** Monotonically increasing access counter for recency tracking. */
+  lastAccess: number;
+}
 
 export class ImageLoader {
-  /** path -> decoded image (LRU by insertion order). */
-  private cache = new Map<string, HTMLImageElement>();
-  /** path -> in-flight Image element. */
-  private loading = new Map<string, HTMLImageElement>();
-  /** Paths queued for loading. */
-  private queue: { path: string; url: string }[] = [];
-  /** Active concurrent loads. */
-  private activeLoads = 0;
+  /** path -> decoded image + metadata (LRU by access counter). */
+  private cache = new Map<string, CacheEntry>();
+  /** Paths currently queued or inflight in the worker. */
+  private pending = new Set<string>();
   /** URLs that failed loading — won't be retried until evicted. */
   private failed = new Set<string>();
+  /** Monotonically increasing counter for recency tracking. */
+  private accessCounter = 0;
 
   private onReady: ImageReadyCallback;
   private onError: ((path: string) => void) | null;
-  private maxCacheSize: number;
+  private _maxCacheSize: number;
+
+  /** Optional: map of path -> index for viewport distance calculation. */
+  private pathToIndex: Map<string, number> | null = null;
+  /** Optional: current viewport center index for distance scoring. */
+  private viewportCenter = 0;
+
+  /** Dedicated Web Worker for off-thread image decoding. */
+  private worker: Worker;
 
   constructor(
     onReady: ImageReadyCallback,
     onError: ((path: string) => void) | null = null,
-    maxCacheSize = 600,
+    maxCacheSize = DEFAULT_CACHE_SIZE,
   ) {
     this.onReady = onReady;
     this.onError = onError;
-    this.maxCacheSize = maxCacheSize;
+    this._maxCacheSize = maxCacheSize;
+
+    // Launch the decode worker
+    this.worker = new Worker(
+      new URL("./imageDecodeWorker.ts", import.meta.url),
+      { type: "module" },
+    );
+
+    this.worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
+      this.handleWorkerMessage(e.data);
+    };
   }
 
+  // -------------------------------------------------------------------------
+  // Worker message handler
+  // -------------------------------------------------------------------------
+
+  private handleWorkerMessage(msg: WorkerResponse) {
+    switch (msg.type) {
+      case "decoded": {
+        this.pending.delete(msg.path);
+        this.insertCache(msg.path, msg.bitmap);
+        this.onReady(msg.path, msg.bitmap);
+        break;
+      }
+      case "error": {
+        this.pending.delete(msg.path);
+        this.failed.add(msg.path);
+        this.onError?.(msg.path);
+        break;
+      }
+    }
+  }
+
+  private postToWorker(msg: WorkerRequest) {
+    this.worker.postMessage(msg);
+  }
+
+  // -------------------------------------------------------------------------
+  // Pressure-aware API
+  // -------------------------------------------------------------------------
+
+  /** Update cache capacity dynamically (called by MemoryPressureMonitor). */
+  setMaxCacheSize(size: number) {
+    this._maxCacheSize = size;
+    this.trimToCapacity();
+  }
+
+  get maxCacheSize(): number {
+    return this._maxCacheSize;
+  }
+
+  /** Provide viewport context for distance-based eviction. */
+  setViewportContext(pathToIndex: Map<string, number>, centerIndex: number) {
+    this.pathToIndex = pathToIndex;
+    this.viewportCenter = centerIndex;
+  }
+
+  /** Emergency purge: evict everything except the given keep set. */
+  emergencyPurge(keepPaths: Set<string>) {
+    for (const [path, entry] of this.cache) {
+      if (!keepPaths.has(path)) {
+        entry.img.close();
+        this.cache.delete(path);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Core API
+  // -------------------------------------------------------------------------
+
   /** Get a cached image, or null if not yet loaded. */
-  get(path: string): HTMLImageElement | null {
-    const img = this.cache.get(path);
-    if (img) {
-      // Move to end (most recently used)
-      this.cache.delete(path);
-      this.cache.set(path, img);
-      return img;
+  get(path: string): ImageBitmap | null {
+    const entry = this.cache.get(path);
+    if (entry) {
+      // Update recency
+      entry.lastAccess = ++this.accessCounter;
+      return entry.img;
     }
     return null;
   }
 
-  /** Request an image. If cached, returns immediately. Otherwise queues a load. */
-  request(path: string, url: string): HTMLImageElement | null {
+  /**
+   * Request an image. If cached, returns immediately. Otherwise queues a
+   * decode in the Web Worker.
+   * @param priority 0=viewport, 1=buffer, 2=background (default: 1)
+   */
+  request(
+    path: string,
+    url: string,
+    priority: DecodePriority = 1,
+  ): ImageBitmap | null {
     const cached = this.get(path);
     if (cached) return cached;
 
-    if (this.loading.has(path) || this.failed.has(path)) return null;
+    if (this.pending.has(path) || this.failed.has(path)) return null;
 
-    this.queue.push({ path, url });
-    this.drain();
+    this.pending.add(path);
+    this.postToWorker({
+      type: "decode",
+      path,
+      url,
+      priority,
+    });
     return null;
   }
 
   /** Cancel all pending loads and clear the queue (e.g. on generation change). */
   cancelAll() {
-    for (const [, img] of this.loading) {
-      img.src = "";
-    }
-    this.loading.clear();
-    this.queue.length = 0;
-    this.activeLoads = 0;
+    this.postToWorker({ type: "cancelAll" });
+    this.pending.clear();
     this.failed.clear();
   }
 
   /** Evict a specific path from cache. */
   evict(path: string) {
-    this.cache.delete(path);
+    const entry = this.cache.get(path);
+    if (entry) {
+      entry.img.close();
+      this.cache.delete(path);
+    }
     this.failed.delete(path);
-    const loading = this.loading.get(path);
-    if (loading) {
-      loading.src = "";
-      this.loading.delete(path);
-      this.activeLoads = Math.max(0, this.activeLoads - 1);
+    if (this.pending.has(path)) {
+      this.postToWorker({ type: "cancel", path });
+      this.pending.delete(path);
     }
   }
 
   /** Evict paths not in the provided keep set. */
   evictExcept(keepPaths: Set<string>) {
-    for (const p of [...this.cache.keys()]) {
-      if (!keepPaths.has(p)) this.cache.delete(p);
+    for (const [p, entry] of this.cache) {
+      if (!keepPaths.has(p)) {
+        entry.img.close();
+        this.cache.delete(p);
+      }
     }
   }
 
@@ -102,52 +215,90 @@ export class ImageLoader {
 
   destroy() {
     this.cancelAll();
+    for (const [, entry] of this.cache) {
+      entry.img.close();
+    }
     this.cache.clear();
+    this.worker.terminate();
   }
 
   // -------------------------------------------------------------------------
   // Internal
   // -------------------------------------------------------------------------
 
-  private drain() {
-    while (this.activeLoads < MAX_CONCURRENT_LOADS && this.queue.length > 0) {
-      const { path, url } = this.queue.shift()!;
-      if (this.cache.has(path) || this.loading.has(path)) continue;
-      this.startLoad(path, url);
+  private insertCache(path: string, img: ImageBitmap) {
+    this.cache.set(path, {
+      img,
+      lastAccess: ++this.accessCounter,
+    });
+    this.trimToCapacity();
+  }
+
+  /**
+   * Trim cache to capacity using a hybrid score: viewport distance + recency.
+   * Items far from the viewport and accessed least recently are evicted first.
+   */
+  private trimToCapacity() {
+    while (this.cache.size > this._maxCacheSize) {
+      const victim = this.findEvictionCandidate();
+      if (victim) {
+        victim[1].img.close();
+        this.cache.delete(victim[0]);
+      } else {
+        // Fallback: evict oldest by insertion order
+        const oldest = this.cache.keys().next().value;
+        if (oldest !== undefined) {
+          const entry = this.cache.get(oldest)!;
+          entry.img.close();
+          this.cache.delete(oldest);
+        } else {
+          break;
+        }
+      }
     }
   }
 
-  private startLoad(path: string, url: string) {
-    this.activeLoads++;
-    const img = new Image();
-    this.loading.set(path, img);
+  /**
+   * Find the best eviction candidate using hybrid scoring (Phase 3.3).
+   * Score = distance_from_viewport * weight + inverse_recency * weight
+   * Higher score = better candidate for eviction.
+   */
+  private findEvictionCandidate(): [string, CacheEntry] | null {
+    let worstPath: string | null = null;
+    let worstEntry: CacheEntry | null = null;
+    let worstScore = -Infinity;
 
-    img.onload = () => {
-      this.loading.delete(path);
-      this.activeLoads--;
-      this.insertCache(path, img);
-      this.onReady(path, img);
-      this.drain();
-    };
+    const maxAccess = this.accessCounter;
 
-    img.onerror = () => {
-      this.loading.delete(path);
-      this.activeLoads--;
-      this.failed.add(path);
-      this.onError?.(path);
-      this.drain();
-    };
+    for (const [path, entry] of this.cache) {
+      // Distance component
+      let distance = 0;
+      if (this.pathToIndex) {
+        const idx = this.pathToIndex.get(path);
+        if (idx !== undefined) {
+          distance = Math.abs(idx - this.viewportCenter);
+        } else {
+          // Path not in current set — high eviction priority
+          distance = 100_000;
+        }
+      }
 
-    img.crossOrigin = "anonymous";
-    img.src = url;
-  }
+      // Recency component: how many accesses ago (normalized)
+      const staleness = maxAccess - entry.lastAccess;
 
-  private insertCache(path: string, img: HTMLImageElement) {
-    this.cache.set(path, img);
-    // Evict oldest entries if over capacity
-    while (this.cache.size > this.maxCacheSize) {
-      const oldest = this.cache.keys().next().value;
-      if (oldest !== undefined) this.cache.delete(oldest);
+      // Combined score: distance is primary, recency breaks ties
+      const score = distance * 10 + staleness;
+
+      if (score > worstScore) {
+        worstScore = score;
+        worstPath = path;
+        worstEntry = entry;
+      }
     }
+
+    if (worstPath && worstEntry) {
+      return [worstPath, worstEntry];
+    }
+    return null;
   }
 }

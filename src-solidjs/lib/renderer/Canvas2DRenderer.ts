@@ -138,10 +138,19 @@ export class Canvas2DRenderer implements GridRenderer {
   }
 
   evictImage(path: string): void {
+    const img = this.images.get(path);
+    if (img && img instanceof ImageBitmap) {
+      img.close();
+    }
     this.images.delete(path);
   }
 
   destroy(): void {
+    for (const img of this.images.values()) {
+      if (img instanceof ImageBitmap) {
+        img.close();
+      }
+    }
     this.images.clear();
   }
 

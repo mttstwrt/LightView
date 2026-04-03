@@ -12,10 +12,11 @@ import { settings } from "../../stores/settingsStore";
 import { getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
-import { recordCacheMiss } from "../../lib/perfMonitor";
+import { recordCacheMiss, setImageCountSource } from "../../lib/perfMonitor";
 import { Canvas2DRenderer } from "../../lib/renderer/Canvas2DRenderer";
 import { WebGLRenderer } from "../../lib/renderer/WebGLRenderer";
-import { ImageLoader } from "../../lib/renderer/ImageLoader";
+import { ImageLoader, type DecodePriority } from "../../lib/renderer/ImageLoader";
+import { MemoryPressureMonitor } from "../../lib/memoryPressure";
 import type { GridRenderer, GridLayout, GridItem } from "../../lib/renderer/types";
 import type { RendererMode } from "../../lib/types";
 
@@ -76,6 +77,7 @@ export function CanvasGrid(props: CanvasGridProps) {
   let canvasWrapperRef: HTMLDivElement | undefined;
   let renderer: GridRenderer | null = null;
   let imageLoader: ImageLoader | null = null;
+  let pressureMonitor: MemoryPressureMonitor | null = null;
   let rafPending = false;
   let recalcRange: (() => void) | undefined;
 
@@ -274,6 +276,44 @@ export function CanvasGrid(props: CanvasGridProps) {
       },
     );
 
+    // Phase 3: pressure-aware memory management
+    pressureMonitor = new MemoryPressureMonitor((state) => {
+      if (!imageLoader) return;
+
+      if (state.level === "emergency") {
+        // Emergency purge: keep only visible items
+        const sr = startRow();
+        const er = endRow();
+        const c = cols();
+        const keepPaths = new Set<string>();
+        for (let i = sr * c; i < Math.min(er * c, props.paths.length); i++) {
+          keepPaths.add(props.paths[i]);
+        }
+        imageLoader.emergencyPurge(keepPaths);
+        renderer?.destroy();
+        renderer = createRenderer(props.rendererMode);
+        if (canvasWrapperRef && renderer) {
+          canvasWrapperRef.innerHTML = "";
+          canvasWrapperRef.appendChild(renderer.canvas);
+        }
+        // Re-feed surviving cache entries to renderer
+        for (const p of keepPaths) {
+          const img = imageLoader.get(p);
+          if (img) renderer?.imageLoaded(p, img);
+        }
+        scheduleRepaint();
+      }
+
+      imageLoader.setMaxCacheSize(state.targetCacheSize);
+    });
+    pressureMonitor.start();
+
+    // Register getter so perf monitor can sample counts each tick
+    setImageCountSource(() => ({
+      visible: visibleItems().length,
+      cached: imageLoader?.size ?? 0,
+    }));
+
     if (containerRef) {
       setContainerWidth(containerRef.clientWidth);
     }
@@ -463,9 +503,9 @@ export function CanvasGrid(props: CanvasGridProps) {
                 urlVersions.set(r.path, v);
                 const url = `${thumbUrl(r.path)}?v=${v}`;
                 urlMap.set(r.path, url);
-                // Re-request the image with the new URL
+                // Re-request with priority 1 (buffer) — just generated
                 imageLoader?.evict(r.path);
-                imageLoader?.request(r.path, url);
+                imageLoader?.request(r.path, url, 1);
               }
 
               thumbGenDone += results.length;
@@ -549,7 +589,8 @@ export function CanvasGrid(props: CanvasGridProps) {
       const url = `${thumbUrl(r.path)}?v=${v}`;
       urlMap.set(r.path, url);
       imageLoader?.evict(r.path);
-      imageLoader?.request(r.path, url);
+      // Phase 5: priority 1 (buffer) for streamed results
+      imageLoader?.request(r.path, url, 1);
     }).then((fn) => {
       unlistenStreamed = fn;
     });
@@ -686,6 +727,8 @@ export function CanvasGrid(props: CanvasGridProps) {
       clearInterval(bgIntervalId);
       fetchAbort = true;
       unlistenStreamed?.();
+      pressureMonitor?.stop();
+      setImageCountSource(() => ({ visible: 0, cached: 0 }));
       renderer?.destroy();
       imageLoader?.destroy();
     });
@@ -702,9 +745,21 @@ export function CanvasGrid(props: CanvasGridProps) {
         const v = urlVersions.get(item.path);
         const url = v ? `${thumbUrl(item.path)}?v=${v}` : thumbUrl(item.path);
         urlMap.set(item.path, url);
-        imageLoader?.request(item.path, url);
+        // Phase 5: priority 0 = viewport-visible (highest)
+        imageLoader?.request(item.path, url, 0);
       }
     }
+
+    // Phase 3: update viewport context for distance-based eviction
+    if (imageLoader) {
+      const sr = startRow();
+      const er = endRow();
+      const c = cols();
+      const centerIndex = Math.floor((sr + er) / 2) * c;
+      imageLoader.setViewportContext(pathToIndex, centerIndex);
+    }
+    // Update visible count for emergency purge sizing
+    pressureMonitor?.setVisibleCount(items.length);
   }));
 
   // Repaint when visible items or selection changes

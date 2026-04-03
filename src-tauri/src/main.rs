@@ -311,6 +311,7 @@ fn main() {
 
             // Settings / maintenance commands
             commands::settings::get_hardware_profile,
+            commands::settings::get_memory_status,
             commands::settings::reindex_gallery,
             commands::settings::rebuild_thumbnails,
             commands::settings::clear_cache,

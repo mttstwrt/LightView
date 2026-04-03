@@ -107,6 +107,16 @@ export function recordCacheMiss() {
 }
 
 // -------------------------------------------------------------------------
+// Image cache tracking (sampled each tick via getter)
+// -------------------------------------------------------------------------
+
+let _imageCounts: (() => { visible: number; cached: number }) | null = null;
+
+export function setImageCountSource(fn: () => { visible: number; cached: number }) {
+  _imageCounts = fn;
+}
+
+// -------------------------------------------------------------------------
 // Metric histories
 // -------------------------------------------------------------------------
 
@@ -119,7 +129,8 @@ export const cacheMisses = new RingBuffer(HISTORY_LEN);       // misses/sec
 export const domNodes = new RingBuffer(HISTORY_LEN);          // count
 export const diskReadRate = new RingBuffer(HISTORY_LEN);      // KB/s
 export const diskWriteRate = new RingBuffer(HISTORY_LEN);     // KB/s
-export const thumbsCached = new RingBuffer(HISTORY_LEN);      // count
+export const visibleImages = new RingBuffer(HISTORY_LEN);     // count
+export const cachedImages = new RingBuffer(HISTORY_LEN);      // count
 export const jsHeapUsed = new RingBuffer(HISTORY_LEN);        // MB
 
 // -------------------------------------------------------------------------
@@ -199,7 +210,14 @@ async function sampleTick() {
     jsHeapUsed.push(perf.memory.usedJSHeapSize / (1024 * 1024));
   }
 
-  // Backend snapshot (disk IO, cache counts)
+  // Image cache counts (pulled fresh each tick)
+  if (_imageCounts) {
+    const counts = _imageCounts();
+    visibleImages.push(counts.visible);
+    cachedImages.push(counts.cached);
+  }
+
+  // Backend snapshot (disk IO)
   if (fetchSnapshot) {
     try {
       const snap = await fetchSnapshot();
@@ -212,7 +230,6 @@ async function sampleTick() {
       }
       prevDiskRead = snap.disk_read_bytes;
       prevDiskWrite = snap.disk_write_bytes;
-      thumbsCached.push(snap.cached_thumbnails);
     } catch {
       // Backend not ready — skip this tick
     }
@@ -275,6 +292,7 @@ export function stopMonitoring() {
   domNodes.clear();
   diskReadRate.clear();
   diskWriteRate.clear();
-  thumbsCached.clear();
+  visibleImages.clear();
+  cachedImages.clear();
   jsHeapUsed.clear();
 }

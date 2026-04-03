@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::hardware::HardwareProfile;
+use crate::hardware::{HardwareProfile, MemoryStatus};
 use crate::pipeline::thumbnailer::ThumbnailSettings;
 use crate::{AppState, RecentGallery};
 
@@ -39,6 +39,12 @@ pub async fn get_hardware_profile(
     state: tauri::State<'_, AppState>,
 ) -> Result<HardwareProfile, String> {
     Ok((*state.hardware).clone())
+}
+
+/// Get current memory status (available + total RAM) for pressure-aware caching.
+#[tauri::command]
+pub async fn get_memory_status() -> Result<MemoryStatus, String> {
+    Ok(MemoryStatus::sample())
 }
 
 /// Trigger a full re-index of all companion files.
