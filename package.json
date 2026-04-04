@@ -19,6 +19,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
     "@webgpu/types": "^0.1.69",
+    "solid-devtools": "^0.34.5",
     "tailwindcss": "^4.0.0",
     "tinybench": "^6.0.0",
     "typescript": "^5.4.0",

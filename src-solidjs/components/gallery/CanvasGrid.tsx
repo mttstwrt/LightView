@@ -25,6 +25,7 @@ interface CanvasGridProps {
   onItemClick: (index: number) => void;
   onItemSelect: (path: string) => void;
   onDragSelect?: (paths: string[]) => void;
+  onBackgroundClick?: () => void;
   selectedPaths: Set<string>;
   onItemContextMenu?: (e: MouseEvent, path: string, index: number) => void;
   loading: boolean;
@@ -658,7 +659,7 @@ export function CanvasGrid(props: CanvasGridProps) {
     const onMouseUp = () => {
       if (!isDragging()) return;
       const dragged = dragSelectedPaths();
-      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex() || dragBaseSelection.size > 0;
+      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex();
       setIsDragging(false);
 
       if (!wasMultiDrag) {
@@ -684,7 +685,10 @@ export function CanvasGrid(props: CanvasGridProps) {
         return;
       }
       const hit = hitTestAt(e);
-      if (hit.index < 0) return;
+      if (hit.index < 0) {
+        if (!e.ctrlKey && !e.metaKey) props.onBackgroundClick?.();
+        return;
+      }
       if (e.ctrlKey || e.metaKey) {
         props.onItemSelect(hit.path!);
       } else {

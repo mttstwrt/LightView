@@ -83,6 +83,15 @@ impl CacheDb {
         Ok(result)
     }
 
+    /// Update only the rating for a file in the cache.
+    pub fn update_rating(&self, path: &str, rating: Option<u8>) -> Result<(), CacheError> {
+        self.conn().execute(
+            "UPDATE media_meta SET rating = ?1 WHERE path = ?2",
+            rusqlite::params![rating, path],
+        )?;
+        Ok(())
+    }
+
     /// Insert or update media metadata for a file.
     pub fn upsert_media_meta(
         &self,

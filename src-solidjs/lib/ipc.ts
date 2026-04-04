@@ -102,6 +102,7 @@ export const getMediaMeta = (path: string) =>
     width: number | null;
     height: number | null;
     duration_seconds: number | null;
+    rating: number | null;
   } | null>("get_media_meta", { path });
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ interface GalleryGridProps {
   onItemClick: (index: number) => void;
   onItemSelect: (path: string) => void;
   onDragSelect?: (paths: string[]) => void;
+  onBackgroundClick?: () => void;
   selectedPaths: Set<string>;
   onItemContextMenu?: (e: MouseEvent, path: string, index: number) => void;
   loading: boolean;
@@ -57,6 +58,7 @@ export function GalleryGrid(props: GalleryGridProps) {
           onItemClick={props.onItemClick}
           onItemSelect={props.onItemSelect}
           onDragSelect={props.onDragSelect}
+          onBackgroundClick={props.onBackgroundClick}
           selectedPaths={props.selectedPaths}
           onItemContextMenu={props.onItemContextMenu}
           loading={props.loading}
@@ -140,12 +142,20 @@ function DOMGrid(props: GalleryGridProps) {
     }
   };
 
+  const handleBackgroundClick = (e: MouseEvent) => {
+    // Only fire when clicking the background, not on a thumbnail
+    const target = e.target as HTMLElement;
+    if (!target.closest(".thumb-cell") && !e.ctrlKey && !e.metaKey) {
+      props.onBackgroundClick?.();
+    }
+  };
+
   // Global mouseup to end drag
   onMount(() => {
     const onMouseUp = () => {
       if (!isDragging()) return;
       const dragged = dragSelectedPaths();
-      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex() || dragBaseSelection.size > 0;
+      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex();
       setIsDragging(false);
 
       if (!wasMultiDrag) {
@@ -682,7 +692,7 @@ function DOMGrid(props: GalleryGridProps) {
   // -----------------------------------------------------------------------
 
   return (
-    <div ref={containerRef} class="w-full" style={{ "user-select": isDragging() ? "none" : undefined }}>
+    <div ref={containerRef} class="w-full" style={{ "user-select": isDragging() ? "none" : undefined }} onClick={handleBackgroundClick}>
       <Show when={!props.loading && props.paths.length === 0}>
         <div class="flex items-center justify-center h-screen text-neutral-500 text-sm">
           No media files found

@@ -215,6 +215,7 @@ function InfoPanel(props: { path: string; filename: string }) {
               height: result.height,
               duration_seconds: result.duration_seconds,
             });
+            setRating(result.rating ?? 0);
           }
         } catch {}
         try {

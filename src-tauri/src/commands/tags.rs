@@ -195,17 +195,24 @@ pub async fn remove_user_tag_batch(
 /// Set the rating for multiple media files at once (0-5, 0 = unrated).
 #[tauri::command]
 pub async fn set_rating_batch(
-    _state: tauri::State<'_, AppState>,
+    state: tauri::State<'_, AppState>,
     paths: Vec<String>,
     rating: u8,
 ) -> Result<u64, String> {
+    let db_rating = if rating == 0 { None } else { Some(rating) };
     let mut count = 0u64;
     for path in &paths {
         match modify_companion(path, |c| {
             let core = c.meta.core.get_or_insert_with(CoreMeta::default);
-            core.rating = if rating == 0 { None } else { Some(rating) };
+            core.rating = db_rating;
         }) {
-            Ok(_) => count += 1,
+            Ok(_) => {
+                count += 1;
+                let db = state.cache_db.lock().await;
+                if let Some(db) = db.as_ref() {
+                    let _ = db.update_rating(path, db_rating);
+                }
+            }
             Err(e) => log::warn!("Failed to rate {}: {}", path, e),
         }
     }
@@ -215,14 +222,21 @@ pub async fn set_rating_batch(
 /// Set the rating for a media file (0-5, 0 = unrated).
 #[tauri::command]
 pub async fn set_rating(
-    _state: tauri::State<'_, AppState>,
+    state: tauri::State<'_, AppState>,
     path: String,
     rating: u8,
 ) -> Result<(), String> {
+    let db_rating = if rating == 0 { None } else { Some(rating) };
     modify_companion(&path, |c| {
         let core = c.meta.core.get_or_insert_with(CoreMeta::default);
-        core.rating = if rating == 0 { None } else { Some(rating) };
+        core.rating = db_rating;
     })?;
+
+    let db = state.cache_db.lock().await;
+    if let Some(db) = db.as_ref() {
+        let _ = db.update_rating(&path, db_rating);
+    }
+
     Ok(())
 }
 

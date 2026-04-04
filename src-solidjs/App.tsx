@@ -246,6 +246,7 @@ export function App() {
           }}
           onItemSelect={(path) => toggleSelection(path)}
           onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
+          onBackgroundClick={clearSelection}
           selectedPaths={selectedPaths()}
           onItemContextMenu={(e, path, index) => {
             setContextMenu({ x: e.clientX, y: e.clientY, path, index });
