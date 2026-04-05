@@ -305,6 +305,7 @@ fn main() {
             // File operations (copy/move)
             commands::files::copy_files,
             commands::files::move_files,
+            commands::files::trash_files,
 
             // Duplicate detection
             commands::duplicates::find_duplicates,

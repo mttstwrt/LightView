@@ -41,6 +41,7 @@ intel_tex_2 = "0.5"
 memmap2 = "0.9"
 bincode = "1"
 percent-encoding = "2"
+trash = "5"
 bytemuck = { version = "1", features = ["derive"] }
 libheif-rs = "2"
 wgpu = { version = "29", optional = true }

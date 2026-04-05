@@ -219,6 +219,9 @@ export const copyFiles = (paths: string[], destination: string) =>
 export const moveFiles = (paths: string[], destination: string) =>
   invoke<FileOpResult>("move_files", { paths, destination });
 
+export const trashFiles = (paths: string[]) =>
+  invoke<FileOpResult>("trash_files", { paths });
+
 // ---------------------------------------------------------------------------
 // Duplicate Detection
 // ---------------------------------------------------------------------------

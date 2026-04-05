@@ -1,7 +1,7 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles } from "../../lib/ipc";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles } from "../../lib/ipc";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
@@ -229,6 +229,23 @@ export function ContextMenu(props: ContextMenuProps) {
     }
   };
 
+  const handleTrash = async () => {
+    if (!props.state) return;
+    const paths = isBatchContext() ? batchPaths() : [props.state.path];
+    props.onClose();
+    try {
+      const result = await trashFiles(paths);
+      if (result.succeeded.length > 0) {
+        props.onFilesRemoved?.(result.succeeded);
+      }
+      if (result.failed.length > 0) {
+        console.error("Trash failures:", result.failed);
+      }
+    } catch (err) {
+      console.error("Trash failed:", err);
+    }
+  };
+
   // Ensure menu stays within viewport
   const menuStyle = () => {
     if (!props.state) return {};
@@ -291,6 +308,11 @@ export function ContextMenu(props: ContextMenuProps) {
             <MenuItem
               label={isBatchContext() ? `Move ${props.selectedPaths!.size} to...` : "Move to..."}
               onClick={handleMoveTo}
+            />
+            <MenuItem
+              label={isBatchContext() ? `Delete ${props.selectedPaths!.size} Items` : "Delete"}
+              onClick={handleTrash}
+              danger
             />
             <Divider />
             <MenuItem
@@ -380,10 +402,14 @@ export function ContextMenu(props: ContextMenuProps) {
   );
 }
 
-function MenuItem(props: { label: string; onClick: () => void }) {
+function MenuItem(props: { label: string; onClick: () => void; danger?: boolean }) {
   return (
     <button
-      class="w-full text-left px-3 py-1.5 text-neutral-300 hover:bg-neutral-700/50 cursor-pointer transition-colors"
+      class={`w-full text-left px-3 py-1.5 cursor-pointer transition-colors ${
+        props.danger
+          ? "text-red-400 hover:bg-red-900/30"
+          : "text-neutral-300 hover:bg-neutral-700/50"
+      }`}
       onClick={props.onClick}
     >
       {props.label}
