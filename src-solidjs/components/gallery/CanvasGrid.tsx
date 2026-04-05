@@ -638,10 +638,12 @@ export function CanvasGrid(props: CanvasGridProps) {
 
     const onMouseDown = (e: MouseEvent) => {
       if (e.button !== 0) return;
+      // Only start drag-select when Ctrl/Cmd is held
+      if (!(e.ctrlKey || e.metaKey)) return;
       const hit = hitTestAt(e);
       if (hit.index < 0) return;
       e.preventDefault();
-      dragBaseSelection = e.ctrlKey || e.metaKey ? new Set(props.selectedPaths) : new Set<string>();
+      dragBaseSelection = new Set(props.selectedPaths);
       setIsDragging(true);
       setDragStartIndex(hit.index);
       setDragCurrentIndex(hit.index);
@@ -691,6 +693,9 @@ export function CanvasGrid(props: CanvasGridProps) {
       }
       if (e.ctrlKey || e.metaKey) {
         props.onItemSelect(hit.path!);
+      } else if (props.selectedPaths.size > 0) {
+        // Clear selection first — don't open viewer until selection is gone
+        props.onBackgroundClick?.();
       } else {
         props.onItemClick(hit.index);
       }

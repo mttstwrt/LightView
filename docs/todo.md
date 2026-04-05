@@ -1,7 +1,7 @@
 
-- Add delete to context menu (send to trash/recyclebin)
-
 - With multiple images selected, clicking on an image does not deselect the images, but then clicking again both deselects and opens the image. 
+
+- Only select multiple images when using the ctrl key, normal pressing or pressing and holding should not select multiple images.
 
 - Support AVIF thumbnail generation
 
@@ -12,8 +12,6 @@
 - Prevent scrolling while an image is opened. If an image is zoomed to larger than the viewport scrolling and sidescrolling should scroll the image.
 
 - ctrl + scroll should increase/decrease the thumbnail sizes, or image zoom while focused on an image
-
-- Only select multiple images when using the ctrl key, normal pressing or pressing and holding should not select multiple images.
 
 - Abstract ALL constants into a defined file, settings should be able to control some of these
 

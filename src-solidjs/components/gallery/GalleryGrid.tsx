@@ -116,10 +116,11 @@ function DOMGrid(props: GalleryGridProps) {
   };
 
   const handleDragStart = (index: number, e: MouseEvent) => {
-    // Only left mouse button
+    // Only left mouse button, only drag-select with Ctrl/Cmd
     if (e.button !== 0) return;
+    if (!(e.ctrlKey || e.metaKey)) return;
     e.preventDefault(); // Prevent text selection during drag
-    dragBaseSelection = e.ctrlKey || e.metaKey ? new Set(props.selectedPaths) : new Set<string>();
+    dragBaseSelection = new Set(props.selectedPaths);
     setIsDragging(true);
     setDragStartIndex(index);
     setDragCurrentIndex(index);
@@ -137,6 +138,9 @@ function DOMGrid(props: GalleryGridProps) {
     }
     if (e.ctrlKey || e.metaKey) {
       props.onItemSelect(item.path);
+    } else if (props.selectedPaths.size > 0) {
+      // Clear selection first — don't open viewer until selection is gone
+      props.onBackgroundClick?.();
     } else {
       props.onItemClick(item.index);
     }
