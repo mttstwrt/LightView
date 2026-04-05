@@ -1,44 +1,51 @@
 // ---------------------------------------------------------------------------
-// WebGL grid renderer — texture atlas, batched draw calls
+// WebGL grid renderer — texture pool, instanced drawing (single draw call)
 // ---------------------------------------------------------------------------
 //
-// Uses a texture atlas to batch all thumbnail draws into a single draw call.
-// Each thumbnail is uploaded to a region of a large atlas texture. The vertex
-// shader positions quads and the fragment shader samples the atlas with
-// per-quad UV offsets.
+// Architecture (per docs/WebGL.md):
+//   1. Texture Pool — pre-allocated fixed-size slots with texSubImage2D uploads
+//   2. Instanced Drawing — one quad, one drawElementsInstanced call for all items
+//   3. Zero-Copy Loading — ImageBitmap uploaded directly, no intermediate copies
+//   4. Float32Array — all coordinate math uses typed arrays to avoid jitter
+//   5. Culling — only visible items are sent to the GPU (handled upstream)
 
 import type { GridRenderer, GridLayout, GridItem, HitTestResult } from "./types";
 
-// Atlas configuration
-const ATLAS_SIZE = 4096; // pixels per side
-const TILE_SIZE = 256;   // pixels per tile (thumbnails resized to fit)
-const TILES_PER_ROW = Math.floor(ATLAS_SIZE / TILE_SIZE);
-const MAX_TILES = TILES_PER_ROW * TILES_PER_ROW; // 256 tiles in a 4096x4096 atlas
+// Pool configuration
+const SLOT_SIZE = 512; // pixels per slot (uniform size)
 
-// Visual constants (match Canvas2D)
+// Visual constants
 const SELECTION_COLOR = [59 / 255, 130 / 255, 246 / 255, 0.35] as const;
+const SELECTION_BORDER_COLOR = [59 / 255, 130 / 255, 246 / 255, 1.0] as const;
 
-// Shaders
+// ---------------------------------------------------------------------------
+// Instanced thumbnail shaders
+// ---------------------------------------------------------------------------
+
 const VERT_SRC = `#version 100
-attribute vec2 a_position;
-attribute vec2 a_texcoord;
-attribute float a_hasImage;
-attribute float a_selected;
+// Per-vertex: unit quad corner (0,0)→(1,1)
+attribute vec2 a_quad;
+
+// Per-instance (divisor = 1)
+attribute vec2 a_offset;   // pixel position
+attribute vec4 a_uv;       // (u0, v0, u1, v1) in pool texture
+attribute vec2 a_flags;    // (hasImage, selected)
 
 uniform vec2 u_resolution;
+uniform float u_cellSize;
 
 varying vec2 v_texcoord;
 varying float v_hasImage;
 varying float v_selected;
 
 void main() {
-  // Convert pixel coords to clip space
-  vec2 clipSpace = (a_position / u_resolution) * 2.0 - 1.0;
-  gl_Position = vec4(clipSpace.x, -clipSpace.y, 0.0, 1.0);
+  vec2 pos = a_offset + a_quad * u_cellSize;
+  vec2 clip = (pos / u_resolution) * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
 
-  v_texcoord = a_texcoord;
-  v_hasImage = a_hasImage;
-  v_selected = a_selected;
+  v_texcoord = mix(a_uv.xy, a_uv.zw, a_quad);
+  v_hasImage = a_flags.x;
+  v_selected = a_flags.y;
 }
 `;
 
@@ -49,19 +56,18 @@ varying vec2 v_texcoord;
 varying float v_hasImage;
 varying float v_selected;
 
-uniform sampler2D u_atlas;
+uniform sampler2D u_pool;
 uniform vec4 u_skeletonColor;
 uniform vec4 u_selectionColor;
 
 void main() {
   vec4 color;
   if (v_hasImage > 0.5) {
-    color = texture2D(u_atlas, v_texcoord);
+    color = texture2D(u_pool, v_texcoord);
   } else {
     color = u_skeletonColor;
   }
 
-  // Blend selection overlay
   if (v_selected > 0.5) {
     color = mix(color, u_selectionColor, u_selectionColor.a);
   }
@@ -70,8 +76,11 @@ void main() {
 }
 `;
 
-// Badge overlay shader (separate pass for text overlays)
-const BADGE_VERT_SRC = `#version 100
+// ---------------------------------------------------------------------------
+// Overlay shaders (non-instanced — selection borders, check marks, badges)
+// ---------------------------------------------------------------------------
+
+const OVERLAY_VERT_SRC = `#version 100
 attribute vec2 a_position;
 attribute vec4 a_color;
 
@@ -80,13 +89,13 @@ uniform vec2 u_resolution;
 varying vec4 v_color;
 
 void main() {
-  vec2 clipSpace = (a_position / u_resolution) * 2.0 - 1.0;
-  gl_Position = vec4(clipSpace.x, -clipSpace.y, 0.0, 1.0);
+  vec2 clip = (a_position / u_resolution) * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
   v_color = a_color;
 }
 `;
 
-const BADGE_FRAG_SRC = `#version 100
+const OVERLAY_FRAG_SRC = `#version 100
 precision mediump float;
 varying vec4 v_color;
 void main() {
@@ -94,54 +103,67 @@ void main() {
 }
 `;
 
-interface TileSlot {
-  /** Index in the atlas grid. */
-  slotIndex: number;
-  /** Normalized UV coordinates [u0, v0, u1, v1]. */
-  uv: [number, number, number, number];
+// ---------------------------------------------------------------------------
+// Instance buffer layout: 8 floats (32 bytes) per instance
+//   [offsetX, offsetY, u0, v0, u1, v1, hasImage, selected]
+// ---------------------------------------------------------------------------
+
+const FLOATS_PER_INSTANCE = 8;
+const BYTES_PER_INSTANCE = FLOATS_PER_INSTANCE * 4;
+
+interface PoolSlot {
+  index: number;
+  u0: number;
+  v0: number;
+  u1: number;
+  v1: number;
 }
 
 export class WebGLRenderer implements GridRenderer {
   readonly canvas: HTMLCanvasElement;
   private gl: WebGLRenderingContext;
+  private ext: ANGLE_instanced_arrays;
   private dpr = 1;
 
-  // Main thumbnail program
+  // Main instanced program
   private program: WebGLProgram;
-  private posLoc: number;
-  private texLoc: number;
-  private hasImageLoc: number;
-  private selectedLoc: number;
-  private resolutionLoc: WebGLUniformLocation;
-  private skeletonColorLoc: WebGLUniformLocation;
-  private selectionColorLoc: WebGLUniformLocation;
+  private a_quad: number;
+  private a_offset: number;
+  private a_uv: number;
+  private a_flags: number;
+  private u_resolution: WebGLUniformLocation;
+  private u_cellSize: WebGLUniformLocation;
+  private u_skeletonColor: WebGLUniformLocation;
+  private u_selectionColor: WebGLUniformLocation;
 
-  // Badge overlay program
-  private badgeProgram: WebGLProgram;
-  private badgePosLoc: number;
-  private badgeColorLoc: number;
-  private badgeResolutionLoc: WebGLUniformLocation;
+  // Overlay program
+  private overlayProgram: WebGLProgram;
+  private ov_position: number;
+  private ov_color: number;
+  private ov_resolution: WebGLUniformLocation;
 
-  // Buffers
-  private posBuffer: WebGLBuffer;
-  private texBuffer: WebGLBuffer;
-  private hasImageBuffer: WebGLBuffer;
-  private selectedBuffer: WebGLBuffer;
-  private indexBuffer: WebGLBuffer;
-  private badgePosBuffer: WebGLBuffer;
-  private badgeColorBuffer: WebGLBuffer;
-  private badgeIndexBuffer: WebGLBuffer;
+  // Static quad geometry (shared across all instances)
+  private quadVBO: WebGLBuffer;
+  private quadIBO: WebGLBuffer;
 
-  // Atlas
-  private atlas: WebGLTexture;
-  private tileMap = new Map<string, TileSlot>();
-  private freeTiles: number[] = [];
+  // Instance buffer (rebuilt each frame)
+  private instanceVBO: WebGLBuffer;
+  private instanceData: Float32Array;
+  private maxInstances: number;
+
+  // Overlay buffers
+  private overlayPosBuffer: WebGLBuffer;
+  private overlayColorBuffer: WebGLBuffer;
+  private overlayIndexBuffer: WebGLBuffer;
+
+  // Texture pool — pre-allocated GPU memory with fixed-size slots
+  private poolTexture: WebGLTexture;
+  private poolSize: number;
+  private slotsPerRow: number;
+  private totalSlots: number;
+  private slotMap = new Map<string, PoolSlot>();
+  private freeSlots: number[] = [];
   private lruOrder: string[] = [];
-
-  // Selection border canvas for rendering text badges
-  private badgeCanvas: HTMLCanvasElement;
-  private badgeCtx: CanvasRenderingContext2D;
-  private badgeTexture: WebGLTexture;
 
   constructor() {
     this.canvas = document.createElement("canvas");
@@ -153,61 +175,100 @@ export class WebGLRenderer implements GridRenderer {
       alpha: false,
       antialias: false,
       premultipliedAlpha: false,
-      preserveDrawingBuffer: false,
+      preserveDrawingBuffer: true,
     });
     if (!gl) throw new Error("WebGL context unavailable");
     this.gl = gl;
 
-    // Compile programs
+    // Require ANGLE_instanced_arrays for single-call instanced rendering
+    const ext = gl.getExtension("ANGLE_instanced_arrays");
+    if (!ext) throw new Error("ANGLE_instanced_arrays extension unavailable");
+    this.ext = ext;
+
+    // ---------------------------------------------------------------------------
+    // Texture pool sizing — use largest texture the GPU supports (capped at 16384)
+    // 16384/512 = 32 per row → 1024 slots, well above ImageLoader's 300 cache
+    // ---------------------------------------------------------------------------
+    const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    this.poolSize = Math.min(maxTexSize, 16384);
+    this.slotsPerRow = Math.floor(this.poolSize / SLOT_SIZE);
+    this.totalSlots = this.slotsPerRow * this.slotsPerRow;
+
+    // Pre-allocate instance buffer (grows if needed)
+    this.maxInstances = 2000;
+    this.instanceData = new Float32Array(this.maxInstances * FLOATS_PER_INSTANCE);
+
+    // ---------------------------------------------------------------------------
+    // Compile shader programs
+    // ---------------------------------------------------------------------------
     this.program = this.createProgram(VERT_SRC, FRAG_SRC);
-    this.posLoc = gl.getAttribLocation(this.program, "a_position");
-    this.texLoc = gl.getAttribLocation(this.program, "a_texcoord");
-    this.hasImageLoc = gl.getAttribLocation(this.program, "a_hasImage");
-    this.selectedLoc = gl.getAttribLocation(this.program, "a_selected");
-    this.resolutionLoc = gl.getUniformLocation(this.program, "u_resolution")!;
-    this.skeletonColorLoc = gl.getUniformLocation(this.program, "u_skeletonColor")!;
-    this.selectionColorLoc = gl.getUniformLocation(this.program, "u_selectionColor")!;
+    this.a_quad = gl.getAttribLocation(this.program, "a_quad");
+    this.a_offset = gl.getAttribLocation(this.program, "a_offset");
+    this.a_uv = gl.getAttribLocation(this.program, "a_uv");
+    this.a_flags = gl.getAttribLocation(this.program, "a_flags");
+    this.u_resolution = gl.getUniformLocation(this.program, "u_resolution")!;
+    this.u_cellSize = gl.getUniformLocation(this.program, "u_cellSize")!;
+    this.u_skeletonColor = gl.getUniformLocation(this.program, "u_skeletonColor")!;
+    this.u_selectionColor = gl.getUniformLocation(this.program, "u_selectionColor")!;
 
-    this.badgeProgram = this.createProgram(BADGE_VERT_SRC, BADGE_FRAG_SRC);
-    this.badgePosLoc = gl.getAttribLocation(this.badgeProgram, "a_position");
-    this.badgeColorLoc = gl.getAttribLocation(this.badgeProgram, "a_color");
-    this.badgeResolutionLoc = gl.getUniformLocation(this.badgeProgram, "u_resolution")!;
+    this.overlayProgram = this.createProgram(OVERLAY_VERT_SRC, OVERLAY_FRAG_SRC);
+    this.ov_position = gl.getAttribLocation(this.overlayProgram, "a_position");
+    this.ov_color = gl.getAttribLocation(this.overlayProgram, "a_color");
+    this.ov_resolution = gl.getUniformLocation(this.overlayProgram, "u_resolution")!;
 
-    // Create buffers
-    this.posBuffer = gl.createBuffer()!;
-    this.texBuffer = gl.createBuffer()!;
-    this.hasImageBuffer = gl.createBuffer()!;
-    this.selectedBuffer = gl.createBuffer()!;
-    this.indexBuffer = gl.createBuffer()!;
-    this.badgePosBuffer = gl.createBuffer()!;
-    this.badgeColorBuffer = gl.createBuffer()!;
-    this.badgeIndexBuffer = gl.createBuffer()!;
+    // ---------------------------------------------------------------------------
+    // Static quad geometry — one unit square, reused for every instance
+    // ---------------------------------------------------------------------------
+    this.quadVBO = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      0, 0, // top-left
+      1, 0, // top-right
+      1, 1, // bottom-right
+      0, 1, // bottom-left
+    ]), gl.STATIC_DRAW);
 
-    // Create atlas texture
-    this.atlas = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this.atlas);
+    this.quadIBO = gl.createBuffer()!;
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadIBO);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([
+      0, 1, 2, 0, 2, 3,
+    ]), gl.STATIC_DRAW);
+
+    // Dynamic instance buffer
+    this.instanceVBO = gl.createBuffer()!;
+
+    // Overlay buffers
+    this.overlayPosBuffer = gl.createBuffer()!;
+    this.overlayColorBuffer = gl.createBuffer()!;
+    this.overlayIndexBuffer = gl.createBuffer()!;
+
+    // ---------------------------------------------------------------------------
+    // Pre-allocate texture pool — reserves GPU memory, no pixel upload
+    // ---------------------------------------------------------------------------
+    this.poolTexture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.poolTexture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, ATLAS_SIZE, ATLAS_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA,
+      this.poolSize, this.poolSize, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, null,
+    );
 
-    // Initialize free tile list
-    for (let i = MAX_TILES - 1; i >= 0; i--) {
-      this.freeTiles.push(i);
+    // Build free-slot stack (pop gives lowest indices first)
+    for (let i = this.totalSlots - 1; i >= 0; i--) {
+      this.freeSlots.push(i);
     }
 
-    // Badge overlay canvas (for text rendering)
-    this.badgeCanvas = document.createElement("canvas");
-    this.badgeCanvas.width = 64;
-    this.badgeCanvas.height = 20;
-    this.badgeCtx = this.badgeCanvas.getContext("2d")!;
-    this.badgeTexture = gl.createTexture()!;
-
-    // Enable blending
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
+
+  // -------------------------------------------------------------------------
+  // GridRenderer interface
+  // -------------------------------------------------------------------------
 
   resize(width: number, height: number, dpr: number): boolean {
     const pw = Math.round(width * dpr);
@@ -226,98 +287,112 @@ export class WebGLRenderer implements GridRenderer {
 
   render(layout: GridLayout, items: GridItem[]): void {
     const gl = this.gl;
+    const ext = this.ext;
     const { cols, cellSize, gap, startRow } = layout;
     const n = items.length;
-    if (n === 0) {
-      gl.clearColor(10 / 255, 10 / 255, 10 / 255, 1);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      return;
+
+    gl.clearColor(10 / 255, 10 / 255, 10 / 255, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    if (n === 0) return;
+
+    // Grow instance buffer if the visible set exceeds current capacity
+    if (n > this.maxInstances) {
+      this.maxInstances = Math.ceil(n * 1.5);
+      this.instanceData = new Float32Array(this.maxInstances * FLOATS_PER_INSTANCE);
     }
 
-    // Build vertex data: 4 vertices per quad, 6 indices per quad
-    const positions = new Float32Array(n * 8);   // 4 verts * 2 components
-    const texcoords = new Float32Array(n * 8);
-    const hasImage = new Float32Array(n * 4);    // 4 verts * 1
-    const selected = new Float32Array(n * 4);
-    const indices = new Uint16Array(n * 6);
-
-    // Badge overlay data
-    const badgeItems: { x: number; y: number; w: number; h: number; selected: boolean }[] = [];
-    const checkItems: { cx: number; cy: number }[] = [];
+    // -----------------------------------------------------------------
+    // Fill instance data (Float32Array — no jitter during slow scrolls)
+    // -----------------------------------------------------------------
+    const data = this.instanceData;
+    let hasOverlays = false;
 
     for (let i = 0; i < n; i++) {
       const item = items[i];
       const localIdx = item.index - startRow * cols;
       const row = Math.floor(localIdx / cols);
       const col = localIdx % cols;
-      const x = col * (cellSize + gap);
-      const y = row * (cellSize + gap);
 
-      // Quad positions (px)
-      const pi = i * 8;
-      positions[pi + 0] = x;            positions[pi + 1] = y;             // top-left
-      positions[pi + 2] = x + cellSize; positions[pi + 3] = y;             // top-right
-      positions[pi + 4] = x + cellSize; positions[pi + 5] = y + cellSize;  // bottom-right
-      positions[pi + 6] = x;            positions[pi + 7] = y + cellSize;  // bottom-left
+      const base = i * FLOATS_PER_INSTANCE;
+      data[base] = col * (cellSize + gap);     // offsetX
+      data[base + 1] = row * (cellSize + gap); // offsetY
 
-      // UV coordinates from atlas tile
-      const tile = this.tileMap.get(item.path);
-      const ti = i * 8;
-      if (tile) {
-        const [u0, v0, u1, v1] = tile.uv;
-        texcoords[ti + 0] = u0; texcoords[ti + 1] = v0;
-        texcoords[ti + 2] = u1; texcoords[ti + 3] = v0;
-        texcoords[ti + 4] = u1; texcoords[ti + 5] = v1;
-        texcoords[ti + 6] = u0; texcoords[ti + 7] = v1;
+      const slot = this.slotMap.get(item.path);
+      if (slot) {
+        data[base + 2] = slot.u0;
+        data[base + 3] = slot.v0;
+        data[base + 4] = slot.u1;
+        data[base + 5] = slot.v1;
+        data[base + 6] = 1; // hasImage
+      } else {
+        data[base + 2] = 0;
+        data[base + 3] = 0;
+        data[base + 4] = 0;
+        data[base + 5] = 0;
+        data[base + 6] = 0;
       }
+      data[base + 7] = item.selected ? 1 : 0;
 
-      // Per-vertex flags
-      const hi = i * 4;
-      const hasImg = tile ? 1 : 0;
-      const sel = item.selected ? 1 : 0;
-      hasImage[hi] = hasImage[hi + 1] = hasImage[hi + 2] = hasImage[hi + 3] = hasImg;
-      selected[hi] = selected[hi + 1] = selected[hi + 2] = selected[hi + 3] = sel;
-
-      // Indices
-      const ii = i * 6;
-      const vi = i * 4;
-      indices[ii + 0] = vi;     indices[ii + 1] = vi + 1; indices[ii + 2] = vi + 2;
-      indices[ii + 3] = vi;     indices[ii + 4] = vi + 2; indices[ii + 5] = vi + 3;
-
-      // Collect badge/selection overlays
-      if (item.badge) {
-        badgeItems.push({ x, y, w: cellSize, h: cellSize, selected: item.selected });
-      }
-      if (item.selected) {
-        checkItems.push({ cx: x + 12, cy: y + 12 });
-      }
+      if (item.selected || item.badge) hasOverlays = true;
     }
 
-    // --- Draw thumbnail quads ---
-    gl.clearColor(10 / 255, 10 / 255, 10 / 255, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-
+    // -----------------------------------------------------------------
+    // Instanced draw — one call renders the entire grid
+    // -----------------------------------------------------------------
     gl.useProgram(this.program);
-    gl.uniform2f(this.resolutionLoc, this.canvas.width / this.dpr, this.canvas.height / this.dpr);
-    gl.uniform4f(this.skeletonColorLoc, 26 / 255, 26 / 255, 26 / 255, 1);
-    gl.uniform4f(this.selectionColorLoc, ...SELECTION_COLOR);
+
+    const resW = this.canvas.width / this.dpr;
+    const resH = this.canvas.height / this.dpr;
+    gl.uniform2f(this.u_resolution, resW, resH);
+    gl.uniform1f(this.u_cellSize, cellSize);
+    gl.uniform4f(this.u_skeletonColor, 26 / 255, 26 / 255, 26 / 255, 1);
+    gl.uniform4f(this.u_selectionColor, ...SELECTION_COLOR);
 
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.atlas);
+    gl.bindTexture(gl.TEXTURE_2D, this.poolTexture);
 
-    this.uploadAndBind(this.posBuffer, positions, this.posLoc, 2);
-    this.uploadAndBind(this.texBuffer, texcoords, this.texLoc, 2);
-    this.uploadAndBind(this.hasImageBuffer, hasImage, this.hasImageLoc, 1);
-    this.uploadAndBind(this.selectedBuffer, selected, this.selectedLoc, 1);
+    // Bind static quad (per-vertex, divisor 0)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
+    gl.enableVertexAttribArray(this.a_quad);
+    gl.vertexAttribPointer(this.a_quad, 2, gl.FLOAT, false, 0, 0);
+    ext.vertexAttribDivisorANGLE(this.a_quad, 0);
 
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
+    // Upload instance data (sub-array view avoids copying)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, n * FLOATS_PER_INSTANCE), gl.DYNAMIC_DRAW);
 
-    gl.drawElements(gl.TRIANGLES, n * 6, gl.UNSIGNED_SHORT, 0);
+    const stride = BYTES_PER_INSTANCE;
 
-    // --- Draw selection borders and check marks ---
-    if (checkItems.length > 0 || badgeItems.length > 0) {
-      this.drawOverlays(layout, items, checkItems, badgeItems);
+    // a_offset: vec2 at byte 0
+    gl.enableVertexAttribArray(this.a_offset);
+    gl.vertexAttribPointer(this.a_offset, 2, gl.FLOAT, false, stride, 0);
+    ext.vertexAttribDivisorANGLE(this.a_offset, 1);
+
+    // a_uv: vec4 at byte 8
+    gl.enableVertexAttribArray(this.a_uv);
+    gl.vertexAttribPointer(this.a_uv, 4, gl.FLOAT, false, stride, 8);
+    ext.vertexAttribDivisorANGLE(this.a_uv, 1);
+
+    // a_flags: vec2 at byte 24
+    gl.enableVertexAttribArray(this.a_flags);
+    gl.vertexAttribPointer(this.a_flags, 2, gl.FLOAT, false, stride, 24);
+    ext.vertexAttribDivisorANGLE(this.a_flags, 1);
+
+    // One call to rule them all
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadIBO);
+    ext.drawElementsInstancedANGLE(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, n);
+
+    // Reset divisors so overlay drawing isn't affected
+    ext.vertexAttribDivisorANGLE(this.a_offset, 0);
+    ext.vertexAttribDivisorANGLE(this.a_uv, 0);
+    ext.vertexAttribDivisorANGLE(this.a_flags, 0);
+
+    // -----------------------------------------------------------------
+    // Overlay pass (selection borders, check marks, badge backgrounds)
+    // -----------------------------------------------------------------
+    if (hasOverlays) {
+      this.drawOverlays(layout, items);
     }
   }
 
@@ -340,49 +415,56 @@ export class WebGLRenderer implements GridRenderer {
   }
 
   imageLoaded(path: string, img: HTMLImageElement | ImageBitmap): void {
+    // Short-circuit: slot already uploaded — skip redundant GPU work
+    if (this.slotMap.has(path)) return;
+
     const gl = this.gl;
-    let tile = this.tileMap.get(path);
 
-    if (!tile) {
-      // Allocate a tile slot
-      if (this.freeTiles.length === 0) {
-        // Evict LRU tile
-        this.evictLRU();
-      }
-      if (this.freeTiles.length === 0) return; // shouldn't happen
-
-      const slotIndex = this.freeTiles.pop()!;
-      const col = slotIndex % TILES_PER_ROW;
-      const row = Math.floor(slotIndex / TILES_PER_ROW);
-      const u0 = col * TILE_SIZE / ATLAS_SIZE;
-      const v0 = row * TILE_SIZE / ATLAS_SIZE;
-      const u1 = (col + 1) * TILE_SIZE / ATLAS_SIZE;
-      const v1 = (row + 1) * TILE_SIZE / ATLAS_SIZE;
-
-      tile = { slotIndex, uv: [u0, v0, u1, v1] };
-      this.tileMap.set(path, tile);
+    // Allocate a pool slot
+    if (this.freeSlots.length === 0) {
+      this.evictLRU();
     }
+    if (this.freeSlots.length === 0) return;
 
-    // Update LRU order
-    const lruIdx = this.lruOrder.indexOf(path);
-    if (lruIdx >= 0) this.lruOrder.splice(lruIdx, 1);
+    const index = this.freeSlots.pop()!;
+    const slotCol = index % this.slotsPerRow;
+    const slotRow = Math.floor(index / this.slotsPerRow);
+    const px = slotCol * SLOT_SIZE;
+    const py = slotRow * SLOT_SIZE;
+
+    // Compute UVs from actual image dimensions (not full slot) so the
+    // shader never samples uninitialized pixels at the slot edges.
+    // Thumbnails are 400x400; slots are 512x512.
+    const imgW = Math.min(img.width, SLOT_SIZE);
+    const imgH = Math.min(img.height, SLOT_SIZE);
+
+    const slot: PoolSlot = {
+      index,
+      u0: px / this.poolSize,
+      v0: py / this.poolSize,
+      u1: (px + imgW) / this.poolSize,
+      v1: (py + imgH) / this.poolSize,
+    };
+    this.slotMap.set(path, slot);
+
+    // Touch LRU
     this.lruOrder.push(path);
 
-    // Upload image to atlas tile region
-    const col = tile.slotIndex % TILES_PER_ROW;
-    const row = Math.floor(tile.slotIndex / TILES_PER_ROW);
-    const px = col * TILE_SIZE;
-    const py = row * TILE_SIZE;
-
-    gl.bindTexture(gl.TEXTURE_2D, this.atlas);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, px, py, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    // Non-blocking upload via texSubImage2D — no GPU memory reallocation
+    gl.bindTexture(gl.TEXTURE_2D, this.poolTexture);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D, 0,
+      px, py,
+      gl.RGBA, gl.UNSIGNED_BYTE,
+      img,
+    );
   }
 
   evictImage(path: string): void {
-    const tile = this.tileMap.get(path);
-    if (tile) {
-      this.freeTiles.push(tile.slotIndex);
-      this.tileMap.delete(path);
+    const slot = this.slotMap.get(path);
+    if (slot) {
+      this.freeSlots.push(slot.index);
+      this.slotMap.delete(path);
       const lruIdx = this.lruOrder.indexOf(path);
       if (lruIdx >= 0) this.lruOrder.splice(lruIdx, 1);
     }
@@ -391,23 +473,20 @@ export class WebGLRenderer implements GridRenderer {
   destroy(): void {
     const gl = this.gl;
     gl.deleteProgram(this.program);
-    gl.deleteProgram(this.badgeProgram);
-    gl.deleteBuffer(this.posBuffer);
-    gl.deleteBuffer(this.texBuffer);
-    gl.deleteBuffer(this.hasImageBuffer);
-    gl.deleteBuffer(this.selectedBuffer);
-    gl.deleteBuffer(this.indexBuffer);
-    gl.deleteBuffer(this.badgePosBuffer);
-    gl.deleteBuffer(this.badgeColorBuffer);
-    gl.deleteBuffer(this.badgeIndexBuffer);
-    gl.deleteTexture(this.atlas);
-    gl.deleteTexture(this.badgeTexture);
-    this.tileMap.clear();
+    gl.deleteProgram(this.overlayProgram);
+    gl.deleteBuffer(this.quadVBO);
+    gl.deleteBuffer(this.quadIBO);
+    gl.deleteBuffer(this.instanceVBO);
+    gl.deleteBuffer(this.overlayPosBuffer);
+    gl.deleteBuffer(this.overlayColorBuffer);
+    gl.deleteBuffer(this.overlayIndexBuffer);
+    gl.deleteTexture(this.poolTexture);
+    this.slotMap.clear();
     this.lruOrder.length = 0;
   }
 
   // -------------------------------------------------------------------------
-  // Private helpers
+  // Private — pool management
   // -------------------------------------------------------------------------
 
   private evictLRU() {
@@ -416,97 +495,86 @@ export class WebGLRenderer implements GridRenderer {
     this.evictImage(oldest);
   }
 
-  private uploadAndBind(buffer: WebGLBuffer, data: Float32Array, loc: number, size: number) {
-    const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
-  }
+  // -------------------------------------------------------------------------
+  // Private — overlay rendering (selection borders, check marks, badges)
+  // -------------------------------------------------------------------------
 
-  private drawOverlays(
-    layout: GridLayout,
-    items: GridItem[],
-    checkItems: { cx: number; cy: number }[],
-    badgeItems: { x: number; y: number; w: number; h: number }[],
-  ) {
+  private drawOverlays(layout: GridLayout, items: GridItem[]) {
     const gl = this.gl;
     const { cols, cellSize, gap, startRow } = layout;
 
-    // Use badge program for colored quads
-    gl.useProgram(this.badgeProgram);
-    gl.uniform2f(this.badgeResolutionLoc, this.canvas.width / this.dpr, this.canvas.height / this.dpr);
+    gl.useProgram(this.overlayProgram);
+    gl.uniform2f(this.ov_resolution, this.canvas.width / this.dpr, this.canvas.height / this.dpr);
 
-    // Build overlay geometry: selection borders (line quads), check marks (circles as quads), badges
     const positions: number[] = [];
     const colors: number[] = [];
     const indices: number[] = [];
     let vi = 0;
 
-    // Selection borders (4 thin quads per selected item)
     for (const item of items) {
-      if (!item.selected) continue;
-      const localIdx = item.index - startRow * cols;
-      const row = Math.floor(localIdx / cols);
-      const col = localIdx % cols;
-      const x = col * (cellSize + gap);
-      const y = row * (cellSize + gap);
-      const bw = 2; // border width
-
-      const borderColor = [59 / 255, 130 / 255, 246 / 255, 1];
-
-      // Top
-      this.pushQuad(positions, colors, indices, vi, x, y, cellSize, bw, borderColor);
-      vi += 4;
-      // Bottom
-      this.pushQuad(positions, colors, indices, vi, x, y + cellSize - bw, cellSize, bw, borderColor);
-      vi += 4;
-      // Left
-      this.pushQuad(positions, colors, indices, vi, x, y, bw, cellSize, borderColor);
-      vi += 4;
-      // Right
-      this.pushQuad(positions, colors, indices, vi, x + cellSize - bw, y, bw, cellSize, borderColor);
-      vi += 4;
-
-      // Check mark background (square approximation of circle)
-      const checkSize = 20;
-      const cx = x + 12 - checkSize / 2;
-      const cy = y + 12 - checkSize / 2;
-      this.pushQuad(positions, colors, indices, vi, cx, cy, checkSize, checkSize, borderColor);
-      vi += 4;
-    }
-
-    // Badge backgrounds
-    for (const item of items) {
-      if (!item.badge) continue;
       const localIdx = item.index - startRow * cols;
       const row = Math.floor(localIdx / cols);
       const col = localIdx % cols;
       const x = col * (cellSize + gap);
       const y = row * (cellSize + gap);
 
-      const bw = item.badge === "VID" ? 34 : 30;
-      const bh = 18;
-      const bx = x + cellSize - bw - 6;
-      const by = y + cellSize - bh - 6;
+      // Selection: border quads + check mark
+      if (item.selected) {
+        const bw = 2;
+        const bc = [...SELECTION_BORDER_COLOR];
 
-      this.pushQuad(positions, colors, indices, vi, bx, by, bw, bh, [0, 0, 0, 0.5]);
-      vi += 4;
+        // Top
+        this.pushQuad(positions, colors, indices, vi, x, y, cellSize, bw, bc);
+        vi += 4;
+        // Bottom
+        this.pushQuad(positions, colors, indices, vi, x, y + cellSize - bw, cellSize, bw, bc);
+        vi += 4;
+        // Left
+        this.pushQuad(positions, colors, indices, vi, x, y, bw, cellSize, bc);
+        vi += 4;
+        // Right
+        this.pushQuad(positions, colors, indices, vi, x + cellSize - bw, y, bw, cellSize, bc);
+        vi += 4;
+
+        // Check mark background
+        const cs = 20;
+        const cx = x + 12 - cs / 2;
+        const cy = y + 12 - cs / 2;
+        this.pushQuad(positions, colors, indices, vi, cx, cy, cs, cs, bc);
+        vi += 4;
+      }
+
+      // Badge background (VID / GIF)
+      if (item.badge) {
+        const bw = item.badge === "VID" ? 34 : 30;
+        const bh = 18;
+        const bx = x + cellSize - bw - 6;
+        const by = y + cellSize - bh - 6;
+        this.pushQuad(positions, colors, indices, vi, bx, by, bw, bh, [0, 0, 0, 0.5]);
+        vi += 4;
+      }
     }
 
-    if (positions.length > 0) {
-      const posArr = new Float32Array(positions);
-      const colArr = new Float32Array(colors);
-      const idxArr = new Uint16Array(indices);
+    if (positions.length === 0) return;
 
-      this.uploadAndBind(this.badgePosBuffer, posArr, this.badgePosLoc, 2);
-      this.uploadAndBind(this.badgeColorBuffer, colArr, this.badgeColorLoc, 4);
+    const posArr = new Float32Array(positions);
+    const colArr = new Float32Array(colors);
+    const idxArr = new Uint16Array(indices);
 
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.badgeIndexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxArr, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.overlayPosBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, posArr, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(this.ov_position);
+    gl.vertexAttribPointer(this.ov_position, 2, gl.FLOAT, false, 0, 0);
 
-      gl.drawElements(gl.TRIANGLES, indices.length, gl.UNSIGNED_SHORT, 0);
-    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.overlayColorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, colArr, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(this.ov_color);
+    gl.vertexAttribPointer(this.ov_color, 4, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.overlayIndexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxArr, gl.DYNAMIC_DRAW);
+
+    gl.drawElements(gl.TRIANGLES, indices.length, gl.UNSIGNED_SHORT, 0);
   }
 
   private pushQuad(
@@ -520,8 +588,13 @@ export class WebGLRenderer implements GridRenderer {
     indices.push(vi, vi + 1, vi + 2, vi, vi + 2, vi + 3);
   }
 
+  // -------------------------------------------------------------------------
+  // Private — shader compilation
+  // -------------------------------------------------------------------------
+
   private createProgram(vertSrc: string, fragSrc: string): WebGLProgram {
     const gl = this.gl;
+
     const vert = gl.createShader(gl.VERTEX_SHADER)!;
     gl.shaderSource(vert, vertSrc);
     gl.compileShader(vert);

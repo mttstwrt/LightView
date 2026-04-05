@@ -751,6 +751,14 @@ export function CanvasGrid(props: CanvasGridProps) {
         urlMap.set(item.path, url);
         // Phase 5: priority 0 = viewport-visible (highest)
         imageLoader?.request(item.path, url, 0);
+      } else if (imageLoader && renderer) {
+        // Re-feed cached bitmaps whose GPU texture slots may have been
+        // evicted by the renderer's internal pool management. The
+        // renderer short-circuits if the slot still exists (O(1) Map check).
+        const cached = imageLoader.get(item.path);
+        if (cached) {
+          renderer.imageLoaded(item.path, cached);
+        }
       }
     }
 

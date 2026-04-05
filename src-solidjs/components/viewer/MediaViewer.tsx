@@ -1,9 +1,11 @@
-import { Show, For, createSignal, createEffect, on } from "solid-js";
+import { Show, For, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
 import { mediaUrl, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
 import type { CachedThumbnailInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
+import { ViewerImageCache } from "../../lib/viewerCache";
+import { setViewerCacheCountSource } from "../../lib/perfMonitor";
 
 interface MediaViewerProps {
   paths: string[];
@@ -14,8 +16,17 @@ interface MediaViewerProps {
 }
 
 export function MediaViewer(props: MediaViewerProps) {
-  const [mediaSrc, setMediaSrc] = createSignal<string>("");
   const [loaded, setLoaded] = createSignal(false);
+
+  const cache = new ViewerImageCache();
+  setViewerCacheCountSource(() => cache.size);
+  onCleanup(() => {
+    setViewerCacheCountSource(null);
+    cache.destroy();
+  });
+
+  // Container ref for direct DOM image swapping
+  let imageContainerRef: HTMLDivElement | undefined;
 
   const currentPath = () => props.paths[props.currentIndex] || "";
 
@@ -41,20 +52,64 @@ export function MediaViewer(props: MediaViewerProps) {
     );
   };
 
-  // Load full media when index changes.
+  /** Mount an image element into the container. */
+  const mountImage = (img: HTMLImageElement, alreadyLoaded: boolean) => {
+    if (!imageContainerRef) return;
+    imageContainerRef.replaceChildren(img);
+    if (alreadyLoaded) {
+      img.style.opacity = "1";
+      img.style.position = "relative";
+      setLoaded(true);
+    } else {
+      img.style.opacity = "0";
+      img.style.position = "absolute";
+      setLoaded(false);
+      img.onload = () => {
+        img.style.opacity = "1";
+        img.style.position = "relative";
+        setLoaded(true);
+        // Cache this freshly-loaded element for if the user navigates back
+        cache.insert(currentPath(), img);
+      };
+    }
+  };
+
+  // When a preloaded image becomes ready, swap it in if it's the current image
+  cache.onReady((path) => {
+    if (path !== currentPath() || isVideo()) return;
+    const img = cache.get(path);
+    if (img) mountImage(img, true);
+  });
+
+  // Load full media when index changes, using cache + preloading.
   createEffect(
     on(
       () => props.currentIndex,
-      async (idx) => {
+      (idx) => {
         const path = props.paths[idx];
-        if (!path) return;
+        if (!path || isVideo()) {
+          setLoaded(false);
+          if (imageContainerRef) imageContainerRef.replaceChildren();
+          return;
+        }
 
-        setLoaded(false);
-        setMediaSrc("");
+        // Trigger preloading of adjacent images
+        cache.preload(props.paths, idx);
 
-        if (!isVideo()) {
-          // Use binary protocol URL — no Base64/JSON overhead
-          setMediaSrc(mediaUrl(path));
+        // Check if already cached — instant display
+        const cached = cache.get(path);
+        if (cached) {
+          mountImage(cached, true);
+        } else {
+          // Not cached yet — create a fresh img and load via protocol URL
+          const img = new Image();
+          img.style.maxWidth = "90vw";
+          img.style.maxHeight = "90vh";
+          img.style.objectFit = "contain";
+          img.draggable = false;
+          img.alt = filename();
+          img.src = mediaUrl(path);
+          mountImage(img, false);
         }
       },
     ),
@@ -95,15 +150,9 @@ export function MediaViewer(props: MediaViewerProps) {
           </div>
         </Show>
 
-        <Show when={!isVideo() && mediaSrc()}>
-          <img
-            src={mediaSrc()}
-            alt={filename()}
-            class="max-w-[90vw] max-h-[90vh] object-contain"
-            style={{ opacity: loaded() ? "1" : "0", position: loaded() ? "relative" : "absolute" }}
-            onLoad={() => setLoaded(true)}
-            draggable={false}
-          />
+        {/* Image container — preloaded Image elements are swapped in directly */}
+        <Show when={!isVideo()}>
+          <div ref={imageContainerRef} class="max-w-[90vw] max-h-[90vh] flex items-center justify-center" />
         </Show>
 
         <Show when={!isVideo() && !loaded()}>
@@ -268,9 +317,9 @@ function InfoPanel(props: { path: string; filename: string }) {
 
   return (
     <div
-      class="absolute right-0 top-0 h-full w-80 relative"
+      class="fixed right-0 top-0 h-full w-80 z-[60]"
       style={{
-        background: "rgba(10, 10, 10, 0.9)",
+        background: "rgba(10, 10, 10, 0.75)",
         "backdrop-filter": "blur(12px)",
         "border-left": "1px solid rgba(255,255,255,0.05)",
       }}

@@ -111,9 +111,14 @@ export function recordCacheMiss() {
 // -------------------------------------------------------------------------
 
 let _imageCounts: (() => { visible: number; cached: number }) | null = null;
+let _viewerCacheCount: (() => number) | null = null;
 
 export function setImageCountSource(fn: () => { visible: number; cached: number }) {
   _imageCounts = fn;
+}
+
+export function setViewerCacheCountSource(fn: (() => number) | null) {
+  _viewerCacheCount = fn;
 }
 
 // -------------------------------------------------------------------------
@@ -214,7 +219,7 @@ async function sampleTick() {
   if (_imageCounts) {
     const counts = _imageCounts();
     visibleImages.push(counts.visible);
-    cachedImages.push(counts.cached);
+    cachedImages.push(counts.cached + (_viewerCacheCount?.() ?? 0));
   }
 
   // Backend snapshot (disk IO)
