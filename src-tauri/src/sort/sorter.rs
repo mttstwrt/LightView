@@ -12,6 +12,7 @@ pub enum SortField {
     MediaType,
     LastViewed,
     DateAdded,
+    LastRated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,7 @@ pub struct SortedItem {
     pub rating: Option<u8>,
     pub last_viewed: Option<i64>,
     pub date_added: Option<i64>,
+    pub last_rated: Option<i64>,
 }
 
 impl CacheDb {
@@ -55,21 +57,21 @@ impl CacheDb {
             SortField::MediaType => format!("media_type {}", order),
             SortField::LastViewed => format!("last_viewed {} NULLS LAST", order),
             SortField::DateAdded => format!("date_added {} NULLS LAST", order),
+            SortField::LastRated => format!("last_rated {} NULLS LAST", order),
         };
 
+        let cols = "path, date_taken, file_size, media_type, rating, last_viewed, date_added, last_rated";
         let sql = if filter_paths.is_some() {
-            // Use a temporary approach: build IN clause
-            // For large sets, the caller should use SQL-based filtering instead.
             format!(
-                "SELECT path, date_taken, file_size, media_type, rating, last_viewed, date_added FROM media_meta
+                "SELECT {} FROM media_meta
                  WHERE path IN (SELECT value FROM json_each(?1))
                  ORDER BY {}",
-                order_clause
+                cols, order_clause
             )
         } else {
             format!(
-                "SELECT path, date_taken, file_size, media_type, rating, last_viewed, date_added FROM media_meta ORDER BY {}",
-                order_clause
+                "SELECT {} FROM media_meta ORDER BY {}",
+                cols, order_clause
             )
         };
 
@@ -90,10 +92,16 @@ impl CacheDb {
     }
 
     /// Update only the rating for a file in the cache.
+    /// Also sets `last_rated` to the current timestamp.
     pub fn update_rating(&self, path: &str, rating: Option<u8>) -> Result<(), CacheError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
         self.conn().execute(
-            "UPDATE media_meta SET rating = ?1 WHERE path = ?2",
-            rusqlite::params![rating, path],
+            "UPDATE media_meta SET rating = ?1, last_rated = ?2 WHERE path = ?3",
+            rusqlite::params![rating, now, path],
         )?;
         Ok(())
     }
@@ -156,5 +164,6 @@ fn map_sorted_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
         rating: row.get(4)?,
         last_viewed: row.get(5)?,
         date_added: row.get(6)?,
+        last_rated: row.get(7)?,
     })
 }

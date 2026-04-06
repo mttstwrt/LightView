@@ -89,7 +89,7 @@ export type TagNamespace = "user" | "auto" | `plugin.${string}` | "any";
 // Sort and group types (mirrors Rust sort module)
 // ---------------------------------------------------------------------------
 
-export type SortField = "date" | "size" | "name" | "rating" | "media_type" | "lastviewed" | "dateadded";
+export type SortField = "date" | "size" | "name" | "rating" | "media_type" | "lastviewed" | "dateadded" | "lastrated";
 export type SortOrder = "asc" | "desc";
 
 export type GroupBy =
@@ -118,6 +118,7 @@ export interface SortedItem {
   rating: number | null;
   last_viewed: number | null;
   date_added: number | null;
+  last_rated: number | null;
 }
 
 // ---------------------------------------------------------------------------

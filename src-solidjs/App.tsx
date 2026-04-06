@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
-import { openGallery, getSortedItems, getRecentGalleries, removeRecentGallery, type RecentGallery } from "./lib/ipc";
+import { openGallery, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, type RecentGallery } from "./lib/ipc";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
@@ -210,6 +210,12 @@ export function App() {
         prevImage();
       } else if (e.key === "i" || e.key === "I") {
         toggleInfoPanel();
+      } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const paths = displayPaths();
+        const idx = viewerIndex();
+        if (idx >= 0 && idx < paths.length) {
+          setRating(paths[idx], Number(e.key)).catch(() => {});
+        }
       }
     } else {
       if (e.key === "Escape") {

@@ -13,6 +13,7 @@ const SORT_OPTIONS: { field: SortField; label: string }[] = [
   { field: "media_type", label: "Type" },
   { field: "lastviewed", label: "Recently Viewed" },
   { field: "dateadded", label: "Date Added" },
+  { field: "lastrated", label: "Recently Rated" },
 ];
 
 export function SortMenu() {

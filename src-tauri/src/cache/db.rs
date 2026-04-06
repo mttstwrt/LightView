@@ -13,7 +13,7 @@ pub enum CacheError {
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -102,6 +102,13 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_meta_date_added ON media_meta(date_added DESC);
         ",
     },
+    Migration {
+        version: 4,
+        sql: "
+            ALTER TABLE media_meta ADD COLUMN last_rated INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_meta_last_rated ON media_meta(last_rated DESC);
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.
@@ -158,6 +165,15 @@ fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
 
     if !has_last_viewed {
         return 2;
+    }
+
+    // v3 columns exist — check for v4 columns.
+    let has_last_rated = conn
+        .execute("SELECT last_rated FROM media_meta LIMIT 0", [])
+        .is_ok();
+
+    if !has_last_rated {
+        return 3;
     }
 
     // Everything present — fully up to date.
