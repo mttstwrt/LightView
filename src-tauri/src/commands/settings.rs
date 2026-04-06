@@ -23,6 +23,8 @@ pub struct DebugInfo {
     pub atlas_entry_count: usize,
     pub sqlite_thumbnail_count: u64,
     pub gpu_resize_active: bool,
+    pub gdk_backend: String,
+    pub webkit_disable_dmabuf: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +275,10 @@ pub async fn get_debug_info(
         atlas_entry_count: atlas_entries,
         sqlite_thumbnail_count: sqlite_thumbs,
         gpu_resize_active: gpu_active,
+        gdk_backend: std::env::var("GDK_BACKEND").unwrap_or_default(),
+        webkit_disable_dmabuf: std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER")
+            .map(|v| v == "1")
+            .unwrap_or(false),
     })
 }
 

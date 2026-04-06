@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
-import { settings, sortField, sortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
+import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
 import { openGallery, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, type RecentGallery } from "./lib/ipc";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { MediaViewer } from "./components/viewer/MediaViewer";
@@ -173,7 +173,7 @@ export function App() {
       // Restore per-gallery settings from .lightview folder
       await loadSettingsFromGallery();
 
-      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
+      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
       setSortedItems(sorted.items);
       setDisplayPaths(sorted.items.map((item) => item.path));
     } catch (e) {
@@ -211,10 +211,15 @@ export function App() {
       } else if (e.key === "i" || e.key === "I") {
         toggleInfoPanel();
       } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+        e.preventDefault();
         const paths = displayPaths();
         const idx = viewerIndex();
         if (idx >= 0 && idx < paths.length) {
-          setRating(paths[idx], Number(e.key)).catch(() => {});
+          const newRating = Number(e.key);
+          setRating(paths[idx], newRating).catch(() => {});
+          window.dispatchEvent(new CustomEvent("lightview:rating-changed", { detail: { path: paths[idx], rating: newRating } }));
         }
       }
     } else {

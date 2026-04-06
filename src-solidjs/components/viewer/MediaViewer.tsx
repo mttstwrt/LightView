@@ -313,6 +313,16 @@ function InfoPanel(props: { path: string; filename: string }) {
   const userTags = () => tags().filter((t) => t.namespace === "user");
   const otherTags = () => tags().filter((t) => t.namespace !== "user");
 
+  // Listen for rating changes from keyboard hotkeys (dispatched by App.tsx)
+  const onRatingChanged = (e: Event) => {
+    const { path, rating: newRating } = (e as CustomEvent).detail;
+    if (path === props.path) {
+      setRating(newRating);
+    }
+  };
+  window.addEventListener("lightview:rating-changed", onRatingChanged);
+  onCleanup(() => window.removeEventListener("lightview:rating-changed", onRatingChanged));
+
   let panelRef: HTMLDivElement | undefined;
 
   return (

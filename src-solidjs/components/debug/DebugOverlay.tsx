@@ -208,6 +208,8 @@ export function DebugOverlay() {
               <div>Prefetch: <span class="text-neutral-100">{hwInfo()!.prefetch_count}</span></div>
               <div>LRU cache: <span class="text-neutral-100">{hwInfo()!.lru_cache_size}</span></div>
               <div>Reflink: <span class={hwInfo()!.supports_reflink ? "text-green-400" : "text-neutral-500"}>{hwInfo()!.supports_reflink ? "yes" : "no"}</span></div>
+              <div>GDK_BACKEND: <span class="text-neutral-100">{hwInfo()!.gdk_backend || "unset"}</span></div>
+              <div>DMABUF disabled: <span class={hwInfo()!.webkit_disable_dmabuf ? "text-yellow-400" : "text-neutral-500"}>{hwInfo()!.webkit_disable_dmabuf ? "yes" : "no"}</span></div>
             </div>
             <button class="mt-2 text-neutral-500 hover:text-neutral-300 cursor-pointer" onClick={loadHw}>refresh</button>
           </Show>

@@ -10,7 +10,7 @@ import {
   clearAllFilters,
 } from "../../stores/filterStore";
 import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
-import { sortField, sortOrder, groupBy } from "../../stores/settingsStore";
+import { sortField, sortOrder, subSortField, subSortOrder, groupBy } from "../../stores/settingsStore";
 import { autocompleteTags, applyFilter, clearFilter, getSortedItems } from "../../lib/ipc";
 
 export function FilterBar() {
@@ -134,11 +134,11 @@ export function FilterBar() {
     try {
       if (query) {
         const filteredPaths = await applyFilter(query);
-        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filteredPaths);
+        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filteredPaths, subSortField(), subSortOrder());
         setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       } else {
-        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
+        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
         setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       }
@@ -151,7 +151,7 @@ export function FilterBar() {
     clearAllFilters();
     try {
       await clearFilter();
-      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy());
+      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
       setSortedItems(sorted.items);
       setDisplayPaths(sorted.items.map((item) => item.path));
     } catch {}

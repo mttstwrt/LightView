@@ -36,20 +36,9 @@ pub struct SortedItem {
 }
 
 impl CacheDb {
-    /// Get all media items sorted by the specified field and order.
-    /// If `filter_paths` is Some, only return items in that set.
-    pub fn get_sorted_items(
-        &self,
-        sort_field: &SortField,
-        sort_order: &SortOrder,
-        filter_paths: Option<&[String]>,
-    ) -> Result<Vec<SortedItem>, CacheError> {
-        let order = match sort_order {
-            SortOrder::Asc => "ASC",
-            SortOrder::Desc => "DESC",
-        };
-
-        let order_clause = match sort_field {
+    /// Build an ORDER BY expression for a single sort field + direction.
+    fn order_expr(field: &SortField, order: &str) -> String {
+        match field {
             SortField::Date => format!("date_taken {} NULLS LAST", order),
             SortField::Size => format!("file_size {}", order),
             SortField::Name => format!("path {}", order),
@@ -58,7 +47,35 @@ impl CacheDb {
             SortField::LastViewed => format!("last_viewed {} NULLS LAST", order),
             SortField::DateAdded => format!("date_added {} NULLS LAST", order),
             SortField::LastRated => format!("last_rated {} NULLS LAST", order),
+        }
+    }
+
+    /// Get all media items sorted by the specified field and order,
+    /// with an optional secondary sort (tiebreaker within equal primary values).
+    /// If `filter_paths` is Some, only return items in that set.
+    pub fn get_sorted_items(
+        &self,
+        sort_field: &SortField,
+        sort_order: &SortOrder,
+        sub_sort_field: Option<&SortField>,
+        sub_sort_order: Option<&SortOrder>,
+        filter_paths: Option<&[String]>,
+    ) -> Result<Vec<SortedItem>, CacheError> {
+        let order = match sort_order {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
         };
+
+        let mut order_clause = Self::order_expr(sort_field, order);
+
+        if let Some(sub_field) = sub_sort_field {
+            let sub_order = match sub_sort_order.unwrap_or(&SortOrder::Desc) {
+                SortOrder::Asc => "ASC",
+                SortOrder::Desc => "DESC",
+            };
+            order_clause.push_str(", ");
+            order_clause.push_str(&Self::order_expr(sub_field, sub_order));
+        }
 
         let cols = "path, date_taken, file_size, media_type, rating, last_viewed, date_added, last_rated";
         let sql = if filter_paths.is_some() {

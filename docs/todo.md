@@ -1,9 +1,5 @@
 
-- Add 'recently viewed' and 'date added to gallery' tracking and sort options.
-
-- Add 'recently rated' tracking and sort option. Additionally, allow number keys to be used to rate, if an image is focused hitting '3' will rate it '3 stars'
-
-- Add subfilters ie. primarily sort by rating, then within ratings sort by date.
+- Allow number keys to be used to rate, if an image is focused hitting '3' will rate it '3 stars'
 
 - Move the Star filter UI to the other side of the filter bar next to the sort buttons.
 
@@ -22,7 +18,7 @@
 - Improve scroll bar date label placement, larger labels for start of each year, smaller labels for each month?
 
 - Abstract ALL constants into a defined file, settings should be able to control some of these
-
+  
 - Make debug menu properly show number of cached images
 
 - If an image is deleted from a directory by the user or another program the thumbnail shows up in the UI, and clicking fails to load. Need some mechanism to verify the underlying image actually still exists without impacting performance.

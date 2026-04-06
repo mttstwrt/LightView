@@ -167,13 +167,17 @@ export const getSortedItems = (
   sortField: SortField,
   sortOrder: SortOrder,
   groupBy: GroupBy,
-  filterPaths?: string[]
+  filterPaths?: string[],
+  subSortField?: SortField,
+  subSortOrder?: SortOrder,
 ) =>
   invoke<SortedResult>("get_sorted_items", {
     sortField,
     sortOrder,
     groupBy,
     filterPaths,
+    subSortField,
+    subSortOrder,
   });
 
 export const getTimelineIndex = (itemsPerRow: number) =>
@@ -298,6 +302,8 @@ export interface DebugInfo {
   atlas_entry_count: number;
   sqlite_thumbnail_count: number;
   gpu_resize_active: boolean;
+  gdk_backend: string;
+  webkit_disable_dmabuf: boolean;
 }
 
 export const getDebugInfo = () =>

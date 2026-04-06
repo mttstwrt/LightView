@@ -100,6 +100,8 @@ export { settings };
 
 const [sortField, setSortField] = createSignal<SortField>("date");
 const [sortOrder, setSortOrder] = createSignal<SortOrder>("desc");
+const [subSortField, setSubSortField] = createSignal<SortField>("date");
+const [subSortOrder, setSubSortOrder] = createSignal<SortOrder>("desc");
 const [groupBy, setGroupBy] = createSignal<GroupBy>({ type: "time_period", granularity: "month" });
 
-export { sortField, setSortField, sortOrder, setSortOrder, groupBy, setGroupBy };
+export { sortField, setSortField, sortOrder, setSortOrder, subSortField, setSubSortField, subSortOrder, setSubSortOrder, groupBy, setGroupBy };

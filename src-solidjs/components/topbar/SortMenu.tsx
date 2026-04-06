@@ -1,5 +1,5 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
-import { sortField, setSortField, sortOrder, setSortOrder, groupBy } from "../../stores/settingsStore";
+import { sortField, setSortField, sortOrder, setSortOrder, subSortField, setSubSortField, subSortOrder, setSubSortOrder, groupBy } from "../../stores/settingsStore";
 import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
 import { buildFilterQuery } from "../../stores/filterStore";
 import { getSortedItems, applyFilter } from "../../lib/ipc";
@@ -16,6 +16,10 @@ const SORT_OPTIONS: { field: SortField; label: string }[] = [
   { field: "lastrated", label: "Recently Rated" },
 ];
 
+function defaultOrder(field: SortField): SortOrder {
+  return field === "name" || field === "media_type" ? "asc" : "desc";
+}
+
 export function SortMenu() {
   const [open, setOpen] = createSignal(false);
 
@@ -30,18 +34,25 @@ export function SortMenu() {
   window.addEventListener("keydown", handleKey, true);
   onCleanup(() => window.removeEventListener("keydown", handleKey, true));
 
-  const reSort = async (field: SortField, order: SortOrder) => {
+  const reSort = async (
+    field: SortField,
+    order: SortOrder,
+    subField: SortField,
+    subOrder: SortOrder,
+  ) => {
     setSortField(field);
     setSortOrder(order);
+    setSubSortField(subField);
+    setSubSortOrder(subOrder);
     try {
       const query = buildFilterQuery();
       if (query) {
         const filteredPaths = await applyFilter(query);
-        const sorted = await getSortedItems(field, order, groupBy(), filteredPaths);
+        const sorted = await getSortedItems(field, order, groupBy(), filteredPaths, subField, subOrder);
         setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       } else {
-        const sorted = await getSortedItems(field, order, groupBy());
+        const sorted = await getSortedItems(field, order, groupBy(), undefined, subField, subOrder);
         setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       }
@@ -52,22 +63,36 @@ export function SortMenu() {
 
   const handleSelectField = (field: SortField) => {
     if (field === sortField()) {
-      // Toggle order
+      // Toggle primary order
       const newOrder = sortOrder() === "desc" ? "asc" : "desc";
-      reSort(field, newOrder);
+      reSort(field, newOrder, subSortField(), subSortOrder());
     } else {
-      // New field, default asc for name/type, desc for everything else
-      const defaultOrder: SortOrder =
-        field === "name" || field === "media_type" ? "asc" : "desc";
-      reSort(field, defaultOrder);
+      // New primary field — reset sub-sort to date desc
+      reSort(field, defaultOrder(field), "date", "desc");
     }
     setOpen(false);
+  };
+
+  const handleSelectSubField = (field: SortField) => {
+    if (field === subSortField()) {
+      // Toggle sub order
+      const newOrder = subSortOrder() === "desc" ? "asc" : "desc";
+      reSort(sortField(), sortOrder(), field, newOrder);
+    } else {
+      reSort(sortField(), sortOrder(), field, defaultOrder(field));
+    }
   };
 
   const currentLabel = () =>
     SORT_OPTIONS.find((o) => o.field === sortField())?.label ?? "Sort";
 
-  const orderIcon = () => (sortOrder() === "desc" ? "\u2193" : "\u2191");
+  const subLabel = () =>
+    SORT_OPTIONS.find((o) => o.field === subSortField())?.label ?? "";
+
+  const orderIcon = (order: SortOrder) => (order === "desc" ? "\u2193" : "\u2191");
+
+  // Sub-sort options: everything except the current primary field
+  const subOptions = () => SORT_OPTIONS.filter((o) => o.field !== sortField());
 
   return (
     <div class="relative">
@@ -77,26 +102,33 @@ export function SortMenu() {
         title="Sort"
       >
         <span>{currentLabel()}</span>
-        <span class="text-neutral-500">{orderIcon()}</span>
+        <span class="text-neutral-500">{orderIcon(sortOrder())}</span>
+        <span class="text-neutral-600 mx-0.5">/</span>
+        <span class="text-neutral-500">{subLabel()}</span>
+        <span class="text-neutral-600">{orderIcon(subSortOrder())}</span>
       </button>
 
       <Show when={open()}>
         <div class="fixed inset-0 z-40" onClick={() => setOpen(false)} />
 
         <div
-          class="absolute top-full right-0 mt-2 min-w-[140px] rounded-lg overflow-hidden shadow-xl z-50"
+          class="absolute top-full right-0 mt-2 min-w-[220px] rounded-lg overflow-hidden shadow-xl z-50"
           style={{
             background: "rgba(18, 18, 18, 0.96)",
             "backdrop-filter": "blur(16px)",
             border: "1px solid rgba(255,255,255,0.08)",
           }}
         >
+          {/* Primary sort */}
+          <div class="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-neutral-500">
+            Sort by
+          </div>
           <For each={SORT_OPTIONS}>
             {(opt) => {
               const isActive = () => sortField() === opt.field;
               return (
                 <button
-                  class="w-full text-left px-3 py-2 text-xs flex items-center justify-between cursor-pointer transition-colors"
+                  class="w-full text-left px-3 py-1.5 text-xs flex items-center justify-between cursor-pointer transition-colors"
                   classList={{
                     "text-teal-300 bg-teal-900/20": isActive(),
                     "text-neutral-300 hover:bg-neutral-700/50": !isActive(),
@@ -105,7 +137,35 @@ export function SortMenu() {
                 >
                   <span>{opt.label}</span>
                   <Show when={isActive()}>
-                    <span class="text-teal-400/70">{orderIcon()}</span>
+                    <span class="text-teal-400/70">{orderIcon(sortOrder())}</span>
+                  </Show>
+                </button>
+              );
+            }}
+          </For>
+
+          {/* Divider */}
+          <div class="mx-2 my-1 border-t border-neutral-700/50" />
+
+          {/* Sub-sort */}
+          <div class="px-3 pt-1 pb-1 text-[10px] uppercase tracking-wider text-neutral-500">
+            Then by
+          </div>
+          <For each={subOptions()}>
+            {(opt) => {
+              const isActive = () => subSortField() === opt.field;
+              return (
+                <button
+                  class="w-full text-left px-3 py-1.5 text-xs flex items-center justify-between cursor-pointer transition-colors"
+                  classList={{
+                    "text-teal-300 bg-teal-900/20": isActive(),
+                    "text-neutral-300 hover:bg-neutral-700/50": !isActive(),
+                  }}
+                  onClick={() => handleSelectSubField(opt.field)}
+                >
+                  <span>{opt.label}</span>
+                  <Show when={isActive()}>
+                    <span class="text-teal-400/70">{orderIcon(subSortOrder())}</span>
                   </Show>
                 </button>
               );
