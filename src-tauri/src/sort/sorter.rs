@@ -10,6 +10,8 @@ pub enum SortField {
     Name,
     Rating,
     MediaType,
+    LastViewed,
+    DateAdded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +29,8 @@ pub struct SortedItem {
     pub file_size: i64,
     pub media_type: String,
     pub rating: Option<u8>,
+    pub last_viewed: Option<i64>,
+    pub date_added: Option<i64>,
 }
 
 impl CacheDb {
@@ -49,20 +53,22 @@ impl CacheDb {
             SortField::Name => format!("path {}", order),
             SortField::Rating => format!("rating {} NULLS LAST", order),
             SortField::MediaType => format!("media_type {}", order),
+            SortField::LastViewed => format!("last_viewed {} NULLS LAST", order),
+            SortField::DateAdded => format!("date_added {} NULLS LAST", order),
         };
 
         let sql = if filter_paths.is_some() {
             // Use a temporary approach: build IN clause
             // For large sets, the caller should use SQL-based filtering instead.
             format!(
-                "SELECT path, date_taken, file_size, media_type, rating FROM media_meta 
+                "SELECT path, date_taken, file_size, media_type, rating, last_viewed, date_added FROM media_meta
                  WHERE path IN (SELECT value FROM json_each(?1))
                  ORDER BY {}",
                 order_clause
             )
         } else {
             format!(
-                "SELECT path, date_taken, file_size, media_type, rating FROM media_meta ORDER BY {}",
+                "SELECT path, date_taken, file_size, media_type, rating, last_viewed, date_added FROM media_meta ORDER BY {}",
                 order_clause
             )
         };
@@ -93,6 +99,7 @@ impl CacheDb {
     }
 
     /// Insert or update media metadata for a file.
+    /// Preserves `date_added` on update; sets it to now on first insert.
     pub fn upsert_media_meta(
         &self,
         path: &str,
@@ -104,10 +111,37 @@ impl CacheDb {
         duration: Option<f64>,
         rating: Option<u8>,
     ) -> Result<(), CacheError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
         self.conn().execute(
-            "INSERT OR REPLACE INTO media_meta (path, date_taken, file_size, media_type, width, height, duration, rating)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![path, date_taken, file_size, media_type, width, height, duration, rating],
+            "INSERT INTO media_meta (path, date_taken, file_size, media_type, width, height, duration, rating, date_added)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO UPDATE SET
+               date_taken = excluded.date_taken,
+               file_size = excluded.file_size,
+               media_type = excluded.media_type,
+               width = excluded.width,
+               height = excluded.height,
+               duration = excluded.duration,
+               rating = excluded.rating",
+            rusqlite::params![path, date_taken, file_size, media_type, width, height, duration, rating, now],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a media item was viewed (sets last_viewed to now).
+    pub fn record_view(&self, path: &str) -> Result<(), CacheError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        self.conn().execute(
+            "UPDATE media_meta SET last_viewed = ?1 WHERE path = ?2",
+            rusqlite::params![now, path],
         )?;
         Ok(())
     }
@@ -120,5 +154,7 @@ fn map_sorted_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
         file_size: row.get(2)?,
         media_type: row.get(3)?,
         rating: row.get(4)?,
+        last_viewed: row.get(5)?,
+        date_added: row.get(6)?,
     })
 }

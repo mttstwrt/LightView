@@ -298,6 +298,7 @@ fn main() {
 
             // Viewer commands (GPU-accelerated transforms)
             commands::viewer::get_transformed_media,
+            commands::viewer::record_view,
 
             // GPU capability notification
             lightview_lib::pipeline::gpu::notify_gpu_capabilities,

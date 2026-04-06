@@ -8,6 +8,222 @@ pub enum CacheError {
     Io(#[from] std::io::Error),
 }
 
+// ---------------------------------------------------------------------------
+// Schema migrations
+// ---------------------------------------------------------------------------
+
+/// Current schema version. Bump this when adding a new migration.
+const SCHEMA_VERSION: u32 = 3;
+
+/// Base tables created on a fresh database (version 0 → 1).
+const BASE_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS gallery_meta (
+        key     TEXT PRIMARY KEY,
+        value   TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS thumbnails (
+        path         TEXT PRIMARY KEY,
+        media_type   TEXT NOT NULL,
+        mtime        INTEGER NOT NULL,
+        width        INTEGER NOT NULL,
+        height       INTEGER NOT NULL,
+        thumbnail    BLOB NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS tag_index (
+        path        TEXT NOT NULL,
+        namespace   TEXT NOT NULL,
+        tag         TEXT NOT NULL,
+        PRIMARY KEY (path, namespace, tag)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tag_ns ON tag_index(namespace, tag);
+    CREATE INDEX IF NOT EXISTS idx_tag_value ON tag_index(tag);
+
+    CREATE TABLE IF NOT EXISTS tag_counts (
+        namespace   TEXT NOT NULL,
+        tag         TEXT NOT NULL,
+        count       INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (namespace, tag)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tag_counts_pop ON tag_counts(count DESC);
+
+    CREATE TABLE IF NOT EXISTS file_hashes (
+        path        TEXT PRIMARY KEY,
+        hash        TEXT NOT NULL,
+        mtime       INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_hash ON file_hashes(hash);
+
+    CREATE TABLE IF NOT EXISTS index_state (
+        path                TEXT PRIMARY KEY,
+        companion_mtime     INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS media_meta (
+        path          TEXT PRIMARY KEY,
+        date_taken    INTEGER,
+        file_size     INTEGER NOT NULL,
+        media_type    TEXT NOT NULL,
+        width         INTEGER,
+        height        INTEGER,
+        duration      REAL,
+        rating        INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_meta_date ON media_meta(date_taken DESC);
+    CREATE INDEX IF NOT EXISTS idx_meta_size ON media_meta(file_size DESC);
+    CREATE INDEX IF NOT EXISTS idx_meta_type ON media_meta(media_type);
+";
+
+struct Migration {
+    version: u32,
+    sql: &'static str,
+}
+
+/// Ordered list of migrations. Each entry brings the schema from
+/// `version - 1` to `version`. Migrations must be idempotent (use
+/// `IF NOT EXISTS`, `ADD COLUMN` with error-ignore, etc.) so that
+/// a crash mid-migration can be retried safely.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 2,
+        sql: "
+            ALTER TABLE thumbnails ADD COLUMN format TEXT NOT NULL DEFAULT 'jpeg';
+            ALTER TABLE thumbnails ADD COLUMN resize_filter TEXT NOT NULL DEFAULT 'nearest';
+            ALTER TABLE thumbnails ADD COLUMN phash INTEGER;
+        ",
+    },
+    Migration {
+        version: 3,
+        sql: "
+            ALTER TABLE media_meta ADD COLUMN last_viewed INTEGER;
+            ALTER TABLE media_meta ADD COLUMN date_added INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_meta_last_viewed ON media_meta(last_viewed DESC);
+            CREATE INDEX IF NOT EXISTS idx_meta_date_added ON media_meta(date_added DESC);
+        ",
+    },
+];
+
+/// Read the current schema version from `gallery_meta`.
+/// Returns 0 if the table doesn't exist or has no version entry.
+fn get_schema_version(conn: &rusqlite::Connection) -> u32 {
+    conn.query_row(
+        "SELECT value FROM gallery_meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse::<u32>().ok())
+    .unwrap_or(0)
+}
+
+fn set_schema_version(conn: &rusqlite::Connection, version: u32) -> Result<(), CacheError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO gallery_meta (key, value) VALUES ('schema_version', ?1)",
+        rusqlite::params![version.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Detect if this is a pre-versioned database by checking for tables
+/// that only exist after the base schema was applied.
+fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
+    // If media_meta doesn't exist, this is a completely fresh DB.
+    let has_media_meta: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_meta'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !has_media_meta {
+        return 0;
+    }
+
+    // media_meta exists — check if the v2 thumbnail columns are present.
+    let has_thumb_format = conn
+        .execute("SELECT format FROM thumbnails LIMIT 0", [])
+        .is_ok();
+
+    if !has_thumb_format {
+        return 1; // base schema only
+    }
+
+    // v2 columns exist — check for v3 columns.
+    let has_last_viewed = conn
+        .execute("SELECT last_viewed FROM media_meta LIMIT 0", [])
+        .is_ok();
+
+    if !has_last_viewed {
+        return 2;
+    }
+
+    // Everything present — fully up to date.
+    SCHEMA_VERSION
+}
+
+/// Run all pending migrations to bring the database up to `SCHEMA_VERSION`.
+fn run_migrations(conn: &rusqlite::Connection) -> Result<(), CacheError> {
+    let mut version = get_schema_version(conn);
+
+    // Handle databases created before the migration system existed.
+    if version == 0 {
+        let detected = detect_legacy_version(conn);
+        if detected == 0 {
+            // Fresh database — create all base tables.
+            conn.execute_batch(BASE_SCHEMA)?;
+            version = 1;
+        } else {
+            // Existing database without a version stamp.
+            version = detected;
+        }
+        set_schema_version(conn, version)?;
+    }
+
+    // Apply each migration whose version is greater than current.
+    for migration in MIGRATIONS {
+        if migration.version <= version {
+            continue;
+        }
+
+        log::info!(
+            "Running cache schema migration v{} → v{}",
+            version,
+            migration.version
+        );
+
+        // Execute each statement individually so that "duplicate column"
+        // errors on partially-applied migrations don't abort the batch.
+        for statement in migration.sql.split(';') {
+            let trimmed = statement.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Err(e) = conn.execute_batch(trimmed) {
+                // ALTER TABLE ADD COLUMN fails if the column already exists
+                // (e.g. crash during a previous migration attempt). This is
+                // expected and safe to ignore.
+                let msg = e.to_string();
+                if msg.contains("duplicate column") {
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+
+        version = migration.version;
+        set_schema_version(conn, version)?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CacheDb
+// ---------------------------------------------------------------------------
+
 /// SQLite cache database for thumbnails, tag index, media metadata, and counts.
 pub struct CacheDb {
     conn: rusqlite::Connection,
@@ -16,6 +232,7 @@ pub struct CacheDb {
 impl CacheDb {
     /// Open (or create) the cache database for a gallery.
     /// Creates the `.lightview/` directory if it doesn't exist.
+    /// Runs any pending schema migrations automatically.
     pub fn open(gallery_path: &Path) -> Result<Self, CacheError> {
         let lightview_dir = gallery_path.join(".lightview");
         if !lightview_dir.exists() {
@@ -30,81 +247,16 @@ impl CacheDb {
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch("PRAGMA cache_size=-64000;")?; // 64MB cache
 
-        // Create all tables
+        // Ensure gallery_meta exists before anything else — migrations
+        // need it to read/write the schema version.
         conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS thumbnails (
-                path         TEXT PRIMARY KEY,
-                media_type   TEXT NOT NULL,
-                mtime        INTEGER NOT NULL,
-                width        INTEGER NOT NULL,
-                height       INTEGER NOT NULL,
-                thumbnail    BLOB NOT NULL,
-                format       TEXT NOT NULL DEFAULT 'jpeg',
-                resize_filter TEXT NOT NULL DEFAULT 'nearest'
-            );
-
-            CREATE TABLE IF NOT EXISTS tag_index (
-                path        TEXT NOT NULL,
-                namespace   TEXT NOT NULL,
-                tag         TEXT NOT NULL,
-                PRIMARY KEY (path, namespace, tag)
-            );
-            CREATE INDEX IF NOT EXISTS idx_tag_ns ON tag_index(namespace, tag);
-            CREATE INDEX IF NOT EXISTS idx_tag_value ON tag_index(tag);
-
-            CREATE TABLE IF NOT EXISTS tag_counts (
-                namespace   TEXT NOT NULL,
-                tag         TEXT NOT NULL,
-                count       INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (namespace, tag)
-            );
-            CREATE INDEX IF NOT EXISTS idx_tag_counts_pop ON tag_counts(count DESC);
-
-            CREATE TABLE IF NOT EXISTS file_hashes (
-                path        TEXT PRIMARY KEY,
-                hash        TEXT NOT NULL,
-                mtime       INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_hash ON file_hashes(hash);
-
-            CREATE TABLE IF NOT EXISTS index_state (
-                path                TEXT PRIMARY KEY,
-                companion_mtime     INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS media_meta (
-                path          TEXT PRIMARY KEY,
-                date_taken    INTEGER,
-                file_size     INTEGER NOT NULL,
-                media_type    TEXT NOT NULL,
-                width         INTEGER,
-                height        INTEGER,
-                duration      REAL,
-                rating        INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_meta_date ON media_meta(date_taken DESC);
-            CREATE INDEX IF NOT EXISTS idx_meta_size ON media_meta(file_size DESC);
-            CREATE INDEX IF NOT EXISTS idx_meta_type ON media_meta(media_type);
-
-            CREATE TABLE IF NOT EXISTS gallery_meta (
+            "CREATE TABLE IF NOT EXISTS gallery_meta (
                 key     TEXT PRIMARY KEY,
                 value   TEXT NOT NULL
-            );
-            ",
+            );",
         )?;
 
-        // Migrate: add format and resize_filter columns to existing thumbnails tables
-        let _ = conn.execute_batch(
-            "ALTER TABLE thumbnails ADD COLUMN format TEXT NOT NULL DEFAULT 'jpeg'",
-        );
-        let _ = conn.execute_batch(
-            "ALTER TABLE thumbnails ADD COLUMN resize_filter TEXT NOT NULL DEFAULT 'nearest'",
-        );
-        // Migrate: add perceptual hash column for duplicate detection
-        let _ = conn.execute_batch(
-            "ALTER TABLE thumbnails ADD COLUMN phash INTEGER",
-        );
+        run_migrations(&conn)?;
 
         Ok(Self { conn })
     }

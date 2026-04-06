@@ -11,6 +11,8 @@ const SORT_OPTIONS: { field: SortField; label: string }[] = [
   { field: "size", label: "Size" },
   { field: "rating", label: "Rating" },
   { field: "media_type", label: "Type" },
+  { field: "lastviewed", label: "Recently Viewed" },
+  { field: "dateadded", label: "Date Added" },
 ];
 
 export function SortMenu() {
@@ -53,7 +55,7 @@ export function SortMenu() {
       const newOrder = sortOrder() === "desc" ? "asc" : "desc";
       reSort(field, newOrder);
     } else {
-      // New field, default desc for date/rating/size, asc for name/type
+      // New field, default asc for name/type, desc for everything else
       const defaultOrder: SortOrder =
         field === "name" || field === "media_type" ? "asc" : "desc";
       reSort(field, defaultOrder);

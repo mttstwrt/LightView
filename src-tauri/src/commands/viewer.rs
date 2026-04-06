@@ -3,6 +3,17 @@ use serde::Deserialize;
 
 use crate::AppState;
 
+/// Record that a media item was viewed (updates last_viewed timestamp).
+#[tauri::command]
+pub async fn record_view(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    db.record_view(&path).map_err(|e| e.to_string())
+}
+
 /// Image transform parameters for GPU-accelerated viewer adjustments.
 #[derive(Debug, Deserialize)]
 pub struct ImageTransform {

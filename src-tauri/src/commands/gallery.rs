@@ -27,10 +27,15 @@ fn populate_media_meta(
         .map_err(|e| e.to_string())?;
 
     {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
         let mut stmt = tx
             .prepare_cached(
-                "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, width, height, duration)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL)",
+                "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, width, height, duration, date_added)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)",
             )
             .map_err(|e| e.to_string())?;
 
@@ -51,6 +56,7 @@ fn populate_media_meta(
                 entry.mtime as i64,
                 entry.size as i64,
                 media_type,
+                now,
             ])
             .map_err(|e| e.to_string())?;
         }

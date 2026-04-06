@@ -351,6 +351,9 @@ export interface ImageTransform {
 export const getTransformedMedia = (path: string, transform: ImageTransform) =>
   invoke<string>("get_transformed_media", { path, transform });
 
+export const recordView = (path: string) =>
+  invoke<void>("record_view", { path });
+
 // ---------------------------------------------------------------------------
 // GPU
 // ---------------------------------------------------------------------------
