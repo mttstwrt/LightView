@@ -2,6 +2,9 @@ use lightview_lib::AppState;
 use lightview_lib::commands;
 use tauri::{Emitter, Manager};
 
+use memmap2::Mmap;
+use std::io::{Read, Seek, SeekFrom};
+
 
 enum Route {
     Thumb,
@@ -58,31 +61,13 @@ fn serve_thumbnail(
 
     match result {
         Ok((data, width, height, format)) => {
-            if format == "rgba" {
-                // Transcode RGBA→JPEG on-the-fly instead of serving raw pixels
-                match lightview_lib::pipeline::thumbnailer::encode_rgba_to_jpeg(&data, width, height) {
-                    Ok(jpeg) => tauri::http::Response::builder()
-                        .status(200)
-                        .header("Content-Type", "image/jpeg")
-                        .header("Cache-Control", "no-cache")
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(jpeg)
-                        .unwrap(),
-                    Err(_) => tauri::http::Response::builder()
-                        .status(500)
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(Vec::new())
-                        .unwrap(),
-                }
-            } else {
-                tauri::http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "image/jpeg")
-                    .header("Cache-Control", "no-cache")
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(data)
-                    .unwrap()
-            }
+            tauri::http::Response::builder()
+                .status(200)
+                .header("Content-Type", "image/jpeg")
+                .header("Cache-Control", "no-cache")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(data)
+                .unwrap()
         }
         Err(_) => {
             // Not cached yet — 404, frontend queues for generation
@@ -96,8 +81,10 @@ fn serve_thumbnail(
     }
 }
 
-/// Serve full-resolution media directly as binary. HEIC/HEIF are transcoded to JPEG.
+/// Serve full-resolution media. HEIC/HEIF are transcoded to JPEG.
+/// Supports HTTP Range requests for chunked streaming of large files.
 fn serve_full_media(
+    request: &tauri::http::Request<Vec<u8>>,
     path: &str,
 ) -> tauri::http::Response<Vec<u8>> {
     let ext = std::path::Path::new(path)
@@ -106,7 +93,8 @@ fn serve_full_media(
         .unwrap_or("")
         .to_lowercase();
 
-    // HEIC/HEIF: transcode to JPEG since browsers can't render natively
+    // HEIC/HEIF: transcode to JPEG since browsers can't render natively.
+    // Transcoded content is served in full (Range not applicable since size is unknown upfront).
     if ext == "heic" || ext == "heif" {
         let src_path = std::path::Path::new(path);
         match lightview_lib::pipeline::thumbnailer::decode_heic_to_rgba(src_path) {
@@ -142,7 +130,6 @@ fn serve_full_media(
         }
     }
 
-    // All other formats: read and serve directly
     let mime = match ext.as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
@@ -159,18 +146,114 @@ fn serve_full_media(
         _ => "application/octet-stream",
     };
 
-    match std::fs::read(path) {
-        Ok(data) => tauri::http::Response::builder()
-            .status(200)
-            .header("Content-Type", mime)
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(data)
-            .unwrap(),
+    // Open the file and get its length
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) => {
-            log::error!("Failed to read media file {}: {}", path, e);
-            tauri::http::Response::builder()
+            log::error!("Failed to open media file {}: {}", path, e);
+            return tauri::http::Response::builder()
                 .status(404)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Vec::new())
+                .unwrap();
+        }
+    };
+
+    let len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            log::error!("Failed to read metadata for {}: {}", path, e);
+            return tauri::http::Response::builder()
+                .status(500)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Vec::new())
+                .unwrap();
+        }
+    };
+
+    // Handle Range requests for chunked streaming
+    if let Some(range_header) = request
+        .headers()
+        .get("range")
+        .and_then(|r| r.to_str().ok())
+    {
+        let ranges = match http_range::HttpRange::parse(range_header, len) {
+            Ok(r) => r,
+            Err(_) => {
+                return tauri::http::Response::builder()
+                    .status(416)
+                    .header("Content-Range", format!("bytes */{len}"))
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+        };
+
+        // Only handle the first range (covers all practical browser requests)
+        if let Some(range) = ranges.first() {
+            /// Max bytes per chunk (2 MB)
+            const MAX_CHUNK: u64 = 2 * 1024 * 1024;
+
+            let start = range.start;
+            let mut end = start + range.length - 1;
+
+            if start >= len || end >= len {
+                return tauri::http::Response::builder()
+                    .status(416)
+                    .header("Content-Range", format!("bytes */{len}"))
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            // Clamp to MAX_CHUNK
+            end = start + (end - start).min(MAX_CHUNK - 1);
+            let nbytes = (end + 1 - start) as usize;
+
+            let mut buf = vec![0u8; nbytes];
+            if let Err(e) = file.seek(SeekFrom::Start(start)).and_then(|_| file.read_exact(&mut buf)) {
+                log::error!("Failed to read range {}-{} of {}: {}", start, end, path, e);
+                return tauri::http::Response::builder()
+                    .status(500)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            return tauri::http::Response::builder()
+                .status(206)
+                .header("Content-Type", mime)
+                .header("Accept-Ranges", "bytes")
+                .header("Content-Range", format!("bytes {start}-{end}/{len}"))
+                .header("Content-Length", nbytes.to_string())
+                .header("Cache-Control", "no-cache")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Expose-Headers", "content-range")
+                .body(buf)
+                .unwrap();
+        }
+    }
+
+    // No Range header — serve the full file.
+    // Use mmap to avoid a large heap allocation + potential realloc spikes.
+    // The kernel pages in data on demand, and the mmap is dropped after the
+    // single copy into the response Vec.
+
+    let resp = tauri::http::Response::builder()
+        .status(200)
+        .header("Content-Type", mime)
+        .header("Content-Length", len.to_string())
+        .header("Accept-Ranges", "bytes")
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*");
+
+    // SAFETY: read-only mmap, file handle kept open for the duration of the copy.
+    match unsafe { Mmap::map(&file) } {
+        Ok(mmap) => resp.body(mmap[..].to_vec()).unwrap(),
+        Err(e) => {
+            log::error!("Failed to mmap media file {}: {}", path, e);
+            tauri::http::Response::builder()
+                .status(500)
                 .header("Access-Control-Allow-Origin", "*")
                 .body(Vec::new())
                 .unwrap()
@@ -222,7 +305,7 @@ fn main() {
 
             match route {
                 Route::Thumb => serve_thumbnail(&ctx, &path),
-                Route::Media => serve_full_media(&path),
+                Route::Media => serve_full_media(&request, &path),
                 Route::Unknown => tauri::http::Response::builder()
                     .status(404)
                     .header("Access-Control-Allow-Origin", "*")

@@ -688,17 +688,37 @@ pub async fn regenerate_thumbnail(
 }
 
 /// Get the full-resolution media file as a base64-encoded data URI.
+///
+/// **Prefer the `lightview://media/` protocol** for loading images — it serves
+/// binary data directly without the ~33% Base64 inflation overhead.  This
+/// command exists as a fallback and imposes a 100 MB file-size limit to
+/// prevent OOM crashes from Base64-encoding very large files.
 #[tauri::command]
 pub async fn get_full_media(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<String, String> {
+    /// Maximum file size allowed through this IPC path (100 MB).
+    /// Base64 inflates by ~33%, so a 100 MB file becomes ~133 MB of string.
+    const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
     let gallery_path = state
         .current_gallery
         .read()
         .await
         .clone()
         .ok_or("No gallery open")?;
+
+    // Check file size before reading
+    let file_size = std::fs::metadata(&path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if file_size > MAX_FILE_SIZE {
+        return Err(format!(
+            "File too large for IPC ({:.1} MB). Use the lightview://media/ protocol instead.",
+            file_size as f64 / (1024.0 * 1024.0)
+        ));
+    }
 
     let reg = state.providers.read().await;
     let provider = reg.get(&gallery_path).ok_or("Provider not found")?;

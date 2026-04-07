@@ -209,7 +209,7 @@ export const installPlugin = (path: string) =>
   invoke<PluginInfo>("install_plugin", { path });
 
 // ---------------------------------------------------------------------------
-// File Operations (Copy / Move)
+// File Operations (Copy / Move / Trash)
 // ---------------------------------------------------------------------------
 
 export interface FileOpResult {

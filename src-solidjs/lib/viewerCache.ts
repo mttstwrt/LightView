@@ -26,11 +26,11 @@ interface CacheEntry {
 
 const PRESSURE_CONFIGS: Record<
   PressureLevel,
-  { maxCache: number; preloadRange: number }
+  { maxCache: number; preloadRange: number; maxConcurrentLoads: number }
 > = {
-  normal: { maxCache: 20, preloadRange: 3 },
-  warning: { maxCache: 10, preloadRange: 1 },
-  emergency: { maxCache: 1, preloadRange: 0 },
+  normal: { maxCache: 10, preloadRange: 2, maxConcurrentLoads: 3 },
+  warning: { maxCache: 5, preloadRange: 1, maxConcurrentLoads: 2 },
+  emergency: { maxCache: 1, preloadRange: 0, maxConcurrentLoads: 1 },
 };
 
 export class ViewerImageCache {
@@ -94,9 +94,12 @@ export class ViewerImageCache {
   /**
    * Preload images around the given index. Loads the current image plus
    * adjacent images based on memory pressure level.
+   *
+   * Limits concurrent in-flight loads to avoid saturating memory with
+   * multiple large full-resolution files being fetched simultaneously.
    */
   preload(paths: string[], currentIndex: number) {
-    const { preloadRange } = this.config;
+    const { preloadRange, maxConcurrentLoads } = this.config;
 
     const toLoad: { path: string; distance: number }[] = [];
     for (let offset = -preloadRange; offset <= preloadRange; offset++) {
@@ -108,9 +111,10 @@ export class ViewerImageCache {
       }
     }
 
-    // Load nearest first
+    // Load nearest first, but respect concurrent load limit
     toLoad.sort((a, b) => a.distance - b.distance);
-    for (const { path } of toLoad) {
+    const slotsAvailable = Math.max(0, maxConcurrentLoads - this.pending.size);
+    for (const { path } of toLoad.slice(0, slotsAvailable)) {
       this.loadImage(path);
     }
   }

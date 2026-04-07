@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use memmap2::Mmap;
 use std::path::{Path, PathBuf};
 
 use crate::companion::reader;
@@ -170,16 +169,15 @@ impl FileProvider for LocalProvider {
 
     async fn read_file(&self, path: &str) -> Result<Bytes, ProviderError> {
         let full = self.resolve(path);
-        let file = std::fs::File::open(&full).map_err(|e| {
+        // Read directly into a Vec (single allocation, no mmap+copy double-buffer).
+        let data = std::fs::read(&full).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 ProviderError::NotFound(full.display().to_string())
             } else {
                 ProviderError::Io(e)
             }
         })?;
-        // SAFETY: Read-only mmap, file held open for the duration.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(ProviderError::Io)?;
-        Ok(Bytes::copy_from_slice(&mmap))
+        Ok(Bytes::from(data))
     }
 
     async fn read_companion(

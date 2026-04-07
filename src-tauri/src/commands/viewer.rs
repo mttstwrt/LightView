@@ -41,12 +41,19 @@ fn encode_b64(data: &[u8]) -> String {
 
 /// Get a full-resolution image with GPU-applied transforms (rotation, exposure, etc.).
 /// Returns a JPEG data URI. Falls back to CPU if GPU is unavailable.
+///
+/// Images with more than `MAX_PIXELS` pixels are downsampled before
+/// transforms to prevent OOM from the decoded RGBA buffer.
 #[tauri::command]
 pub async fn get_transformed_media(
     state: tauri::State<'_, AppState>,
     path: String,
     transform: ImageTransform,
 ) -> Result<String, String> {
+    /// Maximum decoded pixel count before we downsample (50 megapixels).
+    /// 50 MP × 4 bytes/pixel = 200 MB of RGBA — a safe upper bound.
+    const MAX_PIXELS: u64 = 50_000_000;
+
     let gallery_path = state
         .current_gallery
         .read()
@@ -69,7 +76,7 @@ pub async fn get_transformed_media(
         .unwrap_or("")
         .to_lowercase();
 
-    let (rgba_data, src_w, src_h) = if ext == "heic" || ext == "heif" {
+    let (mut rgba_data, mut src_w, mut src_h) = if ext == "heic" || ext == "heif" {
         let (rgba, w, h, _, _) = crate::pipeline::thumbnailer::decode_heic_to_rgba(std::path::Path::new(&path))
             .map_err(|e| format!("HEIC decode failed: {}", e))?;
         (rgba, w, h)
@@ -81,6 +88,32 @@ pub async fn get_transformed_media(
         (rgba.into_raw(), w, h)
     };
 
+    // Drop the encoded source data now — we only need RGBA from here on.
+    drop(data);
+
+    // Downsample if the decoded image exceeds the pixel budget
+    let pixel_count = src_w as u64 * src_h as u64;
+    if pixel_count > MAX_PIXELS {
+        let scale = (MAX_PIXELS as f64 / pixel_count as f64).sqrt();
+        let new_w = ((src_w as f64 * scale) as u32).max(1);
+        let new_h = ((src_h as f64 * scale) as u32).max(1);
+        log::info!(
+            "Downsampling {}×{} → {}×{} for transform (exceeded {} MP limit)",
+            src_w, src_h, new_w, new_h, MAX_PIXELS / 1_000_000
+        );
+        let src_img = image::RgbaImage::from_raw(src_w, src_h, rgba_data)
+            .ok_or("Failed to create image buffer for downsampling")?;
+        let resized = image::imageops::resize(
+            &src_img,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Lanczos3,
+        );
+        src_w = new_w;
+        src_h = new_h;
+        rgba_data = resized.into_raw();
+    }
+
     // Compute output dimensions (account for rotation)
     let rotation_rad = transform.rotation_degrees.to_radians();
     let (dst_w, dst_h) = if (transform.rotation_degrees.abs() % 180.0 - 90.0).abs() < 1.0 {
@@ -89,7 +122,7 @@ pub async fn get_transformed_media(
         (src_w, src_h)
     };
 
-    // Try GPU transform
+    // Try GPU transform — pass owned data to avoid a redundant clone
     #[cfg(feature = "gpu")]
     if let Some(ref pipeline) = state.gpu_pipeline {
         use crate::pipeline::gpu_pipeline::TransformParams;
@@ -110,12 +143,11 @@ pub async fn get_transformed_media(
         };
 
         let pipeline_clone = pipeline.clone();
-        let rgba_clone = rgba_data.clone();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
             let result = pipeline_clone.transform_image(
-                &rgba_clone,
+                &rgba_data,
                 src_w,
                 src_h,
                 dst_w,
@@ -126,7 +158,6 @@ pub async fn get_transformed_media(
         });
 
         if let Ok(Some(transformed_rgba)) = rx.await {
-            // Encode transformed RGBA to JPEG
             let jpeg_data = crate::pipeline::thumbnailer::encode_rgba_to_jpeg(
                 &transformed_rgba,
                 dst_w,
@@ -137,7 +168,10 @@ pub async fn get_transformed_media(
             let b64 = encode_b64(&jpeg_data);
             return Ok(format!("data:image/jpeg;base64,{}", b64));
         }
-        // Fall through to CPU path if GPU transform failed
+        // Fall through to CPU path if GPU transform failed.
+        // Note: rgba_data was moved into the closure above, so we need to
+        // return an error rather than silently fall through with no data.
+        return Err("GPU transform failed and RGBA data was consumed".to_string());
     }
 
     // CPU fallback: apply transforms on CPU
