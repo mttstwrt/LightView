@@ -28,6 +28,18 @@ export function MediaViewer(props: MediaViewerProps) {
   // Container ref for direct DOM image swapping
   let imageContainerRef: HTMLDivElement | undefined;
 
+  // Zoom and pan state
+  const [zoom, setZoom] = createSignal(1);
+  const [panX, setPanX] = createSignal(0);
+  const [panY, setPanY] = createSignal(0);
+  const [imgNaturalWidth, setImgNaturalWidth] = createSignal(0);
+  let isDragging = false;
+  let didDrag = false;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let panStartX = 0;
+  let panStartY = 0;
+
   const currentPath = () => props.paths[props.currentIndex] || "";
 
   const filename = () => {
@@ -60,6 +72,7 @@ export function MediaViewer(props: MediaViewerProps) {
       img.style.opacity = "1";
       img.style.position = "relative";
       setLoaded(true);
+      setImgNaturalWidth(img.naturalWidth);
     } else {
       img.style.opacity = "0";
       img.style.position = "absolute";
@@ -68,6 +81,7 @@ export function MediaViewer(props: MediaViewerProps) {
         img.style.opacity = "1";
         img.style.position = "relative";
         setLoaded(true);
+        setImgNaturalWidth(img.naturalWidth);
         // Cache this freshly-loaded element for if the user navigates back
         cache.insert(currentPath(), img);
       };
@@ -86,6 +100,12 @@ export function MediaViewer(props: MediaViewerProps) {
     on(
       () => props.currentIndex,
       (idx) => {
+        // Reset zoom/pan on image change
+        setZoom(1);
+        setPanX(0);
+        setPanY(0);
+        setImgNaturalWidth(0);
+
         const path = props.paths[idx];
         if (!path || isVideo()) {
           setLoaded(false);
@@ -116,16 +136,118 @@ export function MediaViewer(props: MediaViewerProps) {
   );
 
   const handleBackdropClick = (e: MouseEvent) => {
+    if (didDrag) { didDrag = false; return; }
     if (e.target === e.currentTarget) {
       props.onClose();
     }
   };
 
+  // --- Zoom / Pan ---
+
+  const handleWheel = (e: WheelEvent) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+
+    const factor = e.deltaY > 0 ? 1 / 1.15 : 1.15;
+    const newZoom = Math.max(0.1, Math.min(50, zoom() * factor));
+
+    // Zoom toward cursor — keep the point under the cursor fixed
+    const mx = e.clientX - window.innerWidth / 2;
+    const my = e.clientY - window.innerHeight / 2;
+    const ratio = newZoom / zoom();
+    setPanX(mx - (mx - panX()) * ratio);
+    setPanY(my - (my - panY()) * ratio);
+    setZoom(newZoom);
+  };
+
+  const handleMouseDown = (e: MouseEvent) => {
+    if (zoom() <= 1 || e.button !== 0) return;
+    isDragging = true;
+    didDrag = false;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    panStartX = panX();
+    panStartY = panY();
+    e.preventDefault();
+  };
+
+  const handleMouseMove = (e: MouseEvent) => {
+    if (!isDragging) return;
+    const dx = e.clientX - dragStartX;
+    const dy = e.clientY - dragStartY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
+    setPanX(panStartX + dx);
+    setPanY(panStartY + dy);
+  };
+
+  const handleMouseUp = () => {
+    isDragging = false;
+  };
+
+  const handleDblClick = (e: MouseEvent) => {
+    if (isVideo()) return;
+    if (zoom() !== 1) {
+      // Reset to fit
+      setZoom(1);
+      setPanX(0);
+      setPanY(0);
+    } else {
+      // Zoom to 1:1 (one image pixel = one CSS pixel)
+      const img = imageContainerRef?.querySelector("img") as HTMLImageElement | null;
+      if (!img || !img.clientWidth || !img.naturalWidth) return;
+      const targetZoom = img.naturalWidth / img.clientWidth;
+      const mx = e.clientX - window.innerWidth / 2;
+      const my = e.clientY - window.innerHeight / 2;
+      const ratio = targetZoom; // zoom() is 1
+      setPanX(mx - mx * ratio);
+      setPanY(my - my * ratio);
+      setZoom(targetZoom);
+    }
+  };
+
+  // Apply CSS transform reactively
+  createEffect(() => {
+    if (!imageContainerRef) return;
+    const z = zoom();
+    const px = panX();
+    const py = panY();
+    if (z === 1 && px === 0 && py === 0) {
+      imageContainerRef.style.transform = "";
+    } else {
+      imageContainerRef.style.transform = `translate(${px}px, ${py}px) scale(${z})`;
+    }
+  });
+
+  // Pixel ratio: effective display width / natural width
+  const pixelRatioPercent = (): number | null => {
+    const nw = imgNaturalWidth();
+    if (!nw) return null;
+    const img = imageContainerRef?.querySelector("img") as HTMLImageElement | null;
+    if (!img || !img.clientWidth) return null;
+    return (img.clientWidth * zoom() / nw) * 100;
+  };
+
+  const pixelRatioLabel = (): string => {
+    const pct = pixelRatioPercent();
+    if (pct === null) return "";
+    const rounded = Math.round(pct);
+    if (rounded === 100) return " — 1:1";
+    return ` — ${rounded}%`;
+  };
+
   return (
     <div
+      ref={(el) => {
+        el.addEventListener("wheel", handleWheel, { passive: false });
+        onCleanup(() => el.removeEventListener("wheel", handleWheel));
+      }}
       class="fixed inset-0 z-50 flex items-center justify-center"
-      style={{ background: "rgba(0, 0, 0, 0.95)" }}
+      style={{ background: "rgba(0, 0, 0, 0.95)", cursor: zoom() > 1 ? "grab" : "default" }}
       onClick={handleBackdropClick}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onDblClick={handleDblClick}
     >
       {/* Navigation — left */}
       <button
@@ -184,7 +306,7 @@ export function MediaViewer(props: MediaViewerProps) {
 
       {/* Bottom info bar */}
       <div class="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/40 text-xs font-mono">
-        {filename()} — {props.currentIndex + 1} / {props.paths.length}
+        {filename()} — {props.currentIndex + 1} / {props.paths.length}{pixelRatioLabel()}
       </div>
 
       {/* Close button */}
