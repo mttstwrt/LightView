@@ -72,6 +72,7 @@ pub struct DuplicateItem {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub file_size: u64,
+    pub date_taken: Option<i64>,
     /// True if this is the recommended "best" version in the group.
     pub is_best: bool,
 }
@@ -183,7 +184,7 @@ impl CacheDb {
 
         // Fetch resolution and file size from media_meta for all entries
         let mut meta_stmt = self.conn().prepare(
-            "SELECT width, height, file_size FROM media_meta WHERE path = ?1",
+            "SELECT width, height, file_size, date_taken FROM media_meta WHERE path = ?1",
         )?;
 
         // Only return groups with 2+ members, enriched with metadata
@@ -196,20 +197,22 @@ impl CacheDb {
                     .into_iter()
                     .map(|i| {
                         let path = entries[i].0.clone();
-                        let (width, height, file_size) = meta_stmt
+                        let (width, height, file_size, date_taken) = meta_stmt
                             .query_row(rusqlite::params![&path], |row| {
                                 Ok((
                                     row.get::<_, Option<u32>>(0)?,
                                     row.get::<_, Option<u32>>(1)?,
                                     row.get::<_, u64>(2)?,
+                                    row.get::<_, Option<i64>>(3)?,
                                 ))
                             })
-                            .unwrap_or((None, None, 0));
+                            .unwrap_or((None, None, 0, None));
                         DuplicateItem {
                             path,
                             width,
                             height,
                             file_size,
+                            date_taken,
                             is_best: false,
                         }
                     })

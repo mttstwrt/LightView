@@ -1,5 +1,5 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
-import { findDuplicates, thumbUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
+import { findDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
 import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
 import { setTotalCount } from "../stores/galleryStore";
 
@@ -21,12 +21,64 @@ function formatRes(w: number | null, h: number | null): string {
   return `${w}\u00D7${h}`;
 }
 
+function formatDate(ts: number | null): string {
+  if (ts == null) return "";
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
 export function DuplicatesPanel(props: { onClose: () => void }) {
   const [groups, setGroups] = createSignal<DuplicateGroup[]>([]);
   const [scanning, setScanning] = createSignal(false);
   const [scanned, setScanned] = createSignal(false);
   const [threshold, setThreshold] = createSignal(8);
   const [hashesComputed, setHashesComputed] = createSignal(0);
+
+  // Preview state: which group and which item index within it
+  const [previewGroup, setPreviewGroup] = createSignal<number | null>(null);
+  const [previewIndex, setPreviewIndex] = createSignal(0);
+
+  const previewItem = (): DuplicateItem | null => {
+    const gi = previewGroup();
+    if (gi === null) return null;
+    const g = groups()[gi];
+    if (!g) return null;
+    return g.items[previewIndex()] ?? null;
+  };
+
+  const openPreview = (groupIdx: number, itemIdx: number) => {
+    setPreviewGroup(groupIdx);
+    setPreviewIndex(itemIdx);
+  };
+
+  const closePreview = () => {
+    setPreviewGroup(null);
+    setPreviewIndex(0);
+  };
+
+  // Keyboard: arrows cycle within group, Escape closes preview or panel
+  const handleKey = (e: KeyboardEvent) => {
+    if (previewGroup() !== null) {
+      const g = groups()[previewGroup()!];
+      if (!g) return;
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        setPreviewIndex((i) => (i + 1) % g.items.length);
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        setPreviewIndex((i) => (i - 1 + g.items.length) % g.items.length);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closePreview();
+      }
+    } else if (e.key === "Escape") {
+      e.stopPropagation();
+      props.onClose();
+    }
+  };
+  window.addEventListener("keydown", handleKey, true);
+  onCleanup(() => window.removeEventListener("keydown", handleKey, true));
 
   const scan = async () => {
     setScanning(true);
@@ -176,10 +228,11 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
                   </span>
                   <div class="flex gap-2 flex-wrap">
                     <For each={group.items}>
-                      {(item) => (
+                      {(item, itemIdx) => (
                         <DuplicateCard
                           item={item}
                           onTrash={() => handleTrash(item.path, groupIdx())}
+                          onClick={() => openPreview(groupIdx(), itemIdx())}
                         />
                       )}
                     </For>
@@ -190,11 +243,89 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
           </div>
         </Show>
       </div>
+
+      {/* Full-res preview overlay */}
+      <Show when={previewItem()}>
+        {(item) => {
+          const g = () => groups()[previewGroup()!];
+          return (
+            <div
+              class="fixed inset-0 z-[210] flex flex-col items-center justify-center"
+              style={{ background: "rgba(0, 0, 0, 0.95)" }}
+              onClick={closePreview}
+              ref={(el) => {
+                const stopWheel = (e: WheelEvent) => { e.preventDefault(); e.stopPropagation(); };
+                el.addEventListener("wheel", stopWheel, { passive: false });
+                onCleanup(() => el.removeEventListener("wheel", stopWheel));
+              }}
+            >
+              {/* Image */}
+              <img
+                src={mediaUrl(item().path)}
+                class="max-w-[90vw] max-h-[80vh] object-contain select-none"
+                draggable={false}
+                onClick={(e) => e.stopPropagation()}
+              />
+
+              {/* Bottom info bar */}
+              <div class="absolute bottom-0 left-0 right-0 flex items-center justify-center gap-6 px-6 py-3" style={{ background: "rgba(0,0,0,0.7)" }}>
+                <span class="text-xs text-neutral-300 truncate max-w-[40vw]" title={item().path}>
+                  {item().path.split("/").pop()}
+                </span>
+                <span class="text-xs text-neutral-500">
+                  {formatRes(item().width, item().height)}
+                </span>
+                <span class="text-xs text-neutral-500">
+                  {formatSize(item().file_size)}
+                </span>
+                <Show when={item().date_taken}>
+                  <span class="text-xs text-neutral-500">
+                    {formatDate(item().date_taken)}
+                  </span>
+                </Show>
+                <Show when={item().is_best}>
+                  <span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-600/80 text-green-100">Best</span>
+                </Show>
+                <span class="text-xs text-neutral-600">
+                  {previewIndex() + 1} / {g()?.items.length ?? 0}
+                </span>
+                <span class="text-[10px] text-neutral-600">
+                  Left/Right to compare
+                </span>
+              </div>
+
+              {/* Nav arrows */}
+              <button
+                class="absolute left-0 top-0 h-full w-16 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity cursor-pointer"
+                onClick={(e) => { e.stopPropagation(); setPreviewIndex((i) => (i - 1 + (g()?.items.length ?? 1)) % (g()?.items.length ?? 1)); }}
+              >
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M15 18l-6-6 6-6" /></svg>
+              </button>
+              <button
+                class="absolute right-0 top-0 h-full w-16 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity cursor-pointer"
+                onClick={(e) => { e.stopPropagation(); setPreviewIndex((i) => (i + 1) % (g()?.items.length ?? 1)); }}
+              >
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M9 18l6-6-6-6" /></svg>
+              </button>
+
+              {/* Close button */}
+              <button
+                class="absolute top-4 right-4 w-8 h-8 flex items-center justify-center text-neutral-400 hover:text-neutral-200 rounded transition-colors cursor-pointer"
+                onClick={(e) => { e.stopPropagation(); closePreview(); }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          );
+        }}
+      </Show>
     </div>
   );
 }
 
-function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void }) {
+function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void; onClick: () => void }) {
   const fileName = () => {
     const parts = props.item.path.split("/");
     return parts[parts.length - 1] || props.item.path;
@@ -218,12 +349,15 @@ function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void }) {
         </div>
       </Show>
 
-      {/* Thumbnail */}
-      <div class="w-full h-[120px] bg-neutral-900 flex items-center justify-center overflow-hidden">
+      {/* Thumbnail — click to preview */}
+      <div
+        class="w-full h-[120px] bg-neutral-900 flex items-center justify-center overflow-hidden cursor-pointer hover:brightness-110"
+        onClick={(e) => { e.stopPropagation(); props.onClick(); }}
+      >
         <img
           src={thumbUrl(props.item.path)}
           alt={fileName()}
-          class="max-w-full max-h-full object-contain"
+          class="max-w-full max-h-full object-contain pointer-events-none"
           loading="lazy"
         />
       </div>
@@ -241,6 +375,11 @@ function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void }) {
             {formatSize(props.item.file_size)}
           </span>
         </div>
+        <Show when={props.item.date_taken}>
+          <span class="text-[10px] text-neutral-600">
+            {formatDate(props.item.date_taken)}
+          </span>
+        </Show>
 
         {/* Trash button — don't show for best */}
         <Show when={!props.item.is_best}>

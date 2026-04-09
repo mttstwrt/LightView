@@ -235,6 +235,7 @@ export interface DuplicateItem {
   width: number | null;
   height: number | null;
   file_size: number;
+  date_taken: number | null;
   is_best: boolean;
 }
 
