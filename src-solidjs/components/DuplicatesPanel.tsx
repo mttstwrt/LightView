@@ -1,4 +1,4 @@
-import { createSignal, Show, For } from "solid-js";
+import { createSignal, Show, For, onCleanup } from "solid-js";
 import { findDuplicates, thumbUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
 import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
 import { setTotalCount } from "../stores/galleryStore";
@@ -82,7 +82,16 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
   };
 
   return (
-    <div class="fixed inset-0 z-[200] flex flex-col" style={{ background: "rgba(10, 10, 10, 0.98)" }}>
+    <div
+      ref={(el) => {
+        // Capture wheel events so the gallery grid underneath never scrolls
+        const stop = (e: WheelEvent) => e.stopPropagation();
+        el.addEventListener("wheel", stop, { passive: false });
+        onCleanup(() => el.removeEventListener("wheel", stop));
+      }}
+      class="fixed inset-0 z-[200] flex flex-col"
+      style={{ background: "rgba(10, 10, 10, 0.98)" }}
+    >
       {/* Header */}
       <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-800/60">
         <div class="flex items-center gap-4">

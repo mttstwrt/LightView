@@ -145,19 +145,26 @@ export function MediaViewer(props: MediaViewerProps) {
   // --- Zoom / Pan ---
 
   const handleWheel = (e: WheelEvent) => {
-    if (!e.ctrlKey) return;
+    // Always block scroll from reaching the gallery grid underneath
     e.preventDefault();
+    e.stopPropagation();
 
-    const factor = e.deltaY > 0 ? 1 / 1.15 : 1.15;
-    const newZoom = Math.max(0.1, Math.min(50, zoom() * factor));
+    if (e.ctrlKey) {
+      // Ctrl+scroll = zoom toward cursor
+      const factor = e.deltaY > 0 ? 1 / 1.15 : 1.15;
+      const newZoom = Math.max(0.1, Math.min(50, zoom() * factor));
 
-    // Zoom toward cursor — keep the point under the cursor fixed
-    const mx = e.clientX - window.innerWidth / 2;
-    const my = e.clientY - window.innerHeight / 2;
-    const ratio = newZoom / zoom();
-    setPanX(mx - (mx - panX()) * ratio);
-    setPanY(my - (my - panY()) * ratio);
-    setZoom(newZoom);
+      const mx = e.clientX - window.innerWidth / 2;
+      const my = e.clientY - window.innerHeight / 2;
+      const ratio = newZoom / zoom();
+      setPanX(mx - (mx - panX()) * ratio);
+      setPanY(my - (my - panY()) * ratio);
+      setZoom(newZoom);
+    } else if (zoom() > 1) {
+      // Plain scroll when zoomed = pan the image
+      setPanX(panX() - e.deltaX);
+      setPanY(panY() - e.deltaY);
+    }
   };
 
   const handleMouseDown = (e: MouseEvent) => {
