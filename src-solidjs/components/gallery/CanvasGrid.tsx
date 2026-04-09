@@ -9,7 +9,7 @@
 import { Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { settings } from "../../stores/settingsStore";
-import { getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbnailResult } from "../../lib/ipc";
+import { getThumbnailsBatch, precacheThumbnails, thumbUrl, mediaUrl, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
 import { recordCacheMiss, setImageCountSource } from "../../lib/perfMonitor";
@@ -91,6 +91,14 @@ export function CanvasGrid(props: CanvasGridProps) {
   let bgCursor = 0;
   let thumbGenTotal = 0;
   let thumbGenDone = 0;
+
+  // GIF hover overlay state
+  const [hoveredGif, setHoveredGif] = createSignal<{
+    path: string;
+    x: number;
+    y: number;
+    size: number;
+  } | null>(null);
 
   // Drag-to-select state
   const [isDragging, setIsDragging] = createSignal(false);
@@ -650,6 +658,27 @@ export function CanvasGrid(props: CanvasGridProps) {
     };
 
     const onMouseMove = (e: MouseEvent) => {
+      // GIF hover overlay
+      if (!isDragging()) {
+        const hit = hitTestAt(e);
+        if (hit.index >= 0 && hit.path && getExt(hit.path) === "gif") {
+          const c = cols();
+          const cs = cellSize();
+          const g = gap();
+          const sr = startRow();
+          const row = Math.floor(hit.index / c) - sr;
+          const col = hit.index % c;
+          setHoveredGif({
+            path: hit.path,
+            x: col * (cs + g),
+            y: row * (cs + g),
+            size: cs,
+          });
+        } else {
+          setHoveredGif(null);
+        }
+      }
+
       if (!isDragging()) return;
       const hit = hitTestAt(e);
       if (hit.index >= 0) {
@@ -709,9 +738,14 @@ export function CanvasGrid(props: CanvasGridProps) {
       props.onItemContextMenu(e, hit.path!, hit.index);
     };
 
+    const onMouseLeave = () => {
+      setHoveredGif(null);
+    };
+
     const canvas = renderer.canvas;
     canvas.addEventListener("mousedown", onMouseDown);
     canvas.addEventListener("mousemove", onMouseMove);
+    canvas.addEventListener("mouseleave", onMouseLeave);
     canvas.addEventListener("click", onClick);
     canvas.addEventListener("contextmenu", onContextMenu);
     window.addEventListener("mouseup", onMouseUp);
@@ -728,6 +762,7 @@ export function CanvasGrid(props: CanvasGridProps) {
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       canvas.removeEventListener("mousedown", onMouseDown);
       canvas.removeEventListener("mousemove", onMouseMove);
+      canvas.removeEventListener("mouseleave", onMouseLeave);
       canvas.removeEventListener("click", onClick);
       canvas.removeEventListener("contextmenu", onContextMenu);
       if (rafId) cancelAnimationFrame(rafId);
@@ -864,7 +899,27 @@ export function CanvasGrid(props: CanvasGridProps) {
               transform: `translateY(${sliceOffsetY()}px)`,
               "will-change": "transform",
             }}
-          />
+          >
+            {/* GIF hover overlay: animated GIF on top of the static canvas thumbnail */}
+            <Show when={hoveredGif()}>
+              {(gif) => (
+                <img
+                  src={mediaUrl(gif().path)}
+                  style={{
+                    position: "absolute",
+                    left: `${gif().x}px`,
+                    top: `${gif().y}px`,
+                    width: `${gif().size}px`,
+                    height: `${gif().size}px`,
+                    "object-fit": "cover",
+                    "pointer-events": "none",
+                  }}
+                  draggable={false}
+                  decoding="async"
+                />
+              )}
+            </Show>
+          </div>
         </div>
       </Show>
     </div>

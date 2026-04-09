@@ -1,5 +1,6 @@
 import { Show, createSignal, createEffect, on } from "solid-js";
 import { settings } from "../../stores/settingsStore";
+import { mediaUrl } from "../../lib/ipc";
 
 interface ThumbnailCellProps {
   path: string;
@@ -20,6 +21,7 @@ const loadedUrls = new Set<string>();
 
 export function ThumbnailCell(props: ThumbnailCellProps) {
   const [errored, setErrored] = createSignal(false);
+  const [hovered, setHovered] = createSignal(false);
 
   const filename = () => {
     const parts = props.path.split("/");
@@ -38,6 +40,14 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
   };
 
   const isGif = () => ext() === "gif";
+
+  // When hovering a GIF, swap to the full animated file via media protocol.
+  const effectiveSrc = () => {
+    if (isGif() && hovered() && props.thumbSrc) {
+      return mediaUrl(props.path);
+    }
+    return props.thumbSrc;
+  };
 
   // Whether this cell's current image has finished loading (for fade-in).
   // Starts true if the URL was already seen, so recycled cells don't re-fade.
@@ -65,7 +75,11 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       }}
       onClick={(e) => props.onClick(e)}
       onMouseDown={(e) => props.onMouseDown?.(e)}
-      onMouseEnter={(e) => props.onMouseEnter?.(e)}
+      onMouseEnter={(e) => {
+        setHovered(true);
+        props.onMouseEnter?.(e);
+      }}
+      onMouseLeave={() => setHovered(false)}
       onContextMenu={(e) => {
         if (props.onContextMenu) {
           e.preventDefault();
@@ -90,7 +104,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
 
       <Show when={hasUrl()}>
         <img
-          src={props.thumbSrc!}
+          src={effectiveSrc()!}
           alt={filename()}
           class="w-full h-full object-cover"
           style={{
@@ -104,6 +118,8 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
             setLoaded(true);
           }}
           onError={() => {
+            // Don't treat media URL errors as thumbnail errors
+            if (isGif() && hovered()) return;
             setErrored(true);
             props.onError?.(props.path);
           }}
