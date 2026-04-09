@@ -7,7 +7,7 @@ use crate::AppState;
 pub struct FindDuplicatesResult {
     /// Number of perceptual hashes newly computed in this run.
     pub hashes_computed: usize,
-    /// Groups of duplicate images (each group has 2+ paths).
+    /// Groups of duplicate images (each group has 2+ items with metadata).
     pub groups: Vec<DuplicateGroup>,
 }
 

@@ -1,11 +1,11 @@
 
-- Allow number keys to be used to rate, if an image is focused hitting '3' will rate it '3 stars'
+- Gif play on hover
+
+- If an image is added to or removed from the directory by the user or another program the UI should react accordingly
+
+- Add deduplication menu in settings, shows duplicates, for images that are similar but not exactly the same highlight a green box around the 'best' version (base solely off of highest resolution, or in the case of identical resolutions the smaller file size)
 
 - Move the Star filter UI to the other side of the filter bar next to the sort buttons.
-
-- While typing in the tag bar of the info panel, the 'i' key should not close the info panel.
-
-- Add image zooming (ctrl+scroll) and current pixel ratio in the info menu (ie. a 1000x1000 image that takes up exactly 1000x1000 pixels on screen shows 1:1) This will require Lightview to know the resolution of the screen its on.
 
 - Prevent scrolling while an image is opened. If an image is zoomed to larger than the viewport scrolling and sidescrolling should pan the image.
 
@@ -25,6 +25,6 @@
 
 - Webserver for webview, for viewing from phone or other devices. We want to keep the performance benefit of Tauri when running on the main device but want a 'headless' backend that consumes as few resources as possible when not actively in use, so it can be made to startup on boot with negligable performance impact.
 
-- Add virtual folder view, default hierarchy should be plugin name or user folders at the top and a folder for each tag inside. The folder view is entirely virtual and does not actually copy or move images. 
+- Add virtual folder view, default hierarchy should be plugin name and user folders at the top and a folder for each tag inside. The folder view is entirely virtual and does not actually copy or move images. 
 
 - Improve scroll performance

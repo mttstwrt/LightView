@@ -5,6 +5,7 @@ import { SettingsMenu } from "./SettingsMenu";
 
 interface TopBarProps {
   onOpenFolder: () => void;
+  onOpenDuplicates?: () => void;
 }
 
 export function TopBar(props: TopBarProps) {
@@ -35,7 +36,7 @@ export function TopBar(props: TopBarProps) {
       >
         <FilterBar />
         <SortMenu />
-        <SettingsMenu onOpenFolder={props.onOpenFolder} />
+        <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} />
       </div>
     </>
   );

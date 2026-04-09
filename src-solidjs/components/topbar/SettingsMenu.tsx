@@ -29,7 +29,7 @@ const GAP_PRESETS = [
   { label: "Wide", value: 8 },
 ] as const;
 
-export function SettingsMenu(props: { onOpenFolder?: () => void }) {
+export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void }) {
   const [open, setOpen] = createSignal(false);
 
   const toggle = () => setOpen((v) => !v);
@@ -526,6 +526,19 @@ export function SettingsMenu(props: { onOpenFolder?: () => void }) {
                   Add Folder...
                 </button>
               </div>
+            </Section>
+
+            {/* ── Deduplication ── */}
+            <Section label="Deduplication">
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  props.onOpenDuplicates?.();
+                }}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+              >
+                Find Duplicates...
+              </button>
             </Section>
 
             {/* ── Gallery ── */}

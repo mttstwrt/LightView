@@ -36,6 +36,25 @@ html, body, #root {
   height: 0;
 }
 
+/* Thin scrollbar for the duplicates panel */
+.dupes-scroll {
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: rgba(255,255,255,0.15) transparent;
+}
+.dupes-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.dupes-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.dupes-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.15);
+  border-radius: 3px;
+}
+.dupes-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.25);
+}
+
 .thumb-cell:hover img {
   filter: brightness(1.1);
 }

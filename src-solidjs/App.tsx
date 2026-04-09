@@ -15,6 +15,7 @@ import { cancelPluginBatch } from "./lib/ipc";
 import { thumbGenActivity } from "./stores/thumbnailProgressStore";
 import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
 import { DebugOverlay } from "./components/debug/DebugOverlay";
+import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import type { SortedItem, SortField } from "./lib/types";
 
 // ---------------------------------------------------------------------------
@@ -156,6 +157,7 @@ function getThumbLabelForItems(items: SortedItem[], field: SortField, fraction: 
 
 export function App() {
   const [debugOpen, setDebugOpen] = createSignal(false);
+  const [duplicatesOpen, setDuplicatesOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
 
@@ -248,7 +250,7 @@ export function App() {
         when={galleryPath()}
         fallback={<WelcomeScreen onOpen={handleOpenFolder} onOpenPath={openPath} />}
       >
-        <TopBar onOpenFolder={handleOpenFolder} />
+        <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} />
         <GalleryGrid
           paths={displayPaths()}
           onItemClick={(index) => {
@@ -296,6 +298,9 @@ export function App() {
             onNext={() => nextImage(displayPaths().length)}
             onPrev={prevImage}
           />
+        </Show>
+        <Show when={duplicatesOpen()}>
+          <DuplicatesPanel onClose={() => setDuplicatesOpen(false)} />
         </Show>
       </Show>
       <Show when={debugOpen()}>

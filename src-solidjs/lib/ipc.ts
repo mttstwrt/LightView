@@ -230,8 +230,16 @@ export const trashFiles = (paths: string[]) =>
 // Duplicate Detection
 // ---------------------------------------------------------------------------
 
+export interface DuplicateItem {
+  path: string;
+  width: number | null;
+  height: number | null;
+  file_size: number;
+  is_best: boolean;
+}
+
 export interface DuplicateGroup {
-  paths: string[];
+  items: DuplicateItem[];
   hash: number;
 }
 

@@ -65,11 +65,22 @@ pub fn hamming_distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
 
+/// Metadata for a single image within a duplicate group.
+#[derive(Debug, serde::Serialize)]
+pub struct DuplicateItem {
+    pub path: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub file_size: u64,
+    /// True if this is the recommended "best" version in the group.
+    pub is_best: bool,
+}
+
 /// A group of duplicate images.
 #[derive(Debug, serde::Serialize)]
 pub struct DuplicateGroup {
-    /// Paths of all images in this group.
-    pub paths: Vec<String>,
+    /// Items in this group with metadata.
+    pub items: Vec<DuplicateItem>,
     /// The shared (or representative) perceptual hash.
     pub hash: u64,
 }
@@ -170,14 +181,52 @@ impl CacheDb {
             groups.entry(root).or_default().push(i);
         }
 
-        // Only return groups with 2+ members
+        // Fetch resolution and file size from media_meta for all entries
+        let mut meta_stmt = self.conn().prepare(
+            "SELECT width, height, file_size FROM media_meta WHERE path = ?1",
+        )?;
+
+        // Only return groups with 2+ members, enriched with metadata
         let result = groups
             .into_values()
             .filter(|members| members.len() > 1)
             .map(|members| {
                 let hash = entries[members[0]].1;
-                let paths = members.into_iter().map(|i| entries[i].0.clone()).collect();
-                DuplicateGroup { hash, paths }
+                let mut items: Vec<DuplicateItem> = members
+                    .into_iter()
+                    .map(|i| {
+                        let path = entries[i].0.clone();
+                        let (width, height, file_size) = meta_stmt
+                            .query_row(rusqlite::params![&path], |row| {
+                                Ok((
+                                    row.get::<_, Option<u32>>(0)?,
+                                    row.get::<_, Option<u32>>(1)?,
+                                    row.get::<_, u64>(2)?,
+                                ))
+                            })
+                            .unwrap_or((None, None, 0));
+                        DuplicateItem {
+                            path,
+                            width,
+                            height,
+                            file_size,
+                            is_best: false,
+                        }
+                    })
+                    .collect();
+
+                // Determine "best": highest resolution wins, ties broken by smallest file size
+                if let Some(best_idx) = items.iter().enumerate().max_by(|(_, a), (_, b)| {
+                    let res_a = a.width.unwrap_or(0) as u64 * a.height.unwrap_or(0) as u64;
+                    let res_b = b.width.unwrap_or(0) as u64 * b.height.unwrap_or(0) as u64;
+                    res_a
+                        .cmp(&res_b)
+                        .then_with(|| b.file_size.cmp(&a.file_size))
+                }).map(|(i, _)| i) {
+                    items[best_idx].is_best = true;
+                }
+
+                DuplicateGroup { items, hash }
             })
             .collect();
 

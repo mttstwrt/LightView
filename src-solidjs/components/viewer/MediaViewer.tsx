@@ -192,10 +192,11 @@ export function MediaViewer(props: MediaViewerProps) {
       setPanX(0);
       setPanY(0);
     } else {
-      // Zoom to 1:1 (one image pixel = one CSS pixel)
+      // Zoom to 1:1 (one image pixel = one physical screen pixel)
       const img = imageContainerRef?.querySelector("img") as HTMLImageElement | null;
       if (!img || !img.clientWidth || !img.naturalWidth) return;
-      const targetZoom = img.naturalWidth / img.clientWidth;
+      const dpr = window.devicePixelRatio || 1;
+      const targetZoom = img.naturalWidth / (img.clientWidth * dpr);
       const mx = e.clientX - window.innerWidth / 2;
       const my = e.clientY - window.innerHeight / 2;
       const ratio = targetZoom; // zoom() is 1
@@ -218,13 +219,15 @@ export function MediaViewer(props: MediaViewerProps) {
     }
   });
 
-  // Pixel ratio: effective display width / natural width
+  // Pixel ratio: effective physical display width / natural width
+  // Accounts for devicePixelRatio so 1:1 = one image pixel per physical screen pixel
   const pixelRatioPercent = (): number | null => {
     const nw = imgNaturalWidth();
     if (!nw) return null;
     const img = imageContainerRef?.querySelector("img") as HTMLImageElement | null;
     if (!img || !img.clientWidth) return null;
-    return (img.clientWidth * zoom() / nw) * 100;
+    const dpr = window.devicePixelRatio || 1;
+    return (img.clientWidth * zoom() * dpr / nw) * 100;
   };
 
   const pixelRatioLabel = (): string => {
