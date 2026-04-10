@@ -1,7 +1,7 @@
 import { Show, createSignal, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
 import { openGallery, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, type RecentGallery } from "./lib/ipc";
@@ -190,6 +190,36 @@ export function App() {
     openPath(event.payload);
   });
   onCleanup(() => { unlisten.then((fn) => fn()); });
+
+  // Listen for external filesystem changes (files added/removed outside the app)
+  const unlistenFs = listen<{ added: string[]; removed: string[] }>("gallery:fs-changed", async (event) => {
+    const { added, removed } = event.payload;
+
+    if (removed.length > 0) {
+      const removedSet = new Set(removed);
+      setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+      setSortedItems(sortedItems().filter((item) => !removedSet.has(item.path)));
+      setSelectedPaths((prev) => {
+        const next = new Set(prev);
+        for (const p of removed) next.delete(p);
+        return next.size !== prev.size ? next : prev;
+      });
+    }
+
+    if (added.length > 0) {
+      // Re-fetch sorted items to get correct insertion order
+      try {
+        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
+        setSortedItems(sorted.items);
+        setDisplayPaths(sorted.items.map((item) => item.path));
+      } catch (e) {
+        console.error("Failed to refresh after file addition:", e);
+      }
+    }
+
+    setTotalCount((c) => c + added.length - removed.length);
+  });
+  onCleanup(() => { unlistenFs.then((fn) => fn()); });
 
   const handleOpenFolder = async () => {
     try {

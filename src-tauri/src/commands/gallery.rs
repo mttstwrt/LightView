@@ -1,12 +1,15 @@
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use tauri::Emitter;
 
 use crate::cache::atlas::ThumbAtlas;
 use crate::cache::db::CacheDb;
 use crate::companion::schema::MediaType;
 use crate::provider::local::LocalProvider;
 use crate::provider::{FileEntry, ProviderType};
+use crate::util::fs_watch::FsWatcher;
 use crate::AppState;
 
 #[derive(Debug, Serialize)]
@@ -59,6 +62,43 @@ fn populate_media_meta(
                 now,
             ])
             .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Prune stale entries — files in DB but no longer on disk
+    {
+        let on_disk: HashSet<&str> = entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.as_str())
+            .collect();
+
+        let mut sel = tx
+            .prepare_cached("SELECT path FROM media_meta")
+            .map_err(|e| e.to_string())?;
+        let stale: Vec<String> = sel
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .filter(|p| !on_disk.contains(p.as_str()))
+            .collect();
+
+        if !stale.is_empty() {
+            log::info!("Pruning {} stale media_meta entries", stale.len());
+            let mut del_meta = tx
+                .prepare_cached("DELETE FROM media_meta WHERE path = ?1")
+                .map_err(|e| e.to_string())?;
+            let mut del_thumb = tx
+                .prepare_cached("DELETE FROM thumbnails WHERE path = ?1")
+                .map_err(|e| e.to_string())?;
+            let mut del_tag = tx
+                .prepare_cached("DELETE FROM tag_index WHERE path = ?1")
+                .map_err(|e| e.to_string())?;
+            for path in &stale {
+                let _ = del_meta.execute(rusqlite::params![path]);
+                let _ = del_thumb.execute(rusqlite::params![path]);
+                let _ = del_tag.execute(rusqlite::params![path]);
+            }
         }
     }
 
@@ -154,10 +194,229 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
     }
 }
 
+/// Payload emitted for `gallery:fs-changed` events.
+#[derive(Debug, Clone, Serialize)]
+pub struct FsChangeEvent {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// Start the filesystem watcher background task.
+/// Polls for notify events, debounces them, updates the DB, and emits
+/// `gallery:fs-changed` to the frontend.
+fn start_fs_watcher(
+    app_handle: tauri::AppHandle,
+    state: &AppState,
+    gallery_path: &str,
+) {
+    // Stop any existing watcher
+    state
+        .fs_watch_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut w = state.fs_watcher.lock().unwrap();
+        *w = None;
+    }
+    state
+        .fs_watch_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let watcher = match FsWatcher::new(Path::new(gallery_path), true) {
+        Ok(w) => w,
+        Err(e) => {
+            log::warn!("Failed to start filesystem watcher: {}", e);
+            return;
+        }
+    };
+
+    {
+        let mut w = state.fs_watcher.lock().unwrap();
+        *w = Some(watcher);
+    }
+
+    let cancel = Arc::clone(&state.fs_watch_cancel);
+    let fs_watcher = Arc::clone(&state.fs_watcher);
+    let cache_db = Arc::clone(&state.cache_db);
+    let gallery = gallery_path.to_string();
+
+    tauri::async_runtime::spawn(async move {
+        use notify::EventKind;
+        use std::sync::atomic::Ordering;
+
+        const POLL_MS: u64 = 300;
+        const DEBOUNCE_MS: u64 = 500;
+
+        let lightview_suffix = std::path::MAIN_SEPARATOR.to_string() + ".lightview";
+        let companion_ext = crate::companion::schema::COMPANION_EXTENSION;
+
+        let mut pending_added: HashSet<String> = HashSet::new();
+        let mut pending_removed: HashSet<String> = HashSet::new();
+        let mut last_event_time: Option<tokio::time::Instant> = None;
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_MS)).await;
+
+            // Poll events from the watcher
+            let events = {
+                let w = fs_watcher.lock().unwrap();
+                match w.as_ref() {
+                    Some(watcher) => watcher.poll_events(),
+                    None => break,
+                }
+            };
+
+            for event in events {
+                for path in &event.paths {
+                    let path_str = path.to_string_lossy().to_string();
+
+                    // Skip .lightview directory and companion files
+                    if path_str.contains(&lightview_suffix) || path_str.ends_with(companion_ext)
+                    {
+                        continue;
+                    }
+
+                    // Only consider files with valid media extensions
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    if MediaType::from_extension(ext).is_none() {
+                        continue;
+                    }
+
+                    match &event.kind {
+                        EventKind::Create(_)
+                        | EventKind::Modify(notify::event::ModifyKind::Name(
+                            notify::event::RenameMode::To,
+                        )) => {
+                            pending_removed.remove(&path_str);
+                            pending_added.insert(path_str);
+                            last_event_time = Some(tokio::time::Instant::now());
+                        }
+                        EventKind::Remove(_)
+                        | EventKind::Modify(notify::event::ModifyKind::Name(
+                            notify::event::RenameMode::From,
+                        )) => {
+                            pending_added.remove(&path_str);
+                            pending_removed.insert(path_str);
+                            last_event_time = Some(tokio::time::Instant::now());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Flush after debounce period
+            let should_flush = match last_event_time {
+                Some(t) => t.elapsed().as_millis() >= DEBOUNCE_MS as u128,
+                None => false,
+            };
+
+            if !should_flush || (pending_added.is_empty() && pending_removed.is_empty()) {
+                continue;
+            }
+
+            let added: Vec<String> = pending_added.drain().collect();
+            let removed: Vec<String> = pending_removed.drain().collect();
+            last_event_time = None;
+
+            // Update the database
+            let db = cache_db.lock().await;
+            if let Some(db) = db.as_ref() {
+                let conn = db.conn();
+
+                // Insert new files
+                if !added.is_empty() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+
+                    for path_str in &added {
+                        let p = std::path::Path::new(path_str);
+                        let ext = p
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        let media_type = match MediaType::from_extension(ext) {
+                            Some(mt) => mt.as_str().to_string(),
+                            None => continue,
+                        };
+                        // Read file metadata for mtime and size
+                        let (mtime, size) = match std::fs::metadata(p) {
+                            Ok(meta) => {
+                                let mtime = meta
+                                    .modified()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(now);
+                                (mtime, meta.len() as i64)
+                            }
+                            Err(_) => continue, // File may have been removed already
+                        };
+
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, date_added) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![path_str, mtime, size, media_type, now],
+                        );
+                    }
+                }
+
+                // Remove deleted files
+                if !removed.is_empty() {
+                    for path_str in &removed {
+                        let _ = conn.execute(
+                            "DELETE FROM media_meta WHERE path = ?1",
+                            rusqlite::params![path_str],
+                        );
+                        let _ = conn.execute(
+                            "DELETE FROM thumbnails WHERE path = ?1",
+                            rusqlite::params![path_str],
+                        );
+                        let _ = conn.execute(
+                            "DELETE FROM tag_index WHERE path = ?1",
+                            rusqlite::params![path_str],
+                        );
+                    }
+                    let _ = db.rebuild_tag_counts();
+                }
+            }
+
+            // Emit event to frontend
+            let _ = app_handle.emit(
+                "gallery:fs-changed",
+                FsChangeEvent {
+                    added,
+                    removed,
+                },
+            );
+        }
+
+        log::info!("Filesystem watcher task exited");
+    });
+
+    log::info!("Filesystem watcher started for {}", gallery_path);
+}
+
+/// Stop the filesystem watcher and clean up.
+fn stop_fs_watcher(state: &AppState) {
+    state
+        .fs_watch_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut w = state.fs_watcher.lock().unwrap();
+    *w = None;
+}
+
 /// Open a gallery directory. Initializes the provider, cache DB,
 /// and begins the background scan/thumbnail/index pipeline.
 #[tauri::command]
 pub async fn open_gallery(
+    app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<GalleryOpenResult, String> {
@@ -282,6 +541,9 @@ pub async fn open_gallery(
     // Track as recently opened
     state.add_recent_gallery(&path).await;
 
+    // Start watching for external file changes
+    start_fs_watcher(app_handle, &state, &path);
+
     Ok(GalleryOpenResult {
         path,
         total_media: media_count,
@@ -292,6 +554,9 @@ pub async fn open_gallery(
 /// Close the current gallery and release resources.
 #[tauri::command]
 pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // Stop filesystem watcher first
+    stop_fs_watcher(&state);
+
     let gallery_path = {
         let current = state.current_gallery.read().await;
         current.clone()

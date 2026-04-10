@@ -1,11 +1,13 @@
 
-- Gif play on hover
-
 - If an image is added to or removed from the directory by the user or another program the UI should update in real time, with as little performance impact as possible
 
 - improve scroll bar visibility
 
+- scroll bar should sit above the filter dropdown
+
 - Move the Star filter UI to the other side of the filter bar next to the sort buttons.
+
+- Regenerating thumbnails needs to clear the previous thumbnail and replace it. Right now to regenerate a thumbnail the user must click regenerate and then restart the program for it to take effect
 
 - ctrl + scroll should increase/decrease the thumbnail sizes when an image is not opened.
 
@@ -23,6 +25,5 @@
 
 - Add virtual folder view, default hierarchy should be plugin name and user folders at the top and a folder for each tag inside. The folder view is entirely virtual and does not actually copy or move images. 
 
-- Regenerating thumbnails needs to clear the previous thumbnail and replace it. Right now to regenerate a thumbnail the user must click regenerate and then restart the program for it to take effect
 
 - Improve scroll performance

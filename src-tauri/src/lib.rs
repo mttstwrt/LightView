@@ -20,6 +20,7 @@ use autocomplete::engine::AutocompleteEngine;
 use hardware::HardwareProfile;
 use pipeline::thumbnailer::{ThumbFormat, ThumbnailSettings};
 use provider::ProviderRegistry;
+use util::fs_watch::FsWatcher;
 
 /// Maximum number of recent galleries to remember.
 const MAX_RECENT_GALLERIES: usize = 10;
@@ -79,6 +80,12 @@ pub struct AppState {
     /// Uses std::sync::Mutex (not tokio) because protocol handlers are synchronous.
     pub thumb_protocol_db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
 
+    /// Filesystem watcher for detecting external file additions/removals.
+    /// Uses std::sync::Mutex because FsWatcher uses std mpsc channels.
+    pub fs_watcher: Arc<std::sync::Mutex<Option<FsWatcher>>>,
+
+    /// Cancellation flag for the filesystem watcher background task.
+    pub fs_watch_cancel: Arc<std::sync::atomic::AtomicBool>,
 
     /// Unified GPU pipeline for accelerated thumbnail generation and image transforms.
     /// None when no suitable GPU adapter was found at startup.
@@ -139,6 +146,8 @@ impl AppState {
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
             plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thumb_protocol_db: Arc::new(std::sync::Mutex::new(None)),
+            fs_watcher: Arc::new(std::sync::Mutex::new(None)),
+            fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "gpu")]
             gpu_pipeline,
         }
