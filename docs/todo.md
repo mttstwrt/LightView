@@ -1,9 +1,13 @@
 
-- If an image is added to or removed from the directory by the user or another program the UI should update in real time, with as little performance impact as possible
+- Thumbnail streaming? How do Apple photos/Google photos handle small vs large thumbnails gracefully? When Thumbnails are big we want higher res and we don't need to worry about performance as much because of fewer images and fewer dom nodes. When thumbnails are small we want to load lower res and figure out how to handle the increased number of DOM nodes. Research high performance methods of storing/loading thumbnails for the grid view. Try to find out how top tier gallery apps like Apple photos, google photos, and Immich handle this. Some prior research exists in docs/gridScaleResearch.md
+
+- When zooming out on the grid, unloaded thumbnails show until a scroll command is input. Preferably we would attach as little as possible to the scoll input. This could be a source of performance issues with scrolling. Research high performance methods for scrolling the grid view. Try to find out how top tier gallery apps like Apple photos, google photos, and Immich handle this. Some prior research exists in docs/scrollPerformanceResearch.md
+
+- When zooming in and out on the grid, try to keep the hovered image in view.
 
 - improve scroll bar visibility
 
-- scroll bar should sit above the filter dropdown
+- Optimize HEIC loading pipeline
 
 - Move the Star filter UI to the other side of the filter bar next to the sort buttons.
 

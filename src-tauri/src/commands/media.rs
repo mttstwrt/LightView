@@ -1,8 +1,9 @@
 use base64::Engine;
 use serde::Serialize;
+use std::path::Path;
 use tauri::Emitter;
 
-use crate::pipeline::thumbnailer::{ResizeFilter, ThumbFormat};
+use crate::pipeline::thumbnailer::{self, ResizeFilter, ThumbFormat};
 use crate::AppState;
 
 /// Thumbnail metadata returned over IPC. No pixel data — the frontend
@@ -108,6 +109,11 @@ pub async fn get_thumbnail(
                     "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
                     rusqlite::params![thumb.src_width, thumb.src_height, thumb.path],
                 );
+
+                // Extract and store video metadata (duration, dimensions, codec)
+                if thumb.media_type == "video" {
+                    populate_video_metadata(db.conn(), &thumb.path);
+                }
             }
 
             Ok(Some(ThumbnailResult {
@@ -336,6 +342,13 @@ pub async fn get_thumbnails_batch(
                 );
             }
             let _ = tx.commit();
+
+            // Extract video metadata outside the transaction
+            for item in &to_cache {
+                if item.media_type == "video" {
+                    populate_video_metadata(db.conn(), &item.path);
+                }
+            }
         }
     }
 
@@ -798,6 +811,21 @@ pub async fn get_media_meta(
     }
 }
 
+/// Extract video metadata via ffprobe and store it in the media_meta table.
+fn populate_video_metadata(conn: &rusqlite::Connection, path: &str) {
+    match thumbnailer::probe_video_metadata(Path::new(path)) {
+        Ok((w, h, duration, _codec, _has_audio, _fps)) => {
+            let _ = conn.execute(
+                "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
+                rusqlite::params![w, h, duration, path],
+            );
+        }
+        Err(e) => {
+            log::debug!("Video metadata extraction failed for {}: {}", path, e);
+        }
+    }
+}
+
 /// Result of background precaching — no blob data returned over IPC.
 #[derive(Debug, Serialize)]
 pub struct PrecacheResult {
@@ -923,6 +951,13 @@ pub async fn precache_thumbnails(
                 );
             }
             let _ = tx.commit();
+
+            // Extract video metadata outside the transaction
+            for item in &to_cache {
+                if item.1 == "video" {
+                    populate_video_metadata(db.conn(), &item.0);
+                }
+            }
         }
     }
 

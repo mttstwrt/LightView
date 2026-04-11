@@ -434,7 +434,7 @@ pub fn generate_for_path(path: &Path, filter: ResizeFilter, format: ThumbFormat,
             r
         }),
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            generate_video_placeholder(path, format, thumb_w, thumb_h)
+            generate_video_thumbnail(path, filter, format, thumb_w, thumb_h)
         }
         _ => generate_image_thumbnail(path, filter, format, thumb_w, thumb_h),
     }
@@ -527,8 +527,7 @@ pub fn decode_and_crop(path: &Path) -> Result<DecodedCrop, ThumbError> {
         "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
         "heic" | "heif" => decode_heic_to_rgba(path)?,
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            // Placeholder: 1x1 grey pixel, crop/resize will scale it
-            (vec![0x3A, 0x3A, 0x3A, 0xFF], 1, 1, 0, 0)
+            decode_video_to_rgba(path)?
         }
         _ => decode_generic_to_rgba(path)?,
     };
@@ -587,8 +586,7 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
         "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
         "heic" | "heif" => decode_heic_to_rgba(path)?,
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            // Placeholder: 1x1 grey pixel, crop/resize will scale it
-            (vec![0x3A, 0x3A, 0x3A, 0xFF], 1, 1, 0, 0)
+            decode_video_to_rgba(path)?
         }
         _ => decode_generic_to_rgba(path)?,
     };
@@ -691,11 +689,206 @@ pub fn decode_heic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32),
     Ok((rgba, w, h, src_w, src_h))
 }
 
-// TODO: Generate real video thumbnails by extracting the first frame via ffmpeg.
-// For now, returns a solid grey placeholder so video files don't block thumbnail generation.
+/// Extract a frame from a video file using ffmpeg and generate a thumbnail.
+/// Falls back to a grey placeholder if ffmpeg is not available or extraction fails.
+fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
+    match extract_video_frame(path) {
+        Ok((rgba, w, h)) => {
+            let (cx, cy, side) = center_crop_square(w, h);
+
+            let final_data = match format {
+                ThumbFormat::Jpeg => {
+                    // Convert RGBA→RGB for JPEG
+                    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+                    for chunk in rgba.chunks_exact(4) {
+                        rgb.push(chunk[0]);
+                        rgb.push(chunk[1]);
+                        rgb.push(chunk[2]);
+                    }
+                    let cropped = crop_rgb(&rgb, w, cx, cy, side, side);
+                    resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
+                }
+                ThumbFormat::Rgba => {
+                    let cropped = crop_rgba(&rgba, w, cx, cy, side, side);
+                    resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
+                }
+            };
+
+            let data = encode_output(&final_data, thumb_w, thumb_h, format)?;
+
+            Ok(ThumbResult {
+                path: path.to_string_lossy().to_string(),
+                width: thumb_w,
+                height: thumb_h,
+                data,
+                media_type: "video".to_string(),
+                src_width: w,
+                src_height: h,
+                format,
+            })
+        }
+        Err(e) => {
+            log::warn!("Video frame extraction failed for {}: {}", path.display(), e);
+            generate_video_placeholder(path, format, thumb_w, thumb_h)
+        }
+    }
+}
+
+/// Extract a single frame from a video using ffmpeg.
+/// Seeks to 1 second (or start for short videos) and outputs raw RGBA pixels.
+fn extract_video_frame(path: &Path) -> Result<(Vec<u8>, u32, u32), ThumbError> {
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-ss", "1",           // seek to 1s (fast keyframe seek before input)
+            "-i",
+        ])
+        .arg(path.as_os_str())
+        .args([
+            "-frames:v", "1",     // extract one frame
+            "-f", "rawvideo",
+            "-pix_fmt", "rgba",
+            "-v", "error",
+            "pipe:1",             // output to stdout
+        ])
+        .output()
+        .map_err(|e| ThumbError::Decode(format!("ffmpeg not found or failed to run: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ThumbError::Decode(format!("ffmpeg failed: {}", stderr.trim())));
+    }
+
+    // We need dimensions — probe them separately
+    let (w, h) = probe_video_dimensions(path)?;
+    let expected = (w as usize) * (h as usize) * 4;
+
+    if output.stdout.len() != expected {
+        return Err(ThumbError::Decode(format!(
+            "ffmpeg output size mismatch: got {} bytes, expected {} ({}x{}x4)",
+            output.stdout.len(), expected, w, h
+        )));
+    }
+
+    Ok((output.stdout, w, h))
+}
+
+/// Get video dimensions using ffprobe.
+fn probe_video_dimensions(path: &Path) -> Result<(u32, u32), ThumbError> {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+        ])
+        .arg(path.as_os_str())
+        .output()
+        .map_err(|e| ThumbError::Decode(format!("ffprobe not found: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(ThumbError::Decode("ffprobe failed".to_string()));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    let parts: Vec<&str> = text.split('x').collect();
+    if parts.len() != 2 {
+        return Err(ThumbError::Decode(format!("ffprobe unexpected output: {}", text)));
+    }
+    let w: u32 = parts[0].parse().map_err(|_| ThumbError::Decode("bad width".to_string()))?;
+    let h: u32 = parts[1].parse().map_err(|_| ThumbError::Decode("bad height".to_string()))?;
+    Ok((w, h))
+}
+
+/// Probe video metadata: (width, height, duration_seconds, codec, has_audio, fps).
+pub fn probe_video_metadata(path: &Path) -> Result<(u32, u32, Option<f64>, Option<String>, bool, Option<f64>), ThumbError> {
+    // Video stream info
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name,r_frame_rate,duration",
+            "-show_entries", "format=duration",
+            "-of", "json",
+        ])
+        .arg(path.as_os_str())
+        .output()
+        .map_err(|e| ThumbError::Decode(format!("ffprobe not found: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(ThumbError::Decode("ffprobe failed".to_string()));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| ThumbError::Decode(format!("ffprobe json parse error: {}", e)))?;
+
+    let stream = json.get("streams").and_then(|s| s.get(0));
+    let format = json.get("format");
+
+    let w = stream
+        .and_then(|s| s.get("width"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let h = stream
+        .and_then(|s| s.get("height"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    // Duration: prefer stream duration, fall back to format duration
+    let duration = stream
+        .and_then(|s| s.get("duration"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| {
+            format
+                .and_then(|f| f.get("duration"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+
+    let codec = stream
+        .and_then(|s| s.get("codec_name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Parse fps from r_frame_rate (e.g. "30000/1001")
+    let fps = stream
+        .and_then(|s| s.get("r_frame_rate"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split('/').collect();
+            if parts.len() == 2 {
+                let num: f64 = parts[0].parse().ok()?;
+                let den: f64 = parts[1].parse().ok()?;
+                if den > 0.0 { Some(num / den) } else { None }
+            } else {
+                s.parse::<f64>().ok()
+            }
+        });
+
+    // Check for audio stream
+    let audio_output = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "csv=p=0",
+        ])
+        .arg(path.as_os_str())
+        .output()
+        .ok();
+
+    let has_audio = audio_output
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+
+    Ok((w, h, duration, codec, has_audio, fps))
+}
+
+/// Grey placeholder fallback when ffmpeg is unavailable.
 fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
     let pixel_count = (thumb_w * thumb_h) as usize;
-    let grey: u8 = 0x3A; // neutral dark grey
+    let grey: u8 = 0x3A;
 
     let data = match format {
         ThumbFormat::Rgba => {
@@ -729,6 +922,13 @@ fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, th
         src_height: 0,
         format,
     })
+}
+
+/// Decode a video frame to RGBA pixels using ffmpeg.
+/// Returns (rgba, width, height, src_width, src_height).
+fn decode_video_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+    let (rgba, w, h) = extract_video_frame(path)?;
+    Ok((rgba, w, h, w, h))
 }
 
 /// Decode a non-JPEG image to RGBA pixels.

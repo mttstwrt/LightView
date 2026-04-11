@@ -171,6 +171,9 @@ fn serve_full_media(
         }
     };
 
+    /// Max bytes per chunk (2 MB)
+    const MAX_CHUNK: u64 = 2 * 1024 * 1024;
+
     // Handle Range requests for chunked streaming
     if let Some(range_header) = request
         .headers()
@@ -191,8 +194,6 @@ fn serve_full_media(
 
         // Only handle the first range (covers all practical browser requests)
         if let Some(range) = ranges.first() {
-            /// Max bytes per chunk (2 MB)
-            const MAX_CHUNK: u64 = 2 * 1024 * 1024;
 
             let start = range.start;
             let mut end = start + range.length - 1;
@@ -235,10 +236,37 @@ fn serve_full_media(
     }
 
     // No Range header — serve the full file.
-    // Use mmap to avoid a large heap allocation + potential realloc spikes.
-    // The kernel pages in data on demand, and the mmap is dropped after the
-    // single copy into the response Vec.
+    // For video files, serve just the first chunk (2 MB) as a 206 response to
+    // avoid loading a multi-GB file entirely into memory.  The <video> element
+    // will follow up with Range requests for subsequent chunks.
+    let is_video = matches!(ext.as_str(), "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv");
 
+    if is_video && len > MAX_CHUNK {
+        let nbytes = MAX_CHUNK as usize;
+        let mut buf = vec![0u8; nbytes];
+        if let Err(e) = file.read_exact(&mut buf) {
+            log::error!("Failed to read first chunk of {}: {}", path, e);
+            return tauri::http::Response::builder()
+                .status(500)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Vec::new())
+                .unwrap();
+        }
+        let end = MAX_CHUNK - 1;
+        return tauri::http::Response::builder()
+            .status(206)
+            .header("Content-Type", mime)
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Range", format!("bytes 0-{end}/{len}"))
+            .header("Content-Length", nbytes.to_string())
+            .header("Cache-Control", "no-cache")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Expose-Headers", "content-range")
+            .body(buf)
+            .unwrap();
+    }
+
+    // Small file — serve the full content via mmap.
     let resp = tauri::http::Response::builder()
         .status(200)
         .header("Content-Type", mime)

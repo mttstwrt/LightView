@@ -8,7 +8,7 @@
 
 import { Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { settings } from "../../stores/settingsStore";
+import { settings, setSettings } from "../../stores/settingsStore";
 import { getThumbnailsBatch, precacheThumbnails, thumbUrl, mediaUrl, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
@@ -43,6 +43,11 @@ const BG_BATCH_SIZE = 64;
 const EVICT_ROWS = 15;
 const SETTLE_MS = 150;
 const SCROLL_DEBOUNCE_MS = 50;
+
+// Ctrl+wheel thumbnail resize bounds (px). Each tick retargets the column
+// count by ±1 so one scroll notch always produces a visible change.
+const THUMB_SIZE_MIN = 80;
+const THUMB_SIZE_MAX = 600;
 
 const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"]);
 
@@ -421,6 +426,30 @@ export function CanvasGrid(props: CanvasGridProps) {
     };
 
     const onWheel = (e: WheelEvent) => {
+      // Ctrl+wheel resizes thumbnails instead of scrolling. cellSize snaps
+      // to a whole-column layout, so we step the column count by 1 per tick
+      // and pick a thumb_size that lands in the middle of the target bucket.
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const w = containerWidth();
+        const g = gap();
+        if (w <= 0) return;
+        const cur = settings().display.thumbnail_size;
+        const curCols = Math.max(1, Math.floor((w + g) / (cur + g)));
+        const targetCols = e.deltaY < 0 ? curCols - 1 : curCols + 1;
+        if (targetCols < 1) return;
+        const upper = (w + g) / targetCols - g;
+        const lower = (w + g) / (targetCols + 1) - g;
+        let next = Math.round((upper + lower) / 2);
+        next = Math.max(THUMB_SIZE_MIN, Math.min(THUMB_SIZE_MAX, next));
+        const newCols = Math.max(1, Math.floor((w + g) / (next + g)));
+        if (newCols === curCols) return;
+        setSettings((prev) => ({
+          ...prev,
+          display: { ...prev.display, thumbnail_size: next },
+        }));
+        return;
+      }
       e.preventDefault();
       wheelAccumulator += e.deltaY;
       if (!wheelRafId) {

@@ -56,7 +56,11 @@ export function MediaViewer(props: MediaViewerProps) {
   const isVideo = () =>
     ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"].includes(ext());
 
-  const openVideoInPlayer = () => {
+  const [videoPlaying, setVideoPlaying] = createSignal(false);
+  const [videoError, setVideoError] = createSignal(false);
+  let videoRef: HTMLVideoElement | undefined;
+
+  const openVideoExternal = () => {
     const path = currentPath();
     if (!path) return;
     invoke("open_with", { command: "xdg-open", args: [path] }).catch((err) =>
@@ -107,6 +111,8 @@ export function MediaViewer(props: MediaViewerProps) {
         setImgNaturalWidth(0);
 
         const path = props.paths[idx];
+        setVideoPlaying(false);
+        setVideoError(false);
         if (!path || isVideo()) {
           setLoaded(false);
           if (imageContainerRef) imageContainerRef.replaceChildren();
@@ -270,16 +276,31 @@ export function MediaViewer(props: MediaViewerProps) {
       {/* Media display */}
       <div class="max-w-[90vw] max-h-[90vh] flex items-center justify-center">
         <Show when={isVideo()}>
-          <div class="text-neutral-400 text-sm text-center">
-            <button
-              class="w-20 h-20 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer transition-colors mb-4"
-              onClick={(e) => { e.stopPropagation(); openVideoInPlayer(); }}
-            >
-              <span class="text-white/80 text-3xl ml-1">&#9654;</span>
-            </button>
-            <div>Open in video player</div>
-            <div class="text-neutral-600 mt-1">{filename()}</div>
-          </div>
+          <Show when={!videoError()} fallback={
+            <div class="text-neutral-400 text-sm text-center" onClick={(e) => e.stopPropagation()}>
+              <button
+                class="w-20 h-20 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer transition-colors mb-4"
+                onClick={() => openVideoExternal()}
+              >
+                <span class="text-white/80 text-3xl ml-1">&#9654;</span>
+              </button>
+              <div>Open in external player</div>
+              <div class="text-neutral-600 mt-1">{filename()}</div>
+            </div>
+          }>
+            <video
+              ref={videoRef}
+              src={mediaUrl(currentPath())}
+              class="max-w-[90vw] max-h-[90vh] outline-none"
+              controls
+              preload="metadata"
+              onPlay={() => setVideoPlaying(true)}
+              onPause={() => setVideoPlaying(false)}
+              onLoadedData={() => setLoaded(true)}
+              onError={() => setVideoError(true)}
+              onClick={(e) => e.stopPropagation()}
+            />
+          </Show>
         </Show>
 
         {/* Image container — preloaded Image elements are swapped in directly */}
