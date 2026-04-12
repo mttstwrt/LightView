@@ -66,6 +66,16 @@ export interface GridRenderer {
   /** Evict a cached image for the given path. */
   evictImage(path: string): void;
 
+  /**
+   * Notify the renderer that a ThumbHash placeholder has been decoded.
+   * Used as a blurred fallback while the real thumbnail is still streaming.
+   * Optional — renderers without a dedicated hash pool may ignore it.
+   */
+  thumbHashLoaded?(path: string, img: HTMLImageElement | ImageBitmap): void;
+
+  /** Evict a cached ThumbHash placeholder for the given path. */
+  evictThumbHash?(path: string): void;
+
   /** Release all GPU/canvas resources. */
   destroy(): void;
 }

@@ -8,9 +8,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Default thumbnail dimensions.
-pub const DEFAULT_THUMB_WIDTH: u32 = 400;
-pub const DEFAULT_THUMB_HEIGHT: u32 = 400;
+/// Standard tier thumbnail size (512px square).
+pub const STANDARD_THUMB_SIZE: u32 = 512;
 
 /// Output format for generated thumbnails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -21,33 +20,25 @@ pub enum ThumbFormat {
     Jpeg,
     /// Raw RGBA8 pixels (internal use for GPU/BC7 atlas pipeline only).
     Rgba,
+    /// Lossy WebP — ~30% smaller than JPEG at equivalent visual quality.
+    /// Preferred for the L/P tiers where file size matters more than
+    /// decode speed. Browsers have native WebP support.
+    Webp,
 }
 
-/// User-configurable thumbnail settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThumbnailSettings {
-    /// Output format for cached/served thumbnails.
-    pub format: ThumbFormat,
-    /// Thumbnail width in pixels.
-    pub width: u32,
-    /// Thumbnail height in pixels.
-    pub height: u32,
-    /// Resize algorithm.
-    pub resize_filter: ResizeFilter,
-}
-
-impl Default for ThumbnailSettings {
-    fn default() -> Self {
-        Self {
-            format: ThumbFormat::Jpeg,
-            width: DEFAULT_THUMB_WIDTH,
-            height: DEFAULT_THUMB_HEIGHT,
-            resize_filter: ResizeFilter::default(),
+impl ThumbFormat {
+    /// Cache-row `format` column value. Must match the strings written
+    /// into the `thumbnails*` tables so that lookup comparisons work.
+    pub fn as_cache_str(self) -> &'static str {
+        match self {
+            ThumbFormat::Jpeg => "jpeg",
+            ThumbFormat::Rgba => "rgba",
+            ThumbFormat::Webp => "webp",
         }
     }
 }
 
-/// Resize algorithm selection, exposed to the frontend.
+/// Resize algorithm selection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ResizeFilter {
@@ -72,6 +63,18 @@ impl ResizeFilter {
             ResizeFilter::Bilinear => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
             ResizeFilter::Lanczos3 => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
         }
+    }
+}
+
+/// Pick the best resize algorithm for a given target size.
+/// Small thumbnails (micro/standard) use fast Bilinear — the quality
+/// difference from Lanczos3 is imperceptible at <= 512px.
+/// Large/Preview tiers use Lanczos3 for maximum sharpness.
+pub fn filter_for_size(target: u32) -> ResizeFilter {
+    if target <= STANDARD_THUMB_SIZE {
+        ResizeFilter::Bilinear
+    } else {
+        ResizeFilter::Lanczos3
     }
 }
 
@@ -207,7 +210,7 @@ fn generate_jpeg_thumbnail_inner(path: &Path, filter: ResizeFilter, format: Thum
             let cropped = crop_rgb(&rgb_buf, dw, cx, cy, side, side);
             resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
-        ThumbFormat::Rgba => {
+        ThumbFormat::Rgba | ThumbFormat::Webp => {
             let rgba_src = rgb_to_rgba(&rgb_buf);
             let cropped = crop_rgba(&rgba_src, dw, cx, cy, side, side);
             resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
@@ -246,7 +249,7 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
             let cropped = crop_rgb(src_buf, w, cx, cy, side, side);
             resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
-        ThumbFormat::Rgba => {
+        ThumbFormat::Rgba | ThumbFormat::Webp => {
             let rgba = img.to_rgba8();
             let src_buf = rgba.as_raw();
             let cropped = crop_rgba(src_buf, w, cx, cy, side, side);
@@ -287,7 +290,7 @@ fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForma
             let cropped = crop_rgb(&rgb, dw, cx, cy, side, side);
             resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
-        ThumbFormat::Rgba => {
+        ThumbFormat::Rgba | ThumbFormat::Webp => {
             let cropped = crop_rgba(&rgba_buf, dw, cx, cy, side, side);
             resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
@@ -387,6 +390,8 @@ fn l8_to_rgba(luma: &[u8]) -> Vec<u8> {
 }
 
 /// Encode resized pixel data to the requested output format.
+/// JPEG expects RGB8, WebP + Rgba expect RGBA8; the caller is responsible
+/// for passing the correct layout via `format`.
 fn encode_output(pixels: &[u8], w: u32, h: u32, format: ThumbFormat) -> Result<Vec<u8>, ThumbError> {
     match format {
         ThumbFormat::Jpeg => {
@@ -401,7 +406,109 @@ fn encode_output(pixels: &[u8], w: u32, h: u32, format: ThumbFormat) -> Result<V
             // Raw RGBA pixels — caller will BC7-encode.
             Ok(pixels.to_vec())
         }
+        ThumbFormat::Webp => encode_rgba_to_webp(pixels, w, h),
     }
+}
+
+/// Lossy WebP encode at Q75 — ~30% smaller than JPEG at equivalent
+/// perceptual quality, natively supported by WebKit. Input must be
+/// tightly packed RGBA8 of exactly `w * h * 4` bytes.
+pub fn encode_rgba_to_webp(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbError> {
+    let expected = (w as usize) * (h as usize) * 4;
+    if rgba.len() < expected {
+        return Err(ThumbError::Encode(format!(
+            "RGBA buffer too small for {}x{}: {} bytes",
+            w,
+            h,
+            rgba.len()
+        )));
+    }
+    let encoder = webp::Encoder::from_rgba(&rgba[..expected], w, h);
+    let mem = encoder.encode(75.0);
+    Ok(mem.to_vec())
+}
+
+/// Decode an already-encoded thumbnail blob back to RGBA. Used by the
+/// multi-tier / ThumbHash derivation pass to avoid re-decoding the source
+/// file. Input can be JPEG bytes (the default thumbnail format) or raw
+/// RGBA pixels with explicit dimensions.
+pub fn decode_thumb_bytes_to_rgba(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    format: ThumbFormat,
+) -> Result<Vec<u8>, ThumbError> {
+    match format {
+        ThumbFormat::Rgba => {
+            let expected = (width as usize) * (height as usize) * 4;
+            if data.len() >= expected {
+                Ok(data[..expected].to_vec())
+            } else {
+                Err(ThumbError::Decode("RGBA buffer smaller than dims".into()))
+            }
+        }
+        ThumbFormat::Jpeg | ThumbFormat::Webp => {
+            // image crate handles both JPEG and WebP decode via format sniffing.
+            let img = image::load_from_memory(data)
+                .map_err(|e| ThumbError::Decode(format!("codec decode: {e}")))?;
+            Ok(img.to_rgba8().into_raw())
+        }
+    }
+}
+
+/// Downsample an RGBA image to a target square size.
+/// Used to derive micro/large/preview tiers from the standard tier,
+/// and to derive the ThumbHash source buffer.
+pub fn downsample_rgba_square(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    target: u32,
+) -> Result<Vec<u8>, ThumbError> {
+    resize_rgba(sw, sh, src, target, target, ResizeFilter::Bilinear)
+}
+
+/// Compute a ThumbHash from RGBA pixels. Downsamples internally to ~96px
+/// because the thumbhash crate is O(W*H) and the output is invariant to
+/// input resolution above that. Returns the compact ~25-byte hash blob.
+pub fn compute_thumbhash(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, ThumbError> {
+    const THUMBHASH_SRC_SIZE: u32 = 96;
+    let (src, sw, sh) = if width <= THUMBHASH_SRC_SIZE && height <= THUMBHASH_SRC_SIZE {
+        (rgba.to_vec(), width, height)
+    } else {
+        // Preserve aspect ratio: fit the longer edge into THUMBHASH_SRC_SIZE.
+        let (tw, th) = if width >= height {
+            let tw = THUMBHASH_SRC_SIZE;
+            let th = ((height as u64) * (tw as u64) / (width as u64)).max(1) as u32;
+            (tw, th)
+        } else {
+            let th = THUMBHASH_SRC_SIZE;
+            let tw = ((width as u64) * (th as u64) / (height as u64)).max(1) as u32;
+            (tw, th)
+        };
+        (
+            resize_rgba(width, height, rgba, tw, th, ResizeFilter::Bilinear)?,
+            tw,
+            th,
+        )
+    };
+    Ok(thumbhash::rgba_to_thumb_hash(sw as usize, sh as usize, &src))
+}
+
+/// Encode RGBA pixels to JPEG. Used when deriving tier bytes for storage.
+pub fn encode_rgba_to_jpeg_tier(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbError> {
+    // Convert to RGB first — JpegEncoder expects 3 channels for quality path.
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for chunk in rgba.chunks_exact(4) {
+        rgb.push(chunk[0]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[2]);
+    }
+    let mut buf = std::io::Cursor::new(Vec::with_capacity(16_000));
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
+    enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)
+        .map_err(|e| ThumbError::Encode(e.to_string()))?;
+    Ok(buf.into_inner())
 }
 
 /// Generate a thumbnail for a single image file.
@@ -627,7 +734,7 @@ fn decode_jpeg_to_rgba_inner(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32
         return Err(ThumbError::Decode("Zero dimension".into()));
     }
 
-    let target = DEFAULT_THUMB_WIDTH.max(DEFAULT_THUMB_HEIGHT) as u16;
+    let target = STANDARD_THUMB_SIZE as u16;
     let _ = decoder.scale(target, target);
 
     let pixels = decoder.decode().map_err(|e| ThumbError::Decode(e.to_string()))?;
@@ -708,7 +815,7 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
                     let cropped = crop_rgb(&rgb, w, cx, cy, side, side);
                     resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
                 }
-                ThumbFormat::Rgba => {
+                ThumbFormat::Rgba | ThumbFormat::Webp => {
                     let cropped = crop_rgba(&rgba, w, cx, cy, side, side);
                     resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
                 }
@@ -909,6 +1016,16 @@ fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, th
                 .encode(&rgb, thumb_w, thumb_h, image::ExtendedColorType::Rgb8)
                 .map_err(|e| ThumbError::Encode(e.to_string()))?;
             cursor.into_inner()
+        }
+        ThumbFormat::Webp => {
+            let mut rgba = vec![0u8; pixel_count * 4];
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[0] = grey;
+                pixel[1] = grey;
+                pixel[2] = grey;
+                pixel[3] = 255;
+            }
+            encode_rgba_to_webp(&rgba, thumb_w, thumb_h)?
         }
     };
 

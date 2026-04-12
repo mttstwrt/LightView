@@ -44,6 +44,8 @@ percent-encoding = "2"
 trash = "5"
 bytemuck = { version = "1", features = ["derive"] }
 libheif-rs = "2"
+thumbhash = "0.1"
+webp = "0.3"
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 http-range = "0.1.5"

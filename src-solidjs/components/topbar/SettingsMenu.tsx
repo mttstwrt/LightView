@@ -1,11 +1,10 @@
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths } from "../../stores/galleryStore";
-import type { AppSettings, ResizeFilter, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
-import { rebuildThumbnails, getThumbnailSettings, updateThumbnailSettings, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch } from "../../lib/ipc";
+import type { AppSettings, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
+import { rebuildThumbnails, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch } from "../../lib/ipc";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
 import { listen } from "@tauri-apps/api/event";
-import type { ThumbnailSettings } from "../../lib/ipc";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 const THUMB_PRESETS = [
@@ -13,13 +12,6 @@ const THUMB_PRESETS = [
   { label: "M", value: 200 },
   { label: "L", value: 300 },
   { label: "XL", value: 400 },
-] as const;
-
-const THUMB_DIM_PRESETS = [
-  { label: "256", value: 256 },
-  { label: "400", value: 400 },
-  { label: "512", value: 512 },
-  { label: "800", value: 800 },
 ] as const;
 
 const GAP_PRESETS = [
@@ -82,29 +74,6 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
       ...prev,
       storage: { ...prev.storage, [key]: value },
     }));
-  };
-
-  const [thumbSettings, setThumbSettings] = createSignal<ThumbnailSettings | null>(null);
-
-  onMount(async () => {
-    try {
-      const ts = await getThumbnailSettings();
-      setThumbSettings(ts);
-    } catch {}
-  });
-
-  const updateThumb = async (patch: Partial<ThumbnailSettings>) => {
-    const current = thumbSettings();
-    if (!current) return;
-    const updated = { ...current, ...patch };
-    setThumbSettings(updated);
-    try {
-      await updateThumbnailSettings(updated);
-      // New settings apply only to newly generated thumbnails.
-      // Use "Rebuild All" to regenerate existing thumbnails with the new settings.
-    } catch (e) {
-      console.error("Failed to update thumbnail settings:", e);
-    }
   };
 
   const [rebuilding, setRebuilding] = createSignal(false);
@@ -374,60 +343,15 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             </Section>
 
             {/* ── Thumbnails ── */}
-            <Show when={thumbSettings()}>
-              <Section label="Thumbnails">
-                <Field label="Dimensions">
-                  <div class="flex gap-1">
-                    {THUMB_DIM_PRESETS.map((p) => (
-                      <button
-                        class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                          thumbSettings()!.width === p.value && thumbSettings()!.height === p.value
-                            ? "bg-teal-700/60 text-teal-200"
-                            : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                        }`}
-                        onClick={() => updateThumb({ width: p.value, height: p.value })}
-                      >
-                        {p.label}
-                      </button>
-                    ))}
-                  </div>
-                </Field>
-
-                <Field label="Format">
-                  <span class="px-2 py-0.5 text-xs rounded bg-teal-700/60 text-teal-200" title="Compressed JPEG (10–50 KB per thumbnail)">
-                    JPEG
-                  </span>
-                </Field>
-
-                <Field label="Resize algorithm">
-                  <div class="flex gap-1">
-                    {(["nearest", "bilinear", "lanczos3"] as const).map((f) => (
-                      <button
-                        class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                          thumbSettings()!.resize_filter === f
-                            ? "bg-teal-700/60 text-teal-200"
-                            : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                        }`}
-                        onClick={() => {
-                          updatePerformance("thumbnail_resize_filter", f);
-                          updateThumb({ resize_filter: f });
-                        }}
-                      >
-                        {f.charAt(0).toUpperCase() + f.slice(1)}
-                      </button>
-                    ))}
-                  </div>
-                </Field>
-
-                <button
-                  onClick={handleRebuild}
-                  disabled={rebuilding()}
-                  class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
-                </button>
-              </Section>
-            </Show>
+            <Section label="Thumbnails">
+              <button
+                onClick={handleRebuild}
+                disabled={rebuilding()}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
+              </button>
+            </Section>
 
             {/* ── Storage ── */}
             <Section label="Storage">

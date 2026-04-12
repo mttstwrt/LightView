@@ -16,8 +16,6 @@ const DEFAULT_SETTINGS: AppSettings = {
     preload_count: 3,
     lru_cache_size: 5,
     thumbnail_threads: 6,
-    thumbnail_quality: 80,
-    thumbnail_resize_filter: "bilinear",
   },
   plugins: {
     max_concurrent: 4,

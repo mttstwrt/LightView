@@ -1,7 +1,7 @@
 import { Show, For, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
-import { mediaUrl, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
+import { mediaUrl, thumbUrl, ensureTierThumbnails, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
 import type { CachedThumbnailInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
 import { ViewerImageCache } from "../../lib/viewerCache";
@@ -121,6 +121,15 @@ export function MediaViewer(props: MediaViewerProps) {
 
         // Trigger preloading of adjacent images
         cache.preload(props.paths, idx);
+
+        // P5: preview tier first-paint. Kick off lazy generation of the
+        // 1600 px preview for this image and its neighbours in the
+        // background; the <img src={thumbUrl(path, 'p')}> tag below
+        // will 404 → retry once the tier is ready. This covers common
+        // arrow-key navigation without an extra round-trip.
+        const previewPaths = [props.paths[idx], props.paths[idx - 1], props.paths[idx + 1]]
+          .filter((p): p is string => !!p);
+        ensureTierThumbnails(previewPaths, "p").catch(() => {});
 
         // Check if already cached — instant display
         const cached = cache.get(path);
@@ -301,6 +310,23 @@ export function MediaViewer(props: MediaViewerProps) {
               onClick={(e) => e.stopPropagation()}
             />
           </Show>
+        </Show>
+
+        {/* Preview tier underlay — shown while the full-resolution image
+            is still decoding. Uses the lazy 1600 px preview cached by
+            ensureTierThumbnails above. Fails silently (404) until the
+            tier is ready, at which point a natural re-render swaps it in. */}
+        <Show when={!isVideo() && !loaded()}>
+          <img
+            src={thumbUrl(currentPath(), "p")}
+            class="absolute max-w-[90vw] max-h-[90vh] object-contain pointer-events-none"
+            style={{ filter: "blur(2px)" }}
+            draggable={false}
+            onError={(e) => {
+              // Hide the broken-image icon if the preview isn't ready yet.
+              (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
+            }}
+          />
         </Show>
 
         {/* Image container — preloaded Image elements are swapped in directly */}

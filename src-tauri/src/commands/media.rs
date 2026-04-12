@@ -3,7 +3,8 @@ use serde::Serialize;
 use std::path::Path;
 use tauri::Emitter;
 
-use crate::pipeline::thumbnailer::{self, ResizeFilter, ThumbFormat};
+use crate::cache::thumbnails::ThumbTier;
+use crate::pipeline::thumbnailer::{self, ResizeFilter, ThumbFormat, STANDARD_THUMB_SIZE};
 use crate::AppState;
 
 /// Thumbnail metadata returned over IPC. No pixel data — the frontend
@@ -39,19 +40,16 @@ fn encode_b64(data: &[u8]) -> String {
 pub async fn get_thumbnail(
     state: tauri::State<'_, AppState>,
     path: String,
-    resize_filter: Option<ResizeFilter>,
 ) -> Result<Option<ThumbnailResult>, String> {
-    let settings = state.thumbnail_settings.read().await.clone();
-    let filter = resize_filter.unwrap_or(settings.resize_filter);
+    let format = state.thumb_format();
+    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let use_atlas = state
         .use_bc7_atlas
         .load(std::sync::atomic::Ordering::Relaxed);
+    let thumb_size = STANDARD_THUMB_SIZE;
 
     // Check SQLite cache — return as-is if format matches, otherwise regenerate
-    let requested_fmt = match settings.format {
-        ThumbFormat::Rgba => "rgba",
-        ThumbFormat::Jpeg => "jpeg",
-    };
+    let requested_fmt = format.as_cache_str();
     {
         let db = state.cache_db.lock().await;
         let db = db.as_ref().ok_or("No gallery open")?;
@@ -71,10 +69,8 @@ pub async fn get_thumbnail(
     }
     // Lock released — generate without holding the mutex
 
-    // Generate thumbnail using configured format and dimensions
-    let format = settings.format;
-    let (thumb_w, thumb_h) = (settings.width, settings.height);
-    let result = dispatch_thumbnail(&state.thumb_pool, path.clone(), filter, format, thumb_w, thumb_h).await?;
+    // Generate thumbnail using tier-derived format and dimensions
+    let result = dispatch_thumbnail(&state.thumb_pool, path.clone(), filter, format, thumb_size, thumb_size).await?;
 
     match result {
         Ok(thumb) => {
@@ -87,10 +83,7 @@ pub async fn get_thumbnail(
                 }
             }
 
-            let fmt_str = match thumb.format {
-                ThumbFormat::Rgba => "rgba",
-                ThumbFormat::Jpeg => "jpeg",
-            };
+            let fmt_str = thumb.format.as_cache_str();
 
             // Cache in SQLite in the generated format
             let db = state.cache_db.lock().await;
@@ -139,24 +132,23 @@ pub async fn get_thumbnails_batch(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
-    resize_filter: Option<ResizeFilter>,
 ) -> Result<Vec<ThumbnailResult>, String> {
-    let settings = state.thumbnail_settings.read().await.clone();
-    let filter = resize_filter.unwrap_or(settings.resize_filter);
+    let format = state.thumb_format();
+    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let use_atlas = state
         .use_bc7_atlas
         .load(std::sync::atomic::Ordering::Relaxed);
-    let format = settings.format;
-    let (thumb_w, thumb_h) = (settings.width, settings.height);
+    let thumb_w = STANDARD_THUMB_SIZE;
+    let thumb_h = STANDARD_THUMB_SIZE;
 
     let mut results = Vec::with_capacity(paths.len());
     let mut uncached_paths = Vec::new();
+    // Paths that have a standard thumbnail but are missing micro/thumbhash rows.
+    // These need derivation from the cached standard-tier bytes.
+    let mut micro_missing: Vec<String> = Vec::new();
 
     // Phase 1: Check SQLite cache — return as-is if format matches, otherwise regenerate
-    let requested_fmt = match format {
-        ThumbFormat::Rgba => "rgba",
-        ThumbFormat::Jpeg => "jpeg",
-    };
+    let requested_fmt = format.as_cache_str();
     {
         let db = state.cache_db.lock().await;
         let db = db.as_ref().ok_or("No gallery open")?;
@@ -172,6 +164,10 @@ pub async fn get_thumbnails_batch(
                         media_type: String::new(),
                         format: fmt.clone(),
                     });
+                    // Check if micro tier is missing for this cached path
+                    if !db.tier_is_cached(ThumbTier::Micro, path).unwrap_or(false) {
+                        micro_missing.push(path.clone());
+                    }
                 } else {
                     // Format mismatch — regenerate
                     uncached_paths.push(path.clone());
@@ -180,6 +176,11 @@ pub async fn get_thumbnails_batch(
                 uncached_paths.push(path.clone());
             }
         }
+    }
+
+    // Derive micro + thumbhash for cached paths that are missing them
+    if !micro_missing.is_empty() {
+        derive_micro_for_cached(&state, &micro_missing).await;
     }
 
     if uncached_paths.is_empty() {
@@ -242,10 +243,7 @@ pub async fn get_thumbnails_batch(
                     width: thumb.width,
                     height: thumb.height,
                     media_type: thumb.media_type.clone(),
-                    format: match thumb.format {
-                        ThumbFormat::Rgba => "rgba".to_string(),
-                        ThumbFormat::Jpeg => "jpeg".to_string(),
-                    },
+                    format: thumb.format.as_cache_str().to_string(),
                 });
             }
             if let Ok(Ok(thumb)) = result {
@@ -271,10 +269,7 @@ pub async fn get_thumbnails_batch(
     let mut rgba_to_atlas: Vec<(String, Vec<u8>, u32, u32, u64)> = Vec::new();
 
     for thumb in generated_thumbs {
-        let fmt_str = match thumb.format {
-            ThumbFormat::Rgba => "rgba".to_string(),
-            ThumbFormat::Jpeg => "jpeg".to_string(),
-        };
+        let fmt_str = thumb.format.as_cache_str().to_string();
         let needs_atlas = thumb.format == ThumbFormat::Rgba && use_atlas && gpu_bc7_data.is_empty();
 
         // Queue RGBA for CPU BC7 encoding if atlas is active and no GPU BC7 was produced
@@ -325,6 +320,94 @@ pub async fn get_thumbnails_batch(
         }
     }
 
+    // -------------------------------------------------------------------
+    // Derive ThumbHash + micro (T1) tier bytes in parallel on the CPU pool.
+    // Done BEFORE the SQLite transaction so the inserts can include the
+    // thumbhash blob and the micro row in the same commit path.
+    // -------------------------------------------------------------------
+    struct DerivedExtras {
+        path: String,
+        thumbhash: Option<Vec<u8>>,
+        micro_bytes: Option<Vec<u8>>,
+        micro_w: u32,
+        micro_h: u32,
+    }
+
+    let derived_extras: Vec<DerivedExtras> = {
+        use rayon::prelude::*;
+        // Capture what the rayon closure needs, without borrowing `to_cache`.
+        let inputs: Vec<(String, Vec<u8>, u32, u32, ThumbFormat)> = to_cache
+            .iter()
+            .map(|item| {
+                let fmt = match item.format.as_str() {
+                    "rgba" => ThumbFormat::Rgba,
+                    "webp" => ThumbFormat::Webp,
+                    _ => ThumbFormat::Jpeg,
+                };
+                (
+                    item.path.clone(),
+                    item.data.clone(),
+                    item.width,
+                    item.height,
+                    fmt,
+                )
+            })
+            .collect();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.thumb_pool.spawn(move || {
+            let out: Vec<DerivedExtras> = inputs
+                .into_par_iter()
+                .map(|(path, data, w, h, fmt)| {
+                    let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data, w, h, fmt) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return DerivedExtras {
+                                path,
+                                thumbhash: None,
+                                micro_bytes: None,
+                                micro_w: 0,
+                                micro_h: 0,
+                            };
+                        }
+                    };
+
+                    // ThumbHash — ~25-byte compact placeholder (P1).
+                    let thumbhash = thumbnailer::compute_thumbhash(&rgba, w, h).ok();
+
+                    // Micro tier — 128x128 JPEG from the standard-tier RGBA (P2).
+                    let micro_target = 128u32;
+                    let (micro_bytes, micro_w, micro_h) = match thumbnailer::downsample_rgba_square(
+                        &rgba,
+                        w,
+                        h,
+                        micro_target,
+                    ) {
+                        Ok(resized) => match thumbnailer::encode_rgba_to_jpeg_tier(
+                            &resized,
+                            micro_target,
+                            micro_target,
+                        ) {
+                            Ok(jpeg) => (Some(jpeg), micro_target, micro_target),
+                            Err(_) => (None, 0, 0),
+                        },
+                        Err(_) => (None, 0, 0),
+                    };
+
+                    DerivedExtras {
+                        path,
+                        thumbhash,
+                        micro_bytes,
+                        micro_w,
+                        micro_h,
+                    }
+                })
+                .collect();
+            let _ = tx.send(out);
+        });
+        rx.await.unwrap_or_default()
+    };
+
     // Batch-write thumbnails to SQLite in the generated format (single transaction)
     if !to_cache.is_empty() {
         let mut db = state.cache_db.lock().await;
@@ -341,6 +424,40 @@ pub async fn get_thumbnails_batch(
                     rusqlite::params![item.src_width, item.src_height, item.path],
                 );
             }
+
+            // Write ThumbHash + micro tier rows in the same transaction so
+            // queries never observe a split state (standard row present,
+            // placeholder/micro missing).
+            for extra in &derived_extras {
+                if let Some(hash) = &extra.thumbhash {
+                    let _ = tx.execute(
+                        "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
+                        rusqlite::params![hash, extra.path],
+                    );
+                }
+                if let Some(bytes) = &extra.micro_bytes {
+                    // Find matching to_cache entry for media_type
+                    let media_type = to_cache
+                        .iter()
+                        .find(|c| c.path == extra.path)
+                        .map(|c| c.media_type.clone())
+                        .unwrap_or_default();
+                    let _ = tx.execute(
+                        "INSERT OR REPLACE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            extra.path,
+                            media_type,
+                            0u64,
+                            extra.micro_w,
+                            extra.micro_h,
+                            bytes,
+                            "jpeg"
+                        ],
+                    );
+                }
+            }
+
             let _ = tx.commit();
 
             // Extract video metadata outside the transaction
@@ -443,37 +560,34 @@ async fn generate_batch_gpu(
         for (gpu_idx, resize_out) in resized.into_iter().enumerate() {
             let orig_idx = gpu_indices[gpu_idx];
             if let (Some(resized), Some(img)) = (resize_out, &decoded_ref[orig_idx]) {
-                match format {
-                    ThumbFormat::Jpeg => {
-                        match encode_rgba_to_jpeg(&resized.rgba_data, resized.width, resized.height) {
-                            Ok(jpeg_data) => {
-                                results.push(ThumbResult {
-                                    path: img.path.clone(),
-                                    width: resized.width,
-                                    height: resized.height,
-                                    data: jpeg_data,
-                                    media_type: img.media_type.clone(),
-                                    src_width: img.src_width,
-                                    src_height: img.src_height,
-                                    format: ThumbFormat::Jpeg,
-                                });
-                            }
-                            Err(e) => {
-                                log::warn!("JPEG encode failed for {}: {}", img.path, e);
-                            }
-                        }
-                    }
-                    ThumbFormat::Rgba => {
+                let encoded = match format {
+                    ThumbFormat::Jpeg => encode_rgba_to_jpeg(
+                        &resized.rgba_data,
+                        resized.width,
+                        resized.height,
+                    ),
+                    ThumbFormat::Webp => crate::pipeline::thumbnailer::encode_rgba_to_webp(
+                        &resized.rgba_data,
+                        resized.width,
+                        resized.height,
+                    ),
+                    ThumbFormat::Rgba => Ok(resized.rgba_data.clone()),
+                };
+                match encoded {
+                    Ok(data) => {
                         results.push(ThumbResult {
                             path: img.path.clone(),
                             width: resized.width,
                             height: resized.height,
-                            data: resized.rgba_data,
+                            data,
                             media_type: img.media_type.clone(),
                             src_width: img.src_width,
                             src_height: img.src_height,
-                            format: ThumbFormat::Rgba,
+                            format,
                         });
+                    }
+                    Err(e) => {
+                        log::warn!("Encode failed for {}: {}", img.path, e);
                     }
                 }
             }
@@ -579,37 +693,34 @@ async fn generate_batch_gpu_full(
                 ));
 
                 // Encode output from RGBA readback for IPC
-                match format {
-                    ThumbFormat::Jpeg => {
-                        match encode_rgba_to_jpeg(&result.rgba_data, result.width, result.height) {
-                            Ok(jpeg_data) => {
-                                thumbs.push(ThumbResult {
-                                    path: img.path.clone(),
-                                    width: result.width,
-                                    height: result.height,
-                                    data: jpeg_data,
-                                    media_type: img.media_type.clone(),
-                                    src_width: img.src_width,
-                                    src_height: img.src_height,
-                                    format: ThumbFormat::Jpeg,
-                                });
-                            }
-                            Err(e) => {
-                                log::warn!("JPEG encode failed for {}: {}", img.path, e);
-                            }
-                        }
-                    }
-                    ThumbFormat::Rgba => {
+                let encoded = match format {
+                    ThumbFormat::Jpeg => encode_rgba_to_jpeg(
+                        &result.rgba_data,
+                        result.width,
+                        result.height,
+                    ),
+                    ThumbFormat::Webp => crate::pipeline::thumbnailer::encode_rgba_to_webp(
+                        &result.rgba_data,
+                        result.width,
+                        result.height,
+                    ),
+                    ThumbFormat::Rgba => Ok(result.rgba_data.clone()),
+                };
+                match encoded {
+                    Ok(data) => {
                         thumbs.push(ThumbResult {
                             path: img.path.clone(),
                             width: result.width,
                             height: result.height,
-                            data: result.rgba_data,
+                            data,
                             media_type: img.media_type.clone(),
                             src_width: img.src_width,
                             src_height: img.src_height,
-                            format: ThumbFormat::Rgba,
+                            format,
                         });
+                    }
+                    Err(e) => {
+                        log::warn!("Encode failed for {}: {}", img.path, e);
                     }
                 }
             }
@@ -642,16 +753,130 @@ async fn dispatch_thumbnail(
     rx.await.map_err(|_| "Thumbnail task was dropped".to_string())
 }
 
+/// Derive micro-tier (128px) thumbnails + thumbhash for cached standard-tier
+/// paths that are missing them. Reads the standard thumbnail bytes from
+/// SQLite, decodes to RGBA, downsamples, and writes the micro row + thumbhash.
+async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
+    // Read standard-tier bytes from DB
+    let items: Vec<(String, Vec<u8>, u32, u32, ThumbFormat, String)> = {
+        let db = state.cache_db.lock().await;
+        let Some(db) = db.as_ref() else { return };
+        paths
+            .iter()
+            .filter_map(|path| {
+                let row = db.get_thumbnail(path).ok()??;
+                let fmt = match row.format.as_str() {
+                    "rgba" => ThumbFormat::Rgba,
+                    "webp" => ThumbFormat::Webp,
+                    _ => ThumbFormat::Jpeg,
+                };
+                Some((path.clone(), row.thumbnail, row.width, row.height, fmt, row.media_type))
+            })
+            .collect()
+    };
+
+    if items.is_empty() {
+        return;
+    }
+
+    // Derive micro + thumbhash on the CPU pool
+    struct Derived {
+        path: String,
+        media_type: String,
+        thumbhash: Option<Vec<u8>>,
+        micro_bytes: Option<Vec<u8>>,
+        micro_size: u32,
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.thumb_pool.spawn(move || {
+        use rayon::prelude::*;
+        let out: Vec<Derived> = items
+            .into_par_iter()
+            .map(|(path, data, w, h, fmt, media_type)| {
+                let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data, w, h, fmt) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Derived {
+                            path,
+                            media_type,
+                            thumbhash: None,
+                            micro_bytes: None,
+                            micro_size: 0,
+                        };
+                    }
+                };
+
+                let thumbhash = thumbnailer::compute_thumbhash(&rgba, w, h).ok();
+
+                let micro_target = ThumbTier::Micro.target_size();
+                let micro_bytes = thumbnailer::downsample_rgba_square(&rgba, w, h, micro_target)
+                    .ok()
+                    .and_then(|resized| {
+                        thumbnailer::encode_rgba_to_jpeg_tier(&resized, micro_target, micro_target).ok()
+                    });
+
+                Derived {
+                    path,
+                    media_type,
+                    thumbhash,
+                    micro_bytes,
+                    micro_size: micro_target,
+                }
+            })
+            .collect();
+        let _ = tx.send(out);
+    });
+
+    let derived = match rx.await {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    // Write to DB
+    let mut db = state.cache_db.lock().await;
+    let Some(db) = db.as_mut() else { return };
+    let Ok(txn) = db.transaction() else { return };
+    for item in &derived {
+        if let Some(hash) = &item.thumbhash {
+            let _ = txn.execute(
+                "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2 AND thumbhash IS NULL",
+                rusqlite::params![hash, item.path],
+            );
+        }
+        if let Some(bytes) = &item.micro_bytes {
+            let _ = txn.execute(
+                "INSERT OR IGNORE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    item.path,
+                    item.media_type,
+                    0u64,
+                    item.micro_size,
+                    item.micro_size,
+                    bytes,
+                    "jpeg"
+                ],
+            );
+        }
+    }
+    let _ = txn.commit();
+    log::info!(
+        "Derived micro tier for {} cached thumbnails ({} paths checked)",
+        derived.iter().filter(|d| d.micro_bytes.is_some()).count(),
+        paths.len(),
+    );
+}
+
 /// Regenerate a single thumbnail, bypassing all caches.
 #[tauri::command]
 pub async fn regenerate_thumbnail(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    let settings = state.thumbnail_settings.read().await.clone();
-    let filter = settings.resize_filter;
-    let format = settings.format;
-    let (thumb_w, thumb_h) = (settings.width, settings.height);
+    let format = state.thumb_format();
+    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
+    let thumb_size = STANDARD_THUMB_SIZE;
 
     // Remove from SQLite cache
     {
@@ -665,7 +890,7 @@ pub async fn regenerate_thumbnail(
     }
 
     // Generate fresh
-    let result = dispatch_thumbnail(&state.thumb_pool, path.clone(), filter, format, thumb_w, thumb_h).await?;
+    let result = dispatch_thumbnail(&state.thumb_pool, path.clone(), filter, format, thumb_size, thumb_size).await?;
 
     match result {
         Ok(thumb) => {
@@ -677,10 +902,7 @@ pub async fn regenerate_thumbnail(
                     let _ = atlas.remap();
                 }
             }
-            let fmt_str = match thumb.format {
-                ThumbFormat::Rgba => "rgba",
-                ThumbFormat::Jpeg => "jpeg",
-            };
+            let fmt_str = thumb.format.as_cache_str();
             let db = state.cache_db.lock().await;
             if let Some(db) = db.as_ref() {
                 let _ = db.upsert_thumbnail(
@@ -843,19 +1065,16 @@ pub async fn precache_thumbnails(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<PrecacheResult, String> {
-    let settings = state.thumbnail_settings.read().await.clone();
-    let filter = settings.resize_filter;
-    let format = settings.format;
-    let (thumb_w, thumb_h) = (settings.width, settings.height);
+    let format = state.thumb_format();
+    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
+    let thumb_w = STANDARD_THUMB_SIZE;
+    let thumb_h = STANDARD_THUMB_SIZE;
     let use_atlas = state
         .use_bc7_atlas
         .load(std::sync::atomic::Ordering::Relaxed);
 
     // Filter to only paths that are uncached or have a format mismatch
-    let requested_fmt = match format {
-        ThumbFormat::Rgba => "rgba",
-        ThumbFormat::Jpeg => "jpeg",
-    };
+    let requested_fmt = format.as_cache_str();
     let uncached: Vec<String> = {
         let db = state.cache_db.lock().await;
         let db = db.as_ref().ok_or("No gallery open")?;
@@ -898,10 +1117,7 @@ pub async fn precache_thumbnails(
     for (i, result) in results.into_iter().enumerate() {
         match result {
             Ok(Ok(thumb)) => {
-                let fmt_str = match thumb.format {
-                    ThumbFormat::Rgba => "rgba",
-                    ThumbFormat::Jpeg => "jpeg",
-                };
+                let fmt_str = thumb.format.as_cache_str();
 
                 if use_atlas && thumb.format == ThumbFormat::Rgba {
                     let mut atlas = state.thumb_atlas.lock().await;
@@ -993,4 +1209,150 @@ pub async fn get_cached_thumbnail_info(
         Ok(None) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// Entry returned by `get_thumbhashes` — one per requested path.
+/// `hash` is the base64-encoded ThumbHash blob (~32 chars for ~25 bytes),
+/// or None if no hash has been computed yet. The frontend decodes these
+/// into tiny bitmaps and uses them as skeleton placeholders until the
+/// real thumbnail streams in.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThumbHashResult {
+    pub path: String,
+    pub hash: Option<String>,
+}
+
+/// Bulk-fetch ThumbHash placeholders for a list of paths. Returned in the
+/// same order as the input — missing entries become `{ path, hash: null }`.
+/// This is a pure-metadata command (~25 bytes per hash); the frontend
+/// decodes each hash into a 32x32 bitmap locally.
+#[tauri::command]
+pub async fn get_thumbhashes(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<ThumbHashResult>, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+
+    let blobs = db.get_thumbhashes(&paths).map_err(|e| e.to_string())?;
+    let out = paths
+        .into_iter()
+        .zip(blobs.into_iter())
+        .map(|(path, blob)| ThumbHashResult {
+            path,
+            hash: blob.map(|b| encode_b64(&b)),
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Lazily generate high-resolution tier thumbnails (L/P). This is the
+/// entry point for P3 (1024 grid tier) and P5 (1600 viewer preview tier).
+/// Re-decodes each source image at the tier's target size — these tiers
+/// are too large to derive from the 512 px standard thumbnail.
+///
+/// Paths that already have a row in the tier table are skipped. Paths
+/// that fail to generate are silently dropped (the frontend will fall
+/// back to the next lower tier).
+///
+/// Returns the number of thumbnails successfully written. The frontend
+/// should retry its `lightview://thumb/<tier>/<path>` URL (with a new
+/// cache-buster) after this resolves.
+#[tauri::command]
+pub async fn ensure_tier_thumbnails(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    tier: String,
+) -> Result<usize, String> {
+    let tier = ThumbTier::from_segment(&tier).ok_or_else(|| format!("unknown tier: {}", tier))?;
+    if matches!(tier, ThumbTier::Standard) {
+        return Err("ensure_tier_thumbnails does not handle the standard tier; use get_thumbnails_batch".into());
+    }
+
+    // Skip anything already cached.
+    let missing: Vec<String> = {
+        let db = state.cache_db.lock().await;
+        let db = db.as_ref().ok_or("No gallery open")?;
+        paths
+            .into_iter()
+            .filter(|p| !db.tier_is_cached(tier, p).unwrap_or(false))
+            .collect()
+    };
+
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    let target = tier.target_size();
+    let filter = thumbnailer::filter_for_size(target);
+    // L/P tiers use lossy WebP — ~30 % smaller at equivalent quality,
+    // which matters a lot at 1024/1600 px. Micro falls back to JPEG.
+    let tier_format = match tier {
+        ThumbTier::Large | ThumbTier::Preview => ThumbFormat::Webp,
+        _ => ThumbFormat::Jpeg,
+    };
+
+    // Generate on the shared thumb pool. `generate_for_path` decodes from
+    // source, center-crops (for Micro/Standard it also squares), and
+    // resizes with the current filter. For Preview (1600 longest edge)
+    // we accept the square crop since the viewer scales to fit anyway.
+    let missing_clone = missing.clone();
+    let pool = state.thumb_pool.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pool.spawn(move || {
+        use rayon::prelude::*;
+        let out: Vec<(String, Option<crate::pipeline::thumbnailer::ThumbResult>)> = missing_clone
+            .par_iter()
+            .map(|path_str| {
+                let p = std::path::Path::new(path_str);
+                let res = crate::pipeline::thumbnailer::generate_for_path(
+                    p,
+                    filter,
+                    tier_format,
+                    target,
+                    target,
+                );
+                (path_str.clone(), res.ok())
+            })
+            .collect();
+        let _ = tx.send(out);
+    });
+
+    let results = rx
+        .await
+        .map_err(|_| "Tier thumbnail task was dropped".to_string())?;
+
+    // Persist successful results in one transaction.
+    let mut written = 0usize;
+    let mut db = state.cache_db.lock().await;
+    let db = db.as_mut().ok_or("No gallery open")?;
+    let txn = db.transaction().map_err(|e| e.to_string())?;
+    for (path, thumb) in &results {
+        let Some(thumb) = thumb else { continue };
+        let sql = format!(
+            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            tier.table()
+        );
+        let fmt_str = tier_format.as_cache_str();
+        if txn
+            .execute(
+                &sql,
+                rusqlite::params![
+                    path,
+                    thumb.media_type,
+                    0u64,
+                    thumb.width,
+                    thumb.height,
+                    thumb.data,
+                    fmt_str
+                ],
+            )
+            .is_ok()
+        {
+            written += 1;
+        }
+    }
+    txn.commit().map_err(|e| e.to_string())?;
+    Ok(written)
 }

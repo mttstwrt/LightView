@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use lightview_lib::pipeline::thumbnailer::{
-    self, ResizeFilter, ThumbFormat, DEFAULT_THUMB_HEIGHT, DEFAULT_THUMB_WIDTH,
+    self, ResizeFilter, ThumbFormat, STANDARD_THUMB_SIZE,
 };
 
 /// Creates a test JPEG in memory and writes it to a temp file.
@@ -45,8 +45,8 @@ fn bench_jpeg_thumbnail(c: &mut Criterion) {
                             black_box(path),
                             black_box(*filter),
                             ThumbFormat::Jpeg,
-                            DEFAULT_THUMB_WIDTH,
-                            DEFAULT_THUMB_HEIGHT,
+                            STANDARD_THUMB_SIZE,
+                            STANDARD_THUMB_SIZE,
                         )
                         .expect("thumbnail generation")
                     })
@@ -76,8 +76,8 @@ fn bench_png_thumbnail(c: &mut Criterion) {
                             black_box(path),
                             black_box(*filter),
                             ThumbFormat::Jpeg,
-                            DEFAULT_THUMB_WIDTH,
-                            DEFAULT_THUMB_HEIGHT,
+                            STANDARD_THUMB_SIZE,
+                            STANDARD_THUMB_SIZE,
                         )
                         .expect("thumbnail generation")
                     })
@@ -99,8 +99,8 @@ fn bench_rgba_output(c: &mut Criterion) {
                 black_box(&path),
                 ResizeFilter::Nearest,
                 ThumbFormat::Rgba,
-                DEFAULT_THUMB_WIDTH,
-                DEFAULT_THUMB_HEIGHT,
+                STANDARD_THUMB_SIZE,
+                STANDARD_THUMB_SIZE,
             )
             .expect("thumbnail generation")
         })
@@ -147,8 +147,8 @@ fn bench_batch_parallel(c: &mut Criterion) {
                 black_box(&paths),
                 ResizeFilter::Nearest,
                 ThumbFormat::Jpeg,
-                DEFAULT_THUMB_WIDTH,
-                DEFAULT_THUMB_HEIGHT,
+                STANDARD_THUMB_SIZE,
+                STANDARD_THUMB_SIZE,
             )
         })
     });
@@ -171,8 +171,8 @@ fn bench_resize_filters(c: &mut Criterion) {
                         black_box(&path),
                         black_box(filter),
                         ThumbFormat::Jpeg,
-                        DEFAULT_THUMB_WIDTH,
-                        DEFAULT_THUMB_HEIGHT,
+                        STANDARD_THUMB_SIZE,
+                        STANDARD_THUMB_SIZE,
                     )
                     .expect("thumbnail generation")
                 })

@@ -164,7 +164,6 @@ export interface MemoryStatus {
 // Settings types
 // ---------------------------------------------------------------------------
 
-export type ResizeFilter = "nearest" | "bilinear" | "lanczos3";
 export type CompanionLocation = "lightview_folder" | "alongside";
 export type RendererMode = "dom" | "canvas" | "webgl";
 
@@ -182,8 +181,6 @@ export interface AppSettings {
     preload_count: number;
     lru_cache_size: number;
     thumbnail_threads: number;
-    thumbnail_quality: number;
-    thumbnail_resize_filter: ResizeFilter;
   };
   plugins: {
     max_concurrent: number;

@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::hardware::{HardwareProfile, MemoryStatus};
-use crate::pipeline::thumbnailer::ThumbnailSettings;
+use crate::pipeline::thumbnailer::STANDARD_THUMB_SIZE;
 use crate::{AppState, RecentGallery};
 
 /// Debug information about which hardware optimizations are active.
@@ -18,8 +18,7 @@ pub struct DebugInfo {
     pub lru_cache_size: usize,
     pub bc7_atlas_active: bool,
     pub thumb_format: String,
-    pub thumb_width: u32,
-    pub thumb_height: u32,
+    pub standard_thumb_size: u32,
     pub atlas_entry_count: usize,
     pub sqlite_thumbnail_count: u64,
     pub gpu_resize_active: bool,
@@ -236,8 +235,7 @@ pub async fn get_debug_info(
         }
     };
 
-    let thumb_settings = state.thumbnail_settings.read().await.clone();
-    let thumb_format = format!("{:?}", thumb_settings.format).to_lowercase();
+    let thumb_format = format!("{:?}", state.thumb_format()).to_lowercase();
 
     log::info!("=== Hardware Debug Info ===");
     log::info!("  Storage:      {:?}", hw.storage_type);
@@ -247,7 +245,7 @@ pub async fn get_debug_info(
     log::info!("  GPU compute:  {}", hw.gpu_compute);
     log::info!("  Reflink:      {}", hw.supports_reflink);
     log::info!("  Thumb format: {}", &thumb_format);
-    log::info!("  Thumb size:   {}x{}", thumb_settings.width, thumb_settings.height);
+    log::info!("  Thumb size:   {}x{}", STANDARD_THUMB_SIZE, STANDARD_THUMB_SIZE);
     log::info!("  BC7 atlas:    {} ({} entries)", bc7_active, atlas_entries);
     let gpu_active = state.has_gpu();
 
@@ -270,8 +268,7 @@ pub async fn get_debug_info(
         lru_cache_size: hw.lru_cache_size(),
         bc7_atlas_active: bc7_active,
         thumb_format,
-        thumb_width: thumb_settings.width,
-        thumb_height: thumb_settings.height,
+        standard_thumb_size: STANDARD_THUMB_SIZE,
         atlas_entry_count: atlas_entries,
         sqlite_thumbnail_count: sqlite_thumbs,
         gpu_resize_active: gpu_active,
@@ -280,49 +277,6 @@ pub async fn get_debug_info(
             .map(|v| v == "1")
             .unwrap_or(false),
     })
-}
-
-/// Get the current thumbnail settings.
-#[tauri::command]
-pub async fn get_thumbnail_settings(
-    state: tauri::State<'_, AppState>,
-) -> Result<ThumbnailSettings, String> {
-    Ok(state.thumbnail_settings.read().await.clone())
-}
-
-/// Update thumbnail settings. Returns the new settings after applying.
-/// Also persists to the gallery's .lightview folder if a gallery is open.
-#[tauri::command]
-pub async fn update_thumbnail_settings(
-    state: tauri::State<'_, AppState>,
-    settings: ThumbnailSettings,
-) -> Result<ThumbnailSettings, String> {
-    if settings.width == 0 || settings.height == 0 {
-        return Err("Thumbnail dimensions must be > 0".to_string());
-    }
-    if settings.width > 2048 || settings.height > 2048 {
-        return Err("Thumbnail dimensions must be <= 2048".to_string());
-    }
-
-    let mut current = state.thumbnail_settings.write().await;
-    *current = settings;
-    log::info!(
-        "Thumbnail settings updated: format={:?}, {}x{}, filter={:?}",
-        current.format,
-        current.width,
-        current.height,
-        current.resize_filter,
-    );
-
-    // Persist to gallery_meta if a gallery is open
-    if let Ok(json) = serde_json::to_string(&*current) {
-        let db = state.cache_db.lock().await;
-        if let Some(db) = db.as_ref() {
-            let _ = db.set_gallery_meta("thumbnail_settings", &json);
-        }
-    }
-
-    Ok(current.clone())
 }
 
 /// Save frontend app settings to the current gallery's .lightview folder.

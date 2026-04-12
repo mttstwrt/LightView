@@ -48,7 +48,6 @@ export const getGalleryInfo = () =>
 // Media
 // ---------------------------------------------------------------------------
 
-export type ResizeFilter = "nearest" | "bilinear" | "lanczos3";
 
 export interface ThumbnailResult {
   path: string;
@@ -58,10 +57,22 @@ export interface ThumbnailResult {
   format: string;
 }
 
-/** Build a protocol URL for a cached thumbnail. The `lightview://thumb/` protocol
- *  serves image data directly from SQLite — no JSON serialization overhead. */
-export function thumbUrl(path: string): string {
-  return `lightview://thumb/${encodeURIComponent(path)}`;
+/** LOD tier for thumbnails; see docs/thumbnailStreamingResearch.md and
+ *  `ThumbTier` in src-tauri/src/cache/thumbnails.rs. */
+export type ThumbTier = "s" | "m" | "l" | "p";
+
+/** Build a protocol URL for a cached thumbnail at a given tier. The
+ *  `lightview://thumb/<tier>/<path>` protocol serves image data directly
+ *  from SQLite — no JSON serialization overhead. When `tier` is omitted
+ *  the backend falls back to the standard (m) tier for legacy URLs. */
+export function thumbUrl(path: string, tier: ThumbTier = "m"): string {
+  return `lightview://thumb/${tier}/${encodeURIComponent(path)}`;
+}
+
+/** Build a protocol URL for the decoded ThumbHash placeholder of a path.
+ *  Returns a ~32x32 PNG generated on-the-fly from the ~25-byte hash. */
+export function thumbhashUrl(path: string): string {
+  return `lightview://thumbhash/${encodeURIComponent(path)}`;
 }
 
 /** Build a protocol URL for full-resolution media. The `lightview://media/` protocol
@@ -70,17 +81,29 @@ export function mediaUrl(path: string): string {
   return `lightview://media/${encodeURIComponent(path)}`;
 }
 
-export const getThumbnail = (path: string, resizeFilter?: ResizeFilter) =>
-  invoke<ThumbnailResult | null>(
-    "get_thumbnail",
-    { path, resizeFilter }
-  );
+export interface ThumbHashResult {
+  path: string;
+  /** Base64-encoded hash bytes, or null if not yet generated. */
+  hash: string | null;
+}
 
-export const getThumbnailsBatch = (paths: string[], resizeFilter?: ResizeFilter) =>
-  invoke<ThumbnailResult[]>(
-    "get_thumbnails_batch",
-    { paths, resizeFilter }
-  );
+/** Bulk fetch of ThumbHash placeholders for a list of paths. Missing paths
+ *  return `{ hash: null }`; caller can fall back to the skeleton texture. */
+export const getThumbhashes = (paths: string[]) =>
+  invoke<ThumbHashResult[]>("get_thumbhashes", { paths });
+
+/** Lazily generate high-resolution tier thumbnails (L / P). Re-decodes
+ *  each source image at the tier's target size. Returns the count of
+ *  newly cached thumbnails; the caller should refetch the tier URL
+ *  (with a new cache-buster) after this resolves. */
+export const ensureTierThumbnails = (paths: string[], tier: ThumbTier) =>
+  invoke<number>("ensure_tier_thumbnails", { paths, tier });
+
+export const getThumbnail = (path: string) =>
+  invoke<ThumbnailResult | null>("get_thumbnail", { path });
+
+export const getThumbnailsBatch = (paths: string[]) =>
+  invoke<ThumbnailResult[]>("get_thumbnails_batch", { paths });
 
 export interface PrecacheResult {
   generated: number;
@@ -306,8 +329,7 @@ export interface DebugInfo {
   lru_cache_size: number;
   bc7_atlas_active: boolean;
   thumb_format: string;
-  thumb_width: number;
-  thumb_height: number;
+  standard_thumb_size: number;
   atlas_entry_count: number;
   sqlite_thumbnail_count: number;
   gpu_resize_active: boolean;
@@ -319,27 +341,8 @@ export const getDebugInfo = () =>
   invoke<DebugInfo>("get_debug_info");
 
 // ---------------------------------------------------------------------------
-// Thumbnail Settings
+// Thumbnail Info
 // ---------------------------------------------------------------------------
-
-export type ThumbFormat = "jpeg";
-
-export interface ThumbnailSettings {
-  /** Output format: "rgba" (no CPU decode, default) or "jpeg" (compressed). */
-  format: ThumbFormat;
-  /** Thumbnail width in pixels. */
-  width: number;
-  /** Thumbnail height in pixels. */
-  height: number;
-  /** Resize algorithm. */
-  resize_filter: ResizeFilter;
-}
-
-export const getThumbnailSettings = () =>
-  invoke<ThumbnailSettings>("get_thumbnail_settings");
-
-export const updateThumbnailSettings = (settings: ThumbnailSettings) =>
-  invoke<ThumbnailSettings>("update_thumbnail_settings", { settings });
 
 export interface CachedThumbnailInfo {
   width: number;

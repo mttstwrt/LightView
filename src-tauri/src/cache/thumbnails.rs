@@ -12,6 +12,64 @@ pub struct CachedThumbnail {
     pub resize_filter: String,
 }
 
+/// LOD tier for a thumbnail. Determines which SQL table a thumbnail is
+/// read from / written to. Frontend picks the tier from the current
+/// gallery cell size; see docs/thumbnailStreamingResearch.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbTier {
+    /// 128x128 — dense grid (cellSize <= 160). `thumbnails_micro`.
+    Micro,
+    /// ~512x512 — standard grid (160 < cellSize <= 400). `thumbnails`.
+    Standard,
+    /// 1024x1024 — large grid (cellSize > 400), lazy-generated. `thumbnails_large`.
+    Large,
+    /// ~1600 px longest edge — viewer first-paint, lazy-generated. `thumbnails_preview`.
+    Preview,
+}
+
+impl ThumbTier {
+    /// Map a URL-path segment ("s", "m", "l", "p") to a tier.
+    pub fn from_segment(s: &str) -> Option<Self> {
+        match s {
+            "s" | "micro" => Some(Self::Micro),
+            "m" | "standard" | "" => Some(Self::Standard),
+            "l" | "large" => Some(Self::Large),
+            "p" | "preview" => Some(Self::Preview),
+            _ => None,
+        }
+    }
+
+    /// Short URL segment for this tier.
+    pub fn as_segment(self) -> &'static str {
+        match self {
+            Self::Micro => "s",
+            Self::Standard => "m",
+            Self::Large => "l",
+            Self::Preview => "p",
+        }
+    }
+
+    /// SQL table storing this tier.
+    pub fn table(self) -> &'static str {
+        match self {
+            Self::Micro => "thumbnails_micro",
+            Self::Standard => "thumbnails",
+            Self::Large => "thumbnails_large",
+            Self::Preview => "thumbnails_preview",
+        }
+    }
+
+    /// Target dimensions (square) for this tier.
+    pub fn target_size(self) -> u32 {
+        match self {
+            Self::Micro => 128,
+            Self::Standard => 512,
+            Self::Large => 1024,
+            Self::Preview => 1600,
+        }
+    }
+}
+
 impl CacheDb {
     /// Check if a thumbnail is cached and still valid (mtime matches).
     pub fn thumbnail_is_valid(&self, path: &str, current_mtime: u64) -> Result<bool, CacheError> {
@@ -101,7 +159,109 @@ impl CacheDb {
 
     /// Delete all thumbnails (for full rebuild).
     pub fn clear_thumbnails(&self) -> Result<usize, CacheError> {
-        let count = self.conn().execute("DELETE FROM thumbnails", [])?;
+        let mut count = self.conn().execute("DELETE FROM thumbnails", [])?;
+        count += self
+            .conn()
+            .execute("DELETE FROM thumbnails_micro", [])
+            .unwrap_or(0);
+        count += self
+            .conn()
+            .execute("DELETE FROM thumbnails_large", [])
+            .unwrap_or(0);
+        count += self
+            .conn()
+            .execute("DELETE FROM thumbnails_preview", [])
+            .unwrap_or(0);
         Ok(count)
+    }
+
+    // -------------------------------------------------------------------
+    // ThumbHash (P1) — ~25-byte placeholder blob on the `thumbnails` row.
+    // -------------------------------------------------------------------
+
+    /// Set the ThumbHash placeholder for a path. Creates/overwrites
+    /// the thumbhash column on the existing thumbnails row (no-op if
+    /// the row doesn't exist yet — upsert_thumbnail will handle that).
+    pub fn set_thumbhash(&self, path: &str, hash: &[u8]) -> Result<(), CacheError> {
+        self.conn().execute(
+            "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
+            rusqlite::params![hash, path],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a single thumbhash blob by path. None if not cached yet.
+    pub fn get_thumbhash(&self, path: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")?;
+        let mut rows = stmt.query(rusqlite::params![path])?;
+        match rows.next()? {
+            Some(row) => {
+                let blob: Option<Vec<u8>> = row.get(0)?;
+                Ok(blob)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Bulk-fetch thumbhashes for a list of paths. Returned in the same
+    /// order as `paths`; missing/null entries become `None`.
+    pub fn get_thumbhashes(&self, paths: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")?;
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut rows = stmt.query(rusqlite::params![path])?;
+            out.push(match rows.next()? {
+                Some(row) => row.get::<_, Option<Vec<u8>>>(0)?,
+                None => None,
+            });
+        }
+        Ok(out)
+    }
+
+    // -------------------------------------------------------------------
+    // Tiered thumbnails (P2/P3/P5) — micro / large / preview tables.
+    // The Standard tier still lives in `thumbnails`; use the original
+    // methods above for that case.
+    // -------------------------------------------------------------------
+
+    /// Upsert a non-standard-tier thumbnail (micro / large / preview).
+    pub fn upsert_tier(
+        &self,
+        tier: ThumbTier,
+        path: &str,
+        media_type: &str,
+        mtime: u64,
+        width: u32,
+        height: u32,
+        thumbnail: &[u8],
+        format: &str,
+    ) -> Result<(), CacheError> {
+        if matches!(tier, ThumbTier::Standard) {
+            return self.upsert_thumbnail(
+                path, media_type, mtime, width, height, thumbnail, format, "nearest",
+            );
+        }
+        let sql = format!(
+            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            tier.table()
+        );
+        self.conn().execute(
+            &sql,
+            rusqlite::params![path, media_type, mtime, width, height, thumbnail, format],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a non-standard-tier thumbnail exists for this path.
+    pub fn tier_is_cached(&self, tier: ThumbTier, path: &str) -> Result<bool, CacheError> {
+        let sql = format!("SELECT 1 FROM {} WHERE path = ?1", tier.table());
+        let mut stmt = self.conn().prepare_cached(&sql)?;
+        let mut rows = stmt.query(rusqlite::params![path])?;
+        Ok(rows.next()?.is_some())
     }
 }

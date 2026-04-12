@@ -463,21 +463,6 @@ pub async fn open_gallery(
         }
     }
 
-    // Restore thumbnail settings from gallery_meta if present
-    if let Ok(Some(json)) = cache_db.get_gallery_meta("thumbnail_settings") {
-        if let Ok(thumb_settings) = serde_json::from_str::<crate::pipeline::thumbnailer::ThumbnailSettings>(&json) {
-            log::info!(
-                "Restored thumbnail settings: format={:?}, {}x{}, filter={:?}",
-                thumb_settings.format,
-                thumb_settings.width,
-                thumb_settings.height,
-                thumb_settings.resize_filter,
-            );
-            let mut ts = state.thumbnail_settings.write().await;
-            *ts = thumb_settings;
-        }
-    }
-
     // Open a second read-only connection for the thumbnail protocol handler.
     // SQLite WAL mode supports concurrent readers.
     {

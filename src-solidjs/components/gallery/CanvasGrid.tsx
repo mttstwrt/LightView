@@ -9,7 +9,7 @@
 import { Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { settings, setSettings } from "../../stores/settingsStore";
-import { getThumbnailsBatch, precacheThumbnails, thumbUrl, mediaUrl, type ThumbnailResult } from "../../lib/ipc";
+import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, thumbhashUrl, mediaUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
 import { recordCacheMiss, setImageCountSource } from "../../lib/perfMonitor";
@@ -48,6 +48,18 @@ const SCROLL_DEBOUNCE_MS = 50;
 // count by ±1 so one scroll notch always produces a visible change.
 const THUMB_SIZE_MIN = 80;
 const THUMB_SIZE_MAX = 600;
+
+// LOD tier thresholds — cellSize buckets used for URL construction.
+// See docs/thumbnailStreamingResearch.md. Kept in sync with target_size()
+// in src-tauri/src/cache/thumbnails.rs.
+const TIER_MICRO_MAX = 160;
+const TIER_STANDARD_MAX = 400;
+
+function pickTier(cellPx: number): ThumbTier {
+  if (cellPx <= TIER_MICRO_MAX) return "s";
+  if (cellPx <= TIER_STANDARD_MAX) return "m";
+  return "l";
+}
 
 const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"]);
 
@@ -93,6 +105,34 @@ export function CanvasGrid(props: CanvasGridProps) {
   const failedSet = new Set<string>();
   const coalescedPaths = new Set<string>();
   const pathToIndex = new Map<string, number>();
+
+  // ThumbHash placeholder state — tracks which paths have had their
+  // blurred fallback requested. One fetch per path per session; failures
+  // (no hash cached yet) are tracked in `hashFailedSet` so we don't retry.
+  const hashRequestedSet = new Set<string>();
+  const hashFailedSet = new Set<string>();
+
+  /** Load a decoded ThumbHash PNG via the custom protocol and hand it to
+   *  the renderer. Uses HTMLImageElement rather than fetch() because the
+   *  `lightview://` scheme is intercepted at the image-loading layer on
+   *  WebKitGTK, which `fetch()` does not always honour. */
+  const requestThumbHash = (path: string) => {
+    if (hashRequestedSet.has(path) || hashFailedSet.has(path)) return;
+    if (!renderer || typeof renderer.thumbHashLoaded !== "function") return;
+    hashRequestedSet.add(path);
+
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      if (!renderer) return;
+      renderer.thumbHashLoaded?.(path, img);
+      scheduleRepaint();
+    };
+    img.onerror = () => {
+      hashFailedSet.add(path);
+    };
+    img.src = thumbhashUrl(path);
+  };
   let bgCursor = 0;
   let thumbGenTotal = 0;
   let thumbGenDone = 0;
@@ -153,6 +193,10 @@ export function CanvasGrid(props: CanvasGridProps) {
   };
 
   const rowHeight = () => cellSize() + gap();
+
+  // Current LOD tier derived from the rendered cell size. Changes invalidate
+  // the URL cache so visible items re-fetch at the new resolution.
+  const tier = () => pickTier(cellSize());
 
   const totalRows = () => Math.ceil(props.paths.length / cols());
 
@@ -310,6 +354,10 @@ export function CanvasGrid(props: CanvasGridProps) {
           canvasWrapperRef.innerHTML = "";
           canvasWrapperRef.appendChild(renderer.canvas);
         }
+        // Hash pool was wiped with the old renderer — drop the "already
+        // requested" markers so visible items re-fetch on the next tick.
+        hashRequestedSet.clear();
+        hashFailedSet.clear();
         // Re-feed surviving cache entries to renderer
         for (const p of keepPaths) {
           const img = imageLoader.get(p);
@@ -486,7 +534,9 @@ export function CanvasGrid(props: CanvasGridProps) {
         assignedSet.delete(p);
         urlMap.delete(p);
         renderer?.evictImage(p);
+        renderer?.evictThumbHash?.(p);
         imageLoader?.evict(p);
+        hashRequestedSet.delete(p);
       }
     };
 
@@ -530,23 +580,45 @@ export function CanvasGrid(props: CanvasGridProps) {
             inFlightSet.add(p);
           }
 
+          const activeTier = tier();
           inFlightFetch = (async () => {
             try {
-              const results = await getThumbnailsBatch(toGenerate);
-              if (fetchAbort || generation() !== gen) return;
+              // Standard/Micro tiers go through get_thumbnails_batch, which
+              // generates the 512 px standard thumbnail and derives the
+              // 128 px micro (+ ThumbHash) in the same pass. Large and
+              // Preview tiers are lazy — re-decode from source at the
+              // tier's target size and return the count, not metadata.
+              let resultPaths: Set<string>;
+              if (activeTier === "l" || activeTier === "p") {
+                await ensureTierThumbnails(toGenerate, activeTier);
+                if (fetchAbort || generation() !== gen) return;
+                resultPaths = new Set(toGenerate);
+                for (const p of toGenerate) {
+                  const v = (urlVersions.get(p) ?? 0) + 1;
+                  urlVersions.set(p, v);
+                  const url = `${thumbUrl(p, activeTier)}?v=${v}`;
+                  urlMap.set(p, url);
+                  imageLoader?.evict(p);
+                  imageLoader?.request(p, url, 1);
+                }
+                thumbGenDone += toGenerate.length;
+              } else {
+                const results = await getThumbnailsBatch(toGenerate);
+                if (fetchAbort || generation() !== gen) return;
 
-              const resultPaths = new Set(results.map((r) => r.path));
-              for (const r of results) {
-                const v = (urlVersions.get(r.path) ?? 0) + 1;
-                urlVersions.set(r.path, v);
-                const url = `${thumbUrl(r.path)}?v=${v}`;
-                urlMap.set(r.path, url);
-                // Re-request with priority 1 (buffer) — just generated
-                imageLoader?.evict(r.path);
-                imageLoader?.request(r.path, url, 1);
+                resultPaths = new Set(results.map((r) => r.path));
+                for (const r of results) {
+                  const v = (urlVersions.get(r.path) ?? 0) + 1;
+                  urlVersions.set(r.path, v);
+                  const url = `${thumbUrl(r.path, activeTier)}?v=${v}`;
+                  urlMap.set(r.path, url);
+                  // Re-request with priority 1 (buffer) — just generated
+                  imageLoader?.evict(r.path);
+                  imageLoader?.request(r.path, url, 1);
+                }
+
+                thumbGenDone += results.length;
               }
-
-              thumbGenDone += results.length;
               for (const p of toGenerate) {
                 inFlightSet.delete(p);
                 if (!resultPaths.has(p)) failedSet.add(p);
@@ -624,7 +696,7 @@ export function CanvasGrid(props: CanvasGridProps) {
       if (!inFlightSet.has(r.path)) return;
       const v = (urlVersions.get(r.path) ?? 0) + 1;
       urlVersions.set(r.path, v);
-      const url = `${thumbUrl(r.path)}?v=${v}`;
+      const url = `${thumbUrl(r.path, tier())}?v=${v}`;
       urlMap.set(r.path, url);
       imageLoader?.evict(r.path);
       // Phase 5: priority 1 (buffer) for streamed results
@@ -639,6 +711,8 @@ export function CanvasGrid(props: CanvasGridProps) {
       needsGeneration.clear();
       inFlightSet.clear();
       failedSet.clear();
+      hashRequestedSet.clear();
+      hashFailedSet.clear();
       urlVersions.clear();
       urlMap.clear();
       bgCursor = 0;
@@ -812,11 +886,17 @@ export function CanvasGrid(props: CanvasGridProps) {
   // -----------------------------------------------------------------------
 
   createEffect(on(visibleItems, (items) => {
+    const t = tier();
     for (const item of items) {
+      // Request the ThumbHash placeholder for every visible item — cheap,
+      // bounded by pool eviction, and gives us a blurred fallback while
+      // the real thumbnail streams in.
+      requestThumbHash(item.path);
+
       if (!assignedSet.has(item.path)) {
         assignedSet.add(item.path);
         const v = urlVersions.get(item.path);
-        const url = v ? `${thumbUrl(item.path)}?v=${v}` : thumbUrl(item.path);
+        const url = v ? `${thumbUrl(item.path, t)}?v=${v}` : thumbUrl(item.path, t);
         urlMap.set(item.path, url);
         // Phase 5: priority 0 = viewport-visible (highest)
         imageLoader?.request(item.path, url, 0);
@@ -857,6 +937,8 @@ export function CanvasGrid(props: CanvasGridProps) {
       needsGeneration.clear();
       inFlightSet.clear();
       failedSet.clear();
+      hashRequestedSet.clear();
+      hashFailedSet.clear();
       urlVersions.clear();
       urlMap.clear();
       bgCursor = 0;
@@ -878,6 +960,33 @@ export function CanvasGrid(props: CanvasGridProps) {
   createEffect(on(containerWidth, () => {
     recalcRange?.();
   }));
+
+  // Tier change (cellSize crossed a LOD boundary) — wipe assigned URLs,
+  // renderer textures, and the image loader so visible items re-request
+  // at the new tier. The first run on mount is a no-op because `on()`
+  // with `defer: true` holds off until the signal actually changes.
+  createEffect(on(tier, () => {
+    assignedSet.clear();
+    urlMap.clear();
+    urlVersions.clear();
+    needsGeneration.clear();
+    inFlightSet.clear();
+    failedSet.clear();
+    // The renderer is destroyed below — its hash pool is wiped with it,
+    // so we must re-request placeholders for the next render.
+    hashRequestedSet.clear();
+    hashFailedSet.clear();
+    bgCursor = 0;
+    imageLoader?.cancelAll();
+    renderer?.destroy();
+    renderer = createRenderer(props.rendererMode);
+    if (canvasWrapperRef && renderer) {
+      canvasWrapperRef.innerHTML = "";
+      canvasWrapperRef.appendChild(renderer.canvas);
+    }
+    setGeneration((g) => g + 1);
+    scheduleRepaint();
+  }, { defer: true }));
 
   // Report content height
   createEffect(on(totalHeight, (h) => {

@@ -12,7 +12,13 @@
 import type { GridRenderer, GridLayout, GridItem, HitTestResult } from "./types";
 
 // Pool configuration
-const SLOT_SIZE = 512; // pixels per slot (uniform size)
+const SLOT_SIZE = 512; // pixels per slot for the main thumbnail pool
+
+// ThumbHash pool configuration — ThumbHash decodes to ≤32 px per side;
+// 64 px slots give headroom so linear filtering never samples across slot
+// boundaries. 2048×2048 atlas at 64 px = 32×32 = 1024 slots.
+const HASH_SLOT_SIZE = 64;
+const HASH_POOL_SIZE = 2048;
 
 // Visual constants
 const SELECTION_COLOR = [59 / 255, 130 / 255, 246 / 255, 0.35] as const;
@@ -27,15 +33,18 @@ const VERT_SRC = `#version 100
 attribute vec2 a_quad;
 
 // Per-instance (divisor = 1)
-attribute vec2 a_offset;   // pixel position
-attribute vec4 a_uv;       // (u0, v0, u1, v1) in pool texture
-attribute vec2 a_flags;    // (hasImage, selected)
+attribute vec2 a_offset;    // pixel position
+attribute vec4 a_uv;        // (u0, v0, u1, v1) in main pool texture
+attribute vec4 a_hash_uv;   // (u0, v0, u1, v1) in hash pool texture
+attribute vec3 a_flags;     // (hasImage, hasHash, selected)
 
 uniform vec2 u_resolution;
 uniform float u_cellSize;
 
 varying vec2 v_texcoord;
+varying vec2 v_hashcoord;
 varying float v_hasImage;
+varying float v_hasHash;
 varying float v_selected;
 
 void main() {
@@ -44,8 +53,10 @@ void main() {
   gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
 
   v_texcoord = mix(a_uv.xy, a_uv.zw, a_quad);
+  v_hashcoord = mix(a_hash_uv.xy, a_hash_uv.zw, a_quad);
   v_hasImage = a_flags.x;
-  v_selected = a_flags.y;
+  v_hasHash = a_flags.y;
+  v_selected = a_flags.z;
 }
 `;
 
@@ -53,17 +64,23 @@ const FRAG_SRC = `#version 100
 precision mediump float;
 
 varying vec2 v_texcoord;
+varying vec2 v_hashcoord;
 varying float v_hasImage;
+varying float v_hasHash;
 varying float v_selected;
 
 uniform sampler2D u_pool;
+uniform sampler2D u_hashPool;
 uniform vec4 u_skeletonColor;
 uniform vec4 u_selectionColor;
 
 void main() {
+  // Priority: full thumbnail → ThumbHash placeholder → flat skeleton.
   vec4 color;
   if (v_hasImage > 0.5) {
     color = texture2D(u_pool, v_texcoord);
+  } else if (v_hasHash > 0.5) {
+    color = texture2D(u_hashPool, v_hashcoord);
   } else {
     color = u_skeletonColor;
   }
@@ -104,11 +121,14 @@ void main() {
 `;
 
 // ---------------------------------------------------------------------------
-// Instance buffer layout: 8 floats (32 bytes) per instance
-//   [offsetX, offsetY, u0, v0, u1, v1, hasImage, selected]
+// Instance buffer layout: 13 floats (52 bytes) per instance
+//   [offsetX, offsetY,                                   // a_offset  (vec2, byte 0)
+//    u0, v0, u1, v1,                                     // a_uv      (vec4, byte 8)
+//    hU0, hV0, hU1, hV1,                                 // a_hash_uv (vec4, byte 24)
+//    hasImage, hasHash, selected]                        // a_flags   (vec3, byte 40)
 // ---------------------------------------------------------------------------
 
-const FLOATS_PER_INSTANCE = 8;
+const FLOATS_PER_INSTANCE = 13;
 const BYTES_PER_INSTANCE = FLOATS_PER_INSTANCE * 4;
 
 interface PoolSlot {
@@ -130,11 +150,14 @@ export class WebGLRenderer implements GridRenderer {
   private a_quad: number;
   private a_offset: number;
   private a_uv: number;
+  private a_hash_uv: number;
   private a_flags: number;
   private u_resolution: WebGLUniformLocation;
   private u_cellSize: WebGLUniformLocation;
   private u_skeletonColor: WebGLUniformLocation;
   private u_selectionColor: WebGLUniformLocation;
+  private u_pool: WebGLUniformLocation;
+  private u_hashPool: WebGLUniformLocation;
 
   // Overlay program
   private overlayProgram: WebGLProgram;
@@ -164,6 +187,17 @@ export class WebGLRenderer implements GridRenderer {
   private slotMap = new Map<string, PoolSlot>();
   private freeSlots: number[] = [];
   private lruOrder: string[] = [];
+
+  // ThumbHash pool — a smaller parallel pool holding ~32 px decoded
+  // ThumbHash placeholders used as a blurred fallback while the real
+  // thumbnail is still streaming.
+  private hashPoolTexture: WebGLTexture;
+  private hashPoolSize: number;
+  private hashSlotsPerRow: number;
+  private hashTotalSlots: number;
+  private hashSlotMap = new Map<string, PoolSlot>();
+  private hashFreeSlots: number[] = [];
+  private hashLruOrder: string[] = [];
 
   constructor() {
     this.canvas = document.createElement("canvas");
@@ -205,11 +239,14 @@ export class WebGLRenderer implements GridRenderer {
     this.a_quad = gl.getAttribLocation(this.program, "a_quad");
     this.a_offset = gl.getAttribLocation(this.program, "a_offset");
     this.a_uv = gl.getAttribLocation(this.program, "a_uv");
+    this.a_hash_uv = gl.getAttribLocation(this.program, "a_hash_uv");
     this.a_flags = gl.getAttribLocation(this.program, "a_flags");
     this.u_resolution = gl.getUniformLocation(this.program, "u_resolution")!;
     this.u_cellSize = gl.getUniformLocation(this.program, "u_cellSize")!;
     this.u_skeletonColor = gl.getUniformLocation(this.program, "u_skeletonColor")!;
     this.u_selectionColor = gl.getUniformLocation(this.program, "u_selectionColor")!;
+    this.u_pool = gl.getUniformLocation(this.program, "u_pool")!;
+    this.u_hashPool = gl.getUniformLocation(this.program, "u_hashPool")!;
 
     this.overlayProgram = this.createProgram(OVERLAY_VERT_SRC, OVERLAY_FRAG_SRC);
     this.ov_position = gl.getAttribLocation(this.overlayProgram, "a_position");
@@ -260,6 +297,29 @@ export class WebGLRenderer implements GridRenderer {
     // Build free-slot stack (pop gives lowest indices first)
     for (let i = this.totalSlots - 1; i >= 0; i--) {
       this.freeSlots.push(i);
+    }
+
+    // ---------------------------------------------------------------------------
+    // ThumbHash pool — cap at maxTexSize so we never exceed device limits
+    // ---------------------------------------------------------------------------
+    this.hashPoolSize = Math.min(maxTexSize, HASH_POOL_SIZE);
+    this.hashSlotsPerRow = Math.floor(this.hashPoolSize / HASH_SLOT_SIZE);
+    this.hashTotalSlots = this.hashSlotsPerRow * this.hashSlotsPerRow;
+
+    this.hashPoolTexture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.hashPoolTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA,
+      this.hashPoolSize, this.hashPoolSize, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, null,
+    );
+
+    for (let i = this.hashTotalSlots - 1; i >= 0; i--) {
+      this.hashFreeSlots.push(i);
     }
 
     gl.enable(gl.BLEND);
@@ -318,21 +378,41 @@ export class WebGLRenderer implements GridRenderer {
       data[base] = col * (cellSize + gap);     // offsetX
       data[base + 1] = row * (cellSize + gap); // offsetY
 
+      // Main thumbnail slot
       const slot = this.slotMap.get(item.path);
+      let hasImage = 0;
       if (slot) {
         data[base + 2] = slot.u0;
         data[base + 3] = slot.v0;
         data[base + 4] = slot.u1;
         data[base + 5] = slot.v1;
-        data[base + 6] = 1; // hasImage
+        hasImage = 1;
       } else {
         data[base + 2] = 0;
         data[base + 3] = 0;
         data[base + 4] = 0;
         data[base + 5] = 0;
-        data[base + 6] = 0;
       }
-      data[base + 7] = item.selected ? 1 : 0;
+
+      // ThumbHash placeholder slot
+      const hashSlot = this.hashSlotMap.get(item.path);
+      let hasHash = 0;
+      if (hashSlot) {
+        data[base + 6] = hashSlot.u0;
+        data[base + 7] = hashSlot.v0;
+        data[base + 8] = hashSlot.u1;
+        data[base + 9] = hashSlot.v1;
+        hasHash = 1;
+      } else {
+        data[base + 6] = 0;
+        data[base + 7] = 0;
+        data[base + 8] = 0;
+        data[base + 9] = 0;
+      }
+
+      data[base + 10] = hasImage;
+      data[base + 11] = hasHash;
+      data[base + 12] = item.selected ? 1 : 0;
 
       if (item.selected || item.badge) hasOverlays = true;
     }
@@ -349,8 +429,13 @@ export class WebGLRenderer implements GridRenderer {
     gl.uniform4f(this.u_skeletonColor, 26 / 255, 26 / 255, 26 / 255, 1);
     gl.uniform4f(this.u_selectionColor, ...SELECTION_COLOR);
 
+    // Bind both texture pools — main on unit 0, hash on unit 1
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.poolTexture);
+    gl.uniform1i(this.u_pool, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.hashPoolTexture);
+    gl.uniform1i(this.u_hashPool, 1);
 
     // Bind static quad (per-vertex, divisor 0)
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
@@ -374,9 +459,14 @@ export class WebGLRenderer implements GridRenderer {
     gl.vertexAttribPointer(this.a_uv, 4, gl.FLOAT, false, stride, 8);
     ext.vertexAttribDivisorANGLE(this.a_uv, 1);
 
-    // a_flags: vec2 at byte 24
+    // a_hash_uv: vec4 at byte 24
+    gl.enableVertexAttribArray(this.a_hash_uv);
+    gl.vertexAttribPointer(this.a_hash_uv, 4, gl.FLOAT, false, stride, 24);
+    ext.vertexAttribDivisorANGLE(this.a_hash_uv, 1);
+
+    // a_flags: vec3 at byte 40
     gl.enableVertexAttribArray(this.a_flags);
-    gl.vertexAttribPointer(this.a_flags, 2, gl.FLOAT, false, stride, 24);
+    gl.vertexAttribPointer(this.a_flags, 3, gl.FLOAT, false, stride, 40);
     ext.vertexAttribDivisorANGLE(this.a_flags, 1);
 
     // One call to rule them all
@@ -386,6 +476,7 @@ export class WebGLRenderer implements GridRenderer {
     // Reset divisors so overlay drawing isn't affected
     ext.vertexAttribDivisorANGLE(this.a_offset, 0);
     ext.vertexAttribDivisorANGLE(this.a_uv, 0);
+    ext.vertexAttribDivisorANGLE(this.a_hash_uv, 0);
     ext.vertexAttribDivisorANGLE(this.a_flags, 0);
 
     // -----------------------------------------------------------------
@@ -470,6 +561,57 @@ export class WebGLRenderer implements GridRenderer {
     }
   }
 
+  thumbHashLoaded(path: string, img: HTMLImageElement | ImageBitmap): void {
+    // Short-circuit: slot already uploaded
+    if (this.hashSlotMap.has(path)) return;
+
+    const gl = this.gl;
+
+    if (this.hashFreeSlots.length === 0) {
+      this.evictHashLRU();
+    }
+    if (this.hashFreeSlots.length === 0) return;
+
+    const index = this.hashFreeSlots.pop()!;
+    const slotCol = index % this.hashSlotsPerRow;
+    const slotRow = Math.floor(index / this.hashSlotsPerRow);
+    const px = slotCol * HASH_SLOT_SIZE;
+    const py = slotRow * HASH_SLOT_SIZE;
+
+    // ThumbHashes are tiny (≤32 px per side), but clamp defensively so a
+    // malformed response can never write outside the slot.
+    const imgW = Math.min(img.width, HASH_SLOT_SIZE);
+    const imgH = Math.min(img.height, HASH_SLOT_SIZE);
+
+    const slot: PoolSlot = {
+      index,
+      u0: px / this.hashPoolSize,
+      v0: py / this.hashPoolSize,
+      u1: (px + imgW) / this.hashPoolSize,
+      v1: (py + imgH) / this.hashPoolSize,
+    };
+    this.hashSlotMap.set(path, slot);
+    this.hashLruOrder.push(path);
+
+    gl.bindTexture(gl.TEXTURE_2D, this.hashPoolTexture);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D, 0,
+      px, py,
+      gl.RGBA, gl.UNSIGNED_BYTE,
+      img,
+    );
+  }
+
+  evictThumbHash(path: string): void {
+    const slot = this.hashSlotMap.get(path);
+    if (slot) {
+      this.hashFreeSlots.push(slot.index);
+      this.hashSlotMap.delete(path);
+      const lruIdx = this.hashLruOrder.indexOf(path);
+      if (lruIdx >= 0) this.hashLruOrder.splice(lruIdx, 1);
+    }
+  }
+
   destroy(): void {
     const gl = this.gl;
     gl.deleteProgram(this.program);
@@ -481,8 +623,11 @@ export class WebGLRenderer implements GridRenderer {
     gl.deleteBuffer(this.overlayColorBuffer);
     gl.deleteBuffer(this.overlayIndexBuffer);
     gl.deleteTexture(this.poolTexture);
+    gl.deleteTexture(this.hashPoolTexture);
     this.slotMap.clear();
     this.lruOrder.length = 0;
+    this.hashSlotMap.clear();
+    this.hashLruOrder.length = 0;
   }
 
   // -------------------------------------------------------------------------
@@ -493,6 +638,12 @@ export class WebGLRenderer implements GridRenderer {
     if (this.lruOrder.length === 0) return;
     const oldest = this.lruOrder.shift()!;
     this.evictImage(oldest);
+  }
+
+  private evictHashLRU() {
+    if (this.hashLruOrder.length === 0) return;
+    const oldest = this.hashLruOrder.shift()!;
+    this.evictThumbHash(oldest);
   }
 
   // -------------------------------------------------------------------------

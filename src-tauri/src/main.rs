@@ -1,4 +1,5 @@
 use lightview_lib::AppState;
+use lightview_lib::cache::thumbnails::ThumbTier;
 use lightview_lib::commands;
 use tauri::{Emitter, Manager};
 
@@ -7,22 +8,49 @@ use std::io::{Read, Seek, SeekFrom};
 
 
 enum Route {
-    Thumb,
+    /// A tiered thumbnail. The tier defaults to Standard if the URL is
+    /// the legacy form `thumb/<path>` (without a tier segment).
+    Thumb(ThumbTier),
+    /// Decoded ThumbHash placeholder served as a tiny PNG.
+    ThumbHash,
+    /// Full-resolution media (original file).
     Media,
     Unknown,
 }
 
 /// Parse the URI into a route and the remaining path portion.
+/// Tier-aware routes:
+///   lightview://thumb/<path>         — standard tier (legacy)
+///   lightview://thumb/s/<path>       — micro   (128)
+///   lightview://thumb/m/<path>       — standard (512)
+///   lightview://thumb/l/<path>       — large   (1024)
+///   lightview://thumb/p/<path>       — preview (1600, for viewer)
+///   lightview://thumbhash/<path>     — decoded ThumbHash → PNG
+///   lightview://media/<path>         — full-res media
 fn extract_route(uri: &str) -> (Route, &str) {
-    // Try each prefix variant (cross-platform)
     for prefix_base in &[
         "lightview://",
         "lightview://localhost/",
         "http://lightview.localhost/",
     ] {
         if let Some(rest) = uri.strip_prefix(prefix_base) {
+            if let Some(p) = rest.strip_prefix("thumbhash/") {
+                return (Route::ThumbHash, p);
+            }
             if let Some(p) = rest.strip_prefix("thumb/") {
-                return (Route::Thumb, p);
+                // Check for a tier prefix segment ("s/", "m/", "l/", "p/").
+                for (seg, tier) in &[
+                    ("s/", ThumbTier::Micro),
+                    ("m/", ThumbTier::Standard),
+                    ("l/", ThumbTier::Large),
+                    ("p/", ThumbTier::Preview),
+                ] {
+                    if let Some(rest) = p.strip_prefix(*seg) {
+                        return (Route::Thumb(*tier), rest);
+                    }
+                }
+                // Legacy form: no tier segment → standard.
+                return (Route::Thumb(ThumbTier::Standard), p);
             }
             if let Some(p) = rest.strip_prefix("media/") {
                 return (Route::Media, p);
@@ -32,9 +60,11 @@ fn extract_route(uri: &str) -> (Route, &str) {
     (Route::Unknown, "")
 }
 
-/// Serve a cached thumbnail from SQLite.
+/// Serve a cached thumbnail from SQLite. `tier` selects which table the
+/// thumbnail is read from — see `ThumbTier::table()`.
 fn serve_thumbnail(
     ctx: &tauri::UriSchemeContext<'_, tauri::Wry>,
+    tier: ThumbTier,
     path: &str,
 ) -> tauri::http::Response<Vec<u8>> {
     let state = ctx.app_handle().state::<AppState>();
@@ -49,21 +79,28 @@ fn serve_thumbnail(
         }
     };
 
-    let result: Result<(Vec<u8>, u32, u32, String), rusqlite::Error> = conn
-        .prepare_cached(
-            "SELECT thumbnail, width, height, format FROM thumbnails WHERE path = ?1",
-        )
+    let sql = format!(
+        "SELECT thumbnail, format FROM {} WHERE path = ?1",
+        tier.table()
+    );
+    let result: Result<(Vec<u8>, String), rusqlite::Error> = conn
+        .prepare_cached(&sql)
         .and_then(|mut stmt| {
             stmt.query_row(rusqlite::params![path], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?))
             })
         });
 
     match result {
-        Ok((data, width, height, format)) => {
+        Ok((data, format)) => {
+            let mime = match format.as_str() {
+                "webp" => "image/webp",
+                "png" => "image/png",
+                _ => "image/jpeg",
+            };
             tauri::http::Response::builder()
                 .status(200)
-                .header("Content-Type", "image/jpeg")
+                .header("Content-Type", mime)
                 .header("Cache-Control", "no-cache")
                 .header("Access-Control-Allow-Origin", "*")
                 .body(data)
@@ -79,6 +116,76 @@ fn serve_thumbnail(
                 .unwrap()
         }
     }
+}
+
+/// Serve a decoded ThumbHash as a tiny PNG. Reads the ~25-byte blob from
+/// SQLite, decodes to RGBA via the `thumbhash` crate, and encodes a PNG.
+/// The PNG is cacheable in the webview because the underlying blob is
+/// immutable for a given path.
+fn serve_thumbhash(
+    ctx: &tauri::UriSchemeContext<'_, tauri::Wry>,
+    path: &str,
+) -> tauri::http::Response<Vec<u8>> {
+    let state = ctx.app_handle().state::<AppState>();
+    let proto_db = state.thumb_protocol_db.lock().unwrap();
+    let conn = match proto_db.as_ref() {
+        Some(c) => c,
+        None => {
+            return tauri::http::Response::builder()
+                .status(503)
+                .body(Vec::new())
+                .unwrap();
+        }
+    };
+
+    let blob: Result<Option<Vec<u8>>, rusqlite::Error> = conn
+        .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_row(rusqlite::params![path], |row| {
+                row.get::<_, Option<Vec<u8>>>(0)
+            })
+        });
+
+    let Ok(Some(hash)) = blob else {
+        return tauri::http::Response::builder()
+            .status(404)
+            .header("Cache-Control", "no-store")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Vec::new())
+            .unwrap();
+    };
+
+    let Ok((w, h, rgba)) = thumbhash::thumb_hash_to_rgba(&hash) else {
+        return tauri::http::Response::builder()
+            .status(500)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Vec::new())
+            .unwrap();
+    };
+
+    // Encode to PNG so the webview can decode with createImageBitmap.
+    let mut png = std::io::Cursor::new(Vec::with_capacity(2048));
+    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    use image::ImageEncoder;
+    if enc
+        .write_image(&rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
+        .is_err()
+    {
+        return tauri::http::Response::builder()
+            .status(500)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Vec::new())
+            .unwrap();
+    }
+
+    tauri::http::Response::builder()
+        .status(200)
+        .header("Content-Type", "image/png")
+        // ThumbHashes are immutable for a given file mtime — long cache OK.
+        .header("Cache-Control", "public, max-age=31536000, immutable")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(png.into_inner())
+        .unwrap()
 }
 
 /// Serve full-resolution media. HEIC/HEIF are transcoded to JPEG.
@@ -332,7 +439,8 @@ fn main() {
             }
 
             match route {
-                Route::Thumb => serve_thumbnail(&ctx, &path),
+                Route::Thumb(tier) => serve_thumbnail(&ctx, tier, &path),
+                Route::ThumbHash => serve_thumbhash(&ctx, &path),
                 Route::Media => serve_full_media(&request, &path),
                 Route::Unknown => tauri::http::Response::builder()
                     .status(404)
@@ -376,6 +484,8 @@ fn main() {
             commands::media::regenerate_thumbnail,
             commands::media::get_cached_thumbnail_info,
             commands::media::precache_thumbnails,
+            commands::media::get_thumbhashes,
+            commands::media::ensure_tier_thumbnails,
 
             // Tag commands
             commands::tags::get_tags,
@@ -431,8 +541,6 @@ fn main() {
             commands::settings::get_gallery_stats,
             commands::settings::get_debug_info,
             commands::settings::get_perf_snapshot,
-            commands::settings::get_thumbnail_settings,
-            commands::settings::update_thumbnail_settings,
             commands::settings::save_gallery_settings,
             commands::settings::load_gallery_settings,
             commands::settings::get_recent_galleries,

@@ -18,7 +18,7 @@ use cache::atlas::ThumbAtlas;
 use cache::db::CacheDb;
 use autocomplete::engine::AutocompleteEngine;
 use hardware::HardwareProfile;
-use pipeline::thumbnailer::{ThumbFormat, ThumbnailSettings};
+use pipeline::thumbnailer::ThumbFormat;
 use provider::ProviderRegistry;
 use util::fs_watch::FsWatcher;
 
@@ -67,8 +67,11 @@ pub struct AppState {
     /// Determined by hardware profile (NVMe + discrete GPU).
     pub use_bc7_atlas: Arc<std::sync::atomic::AtomicBool>,
 
-    /// User-configurable thumbnail settings (format, dimensions, resize filter).
-    pub thumbnail_settings: Arc<RwLock<ThumbnailSettings>>,
+    /// Thumbnail format override. Standard tier uses JPEG by default;
+    /// L/P tiers use WebP. The BC7 atlas path uses RGBA.
+    /// Uses std::sync::RwLock (not tokio) because it's read from both
+    /// sync (protocol handler) and async (commands) contexts.
+    pub thumb_format_override: Arc<std::sync::RwLock<ThumbFormat>>,
 
     /// Recently opened gallery paths, persisted to disk.
     pub recent_galleries: Arc<Mutex<Vec<RecentGallery>>>,
@@ -142,7 +145,7 @@ impl AppState {
             thumbnail_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             thumb_pool: Arc::new(thumb_pool),
             use_bc7_atlas: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            thumbnail_settings: Arc::new(RwLock::new(ThumbnailSettings::default())),
+            thumb_format_override: Arc::new(std::sync::RwLock::new(ThumbFormat::Jpeg)),
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
             plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thumb_protocol_db: Arc::new(std::sync::Mutex::new(None)),
@@ -153,14 +156,10 @@ impl AppState {
         }
     }
 
-    /// Determine the thumbnail format based on user settings.
-    /// Always returns the user-configured format; the BC7 atlas path
-    /// is an orthogonal storage optimization layered on top.
+    /// Determine the thumbnail format for the standard tier.
+    /// Always JPEG unless overridden (e.g. RGBA for BC7 atlas path).
     pub fn thumb_format(&self) -> ThumbFormat {
-        // Use blocking read — this is only called from sync contexts or
-        // from within a tokio runtime where we can block briefly.
-        // The RwLock is almost never contended.
-        self.thumbnail_settings.blocking_read().format
+        *self.thumb_format_override.read().unwrap()
     }
 
     /// Check if BC7 atlas should be used based on hardware profile.

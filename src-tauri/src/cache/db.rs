@@ -13,7 +13,7 @@ pub enum CacheError {
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 6;
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -109,6 +109,53 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_meta_last_rated ON media_meta(last_rated DESC);
         ",
     },
+    // v5: ThumbHash placeholder column on the existing thumbnails table.
+    // Stores the ~25-byte ThumbHash encoding used for the skeleton fallback
+    // while the full thumbnail is still loading.
+    Migration {
+        version: 5,
+        sql: "
+            ALTER TABLE thumbnails ADD COLUMN thumbhash BLOB;
+        ",
+    },
+    // v6: Separate tier tables for the LOD pyramid.
+    //   thumbnails_micro  — 128x128 (T1, cellSize <= 160)
+    //   thumbnails_large  — 1024x1024 (T3, cellSize > 400, lazy-generated)
+    // The original `thumbnails` table remains the standard 512x512 tier (T2).
+    // Using separate tables avoids rewriting the existing PK and lets queries
+    // on T2 stay untouched.
+    Migration {
+        version: 6,
+        sql: "
+            CREATE TABLE IF NOT EXISTS thumbnails_micro (
+                path         TEXT PRIMARY KEY,
+                media_type   TEXT NOT NULL,
+                mtime        INTEGER NOT NULL,
+                width        INTEGER NOT NULL,
+                height       INTEGER NOT NULL,
+                thumbnail    BLOB NOT NULL,
+                format       TEXT NOT NULL DEFAULT 'jpeg'
+            );
+            CREATE TABLE IF NOT EXISTS thumbnails_large (
+                path         TEXT PRIMARY KEY,
+                media_type   TEXT NOT NULL,
+                mtime        INTEGER NOT NULL,
+                width        INTEGER NOT NULL,
+                height       INTEGER NOT NULL,
+                thumbnail    BLOB NOT NULL,
+                format       TEXT NOT NULL DEFAULT 'jpeg'
+            );
+            CREATE TABLE IF NOT EXISTS thumbnails_preview (
+                path         TEXT PRIMARY KEY,
+                media_type   TEXT NOT NULL,
+                mtime        INTEGER NOT NULL,
+                width        INTEGER NOT NULL,
+                height       INTEGER NOT NULL,
+                thumbnail    BLOB NOT NULL,
+                format       TEXT NOT NULL DEFAULT 'jpeg'
+            );
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.
@@ -174,6 +221,29 @@ fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
 
     if !has_last_rated {
         return 3;
+    }
+
+    // v4 columns exist — check for v5 (thumbhash).
+    let has_thumbhash = conn
+        .execute("SELECT thumbhash FROM thumbnails LIMIT 0", [])
+        .is_ok();
+
+    if !has_thumbhash {
+        return 4;
+    }
+
+    // v5 present — check for v6 (tier tables).
+    let has_micro_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thumbnails_micro'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !has_micro_table {
+        return 5;
     }
 
     // Everything present — fully up to date.

@@ -2,7 +2,7 @@ import { Index, Show, createSignal, createEffect, on, onMount, onCleanup, batch,
 import { createStore, reconcile } from "solid-js/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { settings, setSettings } from "../../stores/settingsStore";
-import { getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbnailResult } from "../../lib/ipc";
+import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
 import { recordCacheMiss } from "../../lib/perfMonitor";
@@ -50,6 +50,17 @@ const SCROLL_DEBOUNCE_MS = 50;
 // count by ±1 so one scroll notch always produces a visible change.
 const THUMB_SIZE_MIN = 80;
 const THUMB_SIZE_MAX = 600;
+
+// LOD tier thresholds — cellSize buckets used for URL construction.
+// See docs/thumbnailStreamingResearch.md.
+const TIER_MICRO_MAX = 160;
+const TIER_STANDARD_MAX = 400;
+
+function pickTier(cellPx: number): ThumbTier {
+  if (cellPx <= TIER_MICRO_MAX) return "s";
+  if (cellPx <= TIER_STANDARD_MAX) return "m";
+  return "l";
+}
 
 export function GalleryGrid(props: GalleryGridProps) {
   const mode = () => settings().display.renderer_mode ?? "dom";
@@ -257,7 +268,7 @@ function DOMGrid(props: GalleryGridProps) {
       if (!inFlightSet.has(r.path)) return;
       const v = (urlVersions.get(r.path) ?? 0) + 1;
       urlVersions.set(r.path, v);
-      setThumbMap(r.path, `${thumbUrl(r.path)}?v=${v}`);
+      setThumbMap(r.path, `${thumbUrl(r.path, tier())}?v=${v}`);
     }).then((fn) => {
       unlistenStreamed = fn;
     });
@@ -284,6 +295,10 @@ function DOMGrid(props: GalleryGridProps) {
   };
 
   const rowHeight = () => cellSize() + gap();
+
+  // LOD tier derived from rendered cell size. Tier changes invalidate the
+  // URL cache below so visible items refetch at the new resolution.
+  const tier = () => pickTier(cellSize());
 
   const totalRows = () => Math.ceil(props.paths.length / cols());
 
@@ -321,12 +336,13 @@ function DOMGrid(props: GalleryGridProps) {
   // -----------------------------------------------------------------------
 
   createEffect(on(visibleItems, (items) => {
+    const t = tier();
     const updates: [string, string][] = [];
     for (const item of items) {
       if (!assignedSet.has(item.path)) {
         assignedSet.add(item.path);
         const v = urlVersions.get(item.path);
-        const url = v ? `${thumbUrl(item.path)}?v=${v}` : thumbUrl(item.path);
+        const url = v ? `${thumbUrl(item.path, t)}?v=${v}` : thumbUrl(item.path, t);
         updates.push([item.path, url]);
       }
     }
@@ -563,21 +579,37 @@ function DOMGrid(props: GalleryGridProps) {
             inFlightSet.add(p);
           }
 
+          const activeTier = tier();
           inFlightFetch = (async () => {
             try {
-              const results = await getThumbnailsBatch(toGenerate);
-              if (fetchAbort || generation() !== gen) return;
+              let resultPaths: Set<string>;
+              if (activeTier === "l" || activeTier === "p") {
+                await ensureTierThumbnails(toGenerate, activeTier);
+                if (fetchAbort || generation() !== gen) return;
+                resultPaths = new Set(toGenerate);
+                batch(() => {
+                  for (const p of toGenerate) {
+                    const v = (urlVersions.get(p) ?? 0) + 1;
+                    urlVersions.set(p, v);
+                    setThumbMap(p, `${thumbUrl(p, activeTier)}?v=${v}`);
+                  }
+                });
+                thumbGenDone += toGenerate.length;
+              } else {
+                const results = await getThumbnailsBatch(toGenerate);
+                if (fetchAbort || generation() !== gen) return;
 
-              const resultPaths = new Set(results.map((r) => r.path));
-              batch(() => {
-                for (const r of results) {
-                  const v = (urlVersions.get(r.path) ?? 0) + 1;
-                  urlVersions.set(r.path, v);
-                  setThumbMap(r.path, `${thumbUrl(r.path)}?v=${v}`);
-                }
-              });
+                resultPaths = new Set(results.map((r) => r.path));
+                batch(() => {
+                  for (const r of results) {
+                    const v = (urlVersions.get(r.path) ?? 0) + 1;
+                    urlVersions.set(r.path, v);
+                    setThumbMap(r.path, `${thumbUrl(r.path, activeTier)}?v=${v}`);
+                  }
+                });
 
-              thumbGenDone += results.length;
+                thumbGenDone += results.length;
+              }
               for (const p of toGenerate) {
                 inFlightSet.delete(p);
                 if (!resultPaths.has(p)) failedSet.add(p);
@@ -711,6 +743,26 @@ function DOMGrid(props: GalleryGridProps) {
     on(containerWidth, () => {
       recalcRange?.();
     }),
+  );
+
+  // Tier change (cellSize crossed an LOD boundary) — wipe URLs so visible
+  // items re-request at the new resolution. The DOM <img>s will swap src
+  // and fetch the new protocol URL.
+  createEffect(
+    on(
+      tier,
+      () => {
+        setThumbMap(reconcile({}));
+        assignedSet.clear();
+        needsGeneration.clear();
+        inFlightSet.clear();
+        failedSet.clear();
+        urlVersions.clear();
+        bgCursor = 0;
+        setGeneration((g) => g + 1);
+      },
+      { defer: true },
+    ),
   );
 
   // Report content height to parent for custom scrollbar
