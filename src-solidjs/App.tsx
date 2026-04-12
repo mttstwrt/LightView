@@ -267,7 +267,7 @@ export function App() {
     if (e.key === "F11") {
       e.preventDefault();
       const win = getCurrentWindow();
-      win.isFullscreen().then((fs) => win.setFullscreen(!fs));
+      win.isDecorated().then((decorated) => win.setDecorations(!decorated));
     }
     if (e.key === "F12") {
       setDebugOpen((prev) => !prev);
