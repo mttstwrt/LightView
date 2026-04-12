@@ -1213,6 +1213,39 @@ pub async fn get_cached_thumbnail_info(
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct ThumbnailTierInfo {
+    pub tier: String,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u64,
+    pub format: String,
+    pub resize_filter: Option<String>,
+}
+
+/// Get metadata about all cached thumbnail tiers for a specific file.
+#[tauri::command]
+pub async fn get_all_thumbnail_tiers(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<Vec<ThumbnailTierInfo>, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+
+    let tiers = db.get_all_tier_info(&path).map_err(|e| e.to_string())?;
+    Ok(tiers
+        .into_iter()
+        .map(|(tier, width, height, size_bytes, format, resize_filter)| ThumbnailTierInfo {
+            tier,
+            width,
+            height,
+            size_bytes,
+            format,
+            resize_filter,
+        })
+        .collect())
+}
+
 /// Entry returned by `get_thumbhashes` — one per requested path.
 /// `hash` is the base64-encoded ThumbHash blob (~32 chars for ~25 bytes),
 /// or None if no hash has been computed yet. The frontend decodes these

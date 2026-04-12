@@ -483,6 +483,7 @@ fn main() {
             commands::media::get_media_meta,
             commands::media::regenerate_thumbnail,
             commands::media::get_cached_thumbnail_info,
+            commands::media::get_all_thumbnail_tiers,
             commands::media::precache_thumbnails,
             commands::media::get_thumbhashes,
             commands::media::ensure_tier_thumbnails,

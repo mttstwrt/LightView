@@ -1,8 +1,8 @@
 import { Show, For, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
-import { mediaUrl, thumbUrl, ensureTierThumbnails, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getCachedThumbnailInfo } from "../../lib/ipc";
-import type { CachedThumbnailInfo } from "../../lib/ipc";
+import { mediaUrl, thumbUrl, ensureTierThumbnails, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getAllThumbnailTiers } from "../../lib/ipc";
+import type { ThumbnailTierInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { setViewerCacheCountSource } from "../../lib/perfMonitor";
@@ -416,7 +416,8 @@ function InfoPanel(props: { path: string; filename: string }) {
   const [newTag, setNewTag] = createSignal("");
   const [rating, setRating] = createSignal(0);
   const [lastRated, setLastRated] = createSignal<number | null>(null);
-  const [thumbInfo, setThumbInfo] = createSignal<CachedThumbnailInfo | null>(null);
+  const [thumbTiers, setThumbTiers] = createSignal<ThumbnailTierInfo[]>([]);
+  const [thumbExpanded, setThumbExpanded] = createSignal(false);
 
   const loadTags = async (path: string) => {
     try {
@@ -434,7 +435,7 @@ function InfoPanel(props: { path: string; filename: string }) {
         setTags([]);
         setRating(0);
         setLastRated(null);
-        setThumbInfo(null);
+        setThumbTiers([]);
         try {
           const result = await getMediaMeta(path);
           if (result) {
@@ -451,8 +452,8 @@ function InfoPanel(props: { path: string; filename: string }) {
           }
         } catch {}
         try {
-          const ti = await getCachedThumbnailInfo(path);
-          setThumbInfo(ti);
+          const tiers = await getAllThumbnailTiers(path);
+          setThumbTiers(tiers);
         } catch {}
         loadTags(path);
       },
@@ -554,14 +555,43 @@ function InfoPanel(props: { path: string; filename: string }) {
             </div>
           </Show>
 
-          {/* Thumbnail */}
-          <Show when={thumbInfo()}>
-            <div class="border-t border-neutral-800 pt-3 mt-3 space-y-3">
-              <span class="text-neutral-500 font-medium">Thumbnail</span>
-              <InfoRow label="Dimensions" value={`${thumbInfo()!.width} × ${thumbInfo()!.height}`} />
-              <InfoRow label="Format" value={thumbInfo()!.format.toUpperCase()} />
-              <InfoRow label="Resize" value={thumbInfo()!.resize_filter.charAt(0).toUpperCase() + thumbInfo()!.resize_filter.slice(1)} />
-              <InfoRow label="Cache size" value={formatBytes(thumbInfo()!.size_bytes)} />
+          {/* Thumbnails */}
+          <Show when={thumbTiers().length > 0}>
+            <div class="border-t border-neutral-800 pt-3 mt-3">
+              <button
+                class="flex items-center gap-1.5 text-neutral-500 font-medium cursor-pointer hover:text-neutral-400 transition-colors w-full text-left"
+                onClick={() => setThumbExpanded((v) => !v)}
+              >
+                <svg
+                  class="w-3 h-3 transition-transform"
+                  style={{ transform: thumbExpanded() ? "rotate(90deg)" : "rotate(0deg)" }}
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  stroke-width="2.5"
+                >
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                </svg>
+                Thumbnails
+                <span class="text-neutral-600 font-normal text-[11px]">({thumbTiers().length})</span>
+              </button>
+              <Show when={thumbExpanded()}>
+                <div class="mt-2 space-y-3">
+                  <For each={thumbTiers()}>
+                    {(tier) => (
+                      <div class="pl-1 space-y-1.5">
+                        <span class="text-neutral-400 text-[11px] font-medium uppercase tracking-wider">{tier.tier}</span>
+                        <InfoRow label="Dimensions" value={`${tier.width} × ${tier.height}`} />
+                        <InfoRow label="Format" value={tier.format.toUpperCase()} />
+                        <InfoRow label="Size" value={formatBytes(tier.size_bytes)} />
+                        <Show when={tier.resize_filter}>
+                          <InfoRow label="Resize" value={tier.resize_filter!.charAt(0).toUpperCase() + tier.resize_filter!.slice(1)} />
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
             </div>
           </Show>
 

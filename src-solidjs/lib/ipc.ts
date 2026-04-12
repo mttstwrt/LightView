@@ -356,6 +356,18 @@ export interface CachedThumbnailInfo {
 export const getCachedThumbnailInfo = (path: string) =>
   invoke<CachedThumbnailInfo | null>("get_cached_thumbnail_info", { path });
 
+export interface ThumbnailTierInfo {
+  tier: string;
+  width: number;
+  height: number;
+  size_bytes: number;
+  format: string;
+  resize_filter: string | null;
+}
+
+export const getAllThumbnailTiers = (path: string) =>
+  invoke<ThumbnailTierInfo[]>("get_all_thumbnail_tiers", { path });
+
 // ---------------------------------------------------------------------------
 // Viewer (GPU-accelerated transforms)
 // ---------------------------------------------------------------------------

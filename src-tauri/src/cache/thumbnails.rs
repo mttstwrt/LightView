@@ -257,6 +257,59 @@ impl CacheDb {
         Ok(())
     }
 
+    /// Get metadata for all cached thumbnail tiers for a given path.
+    /// Returns (tier_name, width, height, size_bytes, format, resize_filter_or_none) per tier.
+    pub fn get_all_tier_info(
+        &self,
+        path: &str,
+    ) -> Result<Vec<(String, u32, u32, u64, String, Option<String>)>, CacheError> {
+        let mut results = Vec::new();
+
+        // Standard tier — has resize_filter column
+        {
+            let mut stmt = self.conn().prepare_cached(
+                "SELECT width, height, LENGTH(thumbnail), format, resize_filter FROM thumbnails WHERE path = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![path])?;
+            if let Some(row) = rows.next()? {
+                results.push((
+                    "Standard".to_string(),
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    Some(row.get::<_, String>(4)?),
+                ));
+            }
+        }
+
+        // Other tiers — no resize_filter column
+        for (label, tier) in [
+            ("Micro", ThumbTier::Micro),
+            ("Large", ThumbTier::Large),
+            ("Preview", ThumbTier::Preview),
+        ] {
+            let sql = format!(
+                "SELECT width, height, LENGTH(thumbnail), format FROM {} WHERE path = ?1",
+                tier.table()
+            );
+            let mut stmt = self.conn().prepare_cached(&sql)?;
+            let mut rows = stmt.query(rusqlite::params![path])?;
+            if let Some(row) = rows.next()? {
+                results.push((
+                    label.to_string(),
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    None,
+                ));
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Check if a non-standard-tier thumbnail exists for this path.
     pub fn tier_is_cached(&self, tier: ThumbTier, path: &str) -> Result<bool, CacheError> {
         let sql = format!("SELECT 1 FROM {} WHERE path = ?1", tier.table());
