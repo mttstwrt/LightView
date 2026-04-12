@@ -13,7 +13,11 @@ import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
 import { sortField, sortOrder, subSortField, subSortOrder, groupBy } from "../../stores/settingsStore";
 import { autocompleteTags, applyFilter, clearFilter, getSortedItems } from "../../lib/ipc";
 
-export function FilterBar() {
+interface FilterBarProps {
+  onInputRef?: (el: HTMLInputElement) => void;
+}
+
+export function FilterBar(props: FilterBarProps) {
   let inputRef: HTMLInputElement | undefined;
   let debounceTimer: number | undefined;
 
@@ -206,7 +210,7 @@ export function FilterBar() {
         </div>
 
         <input
-          ref={inputRef}
+          ref={(el) => { inputRef = el; props.onInputRef?.(el); }}
           type="text"
           value={acQuery()}
           onInput={(e) => handleInput(e.currentTarget.value)}

@@ -28,6 +28,7 @@ pub struct MediaMeta {
     pub height: Option<u32>,
     pub duration_seconds: Option<f64>,
     pub rating: Option<u8>,
+    pub last_rated: Option<i64>,
 }
 
 fn encode_b64(data: &[u8]) -> String {
@@ -1012,7 +1013,7 @@ pub async fn get_media_meta(
     let mut stmt = db
         .conn()
         .prepare_cached(
-            "SELECT path, media_type, file_size, date_taken, width, height, duration, rating FROM media_meta WHERE path = ?1",
+            "SELECT path, media_type, file_size, date_taken, width, height, duration, rating, last_rated FROM media_meta WHERE path = ?1",
         )
         .map_err(|e| e.to_string())?;
 
@@ -1028,6 +1029,7 @@ pub async fn get_media_meta(
             height: row.get(5).map_err(|e| e.to_string())?,
             duration_seconds: row.get(6).map_err(|e| e.to_string())?,
             rating: row.get(7).map_err(|e| e.to_string())?,
+            last_rated: row.get(8).map_err(|e| e.to_string())?,
         })),
         None => Ok(None),
     }

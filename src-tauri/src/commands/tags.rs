@@ -200,11 +200,17 @@ pub async fn set_rating_batch(
     rating: u8,
 ) -> Result<u64, String> {
     let db_rating = if rating == 0 { None } else { Some(rating) };
+    let now = chrono::Utc::now().to_rfc3339();
     let mut count = 0u64;
     for path in &paths {
         match modify_companion(path, |c| {
             let core = c.meta.core.get_or_insert_with(CoreMeta::default);
             core.rating = db_rating;
+            core.date_rated = if db_rating.is_some() {
+                Some(now.clone())
+            } else {
+                None
+            };
         }) {
             Ok(_) => {
                 count += 1;
@@ -230,6 +236,11 @@ pub async fn set_rating(
     modify_companion(&path, |c| {
         let core = c.meta.core.get_or_insert_with(CoreMeta::default);
         core.rating = db_rating;
+        core.date_rated = if db_rating.is_some() {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
     })?;
 
     let db = state.cache_db.lock().await;

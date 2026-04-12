@@ -1,6 +1,7 @@
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths } from "../../stores/galleryStore";
+import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
 import { rebuildThumbnails, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch } from "../../lib/ipc";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
@@ -21,16 +22,27 @@ const GAP_PRESETS = [
   { label: "Wide", value: 8 },
 ] as const;
 
-export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void }) {
+export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onRequestShow?: () => void }) {
   const [open, setOpen] = createSignal(false);
 
   const toggle = () => setOpen((v) => !v);
 
-  // Close on Escape
+  // Close on Escape, toggle on 'I' in grid view
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Escape" && open()) {
       e.stopPropagation();
       setOpen(false);
+      return;
+    }
+    if (
+      e.key === "i" &&
+      !e.ctrlKey && !e.metaKey && !e.altKey &&
+      !viewerOpen() &&
+      !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)
+    ) {
+      e.preventDefault();
+      if (!open()) props.onRequestShow?.();
+      toggle();
     }
   };
   window.addEventListener("keydown", handleKey, true);

@@ -1,4 +1,14 @@
 
+- make thumbnail info in the image info panel an expandable section, showing all levels of thumbnail generated for that image, the resolution of each thumbnail level, file size, the date it was generated, with what algorithm, and what file format.
+
+- make ctrl+f open the filter bar even when not moused over the top bar
+
+- make 'I' hotkey open the settings panel if in grid view
+
+- make 'f11' toggle full screen
+
+- in the info panel add 'date rated' next to the rating. If there is a rating but no date it should say 'unknown' and blank if there is no rating at all.
+
 - Thumbnail streaming? How do Apple photos/Google photos handle small vs large thumbnails gracefully? When Thumbnails are big we want higher res and we don't need to worry about performance as much because of fewer images and fewer dom nodes. When thumbnails are small we want to load lower res and figure out how to handle the increased number of DOM nodes. Research high performance methods of storing/loading thumbnails for the grid view. Try to find out how top tier gallery apps like Apple photos, google photos, and Immich handle this. Some prior research exists in docs/gridScaleResearch.md
 
 - When zooming out on the grid, unloaded thumbnails show until a scroll command is input. Preferably we would attach as little as possible to the scoll input. This could be a source of performance issues with scrolling. Research high performance methods for scrolling the grid view. Try to find out how top tier gallery apps like Apple photos, google photos, and Immich handle this. Some prior research exists in docs/scrollPerformanceResearch.md

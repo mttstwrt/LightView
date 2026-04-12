@@ -126,6 +126,7 @@ export const getMediaMeta = (path: string) =>
     height: number | null;
     duration_seconds: number | null;
     rating: number | null;
+    last_rated: number | null;
   } | null>("get_media_meta", { path });
 
 // ---------------------------------------------------------------------------

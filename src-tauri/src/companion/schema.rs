@@ -149,6 +149,7 @@ pub struct MetaCollection {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CoreMeta {
     pub rating: Option<u8>,
+    pub date_rated: Option<String>,
     pub color_label: Option<String>,
     pub notes: Option<String>,
     pub media: Option<MediaInfo>,

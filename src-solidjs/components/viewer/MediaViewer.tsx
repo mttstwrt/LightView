@@ -400,6 +400,7 @@ function formatDate(unixTimestamp: number): string {
   });
 }
 
+
 interface MetaInfo {
   media_type: string;
   file_size: number;
@@ -414,6 +415,7 @@ function InfoPanel(props: { path: string; filename: string }) {
   const [tags, setTags] = createSignal<{ namespace: string; tag: string }[]>([]);
   const [newTag, setNewTag] = createSignal("");
   const [rating, setRating] = createSignal(0);
+  const [lastRated, setLastRated] = createSignal<number | null>(null);
   const [thumbInfo, setThumbInfo] = createSignal<CachedThumbnailInfo | null>(null);
 
   const loadTags = async (path: string) => {
@@ -431,6 +433,7 @@ function InfoPanel(props: { path: string; filename: string }) {
         setMeta(null);
         setTags([]);
         setRating(0);
+        setLastRated(null);
         setThumbInfo(null);
         try {
           const result = await getMediaMeta(path);
@@ -444,6 +447,7 @@ function InfoPanel(props: { path: string; filename: string }) {
               duration_seconds: result.duration_seconds,
             });
             setRating(result.rating ?? 0);
+            setLastRated(result.last_rated);
           }
         } catch {}
         try {
@@ -484,6 +488,7 @@ function InfoPanel(props: { path: string; filename: string }) {
     try {
       await setRatingIpc(props.path, newRating);
       setRating(newRating);
+      setLastRated(newRating > 0 ? Math.floor(Date.now() / 1000) : null);
     } catch (err) {
       console.error("Failed to set rating:", err);
     }
@@ -497,6 +502,7 @@ function InfoPanel(props: { path: string; filename: string }) {
     const { path, rating: newRating } = (e as CustomEvent).detail;
     if (path === props.path) {
       setRating(newRating);
+      setLastRated(newRating > 0 ? Math.floor(Date.now() / 1000) : null);
     }
   };
   window.addEventListener("lightview:rating-changed", onRatingChanged);
@@ -562,18 +568,25 @@ function InfoPanel(props: { path: string; filename: string }) {
           {/* Rating */}
           <div class="border-t border-neutral-800 pt-3 mt-3">
             <span class="text-neutral-500">Rating:</span>
-            <div class="flex gap-1 mt-1">
-              <For each={[1, 2, 3, 4, 5]}>
-                {(star) => (
-                  <button
-                    class="cursor-pointer text-base transition-colors"
-                    style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
-                    onClick={() => handleSetRating(star)}
-                  >
-                    &#9733;
-                  </button>
-                )}
-              </For>
+            <div class="flex items-center gap-2 mt-1">
+              <div class="flex gap-1">
+                <For each={[1, 2, 3, 4, 5]}>
+                  {(star) => (
+                    <button
+                      class="cursor-pointer text-base transition-colors"
+                      style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
+                      onClick={() => handleSetRating(star)}
+                    >
+                      &#9733;
+                    </button>
+                  )}
+                </For>
+              </div>
+              <Show when={rating() > 0}>
+                <span class="text-neutral-500 text-[11px]">
+                  {lastRated() ? formatDate(lastRated()!) : "unknown"}
+                </span>
+              </Show>
             </div>
           </div>
 

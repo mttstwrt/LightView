@@ -1,4 +1,4 @@
-import { createSignal, Show } from "solid-js";
+import { createSignal, onCleanup, onMount } from "solid-js";
 import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
@@ -10,9 +10,21 @@ interface TopBarProps {
 
 export function TopBar(props: TopBarProps) {
   const [visible, setVisible] = createSignal(false);
+  let filterInputRef: HTMLInputElement | undefined;
 
   const handleMouseEnter = () => setVisible(true);
   const handleMouseLeave = () => setVisible(false);
+
+  const handleGlobalKeyDown = (e: KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+      e.preventDefault();
+      setVisible(true);
+      requestAnimationFrame(() => filterInputRef?.focus());
+    }
+  };
+
+  onMount(() => window.addEventListener("keydown", handleGlobalKeyDown));
+  onCleanup(() => window.removeEventListener("keydown", handleGlobalKeyDown));
 
   return (
     <>
@@ -34,9 +46,9 @@ export function TopBar(props: TopBarProps) {
         onMouseEnter={handleMouseEnter}
         onMouseLeave={handleMouseLeave}
       >
-        <FilterBar />
+        <FilterBar onInputRef={(el) => { filterInputRef = el; }} />
         <SortMenu />
-        <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} />
+        <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onRequestShow={() => setVisible(true)} />
       </div>
     </>
   );

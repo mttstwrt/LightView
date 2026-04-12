@@ -1,5 +1,6 @@
 import { Show, createSignal, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
@@ -262,6 +263,11 @@ export function App() {
         e.preventDefault();
         selectAll(displayPaths());
       }
+    }
+    if (e.key === "F11") {
+      e.preventDefault();
+      const win = getCurrentWindow();
+      win.isFullscreen().then((fs) => win.setFullscreen(!fs));
     }
     if (e.key === "F12") {
       setDebugOpen((prev) => !prev);
