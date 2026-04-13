@@ -233,16 +233,43 @@ export function App() {
     }
   };
 
+  // Throttle held arrow keys to one navigation per frame so the viewer
+  // doesn't queue up a backlog of image loads that keep playing after release.
+  let navPending = false;
+  let navDirection: "left" | "right" | null = null;
+
+  const flushNav = () => {
+    navPending = false;
+    if (!navDirection || !viewerOpen()) { navDirection = null; return; }
+    if (navDirection === "right") {
+      nextImage(displayPaths().length);
+    } else {
+      prevImage();
+    }
+    window.dispatchEvent(new CustomEvent("lightview:scroll-to-index", { detail: viewerIndex() }));
+    navDirection = null;
+  };
+
   const handleKeyDown = (e: KeyboardEvent) => {
     if (viewerOpen()) {
       if (e.key === "Escape") {
         closeViewer();
       } else if (e.key === "ArrowRight") {
-        nextImage(displayPaths().length);
-        window.dispatchEvent(new CustomEvent("lightview:scroll-to-index", { detail: viewerIndex() }));
+        if (e.repeat && navPending) return;
+        navDirection = "right";
+        if (!navPending) {
+          navPending = true;
+          requestAnimationFrame(flushNav);
+        }
+        return;
       } else if (e.key === "ArrowLeft") {
-        prevImage();
-        window.dispatchEvent(new CustomEvent("lightview:scroll-to-index", { detail: viewerIndex() }));
+        if (e.repeat && navPending) return;
+        navDirection = "left";
+        if (!navPending) {
+          navPending = true;
+          requestAnimationFrame(flushNav);
+        }
+        return;
       } else if (e.key === "i" || e.key === "I") {
         toggleInfoPanel();
       } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
