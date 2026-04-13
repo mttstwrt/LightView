@@ -239,8 +239,10 @@ export function App() {
         closeViewer();
       } else if (e.key === "ArrowRight") {
         nextImage(displayPaths().length);
+        window.dispatchEvent(new CustomEvent("lightview:scroll-to-index", { detail: viewerIndex() }));
       } else if (e.key === "ArrowLeft") {
         prevImage();
+        window.dispatchEvent(new CustomEvent("lightview:scroll-to-index", { detail: viewerIndex() }));
       } else if (e.key === "i" || e.key === "I") {
         toggleInfoPanel();
       } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -319,6 +321,7 @@ export function App() {
           onClose={() => setContextMenu(null)}
           paths={displayPaths()}
           selectedPaths={selectedPaths()}
+          hideViewOption={viewerOpen()}
           onFilesRemoved={(removed) => {
             const removedSet = new Set(removed);
             setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
@@ -333,6 +336,9 @@ export function App() {
             onClose={closeViewer}
             onNext={() => nextImage(displayPaths().length)}
             onPrev={prevImage}
+            onContextMenu={(e, path, index) => {
+              setContextMenu({ x: e.clientX, y: e.clientY, path, index });
+            }}
           />
         </Show>
         <Show when={duplicatesOpen()}>

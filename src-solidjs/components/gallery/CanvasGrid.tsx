@@ -492,10 +492,34 @@ export function CanvasGrid(props: CanvasGridProps) {
         next = Math.max(THUMB_SIZE_MIN, Math.min(THUMB_SIZE_MAX, next));
         const newCols = Math.max(1, Math.floor((w + g) / (next + g)));
         if (newCols === curCols) return;
+
+        // --- Anchor: keep hovered image at the same screen position ---
+        const containerTop = containerRef?.offsetTop ?? 0;
+        const curCellSize = (w - (curCols - 1) * g) / curCols;
+        const curRowHeight = curCellSize + g;
+
+        const cursorPageY = e.clientY + window.scrollY;
+        const cursorInGrid = cursorPageY - containerTop;
+        const hoverRow = Math.max(0, Math.floor(cursorInGrid / curRowHeight));
+
+        const gridLeft = (containerRef?.getBoundingClientRect().left ?? 0) + g;
+        const cursorInRow = e.clientX - gridLeft;
+        const hoverCol = Math.max(0, Math.min(curCols - 1, Math.floor(cursorInRow / (curCellSize + g))));
+        const hoverIndex = Math.min(props.paths.length - 1, hoverRow * curCols + hoverCol);
+
+        const imagePageY = containerTop + hoverRow * curRowHeight;
+        const imageClientY = imagePageY - window.scrollY;
+
         setSettings((prev) => ({
           ...prev,
           display: { ...prev.display, thumbnail_size: next },
         }));
+
+        const newCellSize = (w - (newCols - 1) * g) / newCols;
+        const newRowHeight = newCellSize + g;
+        const newRow = Math.floor(hoverIndex / newCols);
+        const newImagePageY = containerTop + newRow * newRowHeight;
+        window.scrollTo(0, newImagePageY - imageClientY);
         return;
       }
       e.preventDefault();
@@ -723,6 +747,24 @@ export function CanvasGrid(props: CanvasGridProps) {
     };
     window.addEventListener("lightview:thumbnails-invalidated", onInvalidate);
 
+    // Scroll grid to keep the viewed image visible (e.g. arrow key navigation)
+    const onScrollToIndex = (e: Event) => {
+      const index = (e as CustomEvent).detail as number;
+      if (index < 0 || index >= props.paths.length) return;
+      const c = cols();
+      const rh = rowHeight();
+      const offset = containerRef?.offsetTop ?? 0;
+      const targetRow = Math.floor(index / c);
+      const imageTop = offset + targetRow * rh;
+      const imageBottom = imageTop + cellSize();
+      const viewTop = window.scrollY;
+      const viewBottom = viewTop + window.innerHeight;
+      if (imageTop < viewTop || imageBottom > viewBottom) {
+        window.scrollTo(0, imageTop - (window.innerHeight - cellSize()) / 2);
+      }
+    };
+    window.addEventListener("lightview:scroll-to-index", onScrollToIndex);
+
     // -------------------------------------------------------------------
     // Mouse event handling via hit-testing
     // -------------------------------------------------------------------
@@ -863,6 +905,7 @@ export function CanvasGrid(props: CanvasGridProps) {
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
+      window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       canvas.removeEventListener("mousedown", onMouseDown);
       canvas.removeEventListener("mousemove", onMouseMove);
       canvas.removeEventListener("mouseleave", onMouseLeave);

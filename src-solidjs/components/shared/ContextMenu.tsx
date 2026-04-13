@@ -20,6 +20,7 @@ interface ContextMenuProps {
   paths: string[];
   selectedPaths?: Set<string>;
   onFilesRemoved?: (removed: string[]) => void;
+  hideViewOption?: boolean;
 }
 
 type SubMenu = "tag" | "rating" | "openWith" | "plugins" | null;
@@ -284,7 +285,7 @@ export function ContextMenu(props: ContextMenuProps) {
               </div>
               <Divider />
             </Show>
-            <Show when={!isBatchContext()}>
+            <Show when={!isBatchContext() && !props.hideViewOption}>
               <MenuItem label="View" onClick={handleOpenViewer} />
             </Show>
             <MenuItem

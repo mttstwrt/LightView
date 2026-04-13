@@ -482,10 +482,36 @@ function DOMGrid(props: GalleryGridProps) {
         next = Math.max(THUMB_SIZE_MIN, Math.min(THUMB_SIZE_MAX, next));
         const newCols = Math.max(1, Math.floor((w + g) / (next + g)));
         if (newCols === curCols) return;
+
+        // --- Anchor: keep hovered image at the same screen position ---
+        const containerTop = containerRef?.offsetTop ?? 0;
+        const curCellSize = (w - (curCols - 1) * g) / curCols;
+        const curRowHeight = curCellSize + g;
+
+        const cursorPageY = e.clientY + window.scrollY;
+        const cursorInGrid = cursorPageY - containerTop;
+        const hoverRow = Math.max(0, Math.floor(cursorInGrid / curRowHeight));
+
+        const gridLeft = (containerRef?.getBoundingClientRect().left ?? 0) + g;
+        const cursorInRow = e.clientX - gridLeft;
+        const hoverCol = Math.max(0, Math.min(curCols - 1, Math.floor(cursorInRow / (curCellSize + g))));
+        const hoverIndex = Math.min(props.paths.length - 1, hoverRow * curCols + hoverCol);
+
+        // Where the hovered image's row currently is on screen
+        const imagePageY = containerTop + hoverRow * curRowHeight;
+        const imageClientY = imagePageY - window.scrollY;
+
         setSettings((prev) => ({
           ...prev,
           display: { ...prev.display, thumbnail_size: next },
         }));
+
+        // Compute new position of that image and adjust scroll
+        const newCellSize = (w - (newCols - 1) * g) / newCols;
+        const newRowHeight = newCellSize + g;
+        const newRow = Math.floor(hoverIndex / newCols);
+        const newImagePageY = containerTop + newRow * newRowHeight;
+        window.scrollTo(0, newImagePageY - imageClientY);
         return;
       }
       e.preventDefault();
@@ -699,11 +725,31 @@ function DOMGrid(props: GalleryGridProps) {
     };
     window.addEventListener("lightview:thumbnails-invalidated", onInvalidate);
 
+    // Scroll grid to keep the viewed image visible (e.g. arrow key navigation)
+    const onScrollToIndex = (e: Event) => {
+      const index = (e as CustomEvent).detail as number;
+      if (index < 0 || index >= props.paths.length) return;
+      const c = cols();
+      const rh = rowHeight();
+      const offset = containerRef?.offsetTop ?? 0;
+      const targetRow = Math.floor(index / c);
+      const imageTop = offset + targetRow * rh;
+      const imageBottom = imageTop + cellSize();
+      const viewTop = window.scrollY;
+      const viewBottom = viewTop + window.innerHeight;
+      if (imageTop < viewTop || imageBottom > viewBottom) {
+        // Center the target row in the viewport
+        window.scrollTo(0, imageTop - (window.innerHeight - cellSize()) / 2);
+      }
+    };
+    window.addEventListener("lightview:scroll-to-index", onScrollToIndex);
+
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
+      window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
       if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);

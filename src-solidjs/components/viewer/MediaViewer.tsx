@@ -13,6 +13,7 @@ interface MediaViewerProps {
   onClose: () => void;
   onNext: () => void;
   onPrev: () => void;
+  onContextMenu?: (e: MouseEvent, path: string, index: number) => void;
 }
 
 export function MediaViewer(props: MediaViewerProps) {
@@ -273,6 +274,12 @@ export function MediaViewer(props: MediaViewerProps) {
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onDblClick={handleDblClick}
+      onContextMenu={(e) => {
+        if (props.onContextMenu) {
+          e.preventDefault();
+          props.onContextMenu(e, currentPath(), props.currentIndex);
+        }
+      }}
     >
       {/* Navigation — left */}
       <button
