@@ -34,15 +34,15 @@ interface CanvasGridProps {
 }
 
 // --- Constants (same as GalleryGrid) ---
-const BUFFER_ROWS = 3;
+// Asymmetric buffer: more rows ahead of scroll direction, fewer behind.
+const BUFFER_AHEAD = 5;
+const BUFFER_BEHIND = 2;
 const BATCH_SIZE = 128;
 const VELOCITY_SLOW = 500;
 const VELOCITY_FAST = 3000;
 const JUMP_FACTOR = 2;
 const BG_BATCH_SIZE = 64;
 const EVICT_ROWS = 15;
-const SETTLE_MS = 150;
-const SCROLL_DEBOUNCE_MS = 50;
 
 // Ctrl+wheel thumbnail resize bounds (px). Each tick retargets the column
 // count by ±1 so one scroll notch always produces a visible change.
@@ -392,10 +392,10 @@ export function CanvasGrid(props: CanvasGridProps) {
     let currentVelocity = 0;
     let lastScrollY = window.scrollY;
     let lastTimestamp = performance.now();
-    let lastFastScrollTime = 0;
+    let scrollDirection: 1 | -1 = 1; // 1 = down, -1 = up
 
     recalcRange = () => {
-      const sy = currentScrollY;
+      const sy = window.scrollY;
       const vh = window.innerHeight;
       const offset = containerRef?.offsetTop ?? 0;
       const rh = rowHeight();
@@ -405,8 +405,11 @@ export function CanvasGrid(props: CanvasGridProps) {
       const relativeTop = Math.max(0, sy - offset);
       const relativeBottom = relativeTop + vh;
 
-      const newStart = Math.max(0, Math.floor(relativeTop / rh) - BUFFER_ROWS);
-      const newEnd = Math.min(totalRows(), Math.ceil(relativeBottom / rh) + BUFFER_ROWS);
+      const bufferTop = scrollDirection === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
+      const bufferBottom = scrollDirection === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+
+      const newStart = Math.max(0, Math.floor(relativeTop / rh) - bufferTop);
+      const newEnd = Math.min(totalRows(), Math.ceil(relativeBottom / rh) + bufferBottom);
 
       if (newStart !== untrack(startRow) || newEnd !== untrack(endRow)) {
         batch(() => {
@@ -426,10 +429,7 @@ export function CanvasGrid(props: CanvasGridProps) {
 
         currentVelocity = dt > 0 ? dy / dt : 0;
         currentScrollY = y;
-
-        if (currentVelocity > VELOCITY_FAST) {
-          lastFastScrollTime = now;
-        }
+        scrollDirection = y >= lastScrollY ? 1 : -1;
 
         if (dy > window.innerHeight * JUMP_FACTOR) {
           setGeneration((g) => g + 1);
@@ -448,7 +448,6 @@ export function CanvasGrid(props: CanvasGridProps) {
         lastTimestamp = now;
 
         recalcRange?.();
-        debouncedFetch();
         rafId = 0;
       });
     };
@@ -465,6 +464,7 @@ export function CanvasGrid(props: CanvasGridProps) {
       if (Math.abs(wheelAccumulator) < WHEEL_THRESHOLD) {
         wheelAccumulator = 0;
         wheelRafId = 0;
+        scheduleFetch(); // Wheel scroll settled — fetch now
         return;
       }
       const step = wheelAccumulator * (1 - WHEEL_DECAY);
@@ -570,7 +570,6 @@ export function CanvasGrid(props: CanvasGridProps) {
       const now = performance.now();
       if (now - lastTimestamp > 150) currentVelocity = 0;
       if (currentVelocity > VELOCITY_FAST) return;
-      if (now - lastFastScrollTime < SETTLE_MS) return;
 
       coalescedPaths.clear();
       const gen = generation();
@@ -697,11 +696,10 @@ export function CanvasGrid(props: CanvasGridProps) {
       evictFaraway();
     };
 
-    let scrollDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-    const debouncedFetch = () => {
-      if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
-      scrollDebounceTimer = setTimeout(scheduleFetch, SCROLL_DEBOUNCE_MS);
-    };
+    // scrollend fires when scrolling stops — replaces manual debounce.
+    const onScrollEnd = () => scheduleFetch();
+    window.addEventListener("scrollend", onScrollEnd);
+
     const bgIntervalId = setInterval(() => {
       if (!inFlightFetch) scheduleFetch();
     }, 500);
@@ -902,6 +900,7 @@ export function CanvasGrid(props: CanvasGridProps) {
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("scrollend", onScrollEnd);
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
@@ -913,7 +912,6 @@ export function CanvasGrid(props: CanvasGridProps) {
       canvas.removeEventListener("contextmenu", onContextMenu);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
-      if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
       unlistenStreamed?.();
@@ -1001,6 +999,13 @@ export function CanvasGrid(props: CanvasGridProps) {
 
   // Recalc on container width change
   createEffect(on(containerWidth, () => {
+    recalcRange?.();
+  }));
+
+  // Recalc when layout geometry changes (zoom via Ctrl+wheel).
+  // thumbSize/cols changes don't trigger scroll events, so recalcRange
+  // must be called directly to update startRow/endRow.
+  createEffect(on(cols, () => {
     recalcRange?.();
   }));
 

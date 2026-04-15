@@ -21,8 +21,9 @@ interface GalleryGridProps {
   onContentHeight?: (height: number) => void;
 }
 
-// Rows of buffer above and below the viewport to pre-render.
-const BUFFER_ROWS = 3;
+// Asymmetric buffer: more rows ahead of scroll direction, fewer behind.
+const BUFFER_AHEAD = 5;
+const BUFFER_BEHIND = 2;
 
 // How many paths to send per IPC batch call.
 const BATCH_SIZE = 128;
@@ -40,11 +41,6 @@ const BG_BATCH_SIZE = 64;
 // Rows beyond the visible+buffer range before thumbnails are evicted from memory.
 const EVICT_ROWS = 15;
 
-// How long (ms) to wait after fast scroll ends before resuming fetches.
-const SETTLE_MS = 150;
-
-// Debounce delay (ms) for scroll-driven metadata requests.
-const SCROLL_DEBOUNCE_MS = 50;
 
 // Ctrl+wheel thumbnail resize bounds (px). Each tick retargets the column
 // count by ±1 so one scroll notch always produces a visible change.
@@ -376,11 +372,11 @@ function DOMGrid(props: GalleryGridProps) {
     let currentVelocity = 0;
     let lastScrollY = window.scrollY;
     let lastTimestamp = performance.now();
-    let lastFastScrollTime = 0;
+    let scrollDirection: 1 | -1 = 1; // 1 = down, -1 = up
 
-    /** Recompute the visible row range from raw scroll state and update signals if changed. */
+    /** Recompute the visible row range from current scroll position and update signals if changed. */
     recalcRange = () => {
-      const sy = currentScrollY;
+      const sy = window.scrollY;
       const vh = window.innerHeight;
       const offset = containerRef?.offsetTop ?? 0;
       const rh = rowHeight();
@@ -390,8 +386,11 @@ function DOMGrid(props: GalleryGridProps) {
       const relativeTop = Math.max(0, sy - offset);
       const relativeBottom = relativeTop + vh;
 
-      const newStart = Math.max(0, Math.floor(relativeTop / rh) - BUFFER_ROWS);
-      const newEnd = Math.min(totalRows(), Math.ceil(relativeBottom / rh) + BUFFER_ROWS);
+      const bufferTop = scrollDirection === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
+      const bufferBottom = scrollDirection === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+
+      const newStart = Math.max(0, Math.floor(relativeTop / rh) - bufferTop);
+      const newEnd = Math.min(totalRows(), Math.ceil(relativeBottom / rh) + bufferBottom);
 
       // Only update signals when the range actually changes — this is the key
       // optimization that prevents reactive recomputation on every scroll pixel.
@@ -413,11 +412,7 @@ function DOMGrid(props: GalleryGridProps) {
 
         currentVelocity = dt > 0 ? dy / dt : 0;
         currentScrollY = y;
-
-        // Track fast scroll time for settle detection
-        if (currentVelocity > VELOCITY_FAST) {
-          lastFastScrollTime = now;
-        }
+        scrollDirection = y >= lastScrollY ? 1 : -1;
 
         // Jump detection
         if (dy > window.innerHeight * JUMP_FACTOR) {
@@ -436,7 +431,6 @@ function DOMGrid(props: GalleryGridProps) {
         lastTimestamp = now;
 
         recalcRange?.();
-        debouncedFetch();
         rafId = 0;
       });
     };
@@ -455,6 +449,7 @@ function DOMGrid(props: GalleryGridProps) {
       if (Math.abs(wheelAccumulator) < WHEEL_THRESHOLD) {
         wheelAccumulator = 0;
         wheelRafId = 0;
+        scheduleFetch(); // Wheel scroll settled — fetch now
         return;
       }
       const step = wheelAccumulator * (1 - WHEEL_DECAY);
@@ -563,7 +558,6 @@ function DOMGrid(props: GalleryGridProps) {
       const now = performance.now();
       if (now - lastTimestamp > 150) currentVelocity = 0;
       if (currentVelocity > VELOCITY_FAST) return;
-      if (now - lastFastScrollTime < SETTLE_MS) return;
 
       // Drain coalesced paths into needsGeneration (they're already there,
       // but clear the coalesced set so new items can accumulate during next fetch).
@@ -691,13 +685,11 @@ function DOMGrid(props: GalleryGridProps) {
       evictFaraway();
     };
 
-    // Debounced fetch: fires 50ms after the last scroll event, plus a
-    // slower background interval for precache when idle.
-    let scrollDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-    const debouncedFetch = () => {
-      if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
-      scrollDebounceTimer = setTimeout(scheduleFetch, SCROLL_DEBOUNCE_MS);
-    };
+    // scrollend fires when scrolling stops — replaces manual debounce.
+    // Also covers native scrollbar drags and programmatic scrollTo().
+    const onScrollEnd = () => scheduleFetch();
+    window.addEventListener("scrollend", onScrollEnd);
+
     // Background interval for precache/eviction when not actively scrolling.
     const bgIntervalId = setInterval(() => {
       if (!inFlightFetch) scheduleFetch();
@@ -747,12 +739,12 @@ function DOMGrid(props: GalleryGridProps) {
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("scrollend", onScrollEnd);
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
-      if (scrollDebounceTimer !== null) clearTimeout(scrollDebounceTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
     });
@@ -787,6 +779,15 @@ function DOMGrid(props: GalleryGridProps) {
   // Also recalc when container width changes (e.g. resize, initial measure).
   createEffect(
     on(containerWidth, () => {
+      recalcRange?.();
+    }),
+  );
+
+  // Recalc when layout geometry changes (zoom via Ctrl+wheel).
+  // thumbSize/cols changes don't trigger scroll events, so recalcRange
+  // must be called directly to update startRow/endRow.
+  createEffect(
+    on(cols, () => {
       recalcRange?.();
     }),
   );
@@ -843,6 +844,7 @@ function DOMGrid(props: GalleryGridProps) {
             position: "relative",
             height: `${totalHeight()}px`,
             overflow: "hidden",
+            contain: "strict",
           }}
         >
           {/* Inner: positioned at the offset of the first visible row */}

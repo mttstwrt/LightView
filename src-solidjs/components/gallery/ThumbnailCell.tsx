@@ -1,4 +1,4 @@
-import { Show, createSignal, createEffect, on } from "solid-js";
+import { createSignal, createEffect, on } from "solid-js";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl } from "../../lib/ipc";
 
@@ -87,66 +87,53 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         }
       }}
     >
-      {/*
-        Skeleton: visible only when there is no URL to load (not yet assigned,
-        or errored). Hidden via display:none when an img is present so it
-        doesn't pulse underneath a loaded thumbnail.
+      {/* Skeleton: hidden when img has a URL. Always present to avoid
+          DOM creation/destruction during <Index> recycling. */}
+      <div
+        class="absolute inset-0 skeleton-pulse"
+        style={{ display: hasUrl() ? "none" : undefined }}
+      />
 
-        We intentionally do NOT track an onLoad "loaded" signal. With <Index>,
-        every cell is recycled on each row shift. Resetting a loaded flag would
-        flash the skeleton across the entire grid. Instead we rely on
-        decoding="async" — the browser keeps the previous frame while decoding
-        the new image, giving a seamless swap with no skeleton flash.
-      */}
-      <Show when={!hasUrl()}>
-        <div class="absolute inset-0 skeleton-pulse" />
-      </Show>
+      {/* Img: always present, hidden when no URL. src cleared to cancel
+          any in-flight decode when recycled without a URL. */}
+      <img
+        src={hasUrl() ? effectiveSrc()! : undefined}
+        alt={filename()}
+        class="w-full h-full object-cover"
+        style={{
+          display: hasUrl() ? undefined : "none",
+          opacity: fadeEnabled() && !loaded() ? "0" : "1",
+          transition: fadeEnabled() ? "opacity 0.15s ease-in" : "none",
+        }}
+        decoding="async"
+        draggable={false}
+        onLoad={() => {
+          if (props.thumbSrc) loadedUrls.add(props.thumbSrc);
+          setLoaded(true);
+        }}
+        onError={() => {
+          // Don't treat media URL errors as thumbnail errors
+          if (isGif() && hovered()) return;
+          setErrored(true);
+          props.onError?.(props.path);
+        }}
+      />
 
-      <Show when={hasUrl()}>
-        <img
-          src={effectiveSrc()!}
-          alt={filename()}
-          class="w-full h-full object-cover"
-          style={{
-            opacity: fadeEnabled() && !loaded() ? "0" : "1",
-            transition: fadeEnabled() ? "opacity 0.15s ease-in" : "none",
-          }}
-          decoding="async"
-          draggable={false}
-          onLoad={() => {
-            if (props.thumbSrc) loadedUrls.add(props.thumbSrc);
-            setLoaded(true);
-          }}
-          onError={() => {
-            // Don't treat media URL errors as thumbnail errors
-            if (isGif() && hovered()) return;
-            setErrored(true);
-            props.onError?.(props.path);
-          }}
-        />
-      </Show>
+      {/* Selection check indicator — always present, toggled via display */}
+      <div
+        class="absolute top-1.5 left-1.5 w-5 h-5 rounded-full flex items-center justify-center text-white text-xs"
+        style={{ background: "#3b82f6", display: props.selected ? undefined : "none" }}
+      >
+        &#10003;
+      </div>
 
-      {/* Selection check indicator */}
-      <Show when={props.selected}>
-        <div
-          class="absolute top-1.5 left-1.5 w-5 h-5 rounded-full flex items-center justify-center text-white text-xs"
-          style={{ background: "#3b82f6" }}
-        >
-          &#10003;
-        </div>
-      </Show>
-
-      <Show when={isVideo()}>
-        <span class="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 text-xs font-mono text-white/80 bg-black/50 rounded">
-          VID
-        </span>
-      </Show>
-
-      <Show when={isGif()}>
-        <span class="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 text-xs font-mono text-white/80 bg-black/50 rounded">
-          GIF
-        </span>
-      </Show>
+      {/* Media badge — always present, toggled via display */}
+      <span
+        class="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 text-xs font-mono text-white/80 bg-black/50 rounded"
+        style={{ display: isVideo() || isGif() ? undefined : "none" }}
+      >
+        {isVideo() ? "VID" : "GIF"}
+      </span>
     </div>
   );
 }
