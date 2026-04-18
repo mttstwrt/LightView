@@ -251,10 +251,13 @@ export function App() {
   };
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    const typingInInput =
+      e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
     if (viewerOpen()) {
       if (e.key === "Escape") {
         closeViewer();
       } else if (e.key === "ArrowRight") {
+        if (typingInInput) return;
         if (e.repeat && navPending) return;
         navDirection = "right";
         if (!navPending) {
@@ -263,6 +266,7 @@ export function App() {
         }
         return;
       } else if (e.key === "ArrowLeft") {
+        if (typingInInput) return;
         if (e.repeat && navPending) return;
         navDirection = "left";
         if (!navPending) {
@@ -271,10 +275,10 @@ export function App() {
         }
         return;
       } else if (e.key === "i" || e.key === "I") {
+        if (typingInInput) return;
         toggleInfoPanel();
       } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        const active = document.activeElement;
-        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+        if (typingInInput) return;
         e.preventDefault();
         const paths = displayPaths();
         const idx = viewerIndex();
