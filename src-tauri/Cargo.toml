@@ -49,6 +49,9 @@ webp = "0.3"
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 http-range = "0.1.5"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Optimize dependencies even in dev builds — image codecs, SIMD resize,
 # BC7 encoding, and SQLite are unusably slow at opt-level 0.

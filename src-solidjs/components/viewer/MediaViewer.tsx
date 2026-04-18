@@ -1,7 +1,7 @@
 import { Show, For, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
-import { mediaUrl, thumbUrl, ensureTierThumbnails, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getAllThumbnailTiers } from "../../lib/ipc";
+import { mediaUrl, videoSrc, thumbUrl, ensureTierThumbnails, getMediaMeta, getTags, addUserTag, removeUserTag, setRating as setRatingIpc, getAllThumbnailTiers } from "../../lib/ipc";
 import type { ThumbnailTierInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
 import { ViewerImageCache } from "../../lib/viewerCache";
@@ -306,14 +306,30 @@ export function MediaViewer(props: MediaViewerProps) {
           }>
             <video
               ref={videoRef}
-              src={mediaUrl(currentPath())}
+              src={videoSrc(currentPath())}
               class="max-w-[90vw] max-h-[90vh] outline-none"
               controls
               preload="metadata"
               onPlay={() => setVideoPlaying(true)}
               onPause={() => setVideoPlaying(false)}
               onLoadedData={() => setLoaded(true)}
-              onError={() => setVideoError(true)}
+              onError={(e) => {
+                const v = e.currentTarget as HTMLVideoElement;
+                const codeNames: Record<number, string> = {
+                  1: "ABORTED",
+                  2: "NETWORK",
+                  3: "DECODE",
+                  4: "SRC_NOT_SUPPORTED",
+                };
+                console.error(
+                  "Video load failed:",
+                  "code=" + (v.error?.code ?? "null"),
+                  codeNames[v.error?.code ?? -1] ?? "",
+                  "message=" + JSON.stringify(v.error?.message ?? ""),
+                  "src=" + v.src,
+                );
+                setVideoError(true);
+              }}
               onClick={(e) => e.stopPropagation()}
             />
           </Show>

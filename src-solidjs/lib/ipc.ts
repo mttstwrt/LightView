@@ -81,6 +81,51 @@ export function mediaUrl(path: string): string {
   return `lightview://media/${encodeURIComponent(path)}`;
 }
 
+/** Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).
+ *  Populated by the Rust backend via an initialization script (see
+ *  `setup` in `main.rs`). Falls back to an IPC fetch if the script has
+ *  not yet executed. */
+let _mediaServerUrl: string | null =
+  (globalThis as any).__LV_MEDIA_URL__ ?? null;
+
+/** Eagerly fetch the media server URL and cache it. Safe to call
+ *  multiple times — subsequent calls are no-ops once the URL is known.
+ *  Call from app startup so `videoSrc()` can run synchronously later. */
+export async function initMediaServer(): Promise<string> {
+  if (_mediaServerUrl) return _mediaServerUrl;
+  const injected = (globalThis as any).__LV_MEDIA_URL__;
+  if (typeof injected === "string" && injected.length > 0) {
+    _mediaServerUrl = injected;
+    return injected;
+  }
+  const url = await invoke<string>("get_media_server_url");
+  _mediaServerUrl = url;
+  return url;
+}
+
+/** Percent-encode each path segment independently so `/` is preserved but
+ *  special characters (spaces, unicode, `?`, `#`, etc.) are encoded.
+ *  Axum's router decodes captures but rejects paths containing raw
+ *  encoded slashes, so we must keep `/` literal. */
+function encodeMediaPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/** Build a URL for a video source suitable for an HTML `<video>` element.
+ *  WebKitGTK (the Linux webview) refuses to play `<video>` from any
+ *  non-http(s) URI scheme — including Tauri's custom and asset protocols
+ *  — so videos are served by the local HTTP media server instead. */
+export function videoSrc(path: string): string {
+  if (!_mediaServerUrl) {
+    // Late refresh in case the initialization script landed after this
+    // module was imported but before `initMediaServer()` was awaited.
+    _mediaServerUrl = (globalThis as any).__LV_MEDIA_URL__ ?? null;
+  }
+  if (!_mediaServerUrl) return "";
+  const rel = path.startsWith("/") ? path.slice(1) : path;
+  return `${_mediaServerUrl}/media/${encodeMediaPath(rel)}`;
+}
+
 export interface ThumbHashResult {
   path: string;
   /** Base64-encoded hash bytes, or null if not yet generated. */

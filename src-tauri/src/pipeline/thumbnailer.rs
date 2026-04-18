@@ -842,21 +842,41 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
 }
 
 /// Extract a single frame from a video using ffmpeg.
-/// Seeks to 1 second (or start for short videos) and outputs raw RGBA pixels.
+/// Seeks to 1 second first; if the clip is shorter than that (no output), retries
+/// at the first frame. Outputs raw RGBA pixels.
 fn extract_video_frame(path: &Path) -> Result<(Vec<u8>, u32, u32), ThumbError> {
-    let output = std::process::Command::new("ffmpeg")
-        .args([
-            "-ss", "1",           // seek to 1s (fast keyframe seek before input)
-            "-i",
-        ])
-        .arg(path.as_os_str())
-        .args([
-            "-frames:v", "1",     // extract one frame
-            "-f", "rawvideo",
-            "-pix_fmt", "rgba",
-            "-v", "error",
-            "pipe:1",             // output to stdout
-        ])
+    // Probe dimensions up-front so we know the expected buffer size.
+    let (w, h) = probe_video_dimensions(path)?;
+    let expected = (w as usize) * (h as usize) * 4;
+
+    // First attempt: seek to 1 s (avoids initial black frames on most clips).
+    match run_ffmpeg_frame(path, Some("1"), expected) {
+        Ok(bytes) => Ok((bytes, w, h)),
+        Err(_) => {
+            // Retry from the very start for clips < 1 s or streams that
+            // can't key-seek to that position.
+            let bytes = run_ffmpeg_frame(path, None, expected)?;
+            Ok((bytes, w, h))
+        }
+    }
+}
+
+/// Invoke ffmpeg to decode one frame at the given seek offset (or the first
+/// frame when `seek` is `None`). Returns raw RGBA bytes sized to match `expected`.
+fn run_ffmpeg_frame(path: &Path, seek: Option<&str>, expected: usize) -> Result<Vec<u8>, ThumbError> {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    if let Some(ss) = seek {
+        cmd.args(["-ss", ss]);
+    }
+    cmd.arg("-i").arg(path.as_os_str()).args([
+        "-frames:v", "1",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgba",
+        "-v", "error",
+        "pipe:1",
+    ]);
+
+    let output = cmd
         .output()
         .map_err(|e| ThumbError::Decode(format!("ffmpeg not found or failed to run: {}", e)))?;
 
@@ -865,18 +885,15 @@ fn extract_video_frame(path: &Path) -> Result<(Vec<u8>, u32, u32), ThumbError> {
         return Err(ThumbError::Decode(format!("ffmpeg failed: {}", stderr.trim())));
     }
 
-    // We need dimensions — probe them separately
-    let (w, h) = probe_video_dimensions(path)?;
-    let expected = (w as usize) * (h as usize) * 4;
-
     if output.stdout.len() != expected {
         return Err(ThumbError::Decode(format!(
-            "ffmpeg output size mismatch: got {} bytes, expected {} ({}x{}x4)",
-            output.stdout.len(), expected, w, h
+            "ffmpeg output size mismatch: got {} bytes, expected {}",
+            output.stdout.len(),
+            expected,
         )));
     }
 
-    Ok((output.stdout, w, h))
+    Ok(output.stdout)
 }
 
 /// Get video dimensions using ffprobe.

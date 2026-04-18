@@ -9,6 +9,7 @@ pub mod sort;
 pub mod hardware;
 pub mod commands;
 pub mod util;
+pub mod http_server;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -94,6 +95,11 @@ pub struct AppState {
     /// None when no suitable GPU adapter was found at startup.
     #[cfg(feature = "gpu")]
     pub gpu_pipeline: Option<Arc<pipeline::gpu_pipeline::GpuPipeline>>,
+
+    /// Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).
+    /// Set once at startup; `<video>` elements load from this server because
+    /// WebKitGTK rejects non-http(s) schemes for media elements.
+    pub media_server_url: Arc<std::sync::OnceLock<String>>,
 }
 
 impl AppState {
@@ -153,6 +159,7 @@ impl AppState {
             fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "gpu")]
             gpu_pipeline,
+            media_server_url: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

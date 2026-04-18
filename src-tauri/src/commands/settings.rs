@@ -48,6 +48,15 @@ pub async fn get_memory_status() -> Result<MemoryStatus, String> {
     Ok(MemoryStatus::sample())
 }
 
+/// Base URL of the local HTTP media server, used by `<video>` elements.
+/// Returns an empty string if the server has not finished starting.
+#[tauri::command]
+pub async fn get_media_server_url(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    Ok(state.media_server_url.get().cloned().unwrap_or_default())
+}
+
 /// Trigger a full re-index of all companion files.
 #[tauri::command]
 pub async fn reindex_gallery(

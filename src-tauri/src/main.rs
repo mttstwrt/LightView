@@ -1,6 +1,7 @@
 use lightview_lib::AppState;
 use lightview_lib::cache::thumbnails::ThumbTier;
 use lightview_lib::commands;
+use lightview_lib::http_server::{self, HttpConfig};
 use tauri::{Emitter, Manager};
 
 use memmap2::Mmap;
@@ -342,38 +343,12 @@ fn serve_full_media(
         }
     }
 
-    // No Range header — serve the full file.
-    // For video files, serve just the first chunk (2 MB) as a 206 response to
-    // avoid loading a multi-GB file entirely into memory.  The <video> element
-    // will follow up with Range requests for subsequent chunks.
-    let is_video = matches!(ext.as_str(), "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv");
-
-    if is_video && len > MAX_CHUNK {
-        let nbytes = MAX_CHUNK as usize;
-        let mut buf = vec![0u8; nbytes];
-        if let Err(e) = file.read_exact(&mut buf) {
-            log::error!("Failed to read first chunk of {}: {}", path, e);
-            return tauri::http::Response::builder()
-                .status(500)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Vec::new())
-                .unwrap();
-        }
-        let end = MAX_CHUNK - 1;
-        return tauri::http::Response::builder()
-            .status(206)
-            .header("Content-Type", mime)
-            .header("Accept-Ranges", "bytes")
-            .header("Content-Range", format!("bytes 0-{end}/{len}"))
-            .header("Content-Length", nbytes.to_string())
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Expose-Headers", "content-range")
-            .body(buf)
-            .unwrap();
-    }
-
-    // Small file — serve the full content via mmap.
+    // No Range header — serve the full file with status 200. Previously this
+    // handler returned a truncated 206 for videos >2 MB, but WebKitGTK does not
+    // issue a follow-up Range request for `<video>` after an unsolicited 206,
+    // so playback stalled on the first chunk. Serving 200 + full body matches
+    // what Tauri's built-in asset protocol does; the webview then issues Range
+    // requests for seek/progressive playback and those are handled above.
     let resp = tauri::http::Response::builder()
         .status(200)
         .header("Content-Type", mime)
@@ -450,6 +425,38 @@ fn main() {
             }
         })
         .setup(|app| {
+            // Start the local HTTP media server. Used by `<video>` elements
+            // because WebKitGTK rejects custom URI schemes for media elements.
+            // block_on is safe here: setup runs on the main thread outside the
+            // tokio runtime and server startup is a few milliseconds.
+            match tauri::async_runtime::block_on(
+                http_server::start(HttpConfig::local_only()),
+            ) {
+                Ok(server) => {
+                    let url = format!("http://{}", server.addr);
+                    log::info!("Media server URL: {}", url);
+                    let state = app.state::<AppState>();
+                    let _ = state.media_server_url.set(url.clone());
+
+                    // Inject the URL into the webview so `videoSrc()` can
+                    // synthesize URLs synchronously. Tauri's eval queues the
+                    // script until the page is ready, so call-order relative
+                    // to page load does not matter here.
+                    if let Some(window) = app.get_webview_window("main") {
+                        let script = format!(
+                            "window.__LV_MEDIA_URL__ = {};",
+                            serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".into())
+                        );
+                        if let Err(e) = window.eval(&script) {
+                            log::error!("Failed to inject media URL: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to start HTTP media server: {}", e);
+                }
+            }
+
             // If a directory path was passed as a CLI argument, emit it to the frontend
             let args: Vec<String> = std::env::args().collect();
             if let Some(dir) = args.get(1) {
@@ -536,6 +543,7 @@ fn main() {
             // Settings / maintenance commands
             commands::settings::get_hardware_profile,
             commands::settings::get_memory_status,
+            commands::settings::get_media_server_url,
             commands::settings::reindex_gallery,
             commands::settings::rebuild_thumbnails,
             commands::settings::clear_cache,
