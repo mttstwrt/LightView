@@ -1392,11 +1392,56 @@ pub async fn ensure_tier_thumbnails(
     Ok(written)
 }
 
+/// Extras derived from a Standard-tier RGBA: compact placeholder + Micro
+/// tier bytes. Mirrors the derivation step in `get_thumbnails_batch` so a
+/// protocol-triggered Standard generation leaves the DB in the same shape
+/// as the batch path (standard row + thumbhash + micro row all present).
+struct StandardExtras {
+    thumbhash: Option<Vec<u8>>,
+    micro_bytes: Option<Vec<u8>>,
+    micro_size: u32,
+}
+
+/// Decode the just-generated Standard-tier bytes back to RGBA, compute the
+/// ThumbHash, and downsample to the 128px Micro tier. Runs on the CPU
+/// thumb pool so the tokio runtime stays responsive.
+async fn derive_standard_extras(
+    pool: &rayon::ThreadPool,
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    format: ThumbFormat,
+) -> StandardExtras {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pool.spawn(move || {
+        let extras = match thumbnailer::decode_thumb_bytes_to_rgba(&data, width, height, format) {
+            Ok(rgba) => {
+                let thumbhash = thumbnailer::compute_thumbhash(&rgba, width, height).ok();
+                let micro_size = ThumbTier::Micro.target_size();
+                let micro_bytes = thumbnailer::downsample_rgba_square(&rgba, width, height, micro_size)
+                    .ok()
+                    .and_then(|resized| {
+                        thumbnailer::encode_rgba_to_jpeg_tier(&resized, micro_size, micro_size).ok()
+                    });
+                StandardExtras { thumbhash, micro_bytes, micro_size }
+            }
+            Err(_) => StandardExtras { thumbhash: None, micro_bytes: None, micro_size: 0 },
+        };
+        let _ = tx.send(extras);
+    });
+    rx.await.unwrap_or(StandardExtras { thumbhash: None, micro_bytes: None, micro_size: 0 })
+}
+
 /// Generate a single thumbnail for the requested tier, persist it, and
 /// return the encoded bytes + format string. Used by the custom-protocol
 /// handler to serve cache misses inline (see `serve_thumbnail_generate` in
 /// `main.rs`). Mirrors the per-tier format choices of
 /// `ensure_tier_thumbnails` and the Standard-tier storage of `get_thumbnail`.
+///
+/// When `tier == Standard`, also derives the ThumbHash placeholder and
+/// Micro (128px) tier from the standard RGBA and commits all three in a
+/// single transaction — keeping DB state consistent with
+/// `get_thumbnails_batch`.
 pub async fn generate_and_store_tier(
     state: &AppState,
     path: &str,
@@ -1423,21 +1468,79 @@ pub async fn generate_and_store_tier(
     let fmt_str = tier_format.as_cache_str().to_string();
     let bytes = thumb.data.clone();
 
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
+    // For Standard, derive ThumbHash + Micro before taking the DB lock so
+    // everything lands in one transaction.
+    let extras = if matches!(tier, ThumbTier::Standard) {
+        Some(
+            derive_standard_extras(
+                &state.thumb_pool,
+                thumb.data.clone(),
+                thumb.width,
+                thumb.height,
+                tier_format,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    let mut db = state.cache_db.lock().await;
+    let db = db.as_mut().ok_or("No gallery open")?;
 
     if matches!(tier, ThumbTier::Standard) {
-        db.upsert_thumbnail(
-            path,
-            &thumb.media_type,
-            0,
-            thumb.width,
-            thumb.height,
-            &thumb.data,
-            &fmt_str,
-            filter.as_str(),
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO thumbnails (path, media_type, mtime, width, height, thumbnail, format, resize_filter)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                path,
+                thumb.media_type,
+                0u64,
+                thumb.width,
+                thumb.height,
+                thumb.data,
+                fmt_str,
+                filter.as_str(),
+            ],
         )
         .map_err(|e| e.to_string())?;
+
+        // Source dimensions — matches the batch path's media_meta update.
+        let _ = tx.execute(
+            "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
+            rusqlite::params![thumb.src_width, thumb.src_height, path],
+        );
+
+        if let Some(ref ex) = extras {
+            if let Some(hash) = &ex.thumbhash {
+                let _ = tx.execute(
+                    "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
+                    rusqlite::params![hash, path],
+                );
+            }
+            if let Some(micro) = &ex.micro_bytes {
+                let _ = tx.execute(
+                    "INSERT OR REPLACE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        path,
+                        thumb.media_type,
+                        0u64,
+                        ex.micro_size,
+                        ex.micro_size,
+                        micro,
+                        "jpeg",
+                    ],
+                );
+            }
+        }
+
+        tx.commit().map_err(|e| e.to_string())?;
+
+        if thumb.media_type == "video" {
+            populate_video_metadata(db.conn(), path);
+        }
     } else {
         let sql = format!(
             "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
