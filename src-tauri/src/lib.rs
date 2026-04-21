@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tokio::sync::Mutex;
 
 use cache::atlas::ThumbAtlas;
+use cache::coalescer::ThumbGenCoalescer;
 use cache::db::CacheDb;
 use autocomplete::engine::AutocompleteEngine;
 use hardware::HardwareProfile;
@@ -83,6 +84,10 @@ pub struct AppState {
     /// Read-only SQLite connection for the thumbnail protocol handler.
     /// Uses std::sync::Mutex (not tokio) because protocol handlers are synchronous.
     pub thumb_protocol_db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
+
+    /// Deduplicates concurrent generate-on-miss thumbnail requests coming
+    /// from the `lightview://thumb/...` protocol handler.
+    pub thumb_gen_coalescer: Arc<ThumbGenCoalescer>,
 
     /// Filesystem watcher for detecting external file additions/removals.
     /// Uses std::sync::Mutex because FsWatcher uses std mpsc channels.
@@ -155,6 +160,7 @@ impl AppState {
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
             plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thumb_protocol_db: Arc::new(std::sync::Mutex::new(None)),
+            thumb_gen_coalescer: Arc::new(ThumbGenCoalescer::new()),
             fs_watcher: Arc::new(std::sync::Mutex::new(None)),
             fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "gpu")]

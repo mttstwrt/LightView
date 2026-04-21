@@ -15,7 +15,7 @@ pub struct CachedThumbnail {
 /// LOD tier for a thumbnail. Determines which SQL table a thumbnail is
 /// read from / written to. Frontend picks the tier from the current
 /// gallery cell size; see docs/thumbnailStreamingResearch.md.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThumbTier {
     /// 128x128 — dense grid (cellSize <= 160). `thumbnails_micro`.
     Micro,

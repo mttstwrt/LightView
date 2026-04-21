@@ -735,7 +735,7 @@ async fn generate_batch_gpu_full(
 
 /// Dispatch a single thumbnail generation task to the dedicated thread pool.
 /// Returns a future that resolves when the pool thread finishes.
-async fn dispatch_thumbnail(
+pub(crate) async fn dispatch_thumbnail(
     pool: &rayon::ThreadPool,
     path: String,
     filter: ResizeFilter,
@@ -1390,4 +1390,75 @@ pub async fn ensure_tier_thumbnails(
     }
     txn.commit().map_err(|e| e.to_string())?;
     Ok(written)
+}
+
+/// Generate a single thumbnail for the requested tier, persist it, and
+/// return the encoded bytes + format string. Used by the custom-protocol
+/// handler to serve cache misses inline (see `serve_thumbnail_generate` in
+/// `main.rs`). Mirrors the per-tier format choices of
+/// `ensure_tier_thumbnails` and the Standard-tier storage of `get_thumbnail`.
+pub async fn generate_and_store_tier(
+    state: &AppState,
+    path: &str,
+    tier: ThumbTier,
+) -> Result<(Vec<u8>, String), String> {
+    let target = tier.target_size();
+    let filter = thumbnailer::filter_for_size(target);
+    let tier_format = match tier {
+        ThumbTier::Large | ThumbTier::Preview => ThumbFormat::Webp,
+        _ => ThumbFormat::Jpeg,
+    };
+
+    let thumb = dispatch_thumbnail(
+        &state.thumb_pool,
+        path.to_string(),
+        filter,
+        tier_format,
+        target,
+        target,
+    )
+    .await?
+    .map_err(|e| format!("thumb gen: {e}"))?;
+
+    let fmt_str = tier_format.as_cache_str().to_string();
+    let bytes = thumb.data.clone();
+
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+
+    if matches!(tier, ThumbTier::Standard) {
+        db.upsert_thumbnail(
+            path,
+            &thumb.media_type,
+            0,
+            thumb.width,
+            thumb.height,
+            &thumb.data,
+            &fmt_str,
+            filter.as_str(),
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        let sql = format!(
+            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            tier.table()
+        );
+        db.conn()
+            .execute(
+                &sql,
+                rusqlite::params![
+                    path,
+                    thumb.media_type,
+                    0u64,
+                    thumb.width,
+                    thumb.height,
+                    thumb.data,
+                    fmt_str
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok((bytes, fmt_str))
 }
