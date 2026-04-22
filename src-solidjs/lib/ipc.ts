@@ -1,4 +1,4 @@
-import { invoke as _rawInvoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke as _rawInvoke } from "@tauri-apps/api/core";
 import { isActive as isPerfActive, recordIpcCall } from "./perfMonitor";
 import type {
   GalleryOpenResult,
@@ -78,8 +78,7 @@ export function thumbhashUrl(path: string): string {
 /** Build a protocol URL for full-resolution media. The `lightview://media/` protocol
  *  serves binary image data directly — no Base64/JSON overhead. */
 export function mediaUrl(path: string): string {
-  return convertFileSrc(path);
-  //return `lightview://media/${encodeURIComponent(path)}`;
+  return `lightview://media/${encodeURIComponent(path)}`;
 }
 
 /** Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).

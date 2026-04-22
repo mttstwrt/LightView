@@ -1016,10 +1016,10 @@ export function CanvasGrid(props: CanvasGridProps) {
     recalcRange?.();
   }));
 
-  // Tier change (cellSize crossed a LOD boundary) — wipe assigned URLs,
-  // renderer textures, and the image loader so visible items re-request
-  // at the new tier. The first run on mount is a no-op because `on()`
-  // with `defer: true` holds off until the signal actually changes.
+  // Tier change (cellSize crossed a LOD boundary) — wipe assigned URLs and
+  // re-request visible items at the new tier. Existing renderer slots are
+  // kept so the previous-tier bitmap stays on screen until the new one
+  // decodes — onReady swaps the slot in place via evictImage + imageLoaded.
   createEffect(on(tier, () => {
     assignedSet.clear();
     urlMap.clear();
@@ -1027,28 +1027,12 @@ export function CanvasGrid(props: CanvasGridProps) {
     needsGeneration.clear();
     inFlightSet.clear();
     failedSet.clear();
-    // The renderer is destroyed below — its hash pool is wiped with it,
-    // so we must re-request placeholders for the next render.
-    hashRequestedSet.clear();
-    hashFailedSet.clear();
     bgCursor = 0;
     imageLoader?.cancelAll();
-    renderer?.destroy();
-    renderer = createRenderer(props.rendererMode);
-    if (canvasWrapperRef && renderer) {
-      canvasWrapperRef.innerHTML = "";
-      canvasWrapperRef.appendChild(renderer.canvas);
-    }
-    // Seed the new renderer with any already-decoded bitmaps for visible
-    // items so the grid isn't blank while new-tier URLs decode, and kick
-    // off those requests now — the visibleItems effect may not re-run for
-    // this tier change if startRow/endRow happen to be unchanged.
     if (imageLoader && renderer) {
       const newTier = tier();
       untrack(() => {
         for (const item of visibleItems()) {
-          const cached = imageLoader!.get(item.path);
-          if (cached) renderer!.imageLoaded(item.path, cached);
           const url = thumbUrl(item.path, newTier);
           urlMap.set(item.path, url);
           assignedSet.add(item.path);

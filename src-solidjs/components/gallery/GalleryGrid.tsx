@@ -792,20 +792,30 @@ function DOMGrid(props: GalleryGridProps) {
     }),
   );
 
-  // Tier change (cellSize crossed an LOD boundary) — wipe URLs so visible
-  // items re-request at the new resolution. The DOM <img>s will swap src
-  // and fetch the new protocol URL.
+  // Tier change (cellSize crossed an LOD boundary) — re-point visible items
+  // at the new-tier URL in place. We deliberately don't reconcile({}) the
+  // map, because that would set every <img> src to null and blank the grid
+  // until the next visibleItems re-run. Updating src on a live <img> lets
+  // the browser keep the previously-decoded bitmap on screen until the new
+  // one is fetched and decoded.
   createEffect(
     on(
       tier,
       () => {
-        setThumbMap(reconcile({}));
         assignedSet.clear();
         needsGeneration.clear();
         inFlightSet.clear();
         failedSet.clear();
         urlVersions.clear();
         bgCursor = 0;
+        const newTier = tier();
+        const items = visibleItems();
+        batch(() => {
+          for (const item of items) {
+            assignedSet.add(item.path);
+            setThumbMap(item.path, thumbUrl(item.path, newTier));
+          }
+        });
         setGeneration((g) => g + 1);
       },
       { defer: true },
