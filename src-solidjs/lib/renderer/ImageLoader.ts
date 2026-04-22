@@ -31,6 +31,8 @@ const DEFAULT_CACHE_SIZE = 300;
 
 interface CacheEntry {
   img: ImageBitmap;
+  /** URL this bitmap was fetched from — a mismatch on request() forces refetch. */
+  url: string;
   /** Monotonically increasing access counter for recency tracking. */
   lastAccess: number;
 }
@@ -40,7 +42,9 @@ export class ImageLoader {
   private cache = new Map<string, CacheEntry>();
   /** Paths currently queued or inflight in the worker. */
   private pending = new Set<string>();
-  /** URLs that failed loading — won't be retried until evicted. */
+  /** URL each pending request was issued for (so the decoded bitmap records it). */
+  private pendingUrls = new Map<string, string>();
+  /** Paths that failed loading — won't be retried until evicted. */
   private failed = new Set<string>();
   /** Monotonically increasing counter for recency tracking. */
   private accessCounter = 0;
@@ -84,12 +88,15 @@ export class ImageLoader {
   private handleWorkerMessage(msg: WorkerResponse) {
     switch (msg.type) {
       case "decoded": {
+        const url = this.pendingUrls.get(msg.path) ?? "";
+        this.pendingUrls.delete(msg.path);
         this.pending.delete(msg.path);
-        this.insertCache(msg.path, msg.bitmap);
+        this.insertCache(msg.path, msg.bitmap, url);
         this.onReady(msg.path, msg.bitmap);
         break;
       }
       case "error": {
+        this.pendingUrls.delete(msg.path);
         this.pending.delete(msg.path);
         this.failed.add(msg.path);
         this.onError?.(msg.path);
@@ -148,8 +155,10 @@ export class ImageLoader {
   }
 
   /**
-   * Request an image. If cached, returns immediately. Otherwise queues a
-   * decode in the Web Worker.
+   * Request an image. If a bitmap is already cached for the same URL, returns
+   * it immediately. On URL mismatch (e.g. LOD tier change), the old bitmap is
+   * still returned as a placeholder while a fresh decode is queued; the new
+   * bitmap replaces it via onReady when it arrives.
    * @param priority 0=viewport, 1=buffer, 2=background (default: 1)
    */
   request(
@@ -157,25 +166,31 @@ export class ImageLoader {
     url: string,
     priority: DecodePriority = 1,
   ): ImageBitmap | null {
-    const cached = this.get(path);
-    if (cached) return cached;
+    const cached = this.cache.get(path);
+    if (cached && cached.url === url) {
+      cached.lastAccess = ++this.accessCounter;
+      return cached.img;
+    }
 
-    if (this.pending.has(path) || this.failed.has(path)) return null;
+    if (!this.pending.has(path) && !this.failed.has(path)) {
+      this.pending.add(path);
+      this.pendingUrls.set(path, url);
+      this.postToWorker({
+        type: "decode",
+        path,
+        url,
+        priority,
+      });
+    }
 
-    this.pending.add(path);
-    this.postToWorker({
-      type: "decode",
-      path,
-      url,
-      priority,
-    });
-    return null;
+    return cached?.img ?? null;
   }
 
   /** Cancel all pending loads and clear the queue (e.g. on generation change). */
   cancelAll() {
     this.postToWorker({ type: "cancelAll" });
     this.pending.clear();
+    this.pendingUrls.clear();
     this.failed.clear();
   }
 
@@ -190,6 +205,7 @@ export class ImageLoader {
     if (this.pending.has(path)) {
       this.postToWorker({ type: "cancel", path });
       this.pending.delete(path);
+      this.pendingUrls.delete(path);
     }
   }
 
@@ -226,9 +242,14 @@ export class ImageLoader {
   // Internal
   // -------------------------------------------------------------------------
 
-  private insertCache(path: string, img: ImageBitmap) {
+  private insertCache(path: string, img: ImageBitmap, url: string) {
+    const existing = this.cache.get(path);
+    if (existing && existing.img !== img) {
+      existing.img.close();
+    }
     this.cache.set(path, {
       img,
+      url,
       lastAccess: ++this.accessCounter,
     });
     this.trimToCapacity();

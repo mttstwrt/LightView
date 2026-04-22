@@ -323,9 +323,15 @@ export function CanvasGrid(props: CanvasGridProps) {
     }
 
     imageLoader = new ImageLoader(
-      // onReady: image decoded, hand to renderer
+      // onReady: image decoded, hand to renderer. Evict any existing slot
+      // first so a replacement bitmap (e.g. from an LOD tier refetch) is
+      // actually uploaded — WebGL's imageLoaded short-circuits when the slot
+      // already exists, and Canvas2D would otherwise keep a stale reference.
       (path, img) => {
-        renderer?.imageLoaded(path, img);
+        if (renderer) {
+          renderer.evictImage(path);
+          renderer.imageLoaded(path, img);
+        }
         scheduleRepaint();
       },
       // onError: thumbnail not cached, request generation
@@ -940,7 +946,8 @@ export function CanvasGrid(props: CanvasGridProps) {
         const url = v ? `${thumbUrl(item.path, t)}?v=${v}` : thumbUrl(item.path, t);
         urlMap.set(item.path, url);
         // Phase 5: priority 0 = viewport-visible (highest)
-        imageLoader?.request(item.path, url, 0);
+        const cached = imageLoader?.request(item.path, url, 0);
+        if (cached && renderer) renderer.imageLoaded(item.path, cached);
       } else if (imageLoader && renderer) {
         // Re-feed cached bitmaps whose GPU texture slots may have been
         // evicted by the renderer's internal pool management. The
@@ -1031,6 +1038,23 @@ export function CanvasGrid(props: CanvasGridProps) {
     if (canvasWrapperRef && renderer) {
       canvasWrapperRef.innerHTML = "";
       canvasWrapperRef.appendChild(renderer.canvas);
+    }
+    // Seed the new renderer with any already-decoded bitmaps for visible
+    // items so the grid isn't blank while new-tier URLs decode, and kick
+    // off those requests now — the visibleItems effect may not re-run for
+    // this tier change if startRow/endRow happen to be unchanged.
+    if (imageLoader && renderer) {
+      const newTier = tier();
+      untrack(() => {
+        for (const item of visibleItems()) {
+          const cached = imageLoader!.get(item.path);
+          if (cached) renderer!.imageLoaded(item.path, cached);
+          const url = thumbUrl(item.path, newTier);
+          urlMap.set(item.path, url);
+          assignedSet.add(item.path);
+          imageLoader!.request(item.path, url, 0);
+        }
+      });
     }
     setGeneration((g) => g + 1);
     scheduleRepaint();

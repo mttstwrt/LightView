@@ -1,3 +1,16 @@
+- Video path spawns up to 3 subprocesses per thumb (ffprobe dimensions, ffprobe audio, ffmpeg
+  frame). ffmpeg-next bindings or a single combined probe would be a real win at scale.
+
+- RGB↔RGBA and crop paths allocate and push byte-by-byte where a prealloc + copy_from_slice (or
+  resizing from a cropped view) would be faster and warmer on cache.
+
+- 404-then-retry for cache misses is two HTTP round-trips per new thumb; an event-driven
+  "generated" push or generate-and-return command would halve latency on cold galleries.
+
+- Some duplication between generate_jpeg_thumbnail_inner and decode_jpeg_to_rgba_inner.
+
+- Single decode worker is fine in practice (browser parallelizes createImageBitmap), but a small
+  worker pool would eliminate the JS orchestration bottleneck under burst load.
 
 - When zooming out on the grid, thumbnails don't show until a scroll command is input. Preferably we would attach as little as possible to the scoll input. This could be a source of performance issues with scrolling. Research high performance methods for scrolling the grid view. Try to find out how top tier gallery apps like Apple photos, google photos, and Immich handle this. Some prior research exists in docs/scrollPerformanceResearch.md
 
