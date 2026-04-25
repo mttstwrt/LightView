@@ -2,6 +2,7 @@ import { createSignal, Show, For, onCleanup } from "solid-js";
 import { findDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
 import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
 import { setTotalCount } from "../stores/galleryStore";
+import { InfoPanel } from "./viewer/InfoPanel";
 
 const THRESHOLD_PRESETS = [
   { label: "Exact", value: 0, desc: "Identical perceptual hash" },
@@ -37,6 +38,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
   // Preview state: which group and which item index within it
   const [previewGroup, setPreviewGroup] = createSignal<number | null>(null);
   const [previewIndex, setPreviewIndex] = createSignal(0);
+  const [infoOpen, setInfoOpen] = createSignal(false);
 
   const previewItem = (): DuplicateItem | null => {
     const gi = previewGroup();
@@ -54,10 +56,13 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
   const closePreview = () => {
     setPreviewGroup(null);
     setPreviewIndex(0);
+    setInfoOpen(false);
   };
 
-  // Keyboard: arrows cycle within group, Escape closes preview or panel
+  // Keyboard: arrows cycle within group, i toggles info, Escape closes preview or panel
   const handleKey = (e: KeyboardEvent) => {
+    const typingInInput =
+      e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
     if (previewGroup() !== null) {
       const g = groups()[previewGroup()!];
       if (!g) return;
@@ -67,6 +72,9 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
         setPreviewIndex((i) => (i - 1 + g.items.length) % g.items.length);
+      } else if ((e.key === "i" || e.key === "I") && !typingInInput) {
+        e.preventDefault();
+        setInfoOpen((v) => !v);
       } else if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -290,9 +298,26 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
                   {previewIndex() + 1} / {g()?.items.length ?? 0}
                 </span>
                 <span class="text-[10px] text-neutral-600">
-                  Left/Right to compare
+                  Left/Right to compare · i for info
                 </span>
+                <button
+                  class="text-xs text-neutral-300 hover:text-neutral-100 cursor-pointer transition-colors"
+                  title="Toggle info panel (i)"
+                  onClick={(e) => { e.stopPropagation(); setInfoOpen((v) => !v); }}
+                  style={{ opacity: infoOpen() ? "1" : "0.6" }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="16" x2="12" y2="12" />
+                    <line x1="12" y1="8" x2="12.01" y2="8" />
+                  </svg>
+                </button>
               </div>
+
+              {/* Info panel */}
+              <Show when={infoOpen()}>
+                <InfoPanel path={item().path} filename={item().path.split("/").pop() ?? ""} />
+              </Show>
 
               {/* Nav arrows */}
               <button
@@ -381,15 +406,18 @@ function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void; onClic
           </span>
         </Show>
 
-        {/* Trash button — don't show for best */}
-        <Show when={!props.item.is_best}>
-          <button
-            onClick={(e) => { e.stopPropagation(); props.onTrash(); }}
-            class="mt-1 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors bg-red-900/30 text-red-400 hover:bg-red-800/40 hover:text-red-300"
-          >
-            Trash
-          </button>
-        </Show>
+        {/* Trash button — muted for the "best" copy since it's the recommended keep */}
+        <button
+          onClick={(e) => { e.stopPropagation(); props.onTrash(); }}
+          class={`mt-1 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors ${
+            props.item.is_best
+              ? "bg-neutral-800/40 text-neutral-500 hover:bg-red-900/30 hover:text-red-400"
+              : "bg-red-900/30 text-red-400 hover:bg-red-800/40 hover:text-red-300"
+          }`}
+          title={props.item.is_best ? "Trash (marked as best — usually the one to keep)" : "Trash"}
+        >
+          Trash
+        </button>
       </div>
     </div>
   );

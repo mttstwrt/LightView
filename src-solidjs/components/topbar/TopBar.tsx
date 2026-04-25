@@ -19,7 +19,10 @@ export function TopBar(props: TopBarProps) {
     if ((e.ctrlKey || e.metaKey) && e.key === "f") {
       e.preventDefault();
       setVisible(true);
-      requestAnimationFrame(() => filterInputRef?.focus());
+      requestAnimationFrame(() => {
+        filterInputRef?.focus();
+        filterInputRef?.select();
+      });
     }
   };
 

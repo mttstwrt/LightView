@@ -1,3 +1,4 @@
+#!/usr/bin/env xdg-open
 [Desktop Entry]
 Name=LightView
 Comment=Fast, plugin-extensible media gallery viewer

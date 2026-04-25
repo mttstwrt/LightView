@@ -462,7 +462,9 @@ function DOMGrid(props: GalleryGridProps) {
       // Ctrl+wheel resizes thumbnails instead of scrolling. cellSize snaps
       // to a whole-column layout, so we step the column count by 1 per tick
       // and pick a thumb_size that lands in the middle of the target bucket.
-      if (e.ctrlKey || e.metaKey) {
+      // During a Ctrl+drag selection, fall through to scroll so the user can
+      // extend the drag past the viewport without zooming.
+      if ((e.ctrlKey || e.metaKey) && !isDragging()) {
         e.preventDefault();
         const w = containerWidth();
         const g = gap();
