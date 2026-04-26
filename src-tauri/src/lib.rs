@@ -10,6 +10,7 @@ pub mod hardware;
 pub mod commands;
 pub mod util;
 pub mod http_server;
+pub mod file_clipboard;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

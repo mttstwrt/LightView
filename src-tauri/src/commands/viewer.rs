@@ -1,4 +1,5 @@
 use base64::Engine;
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::AppState;
@@ -77,9 +78,15 @@ pub async fn get_transformed_media(
         .to_lowercase();
 
     let (mut rgba_data, mut src_w, mut src_h) = if ext == "heic" || ext == "heif" {
-        let (rgba, w, h, _, _) = crate::pipeline::thumbnailer::decode_heic_to_rgba(std::path::Path::new(&path))
+        let dec = crate::pipeline::thumbnailer::decode_heic_natural_from_bytes(&data)
             .map_err(|e| format!("HEIC decode failed: {}", e))?;
-        (rgba, w, h)
+        let rgba = match dec.pixels {
+            crate::pipeline::thumbnailer::HeicPixels::Rgba(v) => v,
+            crate::pipeline::thumbnailer::HeicPixels::Rgb(v) => {
+                crate::pipeline::thumbnailer::rgb_to_rgba(&v)
+            }
+        };
+        (rgba, dec.width, dec.height)
     } else {
         let img = image::load_from_memory(&data)
             .map_err(|e| format!("Image decode failed: {}", e))?;
@@ -189,20 +196,21 @@ pub async fn get_transformed_media(
     Ok(format!("data:image/jpeg;base64,{}", b64))
 }
 
-/// CPU fallback for image transforms.
+/// CPU fallback for image transforms. Row-parallel over rayon's global pool —
+/// each output row samples independently from `rgba`, so no synchronization
+/// is needed beyond the disjoint mutable row borrows.
 fn apply_cpu_transforms(
     rgba: &[u8],
     width: u32,
     height: u32,
     transform: &ImageTransform,
 ) -> Vec<u8> {
-    let pixel_count = (width * height) as usize;
-    let mut output = Vec::with_capacity(pixel_count * 4);
-
     let rotation_rad = transform.rotation_degrees.to_radians();
     let cos_r = rotation_rad.cos();
     let sin_r = rotation_rad.sin();
     let exposure_mult = 2.0f32.powf(transform.exposure);
+    let saturation = transform.saturation;
+    let contrast = transform.contrast;
 
     let (dst_w, dst_h) = if (transform.rotation_degrees.abs() % 180.0 - 90.0).abs() < 1.0 {
         (height, width)
@@ -210,53 +218,65 @@ fn apply_cpu_transforms(
         (width, height)
     };
 
-    for y in 0..dst_h {
-        for x in 0..dst_w {
-            // Normalized coords centered at 0.5
-            let nx = (x as f32 + 0.5) / dst_w as f32 - 0.5;
-            let ny = (y as f32 + 0.5) / dst_h as f32 - 0.5;
+    let row_bytes = (dst_w as usize) * 4;
+    let mut output = vec![0u8; row_bytes * (dst_h as usize)];
 
-            // Rotate
-            let rx = nx * cos_r - ny * sin_r + 0.5;
-            let ry = nx * sin_r + ny * cos_r + 0.5;
+    let dst_w_f = dst_w as f32;
+    let dst_h_f = dst_h as f32;
+    let src_w_f = width as f32;
+    let src_h_f = height as f32;
+    let src_w_max = src_w_f - 1.0;
+    let src_h_max = src_h_f - 1.0;
 
-            if rx < 0.0 || rx >= 1.0 || ry < 0.0 || ry >= 1.0 {
-                output.extend_from_slice(&[0, 0, 0, 255]);
-                continue;
+    output
+        .par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let ny = (y as f32 + 0.5) / dst_h_f - 0.5;
+            for x in 0..dst_w {
+                let nx = (x as f32 + 0.5) / dst_w_f - 0.5;
+
+                let rx = nx * cos_r - ny * sin_r + 0.5;
+                let ry = nx * sin_r + ny * cos_r + 0.5;
+
+                let out = &mut row[(x as usize) * 4..(x as usize) * 4 + 4];
+
+                if rx < 0.0 || rx >= 1.0 || ry < 0.0 || ry >= 1.0 {
+                    out[0] = 0;
+                    out[1] = 0;
+                    out[2] = 0;
+                    out[3] = 255;
+                    continue;
+                }
+
+                let sx = (rx * src_w_f).min(src_w_max) as u32;
+                let sy = (ry * src_h_f).min(src_h_max) as u32;
+                let idx = ((sy * width + sx) * 4) as usize;
+
+                let mut r = rgba[idx] as f32 / 255.0;
+                let mut g = rgba[idx + 1] as f32 / 255.0;
+                let mut b = rgba[idx + 2] as f32 / 255.0;
+                let a = rgba[idx + 3];
+
+                r *= exposure_mult;
+                g *= exposure_mult;
+                b *= exposure_mult;
+
+                let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                r = lum + (r - lum) * saturation;
+                g = lum + (g - lum) * saturation;
+                b = lum + (b - lum) * saturation;
+
+                r = (r - 0.5) * contrast + 0.5;
+                g = (g - 0.5) * contrast + 0.5;
+                b = (b - 0.5) * contrast + 0.5;
+
+                out[0] = (r.clamp(0.0, 1.0) * 255.0) as u8;
+                out[1] = (g.clamp(0.0, 1.0) * 255.0) as u8;
+                out[2] = (b.clamp(0.0, 1.0) * 255.0) as u8;
+                out[3] = a;
             }
-
-            // Sample nearest pixel
-            let sx = (rx * width as f32).min(width as f32 - 1.0) as u32;
-            let sy = (ry * height as f32).min(height as f32 - 1.0) as u32;
-            let idx = ((sy * width + sx) * 4) as usize;
-
-            let mut r = rgba[idx] as f32 / 255.0;
-            let mut g = rgba[idx + 1] as f32 / 255.0;
-            let mut b = rgba[idx + 2] as f32 / 255.0;
-            let a = rgba[idx + 3];
-
-            // Exposure
-            r *= exposure_mult;
-            g *= exposure_mult;
-            b *= exposure_mult;
-
-            // Saturation
-            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            r = lum + (r - lum) * transform.saturation;
-            g = lum + (g - lum) * transform.saturation;
-            b = lum + (b - lum) * transform.saturation;
-
-            // Contrast
-            r = (r - 0.5) * transform.contrast + 0.5;
-            g = (g - 0.5) * transform.contrast + 0.5;
-            b = (b - 0.5) * transform.contrast + 0.5;
-
-            output.push((r.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push((g.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push((b.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push(a);
-        }
-    }
+        });
 
     output
 }

@@ -224,3 +224,17 @@ fn move_companion(media_src: &Path, dest_dir: &Path) {
         });
     }
 }
+
+/// Place the given media file paths on the OS clipboard so a paste in the
+/// system file manager copies them. Thin wrapper over [`crate::file_clipboard`].
+#[tauri::command]
+pub async fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
+    let bufs: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&Path> = bufs.iter().map(|p| p.as_path()).collect();
+        crate::file_clipboard::write_files(&refs, crate::file_clipboard::Op::Copy)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

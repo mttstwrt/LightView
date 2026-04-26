@@ -869,9 +869,15 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
     );
 }
 
-/// Regenerate a single thumbnail, bypassing all caches.
+/// Regenerate a single thumbnail, bypassing all caches. Clears every tier
+/// (micro/standard/large/preview) so stale rows don't survive when the
+/// gallery is rendered at a different cell size, then regenerates the
+/// standard tier eagerly. Emits `thumb:regenerated` so the frontend can
+/// cache-bust its `<img>` URL — without that, WebKit's image cache keeps
+/// serving the old bytes until the app restarts.
 #[tauri::command]
 pub async fn regenerate_thumbnail(
+    app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
@@ -879,14 +885,16 @@ pub async fn regenerate_thumbnail(
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let thumb_size = STANDARD_THUMB_SIZE;
 
-    // Remove from SQLite cache
+    // Remove from every tier so a re-render at any cell size pulls fresh bytes.
     {
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
-            let _ = db.conn().execute(
-                "DELETE FROM thumbnails WHERE path = ?1",
-                rusqlite::params![path],
-            );
+            for table in ["thumbnails", "thumbnails_micro", "thumbnails_large", "thumbnails_preview"] {
+                let _ = db.conn().execute(
+                    &format!("DELETE FROM {} WHERE path = ?1", table),
+                    rusqlite::params![path],
+                );
+            }
         }
     }
 
@@ -904,19 +912,28 @@ pub async fn regenerate_thumbnail(
                 }
             }
             let fmt_str = thumb.format.as_cache_str();
-            let db = state.cache_db.lock().await;
-            if let Some(db) = db.as_ref() {
-                let _ = db.upsert_thumbnail(
-                    &thumb.path,
-                    &thumb.media_type,
-                    0,
-                    thumb.width,
-                    thumb.height,
-                    &thumb.data,
-                    fmt_str,
-                    filter.as_str(),
-                );
+            {
+                let db = state.cache_db.lock().await;
+                if let Some(db) = db.as_ref() {
+                    let _ = db.upsert_thumbnail(
+                        &thumb.path,
+                        &thumb.media_type,
+                        0,
+                        thumb.width,
+                        thumb.height,
+                        &thumb.data,
+                        fmt_str,
+                        filter.as_str(),
+                    );
+                }
             }
+            let _ = app_handle.emit("thumb:regenerated", ThumbnailResult {
+                path: thumb.path,
+                width: thumb.width,
+                height: thumb.height,
+                media_type: thumb.media_type,
+                format: fmt_str.to_string(),
+            });
             Ok(())
         }
         Err(e) => Err(format!("Thumbnail generation failed: {}", e)),
@@ -956,6 +973,23 @@ pub async fn get_full_media(
         ));
     }
 
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // HEIC/HEIF: transcode to JPEG since browsers can't render HEIC natively.
+    // The transcode cache reads the file itself and is keyed by (path, mtime),
+    // so we skip the provider read on this path.
+    if ext == "heic" || ext == "heif" {
+        let src_path = std::path::Path::new(&path);
+        let jpeg_data = crate::pipeline::heic_cache::get_or_transcode(src_path)
+            .map_err(|e| format!("HEIC transcode failed: {}", e))?;
+        let b64 = encode_b64(&jpeg_data);
+        return Ok(format!("data:image/jpeg;base64,{}", b64));
+    }
+
     let reg = state.providers.read().await;
     let provider = reg.get(&gallery_path).ok_or("Provider not found")?;
 
@@ -963,23 +997,6 @@ pub async fn get_full_media(
         .read_file(&path)
         .await
         .map_err(|e| e.to_string())?;
-
-    let ext = std::path::Path::new(&path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    // HEIC/HEIF: transcode to JPEG since browsers can't render HEIC natively
-    if ext == "heic" || ext == "heif" {
-        let src_path = std::path::Path::new(&path);
-        let (rgba, w, h, _, _) = crate::pipeline::thumbnailer::decode_heic_to_rgba(src_path)
-            .map_err(|e| format!("HEIC decode failed: {}", e))?;
-        let jpeg_data = crate::pipeline::thumbnailer::encode_rgba_to_jpeg(&rgba, w, h)
-            .map_err(|e| format!("JPEG encode failed: {}", e))?;
-        let b64 = encode_b64(&jpeg_data);
-        return Ok(format!("data:image/jpeg;base64,{}", b64));
-    }
 
     let mime = match ext.as_str() {
         "jpg" | "jpeg" => "image/jpeg",

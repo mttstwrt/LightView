@@ -1,4 +1,5 @@
 pub mod thumbnailer;
+pub mod heic_cache;
 pub mod gpu;
 #[cfg(feature = "gpu")]
 pub mod gpu_pipeline;

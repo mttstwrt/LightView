@@ -735,6 +735,24 @@ export function CanvasGrid(props: CanvasGridProps) {
       unlistenStreamed = fn;
     });
 
+    // One-shot regeneration — no in-flight batch to gate on. Bump the URL
+    // version so the protocol fetch returns the fresh bytes instead of a
+    // cached response.
+    let unlistenRegenerated: UnlistenFn | undefined;
+    listen<ThumbnailResult>("thumb:regenerated", (event) => {
+      const r = event.payload;
+      const v = (urlVersions.get(r.path) ?? 0) + 1;
+      urlVersions.set(r.path, v);
+      if (assignedSet.has(r.path)) {
+        const url = `${thumbUrl(r.path, tier())}?v=${v}`;
+        urlMap.set(r.path, url);
+        imageLoader?.evict(r.path);
+        imageLoader?.request(r.path, url, 1);
+      }
+    }).then((fn) => {
+      unlistenRegenerated = fn;
+    });
+
     // Thumbnail invalidation
     const onInvalidate = () => {
       assignedSet.clear();
@@ -923,6 +941,7 @@ export function CanvasGrid(props: CanvasGridProps) {
       clearInterval(bgIntervalId);
       fetchAbort = true;
       unlistenStreamed?.();
+      unlistenRegenerated?.();
       pressureMonitor?.stop();
       setImageCountSource(() => ({ visible: 0, cached: 0 }));
       renderer?.destroy();

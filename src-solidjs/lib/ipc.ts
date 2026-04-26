@@ -295,6 +295,9 @@ export const moveFiles = (paths: string[], destination: string) =>
 export const trashFiles = (paths: string[]) =>
   invoke<FileOpResult>("trash_files", { paths });
 
+export const copyFilesToClipboard = (paths: string[]) =>
+  invoke<void>("copy_files_to_clipboard", { paths });
+
 // ---------------------------------------------------------------------------
 // Duplicate Detection
 // ---------------------------------------------------------------------------

@@ -42,9 +42,7 @@ async fn serve_heic(path: &str) -> Response<Body> {
     let src = path.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let p = std::path::Path::new(&src);
-        let (rgba, w, h, _, _) =
-            crate::pipeline::thumbnailer::decode_heic_to_rgba(p).map_err(|e| e.to_string())?;
-        crate::pipeline::thumbnailer::encode_rgba_to_jpeg(&rgba, w, h).map_err(|e| e.to_string())
+        crate::pipeline::heic_cache::get_or_transcode(p).map_err(|e| e.to_string())
     })
     .await;
 
@@ -56,7 +54,7 @@ async fn serve_heic(path: &str) -> Response<Body> {
             .body(Body::from(jpeg))
             .unwrap(),
         Ok(Err(e)) => {
-            log::error!("HEIC decode/encode failed for {}: {}", path, e);
+            log::error!("HEIC transcode failed for {}: {}", path, e);
             error(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR),

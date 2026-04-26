@@ -1,7 +1,7 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles } from "../../lib/ipc";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard } from "../../lib/ipc";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
@@ -195,6 +195,17 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
   };
 
+  const handleCopyToClipboard = async () => {
+    if (!props.state) return;
+    const paths = isBatchContext() ? batchPaths() : [props.state.path];
+    props.onClose();
+    try {
+      await copyFilesToClipboard(paths);
+    } catch (err) {
+      console.error("Failed to copy files to clipboard:", err);
+    }
+  };
+
   const handleCopyTo = async () => {
     if (!props.state) return;
     const dest = await open({ directory: true, multiple: false });
@@ -301,6 +312,10 @@ export function ContextMenu(props: ContextMenuProps) {
               <MenuItem label="Regenerate Thumbnail" onClick={handleRegenerateThumbnail} />
             </Show>
             <MenuItem label="Copy Path" onClick={handleCopyPath} />
+            <MenuItem
+              label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to Clipboard` : "Copy to Clipboard"}
+              onClick={handleCopyToClipboard}
+            />
             <Divider />
             <MenuItem
               label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to...` : "Copy to..."}

@@ -272,21 +272,20 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
 }
 
 /// Generate a thumbnail for a HEIC/HEIF file using libheif.
+///
+/// Tries the embedded thumbnail first (iPhone HEICs ship a ~320px thumb that
+/// decodes ~100x faster than the full image) and falls back to the primary
+/// handle if no embedded thumbnail is large enough.
 fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
-    let (rgba_buf, _dw, _dh, src_w, src_h) = decode_heic_to_rgba(path)?;
+    let target_edge = thumb_w.max(thumb_h);
+    let (rgba_buf, _dw, _dh, src_w, src_h) = decode_heic_with_target(path, target_edge)?;
     let dw = _dw;
     let dh = _dh;
     let (cx, cy, side) = center_crop_square(dw, dh);
 
     let final_data = match format {
         ThumbFormat::Jpeg => {
-            // Convert RGBA→RGB for JPEG path
-            let mut rgb = Vec::with_capacity((dw * dh * 3) as usize);
-            for chunk in rgba_buf.chunks_exact(4) {
-                rgb.push(chunk[0]);
-                rgb.push(chunk[1]);
-                rgb.push(chunk[2]);
-            }
+            let rgb = rgba_to_rgb(&rgba_buf);
             let cropped = crop_rgb(&rgb, dw, cx, cy, side, side);
             resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
@@ -365,7 +364,7 @@ fn crop_rgba(src: &[u8], src_w: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> 
 }
 
 /// Convert RGB pixel buffer to RGBA (alpha = 255).
-fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
+pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let pixel_count = rgb.len() / 3;
     let mut rgba = Vec::with_capacity(pixel_count * 4);
     for chunk in rgb.chunks_exact(3) {
@@ -375,6 +374,18 @@ fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
         rgba.push(255);
     }
     rgba
+}
+
+/// Strip alpha from an RGBA buffer to produce RGB. Uses 3-byte
+/// `extend_from_slice` per pixel — the compiler emits a memcpy intrinsic
+/// for that, which is meaningfully faster than `push`-per-byte.
+pub fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let pixel_count = rgba.len() / 4;
+    let mut rgb = Vec::with_capacity(pixel_count * 3);
+    for chunk in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&chunk[..3]);
+    }
+    rgb
 }
 
 /// Convert L8 (grayscale) pixel buffer directly to RGBA (alpha = 255).
@@ -497,13 +508,7 @@ pub fn compute_thumbhash(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>
 
 /// Encode RGBA pixels to JPEG. Used when deriving tier bytes for storage.
 pub fn encode_rgba_to_jpeg_tier(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbError> {
-    // Convert to RGB first — JpegEncoder expects 3 channels for quality path.
-    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    for chunk in rgba.chunks_exact(4) {
-        rgb.push(chunk[0]);
-        rgb.push(chunk[1]);
-        rgb.push(chunk[2]);
-    }
+    let rgb = rgba_to_rgb(rgba);
     let mut buf = std::io::Cursor::new(Vec::with_capacity(16_000));
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
     enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)
@@ -763,18 +768,111 @@ fn decode_jpeg_to_rgba_inner(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32
     Ok((rgba, dw, dh, src_w, src_h))
 }
 
-/// Decode a HEIC/HEIF image to RGBA pixels using libheif.
+/// Shared `libheif` instance. The library's docs note that all `LibHeif`
+/// instances use shared global state, and `Drop` calls `heif_deinit` — so we
+/// construct exactly one and let it live for the process lifetime. Plugin
+/// discovery in `LibHeif::new` is non-trivial and was previously paid on
+/// every HEIC decode call.
+fn lib_heif() -> &'static libheif_rs::LibHeif {
+    static LIB_HEIF: std::sync::OnceLock<libheif_rs::LibHeif> = std::sync::OnceLock::new();
+    LIB_HEIF.get_or_init(libheif_rs::LibHeif::new)
+}
+
+/// Decoded HEIC pixels, tagged with their natural channel layout.
+/// The transcode-to-JPEG path uses this to skip the RGBA→RGB strip when
+/// the source has no alpha (the common case).
+pub enum HeicPixels {
+    Rgb(Vec<u8>),
+    Rgba(Vec<u8>),
+}
+
+/// Result of a natural-channel HEIC decode: pixels, decoded dims, original src dims.
+pub struct HeicDecode {
+    pub pixels: HeicPixels,
+    pub width: u32,
+    pub height: u32,
+    pub src_width: u32,
+    pub src_height: u32,
+}
+
+/// Decode a HEIC/HEIF image to RGBA pixels using libheif (primary image only).
 pub fn decode_heic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
-    let lib_heif = libheif_rs::LibHeif::new();
+    let dec = decode_heic_internal(path, None)?;
+    Ok(into_rgba_tuple(dec))
+}
+
+/// Decode a HEIC/HEIF image to RGBA pixels, preferring an embedded thumbnail
+/// that is large enough to satisfy a `target_edge`-pixel output. Falls back
+/// to the primary image when no suitable embedded thumbnail exists.
+///
+/// Returned `src_w`/`src_h` always reflect the original primary image
+/// dimensions; the first three return values describe the actually-decoded
+/// pixels (which may be the embedded thumbnail).
+pub fn decode_heic_with_target(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+    let dec = decode_heic_internal(path, Some(target_edge))?;
+    Ok(into_rgba_tuple(dec))
+}
+
+/// Decode a HEIC/HEIF image into its natural channel layout — RGB if the
+/// source has no alpha (the common case for camera output), RGBA otherwise.
+/// Used by the transcode cache to skip a wasted alpha-strip pass before
+/// JPEG encoding.
+pub fn decode_heic_natural(path: &Path) -> Result<HeicDecode, ThumbError> {
+    decode_heic_internal(path, None)
+}
+
+/// Decode a HEIC/HEIF image from in-memory bytes. Lets callers that
+/// already have the file contents (e.g. via the provider abstraction)
+/// avoid a redundant disk read, and lets remote providers (SMB/SFTP/S3)
+/// participate at all.
+pub fn decode_heic_natural_from_bytes(bytes: &[u8]) -> Result<HeicDecode, ThumbError> {
+    let ctx = libheif_rs::HeifContext::read_from_bytes(bytes)
+        .map_err(|e| ThumbError::Decode(format!("HEIC open failed: {}", e)))?;
+    decode_heic_from_ctx(&ctx, None)
+}
+
+fn into_rgba_tuple(dec: HeicDecode) -> (Vec<u8>, u32, u32, u32, u32) {
+    let HeicDecode { pixels, width, height, src_width, src_height } = dec;
+    let rgba = match pixels {
+        HeicPixels::Rgba(v) => v,
+        HeicPixels::Rgb(v) => rgb_to_rgba(&v),
+    };
+    (rgba, width, height, src_width, src_height)
+}
+
+fn decode_heic_internal(
+    path: &Path,
+    target_edge: Option<u32>,
+) -> Result<HeicDecode, ThumbError> {
     let ctx = libheif_rs::HeifContext::read_from_file(path.to_str().unwrap_or(""))
         .map_err(|e| ThumbError::Decode(format!("HEIC open failed: {}", e)))?;
-    let handle = ctx
+    decode_heic_from_ctx(&ctx, target_edge)
+}
+
+fn decode_heic_from_ctx(
+    ctx: &libheif_rs::HeifContext,
+    target_edge: Option<u32>,
+) -> Result<HeicDecode, ThumbError> {
+    let primary = ctx
         .primary_image_handle()
         .map_err(|e| ThumbError::Decode(format!("HEIC handle failed: {}", e)))?;
-    let src_w = handle.width();
-    let src_h = handle.height();
-    let img = lib_heif
-        .decode(&handle, libheif_rs::ColorSpace::Rgb(libheif_rs::RgbChroma::Rgba), None)
+    let src_w = primary.width();
+    let src_h = primary.height();
+
+    let handle = match target_edge.and_then(|t| pick_thumbnail_handle(&primary, t)) {
+        Some(thumb) => thumb,
+        None => primary,
+    };
+
+    let has_alpha = handle.has_alpha_channel();
+    let chroma = if has_alpha {
+        libheif_rs::RgbChroma::Rgba
+    } else {
+        libheif_rs::RgbChroma::Rgb
+    };
+
+    let img = lib_heif()
+        .decode(&handle, libheif_rs::ColorSpace::Rgb(chroma), None)
         .map_err(|e| ThumbError::Decode(format!("HEIC decode failed: {}", e)))?;
     let plane = img
         .planes()
@@ -784,16 +882,73 @@ pub fn decode_heic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32),
     let stride = plane.stride;
     let w = img.width();
     let h = img.height();
+    let bpp = if has_alpha { 4 } else { 3 } as usize;
+    let row_bytes = (w as usize) * bpp;
+    let total = row_bytes * (h as usize);
 
-    // Copy row-by-row to strip any padding from the stride
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for row in 0..h {
-        let start = (row as usize) * stride;
-        let end = start + (w as usize) * 4;
-        rgba.extend_from_slice(&plane.data[start..end]);
+    // Bulk copy when libheif returned tightly packed rows (the common
+    // case); fall back to row-by-row only when it added stride padding.
+    let buf = if stride == row_bytes {
+        plane.data[..total].to_vec()
+    } else {
+        let mut v = Vec::with_capacity(total);
+        for row in 0..h {
+            let start = (row as usize) * stride;
+            v.extend_from_slice(&plane.data[start..start + row_bytes]);
+        }
+        v
+    };
+
+    let pixels = if has_alpha {
+        HeicPixels::Rgba(buf)
+    } else {
+        HeicPixels::Rgb(buf)
+    };
+
+    Ok(HeicDecode {
+        pixels,
+        width: w,
+        height: h,
+        src_width: src_w,
+        src_height: src_h,
+    })
+}
+
+/// Pick the largest embedded thumbnail whose shorter edge is at least 75% of
+/// `target_edge`. Returns `None` if no embedded thumbnail meets the bar.
+///
+/// Why "shorter edge": after decode we center-crop to a square of
+/// `min(w, h)` then resize to `target_edge`. Allowing a modest (~33%)
+/// upscale catches iPhone HEICs (240×320 embedded thumb) for 256-px grid
+/// targets while keeping output quality essentially unchanged.
+fn pick_thumbnail_handle(
+    primary: &libheif_rs::ImageHandle,
+    target_edge: u32,
+) -> Option<libheif_rs::ImageHandle> {
+    let n = primary.number_of_thumbnails();
+    if n == 0 {
+        return None;
+    }
+    let mut ids = vec![0 as libheif_rs::ItemId; n];
+    let got = primary.thumbnail_ids(&mut ids);
+
+    let mut best: Option<(libheif_rs::ItemId, u32)> = None;
+    for &id in &ids[..got] {
+        let Ok(th) = primary.thumbnail(id) else { continue };
+        let short = th.width().min(th.height());
+        // Require: 4 * short >= 3 * target_edge (i.e. >= 75% of target)
+        if short.saturating_mul(4) < target_edge.saturating_mul(3) {
+            continue;
+        }
+        match best {
+            None => best = Some((id, short)),
+            Some((_, prev)) if short > prev => best = Some((id, short)),
+            _ => {}
+        }
     }
 
-    Ok((rgba, w, h, src_w, src_h))
+    let (id, _) = best?;
+    primary.thumbnail(id).ok()
 }
 
 /// Extract a frame from a video file using ffmpeg and generate a thumbnail.
@@ -805,13 +960,7 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
 
             let final_data = match format {
                 ThumbFormat::Jpeg => {
-                    // Convert RGBA→RGB for JPEG
-                    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-                    for chunk in rgba.chunks_exact(4) {
-                        rgb.push(chunk[0]);
-                        rgb.push(chunk[1]);
-                        rgb.push(chunk[2]);
-                    }
+                    let rgb = rgba_to_rgb(&rgba);
                     let cropped = crop_rgb(&rgb, w, cx, cy, side, side);
                     resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
                 }
@@ -1079,18 +1228,16 @@ fn decode_generic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), 
 
 /// Encode RGBA pixels to JPEG (RGB8) output.
 pub fn encode_rgba_to_jpeg(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbError> {
-    // Convert RGBA → RGB for JPEG encoding
-    let pixel_count = (w * h) as usize;
-    let mut rgb = Vec::with_capacity(pixel_count * 3);
-    for chunk in rgba.chunks_exact(4) {
-        rgb.push(chunk[0]);
-        rgb.push(chunk[1]);
-        rgb.push(chunk[2]);
-    }
+    let rgb = rgba_to_rgb(rgba);
+    encode_rgb_to_jpeg(&rgb, w, h)
+}
+
+/// Encode tightly-packed RGB8 pixels to JPEG.
+pub fn encode_rgb_to_jpeg(rgb: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbError> {
     let mut buf = std::io::Cursor::new(Vec::with_capacity(32_000));
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
     encoder
-        .encode(&rgb, w, h, image::ExtendedColorType::Rgb8)
+        .encode(rgb, w, h, image::ExtendedColorType::Rgb8)
         .map_err(|e| ThumbError::Encode(e.to_string()))?;
     Ok(buf.into_inner())
 }

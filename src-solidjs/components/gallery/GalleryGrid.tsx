@@ -271,6 +271,24 @@ function DOMGrid(props: GalleryGridProps) {
   });
   onCleanup(() => unlistenStreamed?.());
 
+  // Listen for one-shot regeneration. Unlike thumb:streamed there is no
+  // in-flight batch to gate on — just bump the URL version so WebKit's
+  // image cache fetches the fresh bytes from the protocol handler.
+  let unlistenRegenerated: UnlistenFn | undefined;
+  onMount(() => {
+    listen<ThumbnailResult>("thumb:regenerated", (event) => {
+      const r = event.payload;
+      const v = (urlVersions.get(r.path) ?? 0) + 1;
+      urlVersions.set(r.path, v);
+      if (assignedSet.has(r.path)) {
+        setThumbMap(r.path, `${thumbUrl(r.path, tier())}?v=${v}`);
+      }
+    }).then((fn) => {
+      unlistenRegenerated = fn;
+    });
+  });
+  onCleanup(() => unlistenRegenerated?.());
+
   // -----------------------------------------------------------------------
   // Grid geometry — derived from container width, thumb size, gap
   // -----------------------------------------------------------------------

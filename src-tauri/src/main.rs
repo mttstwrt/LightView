@@ -275,30 +275,18 @@ fn serve_full_media(
     // Transcoded content is served in full (Range not applicable since size is unknown upfront).
     if ext == "heic" || ext == "heif" {
         let src_path = std::path::Path::new(path);
-        match lightview_lib::pipeline::thumbnailer::decode_heic_to_rgba(src_path) {
-            Ok((rgba, w, h, _, _)) => {
-                match lightview_lib::pipeline::thumbnailer::encode_rgba_to_jpeg(&rgba, w, h) {
-                    Ok(jpeg_data) => {
-                        return tauri::http::Response::builder()
-                            .status(200)
-                            .header("Content-Type", "image/jpeg")
-                            .header("Cache-Control", "no-cache")
-                            .header("Access-Control-Allow-Origin", "*")
-                            .body(jpeg_data)
-                            .unwrap();
-                    }
-                    Err(e) => {
-                        log::error!("HEIC→JPEG encode failed for {}: {}", path, e);
-                        return tauri::http::Response::builder()
-                            .status(500)
-                            .header("Access-Control-Allow-Origin", "*")
-                            .body(Vec::new())
-                            .unwrap();
-                    }
-                }
+        match lightview_lib::pipeline::heic_cache::get_or_transcode(src_path) {
+            Ok(jpeg_data) => {
+                return tauri::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "image/jpeg")
+                    .header("Cache-Control", "no-cache")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(jpeg_data)
+                    .unwrap();
             }
             Err(e) => {
-                log::error!("HEIC decode failed for {}: {}", path, e);
+                log::error!("HEIC transcode failed for {}: {}", path, e);
                 return tauri::http::Response::builder()
                     .status(500)
                     .header("Access-Control-Allow-Origin", "*")
@@ -627,6 +615,7 @@ fn main() {
             commands::files::copy_files,
             commands::files::move_files,
             commands::files::trash_files,
+            commands::files::copy_files_to_clipboard,
 
             // Duplicate detection
             commands::duplicates::find_duplicates,

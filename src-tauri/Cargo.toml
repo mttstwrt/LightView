@@ -53,6 +53,10 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-clipboard = "0.9"
+x11rb = "0.13"
+
 # Optimize dependencies even in dev builds — image codecs, SIMD resize,
 # BC7 encoding, and SQLite are unusably slow at opt-level 0.
 [profile.dev.package."*"]
