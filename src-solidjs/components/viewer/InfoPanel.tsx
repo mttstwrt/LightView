@@ -45,6 +45,18 @@ export function InfoPanel(props: { path: string; filename: string }) {
   const [lastRated, setLastRated] = createSignal<number | null>(null);
   const [thumbTiers, setThumbTiers] = createSignal<ThumbnailTierInfo[]>([]);
   const [thumbExpanded, setThumbExpanded] = createSignal(false);
+  const [expandedNamespaces, setExpandedNamespaces] = createSignal<Set<string>>(
+    new Set(["user"]),
+  );
+
+  const toggleNamespace = (ns: string) => {
+    setExpandedNamespaces((prev) => {
+      const next = new Set(prev);
+      if (next.has(ns)) next.delete(ns);
+      else next.add(ns);
+      return next;
+    });
+  };
 
   const loadTags = async (path: string) => {
     try {
@@ -122,8 +134,20 @@ export function InfoPanel(props: { path: string; filename: string }) {
     }
   };
 
-  const userTags = () => tags().filter((t) => t.namespace === "user");
-  const otherTags = () => tags().filter((t) => t.namespace !== "user");
+  const tagsByNamespace = () => {
+    const groups = new Map<string, { namespace: string; tag: string }[]>();
+    for (const t of tags()) {
+      const list = groups.get(t.namespace);
+      if (list) list.push(t);
+      else groups.set(t.namespace, [t]);
+    }
+    if (!groups.has("user")) groups.set("user", []);
+    return Array.from(groups.entries()).sort(([a], [b]) => {
+      if (a === "user") return -1;
+      if (b === "user") return 1;
+      return a.localeCompare(b);
+    });
+  };
 
   const onRatingChanged = (e: Event) => {
     const { path, rating: newRating } = (e as CustomEvent).detail;
@@ -246,50 +270,83 @@ export function InfoPanel(props: { path: string; filename: string }) {
             </div>
           </div>
 
-          {/* Tags */}
-          <div class="border-t border-neutral-800 pt-3 mt-3">
-            <span class="text-neutral-500">Tags:</span>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <For each={userTags()}>
-                {(t) => (
-                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-300 bg-neutral-800">
-                    {t.tag}
-                    <button
-                      class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
-                      onClick={() => handleRemoveTag(t.tag)}
-                    >
-                      &times;
-                    </button>
+          {/* Tags — one collapsible section per namespace */}
+          <For each={tagsByNamespace()}>
+            {([namespace, nsTags]) => (
+              <div class="border-t border-neutral-800 pt-3 mt-3">
+                <button
+                  class="flex items-center gap-1.5 text-neutral-500 font-medium cursor-pointer hover:text-neutral-400 transition-colors w-full text-left"
+                  onClick={() => toggleNamespace(namespace)}
+                >
+                  <svg
+                    class="w-3 h-3 transition-transform"
+                    style={{
+                      transform: expandedNamespaces().has(namespace)
+                        ? "rotate(90deg)"
+                        : "rotate(0deg)",
+                    }}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    stroke-width="2.5"
+                  >
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                  </svg>
+                  {namespace}
+                  <span class="text-neutral-600 font-normal text-[11px]">
+                    ({nsTags.length})
                   </span>
-                )}
-              </For>
-              <Show when={otherTags().length > 0}>
-                <For each={otherTags()}>
-                  {(t) => (
-                    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-400 bg-neutral-800/50">
-                      <span class="text-neutral-600">{t.namespace}:</span>
-                      {t.tag}
-                    </span>
-                  )}
-                </For>
-              </Show>
-            </div>
-            <form onSubmit={handleAddTag} class="flex gap-1 mt-2">
-              <input
-                type="text"
-                value={newTag()}
-                onInput={(e) => setNewTag(e.currentTarget.value)}
-                placeholder="Add tag..."
-                class="flex-1 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
-              />
-              <button
-                type="submit"
-                class="px-2 py-1 bg-neutral-700 hover:bg-neutral-600 text-neutral-300 rounded text-xs cursor-pointer transition-colors"
-              >
-                +
-              </button>
-            </form>
-          </div>
+                </button>
+                <Show when={expandedNamespaces().has(namespace)}>
+                  <div class="mt-2">
+                    <Show when={nsTags.length > 0}>
+                      <div class="flex flex-wrap gap-1">
+                        <For each={nsTags}>
+                          {(t) => (
+                            <Show
+                              when={namespace === "user"}
+                              fallback={
+                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-400 bg-neutral-800/50">
+                                  {t.tag}
+                                </span>
+                              }
+                            >
+                              <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-300 bg-neutral-800">
+                                {t.tag}
+                                <button
+                                  class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
+                                  onClick={() => handleRemoveTag(t.tag)}
+                                >
+                                  &times;
+                                </button>
+                              </span>
+                            </Show>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                    <Show when={namespace === "user"}>
+                      <form onSubmit={handleAddTag} class="flex gap-1 mt-2">
+                        <input
+                          type="text"
+                          value={newTag()}
+                          onInput={(e) => setNewTag(e.currentTarget.value)}
+                          placeholder="Add tag..."
+                          class="flex-1 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
+                        />
+                        <button
+                          type="submit"
+                          class="px-2 py-1 bg-neutral-700 hover:bg-neutral-600 text-neutral-300 rounded text-xs cursor-pointer transition-colors"
+                        >
+                          +
+                        </button>
+                      </form>
+                    </Show>
+                  </div>
+                </Show>
+              </div>
+            )}
+          </For>
         </div>
       </div>
       <Show when={panelRef}>
