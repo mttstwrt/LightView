@@ -13,7 +13,7 @@ pub enum CacheError {
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -156,6 +156,17 @@ const MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    // v7: GPS columns on media_meta + spatial index for bbox queries.
+    // Populated lazily by the EXIF backfill pass after gallery open.
+    Migration {
+        version: 7,
+        sql: "
+            ALTER TABLE media_meta ADD COLUMN gps_lat REAL;
+            ALTER TABLE media_meta ADD COLUMN gps_lon REAL;
+            CREATE INDEX IF NOT EXISTS idx_meta_geo ON media_meta(gps_lat, gps_lon)
+                WHERE gps_lat IS NOT NULL;
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.
@@ -244,6 +255,15 @@ fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
 
     if !has_micro_table {
         return 5;
+    }
+
+    // v6 present — check for v7 (GPS columns).
+    let has_gps = conn
+        .execute("SELECT gps_lat FROM media_meta LIMIT 0", [])
+        .is_ok();
+
+    if !has_gps {
+        return 6;
     }
 
     // Everything present — fully up to date.

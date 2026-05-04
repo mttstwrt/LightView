@@ -2,6 +2,7 @@ import { createSignal, onCleanup, onMount } from "solid-js";
 import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
+import { viewMode, setViewMode } from "../../stores/galleryStore";
 
 interface TopBarProps {
   onOpenFolder: () => void;
@@ -51,6 +52,14 @@ export function TopBar(props: TopBarProps) {
       >
         <FilterBar onInputRef={(el) => { filterInputRef = el; }} />
         <SortMenu />
+        <button
+          onClick={() => setViewMode(viewMode() === "grid" ? "map" : "grid")}
+          class="px-2.5 py-1 text-xs rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
+          classList={{ "bg-neutral-700": viewMode() === "map" }}
+          title={viewMode() === "grid" ? "Switch to map view" : "Switch to grid view"}
+        >
+          {viewMode() === "grid" ? "Map" : "Grid"}
+        </button>
         <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onRequestShow={() => setVisible(true)} />
       </div>
     </>

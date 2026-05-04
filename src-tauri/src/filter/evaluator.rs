@@ -60,6 +60,43 @@ pub fn evaluate(expr: &FilterExpr, companion: &CompanionFile) -> bool {
             .as_ref()
             .and_then(|c| c.color_label.as_ref())
             .map_or(false, |l| l == value),
+
+        FilterExpr::GeoBbox { south, west, north, east } => {
+            let loc = match companion
+                .meta
+                .core
+                .as_ref()
+                .and_then(|c| c.location)
+            {
+                Some(l) => l,
+                None => return false,
+            };
+            point_in_bbox(loc.lat, loc.lon, *south, *west, *north, *east)
+        }
+
+        FilterExpr::HasGeo { present } => {
+            let has = companion
+                .meta
+                .core
+                .as_ref()
+                .and_then(|c| c.location)
+                .is_some();
+            has == *present
+        }
+    }
+}
+
+/// Test a point against a bbox. When `west > east` the box wraps across the
+/// anti-meridian, so we OR two longitude ranges instead of using a single
+/// BETWEEN.
+fn point_in_bbox(lat: f64, lon: f64, south: f64, west: f64, north: f64, east: f64) -> bool {
+    if lat < south || lat > north {
+        return false;
+    }
+    if west <= east {
+        lon >= west && lon <= east
+    } else {
+        lon >= west || lon <= east
     }
 }
 
@@ -148,6 +185,39 @@ pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
             // TODO: Add color_label column to media_meta for SQL filtering.
             let _ = value;
             "1 = 1".to_string()
+        }
+
+        FilterExpr::GeoBbox { south, west, north, east } => {
+            params.push(south.to_string());
+            let s_idx = params.len();
+            params.push(north.to_string());
+            let n_idx = params.len();
+            params.push(west.to_string());
+            let w_idx = params.len();
+            params.push(east.to_string());
+            let e_idx = params.len();
+            if west <= east {
+                format!(
+                    "(m.gps_lat IS NOT NULL AND m.gps_lat BETWEEN ?{} AND ?{} \
+                       AND m.gps_lon BETWEEN ?{} AND ?{})",
+                    s_idx, n_idx, w_idx, e_idx
+                )
+            } else {
+                // Wrap around the anti-meridian.
+                format!(
+                    "(m.gps_lat IS NOT NULL AND m.gps_lat BETWEEN ?{} AND ?{} \
+                       AND (m.gps_lon >= ?{} OR m.gps_lon <= ?{}))",
+                    s_idx, n_idx, w_idx, e_idx
+                )
+            }
+        }
+
+        FilterExpr::HasGeo { present } => {
+            if *present {
+                "m.gps_lat IS NOT NULL".to_string()
+            } else {
+                "m.gps_lat IS NULL".to_string()
+            }
         }
     }
 }

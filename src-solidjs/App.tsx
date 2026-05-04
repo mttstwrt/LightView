@@ -2,11 +2,12 @@ import { Show, createSignal, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
 import { openGallery, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, type RecentGallery } from "./lib/ipc";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
+import { MapView } from "./components/map/MapView";
 import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
 import { ContextMenu, type ContextMenuState } from "./components/shared/ContextMenu";
@@ -320,46 +321,51 @@ export function App() {
         fallback={<WelcomeScreen onOpen={handleOpenFolder} onOpenPath={openPath} />}
       >
         <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} />
-        <GalleryGrid
-          paths={displayPaths()}
-          onItemClick={(index) => {
-            clearSelection();
-            openViewer(index);
-          }}
-          onItemSelect={(path) => toggleSelection(path)}
-          onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
-          onBackgroundClick={clearSelection}
-          selectedPaths={selectedPaths()}
-          onItemContextMenu={(e, path, index) => {
-            setContextMenu({ x: e.clientX, y: e.clientY, path, index });
-          }}
-          loading={loading()}
-          onContentHeight={setGalleryContentHeight}
-        />
-        <ScrollBar
-          contentHeight={galleryContentHeight()}
-          indicators={scrollIndicators()}
-          getThumbLabel={thumbLabel}
-        />
-        <Show when={selectedPaths().size > 0}>
-          <SelectionBar
+        <Show when={viewMode() === "grid"}>
+          <GalleryGrid
+            paths={displayPaths()}
+            onItemClick={(index) => {
+              clearSelection();
+              openViewer(index);
+            }}
+            onItemSelect={(path) => toggleSelection(path)}
+            onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
+            onBackgroundClick={clearSelection}
             selectedPaths={selectedPaths()}
-            onClear={clearSelection}
+            onItemContextMenu={(e, path, index) => {
+              setContextMenu({ x: e.clientX, y: e.clientY, path, index });
+            }}
+            loading={loading()}
+            onContentHeight={setGalleryContentHeight}
+          />
+          <ScrollBar
+            contentHeight={galleryContentHeight()}
+            indicators={scrollIndicators()}
+            getThumbLabel={thumbLabel}
+          />
+          <Show when={selectedPaths().size > 0}>
+            <SelectionBar
+              selectedPaths={selectedPaths()}
+              onClear={clearSelection}
+            />
+          </Show>
+          <ContextMenu
+            state={contextMenu()}
+            onClose={() => setContextMenu(null)}
+            paths={displayPaths()}
+            selectedPaths={selectedPaths()}
+            hideViewOption={viewerOpen()}
+            onFilesRemoved={(removed) => {
+              const removedSet = new Set(removed);
+              setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+              clearSelection();
+              setTotalCount((c) => Math.max(0, c - removed.length));
+            }}
           />
         </Show>
-        <ContextMenu
-          state={contextMenu()}
-          onClose={() => setContextMenu(null)}
-          paths={displayPaths()}
-          selectedPaths={selectedPaths()}
-          hideViewOption={viewerOpen()}
-          onFilesRemoved={(removed) => {
-            const removedSet = new Set(removed);
-            setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
-            clearSelection();
-            setTotalCount((c) => Math.max(0, c - removed.length));
-          }}
-        />
+        <Show when={viewMode() === "map"}>
+          <MapView />
+        </Show>
         <Show when={viewerOpen()}>
           <MediaViewer
             paths={displayPaths()}

@@ -11,6 +11,8 @@ pub enum ParseError {
     InvalidRating(String),
     #[error("Unknown media type: {0}")]
     UnknownMediaType(String),
+    #[error("Invalid geo filter: {0}")]
+    InvalidGeo(String),
 }
 
 /// Parse a filter query string into a FilterExpr.
@@ -175,6 +177,19 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
         ));
     }
 
+    // Geo presence: has:geo, missing:geo
+    if token == "has:geo" {
+        return Ok((FilterExpr::HasGeo { present: true }, rest));
+    }
+    if token == "missing:geo" {
+        return Ok((FilterExpr::HasGeo { present: false }, rest));
+    }
+
+    // Geo bounding box: geo:south,west,north,east (decimal degrees)
+    if let Some(bbox_str) = token.strip_prefix("geo:") {
+        return parse_geo_bbox(bbox_str, rest);
+    }
+
     // Has namespace: has::user, has::plugin.geo
     if let Some(ns) = token.strip_prefix("has::") {
         let namespace = parse_namespace(ns);
@@ -209,6 +224,44 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
             namespace: TagNamespace::Any,
             value: token.clone(),
         },
+        rest,
+    ))
+}
+
+fn parse_geo_bbox<'a>(bbox_str: &str, rest: &'a [String]) -> ParseResult<'a> {
+    let parts: Vec<&str> = bbox_str.split(',').collect();
+    if parts.len() != 4 {
+        return Err(ParseError::InvalidGeo(format!(
+            "expected south,west,north,east — got '{}'",
+            bbox_str
+        )));
+    }
+    let parse = |s: &str| -> Result<f64, ParseError> {
+        s.trim()
+            .parse::<f64>()
+            .map_err(|_| ParseError::InvalidGeo(format!("'{}' is not a number", s)))
+    };
+    let south = parse(parts[0])?;
+    let west = parse(parts[1])?;
+    let north = parse(parts[2])?;
+    let east = parse(parts[3])?;
+    if !(-90.0..=90.0).contains(&south)
+        || !(-90.0..=90.0).contains(&north)
+        || !(-180.0..=180.0).contains(&west)
+        || !(-180.0..=180.0).contains(&east)
+    {
+        return Err(ParseError::InvalidGeo(
+            "coordinates out of WGS-84 range".to_string(),
+        ));
+    }
+    if south > north {
+        return Err(ParseError::InvalidGeo(
+            "south must not exceed north".to_string(),
+        ));
+    }
+    // west may exceed east when crossing the anti-meridian — that's allowed.
+    Ok((
+        FilterExpr::GeoBbox { south, west, north, east },
         rest,
     ))
 }
@@ -405,6 +458,60 @@ mod tests {
         // Grouping parentheses (space-separated) should still work.
         let expr = parse_filter("(vacation OR travel) AND family").unwrap();
         assert!(matches!(expr, FilterExpr::And { .. }));
+    }
+
+    #[test]
+    fn test_geo_bbox() {
+        let expr = parse_filter("geo:37.7,-122.5,37.8,-122.4").unwrap();
+        match expr {
+            FilterExpr::GeoBbox { south, west, north, east } => {
+                assert!((south - 37.7).abs() < 1e-9);
+                assert!((west - -122.5).abs() < 1e-9);
+                assert!((north - 37.8).abs() < 1e-9);
+                assert!((east - -122.4).abs() < 1e-9);
+            }
+            _ => panic!("Expected GeoBbox, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_geo_bbox_anti_meridian() {
+        // west > east is allowed (Pacific-spanning bbox).
+        let expr = parse_filter("geo:-30,170,30,-170").unwrap();
+        assert!(matches!(expr, FilterExpr::GeoBbox { .. }));
+    }
+
+    #[test]
+    fn test_geo_bbox_invalid_count() {
+        assert!(parse_filter("geo:1,2,3").is_err());
+    }
+
+    #[test]
+    fn test_geo_bbox_out_of_range() {
+        assert!(parse_filter("geo:0,0,200,0").is_err());
+    }
+
+    #[test]
+    fn test_has_geo() {
+        let expr = parse_filter("has:geo").unwrap();
+        assert!(matches!(expr, FilterExpr::HasGeo { present: true }));
+
+        let expr = parse_filter("missing:geo").unwrap();
+        assert!(matches!(expr, FilterExpr::HasGeo { present: false }));
+    }
+
+    #[test]
+    fn test_geo_composes_with_filter() {
+        // Bbox AND a tag — verifies parser slots the new atom into the
+        // existing precedence chain.
+        let expr = parse_filter("user::vacation AND geo:0,0,10,10").unwrap();
+        match expr {
+            FilterExpr::And { left, right } => {
+                assert!(matches!(left.as_ref(), FilterExpr::Tag { .. }));
+                assert!(matches!(right.as_ref(), FilterExpr::GeoBbox { .. }));
+            }
+            _ => panic!("Expected And, got {:?}", expr),
+        }
     }
 
     #[test]

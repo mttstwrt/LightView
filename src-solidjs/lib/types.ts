@@ -173,9 +173,11 @@ export interface AppSettings {
     grid_gap: number;
     background_color: string;
     video_hover_preview: boolean;
+    video_autoplay_loop: boolean;
     gif_autoplay_grid: boolean;
     scroll_blur: boolean;
     renderer_mode: RendererMode;
+    map_dark_mode: boolean;
   };
   performance: {
     preload_count: number;

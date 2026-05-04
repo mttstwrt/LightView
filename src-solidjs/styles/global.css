@@ -20,6 +20,67 @@ html, body, #root {
   box-sizing: border-box;
 }
 
+/* Map view marker styling. Leaflet injects these via divIcon HTML so the
+   classes need to be globally available rather than scoped/Tailwind-only. */
+@keyframes lv-marker-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.lv-marker {
+  width: 100%;
+  height: 100%;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  background: #1a1a1a;
+  cursor: pointer;
+  position: relative;
+  transition: transform 120ms ease-out;
+  /* Pair with the JS-side opacity-0 fade on the outgoing layer to crossfade
+     between cluster LODs when zoom/filter changes the marker set. */
+  animation: lv-marker-fade-in 250ms ease-out;
+}
+.lv-marker:hover {
+  transform: scale(1.08);
+  z-index: 1000;
+}
+.lv-marker img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.lv-marker-cluster {
+  border-color: #14b8a6;
+}
+.lv-marker-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: #14b8a6;
+  color: #0a0a0a;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+/* Leaflet attribution text needs to be readable on the dark theme. */
+.leaflet-container .leaflet-control-attribution {
+  background: rgba(10, 10, 10, 0.75) !important;
+  color: #a3a3a3 !important;
+  font-size: 10px !important;
+}
+.leaflet-container .leaflet-control-attribution a {
+  color: #14b8a6 !important;
+}
+
 /* Hide native scrollbar — replaced by custom ScrollBar component */
 ::-webkit-scrollbar {
   width: 0;

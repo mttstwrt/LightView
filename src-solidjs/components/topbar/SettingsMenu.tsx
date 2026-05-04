@@ -326,9 +326,19 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 onChange={(v) => updateDisplay("video_hover_preview", v)}
               />
               <Toggle
+                label="Video auto-replay"
+                checked={settings().display.video_autoplay_loop}
+                onChange={(v) => updateDisplay("video_autoplay_loop", v)}
+              />
+              <Toggle
                 label="Thumbnail fade-in"
                 checked={settings().display.scroll_blur}
                 onChange={(v) => updateDisplay("scroll_blur", v)}
+              />
+              <Toggle
+                label="Dark map tiles"
+                checked={settings().display.map_dark_mode ?? true}
+                onChange={(v) => updateDisplay("map_dark_mode", v)}
               />
 
               {/* Renderer mode */}

@@ -1,6 +1,7 @@
 import { Show, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
+import { settings } from "../../stores/settingsStore";
 import { mediaUrl, videoSrc, thumbUrl, ensureTierThumbnails } from "../../lib/ipc";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { setViewerCacheCountSource } from "../../lib/perfMonitor";
@@ -55,6 +56,14 @@ export function MediaViewer(props: MediaViewerProps) {
 
   const isVideo = () =>
     ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"].includes(ext());
+
+  // WebKitGTK's <video> element only handles a narrow set of containers
+  // reliably (H.264/AAC in MP4, VP8/9 in WebM). MKV/AVI/WMV/FLV will fail
+  // to decode regardless of how the bytes are served, so jump straight to
+  // the external-player fallback for those instead of mounting <video>
+  // and waiting for an error event.
+  const isBrowserPlayableVideo = () =>
+    ["mp4", "mov", "webm", "m4v"].includes(ext());
 
   const [videoPlaying, setVideoPlaying] = createSignal(false);
   const [videoError, setVideoError] = createSignal(false);
@@ -291,7 +300,7 @@ export function MediaViewer(props: MediaViewerProps) {
       {/* Media display */}
       <div class="max-w-[90vw] max-h-[90vh] flex items-center justify-center">
         <Show when={isVideo()}>
-          <Show when={!videoError()} fallback={
+          <Show when={isBrowserPlayableVideo() && !videoError()} fallback={
             <div class="text-neutral-400 text-sm text-center" onClick={(e) => e.stopPropagation()}>
               <button
                 class="w-20 h-20 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer transition-colors mb-4"
@@ -308,6 +317,7 @@ export function MediaViewer(props: MediaViewerProps) {
               src={videoSrc(currentPath())}
               class="max-w-[90vw] max-h-[90vh] outline-none"
               controls
+              loop={settings().display.video_autoplay_loop}
               preload="metadata"
               onPlay={() => setVideoPlaying(true)}
               onPause={() => setVideoPlaying(false)}

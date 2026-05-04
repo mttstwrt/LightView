@@ -42,6 +42,18 @@ pub enum FilterExpr {
     ColorLabel {
         value: String,
     },
+    /// Bounding box over GPS coordinates. Decimal degrees, WGS-84.
+    /// When `west > east` the box crosses the anti-meridian.
+    GeoBbox {
+        south: f64,
+        west: f64,
+        north: f64,
+        east: f64,
+    },
+    /// Match images that have (or lack) any GPS coordinates.
+    HasGeo {
+        present: bool,
+    },
 }
 
 /// Tag namespace specifier.

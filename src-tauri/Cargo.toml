@@ -44,6 +44,7 @@ percent-encoding = "2"
 trash = "5"
 bytemuck = { version = "1", features = ["derive"] }
 libheif-rs = "2"
+kamadak-exif = "0.6"
 thumbhash = "0.1"
 webp = "0.3"
 wgpu = { version = "29", optional = true }
@@ -52,6 +53,7 @@ http-range = "0.1.5"
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-clipboard = "0.9"

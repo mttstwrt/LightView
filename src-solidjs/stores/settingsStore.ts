@@ -8,9 +8,11 @@ const DEFAULT_SETTINGS: AppSettings = {
     grid_gap: 2,
     background_color: "#0a0a0a",
     video_hover_preview: false,
+    video_autoplay_loop: false,
     gif_autoplay_grid: false,
     scroll_blur: false,
     renderer_mode: "canvas",
+    map_dark_mode: true,
   },
   performance: {
     preload_count: 3,

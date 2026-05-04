@@ -589,6 +589,10 @@ fn main() {
             commands::filter::apply_filter,
             commands::filter::clear_filter,
 
+            // Geo commands
+            commands::geo::get_geo_points,
+            commands::geo::get_geo_paths,
+
             // Autocomplete commands
             commands::autocomplete::autocomplete_tags,
             commands::autocomplete::get_recent_tags,

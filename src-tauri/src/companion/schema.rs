@@ -153,6 +153,17 @@ pub struct CoreMeta {
     pub color_label: Option<String>,
     pub notes: Option<String>,
     pub media: Option<MediaInfo>,
+    pub location: Option<Location>,
+}
+
+/// GPS coordinates extracted from EXIF (or video container) metadata.
+/// Decimal degrees, WGS-84. Altitude in metres above sea level when present.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Location {
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

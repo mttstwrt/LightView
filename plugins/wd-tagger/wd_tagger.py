@@ -16,8 +16,10 @@ Protocol:
 
 import ctypes
 import glob as _glob
+import io
 import json
 import shutil
+import subprocess
 import sys
 import os
 
@@ -66,6 +68,9 @@ LABEL_FILENAME = "selected_tags.csv"
 GENERAL_THRESHOLD = 0.35
 CHARACTER_THRESHOLD = 0.85
 
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv"}
+VIDEO_FRAME_SAMPLES = 5
+
 # Kaomoji tags that should not have underscores replaced with spaces
 KAOMOJIS = {
     "0_0", "(o)_(o)", "+_+", "+_-", "._.", "<o>_<o>", "<|>_<|>",
@@ -103,8 +108,8 @@ def load_labels(csv_path):
     return names, rating_idxs, general_idxs, character_idxs
 
 
-def prepare_image(image_path, target_size):
-    image = Image.open(image_path).convert("RGBA")
+def prepare_image(image, target_size):
+    image = image.convert("RGBA")
     canvas = Image.new("RGBA", image.size, (255, 255, 255))
     canvas.alpha_composite(image)
     image = canvas.convert("RGB")
@@ -123,6 +128,55 @@ def prepare_image(image_path, target_size):
     # RGB -> BGR (model expects BGR)
     arr = arr[:, :, ::-1]
     return np.expand_dims(arr, axis=0)
+
+
+def is_video(path):
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+
+def get_video_duration(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        return float(out.stdout.strip())
+    except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+        return None
+
+
+def extract_frame(path, timestamp):
+    """Decode a single frame at `timestamp` seconds; returns a PIL Image or None."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-ss", f"{timestamp:.3f}",
+             "-i", path, "-frames:v", "1", "-f", "image2pipe",
+             "-vcodec", "png", "-"],
+            capture_output=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    try:
+        img = Image.open(io.BytesIO(proc.stdout))
+        img.load()
+        return img
+    except Exception:
+        return None
+
+
+def sample_video_timestamps(duration, n):
+    """Pick `n` timestamps evenly within (5%, 95%) of duration."""
+    if duration < 1.0:
+        return [duration / 2.0]
+    start = duration * 0.05
+    end = duration * 0.95
+    if n <= 1:
+        return [(start + end) / 2.0]
+    step = (end - start) / (n - 1)
+    return [start + i * step for i in range(n)]
 
 
 class Tagger:
@@ -173,11 +227,12 @@ class Tagger:
         self.input_name = self.model.get_inputs()[0].name
         self.label_name = self.model.get_outputs()[0].name
 
-    def predict(self, image_path):
-        image_array = prepare_image(image_path, self.target_size)
-        preds = self.model.run([self.label_name], {self.input_name: image_array})[0]
+    def _infer(self, image):
+        arr = prepare_image(image, self.target_size)
+        return self.model.run([self.label_name], {self.input_name: arr})[0][0].astype(float)
 
-        labels = list(zip(self.tag_names, preds[0].astype(float)))
+    def _scores_to_tags(self, preds):
+        labels = list(zip(self.tag_names, preds))
 
         rating_labels = {labels[i][0]: labels[i][1] for i in self.rating_idxs}
         top_rating = max(rating_labels, key=rating_labels.get)
@@ -196,14 +251,52 @@ class Tagger:
 
         return general_tags, character_tags, top_rating, rating_labels
 
+    def predict(self, image_path):
+        preds = self._infer(Image.open(image_path))
+        return self._scores_to_tags(preds)
 
-def build_response(image_path, tagger):
+    def predict_video(self, video_path, n=VIDEO_FRAME_SAMPLES):
+        """Sample n frames, take per-tag max score across frames, then threshold.
+
+        Max-pooling preserves scene-specific tags: a tag passes if it's confident
+        in *any* frame, so a multi-scene video keeps the union of what each
+        scene contains. For rating, the strongest per-frame rating wins (an
+        explicit moment isn't diluted by SFW frames).
+        """
+        duration = get_video_duration(video_path)
+        if not duration or duration <= 0:
+            raise RuntimeError("Could not determine video duration (ffprobe missing or unreadable file)")
+
+        timestamps = sample_video_timestamps(duration, n)
+        score_max = None
+        sampled = []
+        for t in timestamps:
+            frame = extract_frame(video_path, t)
+            if frame is None:
+                continue
+            scores = self._infer(frame)
+            score_max = scores if score_max is None else np.maximum(score_max, scores)
+            sampled.append(t)
+
+        if not sampled:
+            raise RuntimeError("Failed to decode any frames from video")
+
+        return self._scores_to_tags(score_max), sampled
+
+
+def build_response(media_path, tagger):
     """Run inference and return (tags, meta) dict."""
-    if not image_path or not os.path.isfile(image_path):
-        return {"tags": [], "meta": {"error": f"File not found: {image_path}"}}
+    if not media_path or not os.path.isfile(media_path):
+        return {"tags": [], "meta": {"error": f"File not found: {media_path}"}}
 
+    extra_meta = {}
     try:
-        general_tags, character_tags, top_rating, rating_scores = tagger.predict(image_path)
+        if is_video(media_path):
+            (general_tags, character_tags, top_rating, rating_scores), sampled = tagger.predict_video(media_path)
+            extra_meta["video_frames_sampled"] = len(sampled)
+            extra_meta["video_frame_timestamps"] = [round(t, 2) for t in sampled]
+        else:
+            general_tags, character_tags, top_rating, rating_scores = tagger.predict(media_path)
     except Exception as e:
         return {"tags": [], "meta": {"error": str(e)}}
 
@@ -220,6 +313,7 @@ def build_response(image_path, tagger):
         "character_threshold": CHARACTER_THRESHOLD,
         "tag_count": len(tags),
     }
+    meta.update(extra_meta)
 
     return {"tags": tags, "meta": meta}
 

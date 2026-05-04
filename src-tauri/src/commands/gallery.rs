@@ -7,10 +7,12 @@ use tauri::Emitter;
 use crate::cache::atlas::ThumbAtlas;
 use crate::cache::db::CacheDb;
 use crate::companion::schema::MediaType;
+use crate::pipeline::exif;
 use crate::provider::local::LocalProvider;
 use crate::provider::{FileEntry, ProviderType};
 use crate::util::fs_watch::FsWatcher;
 use crate::AppState;
+use rayon::prelude::*;
 
 #[derive(Debug, Serialize)]
 pub struct GalleryOpenResult {
@@ -103,6 +105,64 @@ fn populate_media_meta(
     }
 
     tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read EXIF GPS for every image still missing it and write the result into
+/// `media_meta`. Runs in parallel via rayon; per-file failures are silent.
+/// Skipped for videos — those flow through `populate_video_metadata`/ffprobe.
+fn backfill_gps_meta(db: &CacheDb) -> Result<(), String> {
+    let candidates: Vec<String> = {
+        let mut stmt = db
+            .conn()
+            .prepare_cached(
+                "SELECT path FROM media_meta
+                 WHERE gps_lat IS NULL AND media_type = 'image'",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    log::info!("Extracting EXIF GPS for {} images", candidates.len());
+
+    let extracted: Vec<(String, f64, f64)> = candidates
+        .par_iter()
+        .filter_map(|path| {
+            exif::extract_location(Path::new(path))
+                .map(|loc| (path.clone(), loc.lat, loc.lon))
+        })
+        .collect();
+
+    if extracted.is_empty() {
+        return Ok(());
+    }
+
+    let conn = db.conn();
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "UPDATE media_meta SET gps_lat = ?1, gps_lon = ?2 WHERE path = ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        for (path, lat, lon) in &extracted {
+            let _ = stmt.execute(rusqlite::params![lat, lon, path]);
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    log::info!(
+        "EXIF GPS backfill: {}/{} images had coordinates",
+        extracted.len(),
+        candidates.len()
+    );
     Ok(())
 }
 
@@ -442,6 +502,12 @@ pub async fn open_gallery(
 
     // Populate media_meta table so sorting works immediately
     populate_media_meta(&cache_db, &entries)?;
+
+    // Best-effort EXIF GPS backfill — only touches rows where gps_lat IS NULL,
+    // so subsequent opens of the same gallery skip already-extracted files.
+    if let Err(e) = backfill_gps_meta(&cache_db) {
+        log::warn!("GPS backfill failed: {}", e);
+    }
 
     // Re-index all companion files so the tag_index and tag_counts tables
     // reflect what's on disk.  This makes tags from previous sessions (and

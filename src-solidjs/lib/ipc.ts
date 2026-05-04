@@ -215,6 +215,40 @@ export const applyFilter = (query: string) =>
 export const clearFilter = () => invoke<string[]>("clear_filter");
 
 // ---------------------------------------------------------------------------
+// Geo / map view
+// ---------------------------------------------------------------------------
+
+export interface GeoBbox {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
+}
+
+export interface GeoCluster {
+  lat: number;
+  lon: number;
+  count: number;
+  sample_path: string;
+}
+
+export interface GeoQueryResult {
+  clusters: GeoCluster[];
+  total: number;
+}
+
+export const getGeoPoints = (
+  bbox: GeoBbox,
+  zoom: number,
+  filter?: string,
+) => invoke<GeoQueryResult>("get_geo_points", { bbox, zoom, filter });
+
+export const getGeoPaths = (
+  bbox: GeoBbox,
+  filter?: string,
+) => invoke<string[]>("get_geo_paths", { bbox, filter });
+
+// ---------------------------------------------------------------------------
 // Autocomplete
 // ---------------------------------------------------------------------------
 

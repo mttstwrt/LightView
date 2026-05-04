@@ -28,11 +28,12 @@ const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 // Timeline data for scrollbar
 const [timeline, setTimeline] = createSignal<TimelineEntry[]>([]);
 
-// Active filter query string (empty = no filter)
-const [activeFilterQuery, setActiveFilterQuery] = createSignal("");
-
 // Selected items (multi-select)
 const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
+
+// View mode: grid (default) vs map (geographic browsing).
+export type ViewMode = "grid" | "map";
+const [viewMode, setViewMode] = createSignal<ViewMode>("grid");
 
 export {
   galleryPath, setGalleryPath,
@@ -44,8 +45,8 @@ export {
   sortedItems, setSortedItems,
   groups, setGroups,
   timeline, setTimeline,
-  activeFilterQuery, setActiveFilterQuery,
   selectedPaths, setSelectedPaths,
+  viewMode, setViewMode,
 };
 
 // ---------------------------------------------------------------------------
