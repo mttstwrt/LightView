@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::Emitter;
@@ -8,8 +9,7 @@ use tauri::Emitter;
 use crate::companion::reader;
 use crate::companion::schema::{CompanionFile, MediaType};
 use crate::companion::writer;
-use crate::plugin::daemon::DaemonPool;
-use crate::plugin::manifest::{ExecutionConfig, PluginManifest};
+use crate::plugin::manifest::PluginManifest;
 use crate::plugin::runner;
 use crate::AppState;
 
@@ -22,7 +22,6 @@ pub struct PluginInfo {
     pub tag_prefix: String,
 }
 
-/// Result of running a plugin on a single file.
 #[derive(Debug, Serialize)]
 pub struct PluginRunResult {
     pub path: String,
@@ -35,11 +34,8 @@ fn plugin_dir() -> std::path::PathBuf {
     crate::util::paths::data_dir().join("plugins")
 }
 
-/// List all discovered plugins.
 #[tauri::command]
-pub async fn list_plugins(
-    _state: tauri::State<'_, AppState>,
-) -> Result<Vec<PluginInfo>, String> {
+pub async fn list_plugins(_state: tauri::State<'_, AppState>) -> Result<Vec<PluginInfo>, String> {
     let dir = plugin_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -66,7 +62,6 @@ pub async fn list_plugins(
     Ok(plugins)
 }
 
-/// Read or create a companion file for the given media path.
 fn get_or_create_companion(media_path: &Path) -> Result<CompanionFile, String> {
     match reader::read_companion_optional(media_path).map_err(|e| e.to_string())? {
         Some(c) => Ok(c),
@@ -85,7 +80,37 @@ fn get_or_create_companion(media_path: &Path) -> Result<CompanionFile, String> {
     }
 }
 
-/// Run a plugin on a single media file.
+/// Apply a single plugin result to disk and the tag index.
+/// Returns (tags_added, success, error_message).
+async fn apply_result(
+    result: &runner::PluginResult,
+    manifest: &PluginManifest,
+    cache_db: &Arc<tokio::sync::Mutex<Option<crate::cache::db::CacheDb>>>,
+) -> (Vec<String>, bool, Option<String>) {
+    if let Some(err) = &result.error {
+        return (vec![], false, Some(err.clone()));
+    }
+
+    let media = Path::new(&result.path);
+    let mut companion = match get_or_create_companion(media) {
+        Ok(c) => c,
+        Err(e) => return (vec![], false, Some(e)),
+    };
+
+    runner::apply_plugin_output(&mut companion, manifest, &result.tags, result.meta.as_ref());
+
+    if let Err(e) = writer::write_companion(media, &mut companion) {
+        return (vec![], false, Some(e.to_string()));
+    }
+
+    let db = cache_db.lock().await;
+    if let Some(db) = db.as_ref() {
+        let _ = db.reindex_tags_for_file(&result.path, &companion);
+    }
+
+    (result.tags.clone(), true, None)
+}
+
 #[tauri::command]
 pub async fn run_plugin(
     state: tauri::State<'_, AppState>,
@@ -97,106 +122,41 @@ pub async fn run_plugin(
     let (manifest, plugin_path) =
         runner::find_plugin(&dir, &plugin_name).map_err(|e| e.to_string())?;
 
-    let media = Path::new(&media_path);
+    let requests = vec![runner::PluginRequest {
+        action,
+        path: media_path.clone(),
+    }];
 
-    let output = runner::run_cli_plugin(&manifest, &plugin_path, &media_path, &action, &[])
+    let mut running = runner::run_plugin_stream(&manifest, &plugin_path, requests)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Check if the plugin reported an error via meta
-    if output.tags.is_empty() {
-        if let Some(ref meta) = output.meta {
-            if let Some(err) = meta.get("error").and_then(|v| v.as_str()) {
-                return Ok(PluginRunResult {
-                    path: media_path,
-                    tags_added: vec![],
-                    success: false,
-                    error: Some(err.to_string()),
-                });
-            }
-        }
-    }
+    let result = running
+        .results
+        .recv()
+        .await
+        .ok_or_else(|| "Plugin produced no output".to_string())?;
+    let _ = running.finish().await;
 
-    // App handles all companion file I/O
-    let mut companion = get_or_create_companion(media)?;
-    runner::apply_plugin_output(&mut companion, &manifest, &output);
-    writer::write_companion(media, &mut companion).map_err(|e| e.to_string())?;
+    let (tags_added, ok, err) = apply_result(&result, &manifest, &state.cache_db).await;
 
-    // Update the tag index and rebuild counts so autocomplete picks up plugin tags
+    // Refresh autocomplete since tag counts may have changed.
     let db = state.cache_db.lock().await;
     if let Some(db) = db.as_ref() {
-        let _ = db.reindex_tags_for_file(&media_path, &companion);
         let _ = db.rebuild_tag_counts();
         if let Ok(counts) = db.query_all_tag_counts() {
             state.autocomplete.refresh(counts).await;
         }
     }
 
-    let tags_added = output.tags.clone();
     Ok(PluginRunResult {
-        path: media_path,
+        path: result.path,
         tags_added,
-        success: true,
-        error: None,
+        success: ok,
+        error: err,
     })
 }
 
-/// Process a single plugin result: write companion file, reindex tags, track stats.
-/// Returns (path, tags_added, success, error) for progress reporting.
-async fn handle_plugin_result(
-    media_path: &str,
-    res: Result<runner::PluginOutput, String>,
-    manifest: &PluginManifest,
-    cache_db: &Arc<tokio::sync::Mutex<Option<crate::cache::db::CacheDb>>>,
-    succeeded: &mut usize,
-    failed: &mut usize,
-) -> (String, Vec<String>, bool, Option<String>) {
-    match res {
-        Ok(output) => {
-            // Check if the plugin reported an error via meta (returns empty tags
-            // with error details buried in meta instead of failing outright).
-            if output.tags.is_empty() {
-                if let Some(ref meta) = output.meta {
-                    if let Some(err) = meta.get("error").and_then(|v| v.as_str()) {
-                        *failed += 1;
-                        return (media_path.to_string(), vec![], false, Some(err.to_string()));
-                    }
-                }
-            }
-
-            let media = Path::new(media_path);
-            let companion_result = get_or_create_companion(media).and_then(|mut companion| {
-                runner::apply_plugin_output(&mut companion, manifest, &output);
-                writer::write_companion(media, &mut companion).map_err(|e| e.to_string())?;
-                Ok((output.tags.clone(), companion))
-            });
-
-            match companion_result {
-                Ok((tags, companion)) => {
-                    let db = cache_db.lock().await;
-                    if let Some(db) = db.as_ref() {
-                        let _ = db.reindex_tags_for_file(media_path, &companion);
-                    }
-                    *succeeded += 1;
-                    (media_path.to_string(), tags, true, None)
-                }
-                Err(e) => {
-                    *failed += 1;
-                    (media_path.to_string(), vec![], false, Some(e))
-                }
-            }
-        }
-        Err(e) => {
-            *failed += 1;
-            (media_path.to_string(), vec![], false, Some(e))
-        }
-    }
-}
-
-/// Default maximum number of plugin subprocesses to run concurrently in a batch.
-const DEFAULT_PLUGIN_BATCH_CONCURRENCY: usize = 4;
-
-/// Per-file progress event emitted to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginProgressEvent {
     pub completed: usize,
@@ -207,7 +167,6 @@ pub struct PluginProgressEvent {
     pub error: Option<String>,
 }
 
-/// Final summary event emitted when the batch completes.
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginDoneEvent {
     pub succeeded: usize,
@@ -215,20 +174,18 @@ pub struct PluginDoneEvent {
     pub cancelled: bool,
 }
 
-/// Cancel any running plugin batch.
 #[tauri::command]
 pub async fn cancel_plugin_batch(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.plugin_cancelled.store(true, Ordering::Relaxed);
     Ok(())
 }
 
-/// Run a plugin on a batch of media files with configurable concurrency.
+/// Run a plugin on a batch of media files.
 ///
-/// Returns immediately and runs the batch in the background. Progress is
-/// reported via `plugin:progress` events and completion via `plugin:done`.
-/// Events emitted from within a synchronous `#[tauri::command]` handler are
-/// buffered until the command returns, so we must spawn the work as a
-/// separate task to get real-time delivery.
+/// Spawns one plugin subprocess, streams every path to it as NDJSON, and
+/// forwards each streamed result back to the frontend as a `plugin:progress`
+/// event. The plugin itself decides how to batch and parallelise. The host
+/// just applies results to companion files in arrival order.
 #[tauri::command]
 pub async fn run_plugin_batch(
     state: tauri::State<'_, AppState>,
@@ -236,171 +193,96 @@ pub async fn run_plugin_batch(
     plugin_name: String,
     media_paths: Vec<String>,
     action: String,
-    max_concurrent: Option<usize>,
-    onnx_threads: Option<usize>,
 ) -> Result<(), String> {
-    // Reset cancellation flag at the start of a new batch.
     state.plugin_cancelled.store(false, Ordering::Relaxed);
-
-    let concurrency = max_concurrent
-        .unwrap_or(DEFAULT_PLUGIN_BATCH_CONCURRENCY)
-        .max(1);
-
-    log::info!(
-        "Plugin batch: {} files, concurrency={} (raw={:?}), onnx_threads={:?}",
-        media_paths.len(),
-        concurrency,
-        max_concurrent,
-        onnx_threads,
-    );
-
-    let extra_env: Vec<(String, String)> = match onnx_threads {
-        Some(n) => vec![("ONNX_THREADS".to_string(), n.max(1).to_string())],
-        None => vec![],
-    };
 
     let dir = plugin_dir();
     let (manifest, plugin_path) =
         runner::find_plugin(&dir, &plugin_name).map_err(|e| e.to_string())?;
 
+    log::info!("Plugin batch: {} files for {}", media_paths.len(), manifest.name);
+
     let cancelled = state.plugin_cancelled.clone();
     let cache_db = state.cache_db.clone();
     let autocomplete = state.autocomplete.clone();
 
-    // Check if the plugin supports daemon mode
-    let supports_daemon = matches!(
-        &manifest.execution,
-        ExecutionConfig::Cli { daemon: true, .. }
-    );
-
-    // Spawn the batch as a separate async task so events are delivered in real-time.
     tauri::async_runtime::spawn(async move {
-        use futures::stream::{self, StreamExt};
-
         let total = media_paths.len();
+        let requests: Vec<runner::PluginRequest> = media_paths
+            .into_iter()
+            .map(|path| runner::PluginRequest {
+                action: action.clone(),
+                path,
+            })
+            .collect();
+
+        let mut running = match runner::run_plugin_stream(&manifest, &plugin_path, requests).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("Failed to start plugin '{}': {}", manifest.name, e);
+                let _ = app_handle.emit(
+                    "plugin:done",
+                    PluginDoneEvent {
+                        succeeded: 0,
+                        failed: total,
+                        cancelled: false,
+                    },
+                );
+                return;
+            }
+        };
+
         let mut completed: usize = 0;
         let mut succeeded: usize = 0;
         let mut failed: usize = 0;
         let mut was_cancelled = false;
 
-        // If daemon mode is supported, start a pool of daemon instances.
-        // The pool size is controlled by the concurrency parameter — each
-        // daemon instance holds its own copy of the ONNX model in VRAM,
-        // enabling true parallel inference across CUDA streams.
-        // The pool is dropped when the batch completes, which closes stdin
-        // on each subprocess and lets the Python processes exit cleanly.
-        let pool: Option<DaemonPool> = if supports_daemon {
-            match DaemonPool::start(&manifest, &plugin_path, &extra_env, concurrency).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    log::warn!("Failed to start daemon pool for {}, falling back to CLI: {}", manifest.name, e);
-                    None
+        // Poll the cancellation flag on a timer so cancellation is responsive
+        // even when the plugin is mid-batch and producing no output.
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+
+        loop {
+            tokio::select! {
+                maybe = running.results.recv() => {
+                    let Some(result) = maybe else { break; };
+
+                    completed += 1;
+                    let (tags_added, ok, err) =
+                        apply_result(&result, &manifest, &cache_db).await;
+                    if ok {
+                        succeeded += 1;
+                    } else {
+                        failed += 1;
+                    }
+
+                    let _ = app_handle.emit(
+                        "plugin:progress",
+                        PluginProgressEvent {
+                            completed,
+                            total,
+                            path: result.path.clone(),
+                            tags_added,
+                            success: ok,
+                            error: err,
+                        },
+                    );
                 }
-            }
-        } else {
-            None
-        };
-
-        // Two execution paths: daemon pool (concurrent round-robin)
-        // or legacy CLI (concurrent subprocesses).
-        if let Some(pool) = pool {
-            // Daemon pool path: fan out requests across pool instances.
-            // buffer_unordered ensures at most pool.size() requests in flight,
-            // matching the number of daemon processes available.
-            let pool_concurrency = pool.size();
-            let pool = Arc::new(pool);
-            let pool_ref = pool.clone();
-            let mut result_stream = stream::iter(media_paths.into_iter().map(move |media_path| {
-                let pool = pool_ref.clone();
-                async move {
-                    let res = pool.request(&media_path).await.map_err(|e| e.to_string());
-                    (media_path, res)
+                _ = tick.tick() => {
+                    if cancelled.load(Ordering::Relaxed) {
+                        was_cancelled = true;
+                        break;
+                    }
                 }
-            }))
-            .buffer_unordered(pool_concurrency);
-
-            while let Some((media_path, res)) = result_stream.next().await {
-                if cancelled.load(Ordering::Relaxed) {
-                    was_cancelled = true;
-                    break;
-                }
-
-                completed += 1;
-
-                let (progress_path, progress_tags, progress_ok, progress_err) =
-                    handle_plugin_result(
-                        &media_path,
-                        res,
-                        &manifest,
-                        &cache_db,
-                        &mut succeeded,
-                        &mut failed,
-                    )
-                    .await;
-
-                let _ = app_handle.emit(
-                    "plugin:progress",
-                    PluginProgressEvent {
-                        completed,
-                        total,
-                        path: progress_path,
-                        tags_added: progress_tags,
-                        success: progress_ok,
-                        error: progress_err,
-                    },
-                );
-            }
-        } else {
-            // Legacy CLI path: concurrent subprocesses
-            let mut result_stream = stream::iter(media_paths.into_iter().map(|media_path| {
-                let manifest = &manifest;
-                let plugin_path = &plugin_path;
-                let action = &action;
-                let extra_env = &extra_env;
-                async move {
-                    let res =
-                        runner::run_cli_plugin(manifest, plugin_path, &media_path, action, extra_env)
-                            .await
-                            .map_err(|e| e.to_string());
-                    (media_path, res)
-                }
-            }))
-            .buffer_unordered(concurrency);
-
-            while let Some((media_path, res)) = result_stream.next().await {
-                if cancelled.load(Ordering::Relaxed) {
-                    was_cancelled = true;
-                    break;
-                }
-
-                completed += 1;
-
-                let (progress_path, progress_tags, progress_ok, progress_err) =
-                    handle_plugin_result(
-                        &media_path,
-                        res,
-                        &manifest,
-                        &cache_db,
-                        &mut succeeded,
-                        &mut failed,
-                    )
-                    .await;
-
-                let _ = app_handle.emit(
-                    "plugin:progress",
-                    PluginProgressEvent {
-                        completed,
-                        total,
-                        path: progress_path,
-                        tags_added: progress_tags,
-                        success: progress_ok,
-                        error: progress_err,
-                    },
-                );
             }
         }
 
-        // Rebuild tag counts once after all files processed
+        if was_cancelled {
+            running.kill().await;
+        } else {
+            let _ = running.finish().await;
+        }
+
+        // Rebuild tag counts once at the end.
         let db = cache_db.lock().await;
         if let Some(db) = db.as_ref() {
             let _ = db.rebuild_tag_counts();
@@ -439,7 +321,6 @@ pub async fn install_plugin(
     std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
 
     if source.is_dir() {
-        // Install from a plugin directory (must have manifest.json)
         let manifest_path = source.join("manifest.json");
         if !manifest_path.exists() {
             return Err("Plugin directory must contain a manifest.json".to_string());
@@ -447,16 +328,11 @@ pub async fn install_plugin(
         let manifest = PluginManifest::load(&manifest_path).map_err(|e| e.to_string())?;
         let target = dest_dir.join(&manifest.name);
 
-        // Copy the directory but skip venv directories (they contain symlinks
-        // and hardcoded paths that break when relocated).
         copy_dir_filtered(source, &target, &|name: &str| {
             name == ".venv" || name == "venv" || name == "__pycache__"
         })
         .map_err(|e| e.to_string())?;
 
-        // If the manifest references a venv-relative python ({plugin_dir}/.venv/...),
-        // resolve it to the absolute path of the *source* venv's interpreter so the
-        // installed plugin can still run without a copied venv.
         rewrite_manifest_python(&target.join("manifest.json"), source)?;
 
         Ok(PluginInfo {
@@ -467,9 +343,6 @@ pub async fn install_plugin(
             tag_prefix: manifest.tag_prefix,
         })
     } else if source.extension().and_then(|e| e.to_str()) == Some("py") {
-        // Install a single Python file — auto-generate a manifest.
-        // If a venv exists next to the source file, use its Python interpreter
-        // so that plugin dependencies are available at runtime.
         let stem = source
             .file_stem()
             .and_then(|s| s.to_str())
@@ -478,22 +351,18 @@ pub async fn install_plugin(
         let target = dest_dir.join(&plugin_name);
         std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
 
-        // Copy the Python file
         let dest_script = target.join(source.file_name().unwrap());
         std::fs::copy(source, &dest_script).map_err(|e| e.to_string())?;
 
-        // Copy requirements.txt if present next to the source
         let source_dir = source.parent().unwrap_or(Path::new("."));
         let req_source = source_dir.join("requirements.txt");
         if req_source.exists() {
             let _ = std::fs::copy(&req_source, target.join("requirements.txt"));
         }
 
-        // Detect a venv next to the source file and use its absolute Python path
         let python_command = detect_venv_python(source_dir)
             .unwrap_or_else(|| "python3".to_string());
 
-        // Generate manifest
         let script_name = source
             .file_name()
             .and_then(|n| n.to_str())
@@ -507,7 +376,6 @@ pub async fn install_plugin(
                 "type": "cli",
                 "command": python_command,
                 "args": [format!("{{plugin_dir}}/{}", script_name)],
-                "timeout_seconds": 120
             },
             "capabilities": ["read_image"],
             "tag_prefix": plugin_name,
@@ -530,14 +398,8 @@ pub async fn install_plugin(
 }
 
 /// Look for a Python venv in `dir` and return the absolute path to its interpreter.
-/// Checks `.venv/bin/python` and `venv/bin/python`.
-///
-/// NOTE: We must NOT canonicalize/resolve symlinks here. Python venvs work by
-/// having `bin/python` be a symlink inside the venv directory — Python uses the
-/// symlink's location to discover `lib/pythonX.Y/site-packages`. Resolving to
-/// the system Python binary would lose the venv's package context.
+/// NOTE: Don't canonicalize — Python venvs work via symlink location.
 fn detect_venv_python(dir: &Path) -> Option<String> {
-    // Make sure `dir` is absolute so the resulting path works from any cwd.
     let abs_dir = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
@@ -552,7 +414,6 @@ fn detect_venv_python(dir: &Path) -> Option<String> {
     None
 }
 
-/// Recursively copy a directory, skipping entries whose name matches `skip`.
 fn copy_dir_filtered(
     src: &Path,
     dst: &Path,
@@ -574,7 +435,6 @@ fn copy_dir_filtered(
         if file_type.is_dir() {
             copy_dir_filtered(&entry.path(), &dest_path, skip)?;
         } else if file_type.is_symlink() {
-            // Reproduce symlinks instead of following them
             let link_target = std::fs::read_link(entry.path())?;
             #[cfg(unix)]
             std::os::unix::fs::symlink(&link_target, &dest_path)?;
@@ -585,8 +445,6 @@ fn copy_dir_filtered(
     Ok(())
 }
 
-/// Rewrite a copied manifest's command to use the absolute path of the source
-/// venv's Python interpreter, since venvs are not copied.
 fn rewrite_manifest_python(manifest_path: &Path, source_dir: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(manifest_path).map_err(|e| e.to_string())?;
     let mut doc: serde_json::Value =

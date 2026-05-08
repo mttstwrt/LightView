@@ -8,8 +8,7 @@
   "execution": {
     "type": "cli",
     "command": "python3",
-    "args": ["{plugin_dir}/tagger.py"],
-    "timeout_seconds": 30
+    "args": ["{plugin_dir}/tagger.py"]
   },
   "capabilities": ["read_image"],
   "tag_prefix": "example",

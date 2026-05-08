@@ -148,8 +148,7 @@ export function ContextMenu(props: ContextMenuProps) {
           },
         );
 
-        const { max_concurrent, onnx_threads } = settings().plugins;
-        runPluginBatch(pluginName, paths, "tag", max_concurrent, onnx_threads).catch((err) => {
+        runPluginBatch(pluginName, paths, "tag").catch((err) => {
           console.error("Plugin batch failed to start:", err);
           unlistenProgress();
           unlistenDone();

@@ -8,9 +8,7 @@
   "execution": {
     "type": "cli",
     "command": "{plugin_dir}/.venv/bin/python",
-    "args": ["{plugin_dir}/wd_tagger.py"],
-    "timeout_seconds": 120,
-    "daemon": true
+    "args": ["{plugin_dir}/wd_tagger.py"]
   },
   "capabilities": ["read_image", "network_access"],
   "tag_prefix": "wd",

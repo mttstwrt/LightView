@@ -19,10 +19,6 @@ const DEFAULT_SETTINGS: AppSettings = {
     lru_cache_size: 5,
     thumbnail_threads: 6,
   },
-  plugins: {
-    max_concurrent: 4,
-    onnx_threads: 2,
-  },
   storage: {
     companion_location: "lightview_folder",
   },

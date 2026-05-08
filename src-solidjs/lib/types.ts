@@ -184,10 +184,6 @@ export interface AppSettings {
     lru_cache_size: number;
     thumbnail_threads: number;
   };
-  plugins: {
-    max_concurrent: number;
-    onnx_threads: number;
-  };
   storage: {
     companion_location: CompanionLocation;
   };

@@ -302,9 +302,7 @@ export const runPluginBatch = (
   pluginName: string,
   mediaPaths: string[],
   action: string,
-  maxConcurrent?: number,
-  onnxThreads?: number,
-) => invoke<void>("run_plugin_batch", { pluginName, mediaPaths, action, maxConcurrent, onnxThreads });
+) => invoke<void>("run_plugin_batch", { pluginName, mediaPaths, action });
 
 export const cancelPluginBatch = () => invoke<void>("cancel_plugin_batch");
 

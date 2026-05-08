@@ -2,16 +2,12 @@
 """
 Example auto-tagger plugin for LightView.
 
-Protocol:
-  - Reads a JSON object from stdin with fields:
-      action:     str — the action to perform (e.g. "tag")
-      media_path: str — absolute path to the media file
-  - Writes a JSON object to stdout with fields:
-      tags: list[str]   — tags to assign under this plugin's namespace
-      meta: dict | null — optional metadata to store alongside tags
+Streaming protocol (newline-delimited JSON):
+  Stdin:  {"action": "tag", "path": "/abs/path/img.jpg"}\n  ...
+  Stdout: {"path": "...", "tags": [...], "meta": {...}}\n   ...
 
-The plugin never reads or writes companion files — the host app handles
-all file I/O, batching, and index updates.
+The plugin reads stdin to EOF and writes one result per request. The host
+handles all companion-file I/O, batching, and index updates.
 """
 
 import json
@@ -19,34 +15,40 @@ import os
 import sys
 
 
-def main():
-    raw = sys.stdin.read()
-    request = json.loads(raw)
-
+def handle(request):
+    path = request.get("path", "")
     action = request.get("action", "tag")
-    media_path = request.get("media_path", "")
 
-    if action == "tag":
-        # Always add the "example" tag.
-        # A real plugin would analyse the image here (EXIF, ML model, etc.).
-        tags = ["example"]
+    if action != "tag":
+        return {"path": path, "tags": [], "error": f"Unknown action: {action}"}
 
-        # Derive a simple filename-based tag as a bonus demonstration.
-        basename = os.path.splitext(os.path.basename(media_path))[0].lower()
-        tags.append(f"file:{basename}")
+    tags = ["example"]
+    basename = os.path.splitext(os.path.basename(path))[0].lower()
+    tags.append(f"file:{basename}")
 
-        result = {
-            "tags": tags,
-            "meta": {
-                "source": "example-auto-tagger",
-                "note": "This tag was added by the example plugin.",
-            },
-        }
-    else:
-        # Unknown action — return empty output.
-        result = {"tags": [], "meta": None}
+    return {
+        "path": path,
+        "tags": tags,
+        "meta": {
+            "source": "example-auto-tagger",
+            "note": "This tag was added by the example plugin.",
+        },
+    }
 
-    json.dump(result, sys.stdout)
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as e:
+            sys.stdout.write(json.dumps({"path": "", "tags": [], "error": f"Invalid JSON: {e}"}) + "\n")
+            sys.stdout.flush()
+            continue
+        sys.stdout.write(json.dumps(handle(request)) + "\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

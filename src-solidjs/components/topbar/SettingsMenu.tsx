@@ -68,16 +68,6 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     }));
   };
 
-  const updatePlugins = <K extends keyof AppSettings["plugins"]>(
-    key: K,
-    value: AppSettings["plugins"][K],
-  ) => {
-    setSettings((prev) => ({
-      ...prev,
-      plugins: { ...prev.plugins, [key]: value },
-    }));
-  };
-
   const updateStorage = <K extends keyof AppSettings["storage"]>(
     key: K,
     value: AppSettings["storage"][K],
@@ -199,12 +189,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     // Fire-and-forget — the backend runs the batch in a background task
     // and reports progress/completion via events.
     try {
-      const s = settings();
-      await runPluginBatch(
-        pluginName, paths, "tag",
-        s.plugins.max_concurrent,
-        s.plugins.onnx_threads,
-      );
+      await runPluginBatch(pluginName, paths, "tag");
     } catch (e) {
       console.error("Plugin batch launch failed:", e);
       setPluginStatus("Run failed");
@@ -425,38 +410,6 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
               <Show when={pluginStatus()}>
                 <span class="text-xs text-neutral-400">{pluginStatus()}</span>
               </Show>
-
-              {/* Resource limits */}
-              <Field label="Max concurrent processes">
-                <div class="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min="1"
-                    max="16"
-                    value={settings().plugins.max_concurrent}
-                    onInput={(e) => updatePlugins("max_concurrent", parseInt(e.currentTarget.value))}
-                    class="flex-1 h-1 accent-teal-500"
-                  />
-                  <span class="text-xs text-neutral-400 w-5 text-right font-mono">
-                    {settings().plugins.max_concurrent}
-                  </span>
-                </div>
-              </Field>
-              <Field label="ONNX threads per process">
-                <div class="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min="1"
-                    max="8"
-                    value={settings().plugins.onnx_threads}
-                    onInput={(e) => updatePlugins("onnx_threads", parseInt(e.currentTarget.value))}
-                    class="flex-1 h-1 accent-teal-500"
-                  />
-                  <span class="text-xs text-neutral-400 w-5 text-right font-mono">
-                    {settings().plugins.onnx_threads}
-                  </span>
-                </div>
-              </Field>
 
               <div class="flex gap-1">
                 <button

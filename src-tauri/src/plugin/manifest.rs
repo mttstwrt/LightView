@@ -21,12 +21,6 @@ pub enum ExecutionConfig {
     Cli {
         command: String,
         args: Vec<String>,
-        timeout_seconds: Option<u64>,
-        /// When true, the plugin supports `--daemon` mode: launched once, kept
-        /// resident, and communicated with via NDJSON on stdin/stdout.
-        /// This eliminates per-image process startup and model loading overhead.
-        #[serde(default)]
-        daemon: bool,
     },
     #[serde(rename = "wasm")]
     Wasm {
@@ -60,7 +54,6 @@ pub struct ContextMenuItem {
 }
 
 impl PluginManifest {
-    /// Load a manifest from a JSON file path.
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = std::fs::read_to_string(path)?;
         let manifest: Self = serde_json::from_str(&contents)?;
