@@ -36,3 +36,16 @@ pub async fn find_duplicates(
         groups,
     })
 }
+
+/// Mark a set of paths as confirmed non-duplicates. Every pair within the
+/// set is recorded so future `find_duplicates` runs skip the union for those
+/// pairs and the group stays dismissed.
+#[tauri::command]
+pub async fn mark_not_duplicates(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<usize, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    db.mark_not_duplicates(&paths).map_err(|e| e.to_string())
+}

@@ -131,6 +131,8 @@ impl CacheDb {
 
     /// Find groups of visually similar images based on perceptual hash.
     /// `threshold` is the maximum hamming distance to consider a match (0 = exact, 10 = loose).
+    /// Pairs that the user has explicitly marked as "not duplicates" are skipped
+    /// during union, so groups the user has already triaged stay dismissed.
     pub fn find_duplicates(&self, threshold: u32) -> Result<Vec<DuplicateGroup>, rusqlite::Error> {
         let mut stmt = self
             .conn()
@@ -143,6 +145,16 @@ impl CacheDb {
             })?
             .filter_map(|r| r.ok())
             .collect();
+
+        let excluded_pairs: std::collections::HashSet<(String, String)> = {
+            let mut not_dup_stmt = self
+                .conn()
+                .prepare("SELECT path_a, path_b FROM not_duplicates")?;
+            not_dup_stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
 
         // Union-Find for grouping
         let n = entries.len();
@@ -169,6 +181,14 @@ impl CacheDb {
         for i in 0..n {
             for j in (i + 1)..n {
                 if hamming_distance(entries[i].1, entries[j].1) <= threshold {
+                    let (a, b) = if entries[i].0 < entries[j].0 {
+                        (&entries[i].0, &entries[j].0)
+                    } else {
+                        (&entries[j].0, &entries[i].0)
+                    };
+                    if excluded_pairs.contains(&(a.clone(), b.clone())) {
+                        continue;
+                    }
                     union(&mut parent, i, j);
                 }
             }
@@ -234,5 +254,37 @@ impl CacheDb {
             .collect();
 
         Ok(result)
+    }
+
+    /// Persist every pair-wise combination of the supplied paths as
+    /// "not duplicates" so future scans skip them. Pairs are stored
+    /// canonically (smaller path first) and dedupe on conflict.
+    ///
+    /// Note: a third image that is perceptually close to two excluded
+    /// items can still bridge them through the union step. The user can
+    /// dismiss the resulting group again to add the missing pairs.
+    pub fn mark_not_duplicates(&self, paths: &[String]) -> Result<usize, rusqlite::Error> {
+        if paths.len() < 2 {
+            return Ok(0);
+        }
+        let tx = self.conn().unchecked_transaction()?;
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO not_duplicates (path_a, path_b) VALUES (?1, ?2)",
+            )?;
+            for i in 0..paths.len() {
+                for j in (i + 1)..paths.len() {
+                    let (a, b) = if paths[i] < paths[j] {
+                        (&paths[i], &paths[j])
+                    } else {
+                        (&paths[j], &paths[i])
+                    };
+                    inserted += stmt.execute(rusqlite::params![a, b])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 }

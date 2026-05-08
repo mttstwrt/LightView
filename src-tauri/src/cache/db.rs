@@ -13,7 +13,7 @@ pub enum CacheError {
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -167,6 +167,18 @@ const MIGRATIONS: &[Migration] = &[
                 WHERE gps_lat IS NOT NULL;
         ",
     },
+    // v8: User-confirmed non-duplicate pairs. Pairs are stored with
+    // path_a < path_b so order is canonical and lookups are simple.
+    Migration {
+        version: 8,
+        sql: "
+            CREATE TABLE IF NOT EXISTS not_duplicates (
+                path_a  TEXT NOT NULL,
+                path_b  TEXT NOT NULL,
+                PRIMARY KEY (path_a, path_b)
+            );
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.
@@ -264,6 +276,20 @@ fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
 
     if !has_gps {
         return 6;
+    }
+
+    // v7 present — check for v8 (not_duplicates table).
+    let has_not_duplicates: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='not_duplicates'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !has_not_duplicates {
+        return 7;
     }
 
     // Everything present — fully up to date.

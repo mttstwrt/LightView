@@ -356,6 +356,9 @@ export interface FindDuplicatesResult {
 export const findDuplicates = (threshold?: number) =>
   invoke<FindDuplicatesResult>("find_duplicates", { threshold });
 
+export const markNotDuplicates = (paths: string[]) =>
+  invoke<number>("mark_not_duplicates", { paths });
+
 // ---------------------------------------------------------------------------
 // Settings / Maintenance
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
-import { findDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
+import { findDuplicates, markNotDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
 import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
 import { setTotalCount } from "../stores/galleryStore";
 import { InfoPanel } from "./viewer/InfoPanel";
@@ -100,6 +100,19 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
       console.error("Duplicate scan failed:", e);
     }
     setScanning(false);
+  };
+
+  const handleNotDuplicates = async (groupIdx: number) => {
+    const group = groups()[groupIdx];
+    if (!group) return;
+    const paths = group.items.map((it) => it.path);
+    try {
+      await markNotDuplicates(paths);
+      setGroups((prev) => prev.filter((_, i) => i !== groupIdx));
+      if (previewGroup() === groupIdx) closePreview();
+    } catch (e) {
+      console.error("Mark not duplicates failed:", e);
+    }
   };
 
   const handleTrash = async (path: string, groupIdx: number) => {
@@ -231,9 +244,18 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
                   class="flex flex-col gap-2 rounded-lg p-3"
                   style={{ background: "rgba(255, 255, 255, 0.02)", border: "1px solid rgba(255,255,255,0.04)" }}
                 >
-                  <span class="text-[11px] uppercase tracking-wider text-neutral-500 font-medium">
-                    Group {groupIdx() + 1} — {group.items.length} images
-                  </span>
+                  <div class="flex items-center justify-between">
+                    <span class="text-[11px] uppercase tracking-wider text-neutral-500 font-medium">
+                      Group {groupIdx() + 1} — {group.items.length} images
+                    </span>
+                    <button
+                      onClick={() => handleNotDuplicates(groupIdx())}
+                      class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
+                      title="Mark these images as not duplicates — they won't be grouped together in future scans"
+                    >
+                      Not duplicates
+                    </button>
+                  </div>
                   <div class="flex gap-2 flex-wrap">
                     <For each={group.items}>
                       {(item, itemIdx) => (

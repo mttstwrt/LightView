@@ -623,6 +623,7 @@ fn main() {
 
             // Duplicate detection
             commands::duplicates::find_duplicates,
+            commands::duplicates::mark_not_duplicates,
 
             // Settings / maintenance commands
             commands::settings::get_hardware_profile,
