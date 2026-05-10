@@ -5,9 +5,6 @@ use lightview_lib::commands;
 use lightview_lib::http_server::{self, HttpConfig};
 use tauri::{AppHandle, Emitter, Manager, UriSchemeResponder};
 
-use memmap2::Mmap;
-use std::io::{Read, Seek, SeekFrom};
-
 
 enum Route {
     /// A tiered thumbnail. The tier defaults to Standard if the URL is
@@ -15,8 +12,6 @@ enum Route {
     Thumb(ThumbTier),
     /// Decoded ThumbHash placeholder served as a tiny PNG.
     ThumbHash,
-    /// Full-resolution media (original file).
-    Media,
     Unknown,
 }
 
@@ -28,7 +23,10 @@ enum Route {
 ///   lightview://thumb/l/<path>       — large   (1024)
 ///   lightview://thumb/p/<path>       — preview (1600, for viewer)
 ///   lightview://thumbhash/<path>     — decoded ThumbHash → PNG
-///   lightview://media/<path>         — full-res media
+///
+/// Full-resolution media is served by the local axum HTTP server (see
+/// `http_server/routes.rs`) — one streaming code path for both `<img>`
+/// and `<video>` elements.
 fn extract_route(uri: &str) -> (Route, &str) {
     for prefix_base in &[
         "lightview://",
@@ -53,9 +51,6 @@ fn extract_route(uri: &str) -> (Route, &str) {
                 }
                 // Legacy form: no tier segment → standard.
                 return (Route::Thumb(ThumbTier::Standard), p);
-            }
-            if let Some(p) = rest.strip_prefix("media/") {
-                return (Route::Media, p);
             }
         }
     }
@@ -259,176 +254,6 @@ fn serve_thumbhash(
         .unwrap()
 }
 
-/// Serve full-resolution media. HEIC/HEIF are transcoded to JPEG.
-/// Supports HTTP Range requests for chunked streaming of large files.
-fn serve_full_media(
-    request: &tauri::http::Request<Vec<u8>>,
-    path: &str,
-) -> tauri::http::Response<Vec<u8>> {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    // HEIC/HEIF: transcode to JPEG since browsers can't render natively.
-    // Transcoded content is served in full (Range not applicable since size is unknown upfront).
-    if ext == "heic" || ext == "heif" {
-        let src_path = std::path::Path::new(path);
-        match lightview_lib::pipeline::heic_cache::get_or_transcode(src_path) {
-            Ok(jpeg_data) => {
-                return tauri::http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "image/jpeg")
-                    .header("Cache-Control", "no-cache")
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(jpeg_data)
-                    .unwrap();
-            }
-            Err(e) => {
-                log::error!("HEIC transcode failed for {}: {}", path, e);
-                return tauri::http::Response::builder()
-                    .status(500)
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(Vec::new())
-                    .unwrap();
-            }
-        }
-    }
-
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "avif" => "image/avif",
-        "tiff" | "tif" => "image/tiff",
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "avi" => "video/x-msvideo",
-        "mkv" => "video/x-matroska",
-        "webm" => "video/webm",
-        _ => "application/octet-stream",
-    };
-
-    // Open the file and get its length
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            log::error!("Failed to open media file {}: {}", path, e);
-            return tauri::http::Response::builder()
-                .status(404)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Vec::new())
-                .unwrap();
-        }
-    };
-
-    let len = match file.metadata() {
-        Ok(m) => m.len(),
-        Err(e) => {
-            log::error!("Failed to read metadata for {}: {}", path, e);
-            return tauri::http::Response::builder()
-                .status(500)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Vec::new())
-                .unwrap();
-        }
-    };
-
-    /// Max bytes per chunk (2 MB)
-    const MAX_CHUNK: u64 = 2 * 1024 * 1024;
-
-    // Handle Range requests for chunked streaming
-    if let Some(range_header) = request
-        .headers()
-        .get("range")
-        .and_then(|r| r.to_str().ok())
-    {
-        let ranges = match http_range::HttpRange::parse(range_header, len) {
-            Ok(r) => r,
-            Err(_) => {
-                return tauri::http::Response::builder()
-                    .status(416)
-                    .header("Content-Range", format!("bytes */{len}"))
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(Vec::new())
-                    .unwrap();
-            }
-        };
-
-        // Only handle the first range (covers all practical browser requests)
-        if let Some(range) = ranges.first() {
-
-            let start = range.start;
-            let mut end = start + range.length - 1;
-
-            if start >= len || end >= len {
-                return tauri::http::Response::builder()
-                    .status(416)
-                    .header("Content-Range", format!("bytes */{len}"))
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(Vec::new())
-                    .unwrap();
-            }
-
-            // Clamp to MAX_CHUNK
-            end = start + (end - start).min(MAX_CHUNK - 1);
-            let nbytes = (end + 1 - start) as usize;
-
-            let mut buf = vec![0u8; nbytes];
-            if let Err(e) = file.seek(SeekFrom::Start(start)).and_then(|_| file.read_exact(&mut buf)) {
-                log::error!("Failed to read range {}-{} of {}: {}", start, end, path, e);
-                return tauri::http::Response::builder()
-                    .status(500)
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(Vec::new())
-                    .unwrap();
-            }
-
-            return tauri::http::Response::builder()
-                .status(206)
-                .header("Content-Type", mime)
-                .header("Accept-Ranges", "bytes")
-                .header("Content-Range", format!("bytes {start}-{end}/{len}"))
-                .header("Content-Length", nbytes.to_string())
-                .header("Cache-Control", "no-cache")
-                .header("Access-Control-Allow-Origin", "*")
-                .header("Access-Control-Expose-Headers", "content-range")
-                .body(buf)
-                .unwrap();
-        }
-    }
-
-    // No Range header — serve the full file with status 200. Previously this
-    // handler returned a truncated 206 for videos >2 MB, but WebKitGTK does not
-    // issue a follow-up Range request for `<video>` after an unsolicited 206,
-    // so playback stalled on the first chunk. Serving 200 + full body matches
-    // what Tauri's built-in asset protocol does; the webview then issues Range
-    // requests for seek/progressive playback and those are handled above.
-    let resp = tauri::http::Response::builder()
-        .status(200)
-        .header("Content-Type", mime)
-        .header("Content-Length", len.to_string())
-        .header("Accept-Ranges", "bytes")
-        .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*");
-
-    // SAFETY: read-only mmap, file handle kept open for the duration of the copy.
-    match unsafe { Mmap::map(&file) } {
-        Ok(mmap) => resp.body(mmap[..].to_vec()).unwrap(),
-        Err(e) => {
-            log::error!("Failed to mmap media file {}: {}", path, e);
-            tauri::http::Response::builder()
-                .status(500)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Vec::new())
-                .unwrap()
-        }
-    }
-}
-
 fn main() {
     // WebKitGTK can crash with protocol errors on some Wayland compositors.
     // Falling back to X11 via XWayland avoids this.
@@ -454,7 +279,7 @@ fn main() {
             |ctx, request, responder: UriSchemeResponder| {
                 let uri = request.uri().to_string();
 
-                // Route: lightview://thumb/<path> or lightview://media/<path>
+                // Route: lightview://thumb/<path> or lightview://thumbhash/<path>
                 // On Linux: lightview://localhost/thumb/<path>
                 // On Windows: http://lightview.localhost/thumb/<path>
                 let (route, raw_path) = extract_route(&uri);
@@ -492,7 +317,6 @@ fn main() {
                         });
                     }
                     Route::ThumbHash => responder.respond(serve_thumbhash(&ctx, &path)),
-                    Route::Media => responder.respond(serve_full_media(&request, &path)),
                     Route::Unknown => responder.respond(
                         tauri::http::Response::builder()
                             .status(404)

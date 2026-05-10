@@ -2,7 +2,7 @@ import { Show, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { infoPanelOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
-import { mediaUrl, videoSrc, thumbUrl, ensureTierThumbnails } from "../../lib/ipc";
+import { mediaUrl, thumbUrl, ensureTierThumbnails } from "../../lib/ipc";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { setViewerCacheCountSource } from "../../lib/perfMonitor";
 import { InfoPanel } from "./InfoPanel";
@@ -65,9 +65,12 @@ export function MediaViewer(props: MediaViewerProps) {
   const isBrowserPlayableVideo = () =>
     ["mp4", "mov", "webm", "m4v"].includes(ext());
 
-  const [videoPlaying, setVideoPlaying] = createSignal(false);
+  // Lazy video mounting: don't attach <video src=...> until the user
+  // clicks play. With `preload="metadata"` the browser would still pull
+  // the moov atom + leading bytes immediately on navigation; for nearby
+  // videos (e.g. arrow-keying past one) that's pure waste.
+  const [videoStarted, setVideoStarted] = createSignal(false);
   const [videoError, setVideoError] = createSignal(false);
-  let videoRef: HTMLVideoElement | undefined;
 
   const openVideoExternal = () => {
     const path = currentPath();
@@ -108,6 +111,33 @@ export function MediaViewer(props: MediaViewerProps) {
     if (img) mountImage(img, true);
   });
 
+  // Schedule non-critical work (neighbour preload, preview-tier generation)
+  // for the next idle period so the current image's decode/paint owns the
+  // main thread. Cancelled on each navigation so rapid arrow-keying doesn't
+  // pile up stale work.
+  let idleHandle: number | null = null;
+  const scheduleIdle = (fn: () => void) => {
+    if (idleHandle !== null) {
+      const w = window as unknown as {
+        cancelIdleCallback?: (h: number) => void;
+      };
+      if (w.cancelIdleCallback) w.cancelIdleCallback(idleHandle);
+      else clearTimeout(idleHandle);
+    }
+    const w = window as unknown as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+    };
+    idleHandle = w.requestIdleCallback
+      ? w.requestIdleCallback(() => { idleHandle = null; fn(); }, { timeout: 200 })
+      : (setTimeout(() => { idleHandle = null; fn(); }, 0) as unknown as number);
+  };
+  onCleanup(() => {
+    if (idleHandle === null) return;
+    const w = window as unknown as { cancelIdleCallback?: (h: number) => void };
+    if (w.cancelIdleCallback) w.cancelIdleCallback(idleHandle);
+    else clearTimeout(idleHandle);
+  });
+
   // Load full media when index changes, using cache + preloading.
   createEffect(
     on(
@@ -120,7 +150,7 @@ export function MediaViewer(props: MediaViewerProps) {
         setImgNaturalWidth(0);
 
         const path = props.paths[idx];
-        setVideoPlaying(false);
+        setVideoStarted(false);
         setVideoError(false);
         if (!path || isVideo()) {
           setLoaded(false);
@@ -128,24 +158,11 @@ export function MediaViewer(props: MediaViewerProps) {
           return;
         }
 
-        // Trigger preloading of adjacent images
-        cache.preload(props.paths, idx);
-
-        // P5: preview tier first-paint. Kick off lazy generation of the
-        // 1600 px preview for this image and its neighbours in the
-        // background; the <img src={thumbUrl(path, 'p')}> tag below
-        // will 404 → retry once the tier is ready. This covers common
-        // arrow-key navigation without an extra round-trip.
-        const previewPaths = [props.paths[idx], props.paths[idx - 1], props.paths[idx + 1]]
-          .filter((p): p is string => !!p);
-        ensureTierThumbnails(previewPaths, "p").catch(() => {});
-
-        // Check if already cached — instant display
+        // Mount the current image first, before queueing background work.
         const cached = cache.get(path);
         if (cached) {
           mountImage(cached, true);
         } else {
-          // Not cached yet — create a fresh img and load via protocol URL
           const img = new Image();
           img.style.maxWidth = "90vw";
           img.style.maxHeight = "90vh";
@@ -155,6 +172,18 @@ export function MediaViewer(props: MediaViewerProps) {
           img.src = mediaUrl(path);
           mountImage(img, false);
         }
+
+        // Defer neighbour preloading + preview-tier generation to idle so
+        // they don't contend with the current image's decode.
+        scheduleIdle(() => {
+          cache.preload(props.paths, idx);
+          // P5: preview tier first-paint. Lazy 1600 px generation for this
+          // image and its neighbours; the underlay <img src={thumbUrl(path, 'p')}>
+          // 404s until the tier is ready, then a natural re-render swaps it in.
+          const previewPaths = [props.paths[idx], props.paths[idx - 1], props.paths[idx + 1]]
+            .filter((p): p is string => !!p);
+          ensureTierThumbnails(previewPaths, "p").catch(() => {});
+        });
       },
     ),
   );
@@ -312,35 +341,56 @@ export function MediaViewer(props: MediaViewerProps) {
               <div class="text-neutral-600 mt-1">{filename()}</div>
             </div>
           }>
-            <video
-              ref={videoRef}
-              src={videoSrc(currentPath())}
-              class="max-w-[90vw] max-h-[90vh] outline-none"
-              controls
-              loop={settings().display.video_autoplay_loop}
-              preload="metadata"
-              onPlay={() => setVideoPlaying(true)}
-              onPause={() => setVideoPlaying(false)}
-              onLoadedData={() => setLoaded(true)}
-              onError={(e) => {
-                const v = e.currentTarget as HTMLVideoElement;
-                const codeNames: Record<number, string> = {
-                  1: "ABORTED",
-                  2: "NETWORK",
-                  3: "DECODE",
-                  4: "SRC_NOT_SUPPORTED",
-                };
-                console.error(
-                  "Video load failed:",
-                  "code=" + (v.error?.code ?? "null"),
-                  codeNames[v.error?.code ?? -1] ?? "",
-                  "message=" + JSON.stringify(v.error?.message ?? ""),
-                  "src=" + v.src,
-                );
-                setVideoError(true);
-              }}
-              onClick={(e) => e.stopPropagation()}
-            />
+            <Show when={videoStarted()} fallback={
+              <div
+                class="relative max-w-[90vw] max-h-[90vh] flex items-center justify-center"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <img
+                  src={thumbUrl(currentPath(), "p")}
+                  class="max-w-[90vw] max-h-[90vh] object-contain"
+                  draggable={false}
+                  onError={(e) => {
+                    (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
+                  }}
+                />
+                <button
+                  class="absolute w-20 h-20 rounded-full bg-black/40 hover:bg-black/60 flex items-center justify-center cursor-pointer transition-colors"
+                  onClick={() => setVideoStarted(true)}
+                  aria-label="Play video"
+                >
+                  <span class="text-white text-3xl ml-1">&#9654;</span>
+                </button>
+              </div>
+            }>
+              <video
+                src={mediaUrl(currentPath())}
+                class="max-w-[90vw] max-h-[90vh] outline-none"
+                controls
+                autoplay
+                loop={settings().display.video_autoplay_loop}
+                preload="auto"
+                onLoadedData={() => setLoaded(true)}
+                onError={(e) => {
+                  const v = e.currentTarget as HTMLVideoElement;
+                  const codeNames: Record<number, string> = {
+                    1: "ABORTED",
+                    2: "NETWORK",
+                    3: "DECODE",
+                    4: "SRC_NOT_SUPPORTED",
+                  };
+                  console.error(
+                    "Video load failed:",
+                    "code=" + (v.error?.code ?? "null"),
+                    codeNames[v.error?.code ?? -1] ?? "",
+                    "message=" + JSON.stringify(v.error?.message ?? ""),
+                    "src=" + v.src,
+                  );
+                  setVideoError(true);
+                }}
+                onClick={(e) => e.stopPropagation()}
+              />
+            </Show>
           </Show>
         </Show>
 

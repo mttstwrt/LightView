@@ -75,12 +75,6 @@ export function thumbhashUrl(path: string): string {
   return `lightview://thumbhash/${encodeURIComponent(path)}`;
 }
 
-/** Build a protocol URL for full-resolution media. The `lightview://media/` protocol
- *  serves binary image data directly — no Base64/JSON overhead. */
-export function mediaUrl(path: string): string {
-  return `lightview://media/${encodeURIComponent(path)}`;
-}
-
 /** Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).
  *  Populated by the Rust backend via an initialization script (see
  *  `setup` in `main.rs`). Falls back to an IPC fetch if the script has
@@ -90,7 +84,7 @@ let _mediaServerUrl: string | null =
 
 /** Eagerly fetch the media server URL and cache it. Safe to call
  *  multiple times — subsequent calls are no-ops once the URL is known.
- *  Call from app startup so `videoSrc()` can run synchronously later. */
+ *  Call from app startup so `mediaUrl()` can run synchronously later. */
 export async function initMediaServer(): Promise<string> {
   if (_mediaServerUrl) return _mediaServerUrl;
   const injected = (globalThis as any).__LV_MEDIA_URL__;
@@ -111,20 +105,23 @@ function encodeMediaPath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-/** Build a URL for a video source suitable for an HTML `<video>` element.
- *  WebKitGTK (the Linux webview) refuses to play `<video>` from any
- *  non-http(s) URI scheme — including Tauri's custom and asset protocols
- *  — so videos are served by the local HTTP media server instead. */
-export function videoSrc(path: string): string {
+/** Build a URL for full-resolution media (image or video). Served by the
+ *  local axum HTTP server, which streams the file with Range support — so
+ *  large videos don't get buffered into memory and large images don't
+ *  block the protocol thread. WebKitGTK also refuses `<video>` from any
+ *  non-http(s) URI scheme, so this single path covers both elements. */
+export function mediaUrl(path: string): string {
   if (!_mediaServerUrl) {
-    // Late refresh in case the initialization script landed after this
-    // module was imported but before `initMediaServer()` was awaited.
     _mediaServerUrl = (globalThis as any).__LV_MEDIA_URL__ ?? null;
   }
   if (!_mediaServerUrl) return "";
   const rel = path.startsWith("/") ? path.slice(1) : path;
   return `${_mediaServerUrl}/media/${encodeMediaPath(rel)}`;
 }
+
+/** Alias for `mediaUrl`. Kept for the `<video>` callsite where the name
+ *  documents intent. */
+export const videoSrc = mediaUrl;
 
 export interface ThumbHashResult {
   path: string;

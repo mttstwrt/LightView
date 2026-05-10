@@ -19,6 +19,16 @@ import {
   type PressureState,
 } from "./memoryPressure";
 
+const VIDEO_EXTS = new Set([
+  "mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv",
+]);
+
+function isVideoPath(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) return false;
+  return VIDEO_EXTS.has(path.slice(dot + 1).toLowerCase());
+}
+
 interface CacheEntry {
   img: HTMLImageElement;
   lastAccess: number;
@@ -106,6 +116,10 @@ export class ViewerImageCache {
       const idx = currentIndex + offset;
       if (idx < 0 || idx >= paths.length) continue;
       const path = paths[idx];
+      // Skip videos — they'd be fetched by `<img>` only to fail decoding,
+      // wasting bandwidth and (pre-axum) blocking the protocol thread.
+      // The viewer lazy-mounts <video> on play-click anyway.
+      if (isVideoPath(path)) continue;
       if (!this.cache.has(path) && !this.pending.has(path)) {
         toLoad.push({ path, distance: Math.abs(offset) });
       }
