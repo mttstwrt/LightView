@@ -1,5 +1,5 @@
 import { Show, createSignal, onMount, onCleanup } from "solid-js";
-import { listen } from "@tauri-apps/api/event";
+import { safeListen as listen } from "../../lib/runtime";
 import { getDebugInfo, type DebugInfo } from "../../lib/ipc";
 import type { MetricSnapshot, MetricEntry } from "../../lib/perfMonitor";
 import { Sparkline } from "./Sparkline";

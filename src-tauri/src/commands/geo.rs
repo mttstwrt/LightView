@@ -51,6 +51,15 @@ pub async fn get_geo_points(
     zoom: u8,
     filter: Option<String>,
 ) -> Result<GeoQueryResult, String> {
+    get_geo_points_impl(&state, bbox, zoom, filter).await
+}
+
+pub async fn get_geo_points_impl(
+    state: &AppState,
+    bbox: GeoBbox,
+    zoom: u8,
+    filter: Option<String>,
+) -> Result<GeoQueryResult, String> {
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;
 
@@ -167,6 +176,14 @@ struct Bucket {
 #[tauri::command]
 pub async fn get_geo_paths(
     state: tauri::State<'_, AppState>,
+    bbox: GeoBbox,
+    filter: Option<String>,
+) -> Result<Vec<String>, String> {
+    get_geo_paths_impl(&state, bbox, filter).await
+}
+
+pub async fn get_geo_paths_impl(
+    state: &AppState,
     bbox: GeoBbox,
     filter: Option<String>,
 ) -> Result<Vec<String>, String> {

@@ -1,12 +1,16 @@
 use axum::{
     body::Body,
-    extract::Path,
+    extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
 };
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
+
+use super::server::ServerState;
+use crate::cache::thumbnails::ThumbTier;
+use crate::thumb_serve::{self, ThumbOutcome, ThumbhashOutcome};
 
 // 64 KiB read chunks. Small enough to keep the WebKitGTK reader fed without
 // stalling on large allocations; large enough to amortize syscall overhead.
@@ -18,6 +22,7 @@ const STREAM_CHUNK: usize = 64 * 1024;
 /// matchit router accepts the URL). HEIC/HEIF are transcoded to JPEG to
 /// match the behavior of the `lightview://media/` custom protocol.
 pub async fn media(
+    State(state): State<ServerState>,
     Path(rel): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -26,6 +31,13 @@ pub async fn media(
     }
     // Axum already percent-decodes path captures.
     let path = format!("/{}", rel);
+
+    // Confine to the open gallery root — without this, a non-loopback bind
+    // would expose every file on the host. Return 404 (not 403) so we don't
+    // distinguish "outside gallery" from "missing".
+    if !path_in_gallery(&state, &path).await {
+        return error(StatusCode::NOT_FOUND);
+    }
 
     let ext = std::path::Path::new(&path)
         .extension()
@@ -39,6 +51,63 @@ pub async fn media(
 
     let mime = mime_for(&ext);
     serve_file(&path, mime, &headers).await
+}
+
+/// `GET /thumb/{tier}/{*rel}` — serves a cached thumbnail, generating it on a
+/// miss. `tier` is one of `s`/`m`/`l`/`p`; `rel` is the absolute path with the
+/// leading `/` stripped (same convention as `/media`). Mirrors the
+/// `lightview://thumb/<tier>/<path>` custom protocol for the web client.
+pub async fn thumb(
+    State(state): State<ServerState>,
+    Path((tier, rel)): Path<(String, String)>,
+) -> Response<Body> {
+    let Some(tier) = ThumbTier::from_segment(&tier) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    if rel.is_empty() {
+        return error(StatusCode::BAD_REQUEST);
+    }
+    let path = format!("/{}", rel);
+
+    // Generate-on-miss would otherwise decode an arbitrary file on the host.
+    if !path_in_gallery(&state, &path).await {
+        return error(StatusCode::NOT_FOUND);
+    }
+
+    match thumb_serve::get_or_generate(&state.app, tier, path).await {
+        ThumbOutcome::Hit { data, format } => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, thumb_serve::thumb_mime(&format))
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(data))
+            .unwrap(),
+        ThumbOutcome::NoGallery => error(StatusCode::SERVICE_UNAVAILABLE),
+        ThumbOutcome::Miss => error(StatusCode::NOT_FOUND),
+    }
+}
+
+/// `GET /thumbhash/{*rel}` — serves the decoded ThumbHash placeholder as a tiny
+/// PNG. Mirrors the `lightview://thumbhash/<path>` custom protocol.
+pub async fn thumbhash(
+    State(state): State<ServerState>,
+    Path(rel): Path<String>,
+) -> Response<Body> {
+    if rel.is_empty() {
+        return error(StatusCode::BAD_REQUEST);
+    }
+    let path = format!("/{}", rel);
+
+    match thumb_serve::render_thumbhash_png(&state.app, &path) {
+        ThumbhashOutcome::Png(png) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/png")
+            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .body(Body::from(png))
+            .unwrap(),
+        ThumbhashOutcome::NoGallery => error(StatusCode::SERVICE_UNAVAILABLE),
+        ThumbhashOutcome::Miss => error(StatusCode::NOT_FOUND),
+        ThumbhashOutcome::Error => error(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn serve_heic(path: &str) -> Response<Body> {
@@ -142,6 +211,26 @@ async fn serve_file(path: &str, mime: &'static str, headers: &HeaderMap) -> Resp
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// True if `path` resolves to a file inside the currently-open gallery root.
+/// Canonicalizes both sides so `..` traversal and symlinks that escape the
+/// root are rejected. False when no gallery is open or the path is missing.
+async fn path_in_gallery(state: &ServerState, path: &str) -> bool {
+    let root = {
+        let guard = state.app.current_gallery.read().await;
+        match guard.as_ref() {
+            Some(r) => r.clone(),
+            None => return false,
+        }
+    };
+    let (Ok(root), Ok(candidate)) = (
+        tokio::fs::canonicalize(&root).await,
+        tokio::fs::canonicalize(path).await,
+    ) else {
+        return false;
+    };
+    candidate.starts_with(&root)
 }
 
 fn mime_for(ext: &str) -> &'static str {

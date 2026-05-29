@@ -1,36 +1,74 @@
-use axum::{middleware, routing::get, Router};
+use axum::{
+    middleware,
+    routing::{get, post},
+    Router,
+};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
 use tokio::task::JoinHandle;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 
+use super::api;
 use super::config::HttpConfig;
 use super::middleware as mw;
 use super::routes;
+use crate::AppState;
 
 #[derive(Clone)]
 pub struct ServerState {
     pub config: Arc<HttpConfig>,
+    pub app: AppState,
+    /// Count of requests from non-loopback (i.e. remote) peers. A non-zero
+    /// value proves an external device reached the server — the only reliable
+    /// signal that the port is actually allowed through the firewall.
+    pub remote_hits: Arc<AtomicU64>,
 }
 
 pub struct RunningServer {
     pub addr: SocketAddr,
     #[allow(dead_code)]
     pub handle: JoinHandle<()>,
+    pub remote_hits: Arc<AtomicU64>,
+}
+
+/// A running remote-access server, retained in `AppState` so it can be
+/// queried for status and aborted when remote access is disabled.
+pub struct RemoteAccess {
+    pub addr: SocketAddr,
+    pub token: String,
+    pub handle: JoinHandle<()>,
+    pub remote_hits: Arc<AtomicU64>,
+    /// Pre-computed firewall guidance for this port, if a firewall is active.
+    pub firewall_hint: Option<String>,
 }
 
 /// Bind a TCP listener and spawn the axum server. Returns the actual bound
 /// address (port is OS-assigned when `config.port` is 0).
-pub async fn start(config: HttpConfig) -> std::io::Result<RunningServer> {
+pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<RunningServer> {
     let requested = SocketAddr::new(config.bind, config.port);
-    let listener = TcpListener::bind(requested).await?;
+    let socket = if requested.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    // Permit immediate rebind to a fixed port after the previous server is
+    // stopped, instead of failing with "address in use" while the old socket
+    // lingers in TIME_WAIT.
+    socket.set_reuseaddr(true)?;
+    socket.bind(requested)?;
+    let listener = socket.listen(1024)?;
     let addr = listener.local_addr()?;
 
     log::info!("HTTP media server listening on http://{}", addr);
 
+    let remote_hits = Arc::new(AtomicU64::new(0));
     let state = ServerState {
         config: Arc::new(config),
+        app,
+        remote_hits: remote_hits.clone(),
     };
 
     // Permissive CORS — server is loopback-only today. When remote access
@@ -40,21 +78,56 @@ pub async fn start(config: HttpConfig) -> std::io::Result<RunningServer> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let router = Router::new()
-        .route("/healthz", get(routes::healthz))
+    // Data routes carry sensitive content and sit behind the auth layer.
+    // Static SPA assets do not — the app shell needs to load before the
+    // client can attach its token to subsequent API/media requests.
+    let protected = Router::new()
         .route("/media/{*path}", get(routes::media))
+        .route("/thumb/{tier}/{*path}", get(routes::thumb))
+        .route("/thumbhash/{*path}", get(routes::thumbhash))
+        .route("/api/invoke", post(api::invoke))
+        .layer(middleware::from_fn_with_state(state.clone(), mw::auth_layer));
+
+    let mut router = Router::new()
+        .route("/healthz", get(routes::healthz))
+        .merge(protected);
+
+    if let Some(web_root) = state.config.web_root.clone() {
+        if web_root.is_dir() {
+            let index = web_root.join("index.html");
+            router = router
+                .fallback_service(ServeDir::new(&web_root).fallback(ServeFile::new(index)));
+            log::info!("Serving web app from {}", web_root.display());
+        } else {
+            log::warn!(
+                "web_root {} does not exist; SPA will not be served",
+                web_root.display()
+            );
+        }
+    }
+
+    let router = router
+        // Outermost layer: count remote peers across every route (including
+        // unauthenticated static assets — the first thing a browser fetches).
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            mw::auth_layer,
+            mw::track_remote_hits,
         ))
         .layer(cors)
         .with_state(state);
 
+    // Serve with peer-address info so the tracking middleware can tell remote
+    // clients from loopback ones.
+    let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
     let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
+        if let Err(e) = axum::serve(listener, make_service).await {
             log::error!("HTTP media server exited with error: {}", e);
         }
     });
 
-    Ok(RunningServer { addr, handle })
+    Ok(RunningServer {
+        addr,
+        handle,
+        remote_hits,
+    })
 }

@@ -1,5 +1,6 @@
 import { invoke as _rawInvoke } from "@tauri-apps/api/core";
 import { isActive as isPerfActive, recordIpcCall } from "./perfMonitor";
+import { isTauri } from "./runtime";
 import type {
   GalleryOpenResult,
   GalleryStats,
@@ -16,16 +17,42 @@ import type {
 } from "./types";
 
 // ---------------------------------------------------------------------------
+// Transport — Tauri IPC on desktop, HTTP bridge in the browser
+// ---------------------------------------------------------------------------
+
+/** Web-client transport: POST to the read-only `/api/invoke` bridge. The auth
+ *  token rides along as a same-origin cookie (set by `initWebAuth`), so no
+ *  header is needed here. Only read-only commands are accepted server-side. */
+async function _httpInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const res = await fetch("/api/invoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: cmd, args: args ?? {} }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`invoke ${cmd} failed (${res.status}): ${detail}`);
+  }
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+/** Dispatch a command over the active transport. */
+function _transport<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  return isTauri() ? _rawInvoke<T>(cmd, args) : _httpInvoke<T>(cmd, args);
+}
+
+// ---------------------------------------------------------------------------
 // Instrumented invoke — records IPC metrics when perf monitor is active
 // ---------------------------------------------------------------------------
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (!isPerfActive()) {
-    return _rawInvoke<T>(cmd, args);
+    return _transport<T>(cmd, args);
   }
   const argStr = args ? JSON.stringify(args) : "";
   const start = performance.now();
-  const result = await _rawInvoke<T>(cmd, args);
+  const result = await _transport<T>(cmd, args);
   const elapsed = performance.now() - start;
   const resStr = result !== undefined && result !== null ? JSON.stringify(result) : "";
   recordIpcCall(cmd, argStr.length, resStr.length, elapsed);
@@ -66,13 +93,22 @@ export type ThumbTier = "s" | "m" | "l" | "p";
  *  from SQLite — no JSON serialization overhead. When `tier` is omitted
  *  the backend falls back to the standard (m) tier for legacy URLs. */
 export function thumbUrl(path: string, tier: ThumbTier = "m"): string {
-  return `lightview://thumb/${tier}/${encodeURIComponent(path)}`;
+  if (isTauri()) {
+    return `lightview://thumb/${tier}/${encodeURIComponent(path)}`;
+  }
+  // Web client: same-origin HTTP route served by the axum server. Cookie auth.
+  const rel = path.startsWith("/") ? path.slice(1) : path;
+  return `/thumb/${tier}/${encodeMediaPath(rel)}`;
 }
 
 /** Build a protocol URL for the decoded ThumbHash placeholder of a path.
  *  Returns a ~32x32 PNG generated on-the-fly from the ~25-byte hash. */
 export function thumbhashUrl(path: string): string {
-  return `lightview://thumbhash/${encodeURIComponent(path)}`;
+  if (isTauri()) {
+    return `lightview://thumbhash/${encodeURIComponent(path)}`;
+  }
+  const rel = path.startsWith("/") ? path.slice(1) : path;
+  return `/thumbhash/${encodeMediaPath(rel)}`;
 }
 
 /** Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).
@@ -86,6 +122,9 @@ let _mediaServerUrl: string | null =
  *  multiple times — subsequent calls are no-ops once the URL is known.
  *  Call from app startup so `mediaUrl()` can run synchronously later. */
 export async function initMediaServer(): Promise<string> {
+  // Web client serves media from its own origin, so there is no separate URL
+  // to prime — `mediaUrl()` returns same-origin relative paths.
+  if (!isTauri()) return "";
   if (_mediaServerUrl) return _mediaServerUrl;
   const injected = (globalThis as any).__LV_MEDIA_URL__;
   if (typeof injected === "string" && injected.length > 0) {
@@ -111,11 +150,15 @@ function encodeMediaPath(path: string): string {
  *  block the protocol thread. WebKitGTK also refuses `<video>` from any
  *  non-http(s) URI scheme, so this single path covers both elements. */
 export function mediaUrl(path: string): string {
+  const rel = path.startsWith("/") ? path.slice(1) : path;
+  // Web client: same-origin HTTP route served by the axum server. Cookie auth.
+  if (!isTauri()) {
+    return `/media/${encodeMediaPath(rel)}`;
+  }
   if (!_mediaServerUrl) {
     _mediaServerUrl = (globalThis as any).__LV_MEDIA_URL__ ?? null;
   }
   if (!_mediaServerUrl) return "";
-  const rel = path.startsWith("/") ? path.slice(1) : path;
   return `${_mediaServerUrl}/media/${encodeMediaPath(rel)}`;
 }
 
@@ -366,6 +409,24 @@ export const getHardwareProfile = () =>
 export const getMemoryStatus = () =>
   invoke<MemoryStatus>("get_memory_status");
 
+export interface RemoteAccessInfo {
+  port: number;
+  token: string;
+  lan_ip: string | null;
+  url: string | null;
+  clients_seen: number;
+  firewall_hint: string | null;
+}
+
+export const enableRemoteAccess = (port?: number) =>
+  invoke<RemoteAccessInfo>("enable_remote_access", { port });
+
+export const disableRemoteAccess = () =>
+  invoke<void>("disable_remote_access");
+
+export const getRemoteAccessInfo = () =>
+  invoke<RemoteAccessInfo | null>("get_remote_access_info");
+
 export const reindexGallery = () => invoke<number>("reindex_gallery");
 
 export const rebuildThumbnails = () => invoke<number>("rebuild_thumbnails");
@@ -486,4 +547,4 @@ export interface PerfSnapshot {
 }
 
 export const getPerfSnapshot = () =>
-  _rawInvoke<PerfSnapshot>("get_perf_snapshot");
+  _transport<PerfSnapshot>("get_perf_snapshot");

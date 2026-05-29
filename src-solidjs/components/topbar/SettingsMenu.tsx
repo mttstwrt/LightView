@@ -1,12 +1,13 @@
-import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
+import { createSignal, createEffect, Show, For, onCleanup, onMount } from "solid-js";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
-import { rebuildThumbnails, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch } from "../../lib/ipc";
+import { rebuildThumbnails, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch, enableRemoteAccess, disableRemoteAccess, getRemoteAccessInfo, type RemoteAccessInfo } from "../../lib/ipc";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
-import { listen } from "@tauri-apps/api/event";
+import { safeListen as listen } from "../../lib/runtime";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { isWeb } from "../../lib/runtime";
 
 const THUMB_PRESETS = [
   { label: "S", value: 120 },
@@ -76,6 +77,85 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
       ...prev,
       storage: { ...prev.storage, [key]: value },
     }));
+  };
+
+  // ── Remote (LAN) web access ──
+  const REMOTE_PORT_KEY = "lv_remote_port";
+  const DEFAULT_REMOTE_PORT = 8723;
+  const [remote, setRemote] = createSignal<RemoteAccessInfo | null>(null);
+  const [remoteBusy, setRemoteBusy] = createSignal(false);
+  const [remoteError, setRemoteError] = createSignal("");
+  const [copied, setCopied] = createSignal(false);
+
+  // Fixed port persisted in localStorage so a firewall rule made for it keeps
+  // working across launches. 0 means "let the OS pick" (ephemeral).
+  const storedPort = Number(localStorage.getItem(REMOTE_PORT_KEY));
+  const [remotePort, setRemotePort] = createSignal<number>(
+    Number.isFinite(storedPort) && storedPort > 0 ? storedPort : DEFAULT_REMOTE_PORT,
+  );
+
+  const updateRemotePort = (raw: string) => {
+    const n = parseInt(raw, 10);
+    const port = Number.isFinite(n) ? Math.min(Math.max(n, 0), 65535) : 0;
+    setRemotePort(port);
+    localStorage.setItem(REMOTE_PORT_KEY, String(port));
+  };
+
+  onMount(() => {
+    if (isWeb()) return;
+    getRemoteAccessInfo().then(setRemote).catch(() => {});
+  });
+
+  // While the panel is open and remote access is on, poll status so the
+  // reachability indicator (clients_seen) updates as devices connect.
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  createEffect(() => {
+    clearInterval(pollTimer);
+    if (open() && remote() && !isWeb()) {
+      pollTimer = setInterval(() => {
+        getRemoteAccessInfo()
+          .then((info) => info && setRemote(info))
+          .catch(() => {});
+      }, 3000);
+    }
+  });
+  onCleanup(() => clearInterval(pollTimer));
+
+  const toggleRemote = async () => {
+    if (remoteBusy()) return;
+    setRemoteBusy(true);
+    setRemoteError("");
+    try {
+      if (remote()) {
+        await disableRemoteAccess();
+        setRemote(null);
+      } else {
+        // 0 → ephemeral (OS-assigned); any other value → fixed port.
+        setRemote(await enableRemoteAccess(remotePort() || undefined));
+      }
+    } catch (e) {
+      console.error("Remote access toggle failed:", e);
+      const msg = String(e);
+      setRemoteError(
+        msg.includes("in use") || msg.includes("address")
+          ? `Port ${remotePort()} is unavailable — try another.`
+          : "Failed to start remote access.",
+      );
+    } finally {
+      setRemoteBusy(false);
+    }
+  };
+
+  const copyRemoteUrl = async () => {
+    const url = remote()?.url;
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      console.error("Clipboard write failed:", e);
+    }
   };
 
   const [rebuilding, setRebuilding] = createSignal(false);
@@ -349,18 +429,109 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
               </Field>
             </Section>
 
-            {/* ── Thumbnails ── */}
-            <Section label="Thumbnails">
-              <button
-                onClick={handleRebuild}
-                disabled={rebuilding()}
-                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
-              </button>
-            </Section>
+            {/* ── Remote access (desktop only) ── */}
+            <Show when={!isWeb()}>
+              <Section label="Remote Access">
+                <Toggle
+                  label="Enable LAN web access"
+                  checked={remote() !== null}
+                  onChange={() => void toggleRemote()}
+                />
+                {/* Port is editable only while disabled — changing it requires
+                    a restart of the server. A fixed port lets a firewall rule
+                    stick across launches. */}
+                <Show when={!remote()}>
+                  <Field label="Port">
+                    <input
+                      type="number"
+                      min="0"
+                      max="65535"
+                      value={remotePort()}
+                      onInput={(e) => updateRemotePort(e.currentTarget.value)}
+                      class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
+                      title="0 = random port each launch"
+                    />
+                  </Field>
+                </Show>
+                <Show when={remoteError()}>
+                  <span class="text-xs text-red-400">{remoteError()}</span>
+                </Show>
+                <Show when={remote()}>
+                  {(info) => (
+                    <div class="flex flex-col gap-1.5">
+                      <span class="text-[10px] text-neutral-500">
+                        Open this URL in a browser on another device:
+                      </span>
+                      <Show
+                        when={info().url}
+                        fallback={
+                          <span class="text-xs text-amber-400">
+                            No LAN IP detected — port {info().port}, token {info().token}
+                          </span>
+                        }
+                      >
+                        <button
+                          onClick={copyRemoteUrl}
+                          class="text-left px-2 py-1.5 rounded bg-neutral-800 hover:bg-neutral-700 text-[11px] text-teal-300 font-mono break-all cursor-pointer transition-colors"
+                          title="Click to copy"
+                        >
+                          {info().url}
+                        </button>
+                      </Show>
+                      <span class="text-[10px] text-neutral-600">
+                        {copied() ? "Copied!" : "Read-only. Anyone with this link can browse the gallery."}
+                      </span>
 
-            {/* ── Storage ── */}
+                      {/* Reachability indicator — the host can't pre-detect a
+                          firewall block, but a connection from a remote device
+                          proves the port is open. */}
+                      <div class="flex items-start gap-1.5 mt-1">
+                        <Show
+                          when={info().clients_seen > 0}
+                          fallback={
+                            <>
+                              <span class="text-amber-400 leading-tight">&#9679;</span>
+                              <span class="text-[10px] text-neutral-500 leading-tight">
+                                Waiting for a device to connect. If a device can't
+                                load the page, allow the port in your firewall.
+                              </span>
+                            </>
+                          }
+                        >
+                          <span class="text-teal-400 leading-tight">&#9679;</span>
+                          <span class="text-[10px] text-neutral-400 leading-tight">
+                            Reachable — a device has connected.
+                          </span>
+                        </Show>
+                      </div>
+
+                      {/* Firewall guidance, shown until a device connects. */}
+                      <Show when={info().firewall_hint && info().clients_seen === 0}>
+                        <pre class="mt-1 px-2 py-1.5 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] text-neutral-400 whitespace-pre-wrap break-all font-mono">
+                          {info().firewall_hint}
+                        </pre>
+                      </Show>
+                    </div>
+                  )}
+                </Show>
+              </Section>
+            </Show>
+
+            {/* ── Thumbnails (desktop only — write op) ── */}
+            <Show when={!isWeb()}>
+              <Section label="Thumbnails">
+                <button
+                  onClick={handleRebuild}
+                  disabled={rebuilding()}
+                  class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
+                </button>
+              </Section>
+            </Show>
+
+            {/* ── Storage (desktop only) ── */}
+            <Show when={!isWeb()}>
             <Section label="Storage">
               <Field label="Companion file location">
                 <div class="flex gap-1">
@@ -382,8 +553,10 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 </div>
               </Field>
             </Section>
+            </Show>
 
-            {/* ── Plugins ── */}
+            {/* ── Plugins (desktop only) ── */}
+            <Show when={!isWeb()}>
             <Section label="Plugins">
               <div class="flex flex-col gap-2">
                 <For each={plugins()}>
@@ -426,8 +599,10 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 </button>
               </div>
             </Section>
+            </Show>
 
-            {/* ── Deduplication ── */}
+            {/* ── Deduplication (desktop only) ── */}
+            <Show when={!isWeb()}>
             <Section label="Deduplication">
               <button
                 onClick={() => {
@@ -439,9 +614,10 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 Find Duplicates...
               </button>
             </Section>
+            </Show>
 
             {/* ── Gallery ── */}
-            <Show when={props.onOpenFolder}>
+            <Show when={props.onOpenFolder && !isWeb()}>
               <div class="border-t border-neutral-800/60 pt-3">
                 <button
                   onClick={() => { props.onOpenFolder!(); setOpen(false); }}

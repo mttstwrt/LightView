@@ -1,5 +1,6 @@
 import { Show, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { isWeb } from "../../lib/runtime";
 import { infoPanelOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, thumbUrl, ensureTierThumbnails } from "../../lib/ipc";
@@ -75,6 +76,13 @@ export function MediaViewer(props: MediaViewerProps) {
   const openVideoExternal = () => {
     const path = currentPath();
     if (!path) return;
+    // On the desktop, hand the file to the host's default player. The web
+    // client has no host to launch, so open the streamed media URL in a new
+    // tab and let the browser download or play it.
+    if (isWeb()) {
+      window.open(mediaUrl(path), "_blank", "noopener");
+      return;
+    }
     invoke("open_with", { command: "xdg-open", args: [path] }).catch((err) =>
       console.error("Failed to open video:", err)
     );
@@ -337,7 +345,7 @@ export function MediaViewer(props: MediaViewerProps) {
               >
                 <span class="text-white/80 text-3xl ml-1">&#9654;</span>
               </button>
-              <div>Open in external player</div>
+              <div>{isWeb() ? "Open / download video" : "Open in external player"}</div>
               <div class="text-neutral-600 mt-1">{filename()}</div>
             </div>
           }>

@@ -1,9 +1,9 @@
 use lightview_lib::AppState;
-use lightview_lib::cache::coalescer::Role;
 use lightview_lib::cache::thumbnails::ThumbTier;
 use lightview_lib::commands;
 use lightview_lib::http_server::{self, HttpConfig};
-use tauri::{AppHandle, Emitter, Manager, UriSchemeResponder};
+use lightview_lib::thumb_serve::{self, ThumbOutcome, ThumbhashOutcome};
+use tauri::{Emitter, Manager, UriSchemeResponder};
 
 
 enum Route {
@@ -81,43 +81,13 @@ fn thumb_miss_response() -> tauri::http::Response<Vec<u8>> {
         .unwrap()
 }
 
-/// Read a cached thumbnail directly from SQLite via the read-only
-/// protocol connection. Returns `None` on cache miss (caller decides
-/// whether to generate) and `Some(Err)` on infrastructure errors that
-/// should short-circuit with a pre-built response (e.g. 503 while no
-/// gallery is open).
-fn read_cached_thumbnail(
-    state: &AppState,
-    tier: ThumbTier,
-    path: &str,
-) -> Result<Option<(Vec<u8>, String)>, tauri::http::Response<Vec<u8>>> {
-    let proto_db = state.thumb_protocol_db.lock().unwrap();
-    let conn = match proto_db.as_ref() {
-        Some(c) => c,
-        None => {
-            return Err(tauri::http::Response::builder()
-                .status(503)
-                .body(Vec::new())
-                .unwrap());
-        }
-    };
-
-    let sql = format!(
-        "SELECT thumbnail, format FROM {} WHERE path = ?1",
-        tier.table()
-    );
-    match conn.prepare_cached(&sql).and_then(|mut stmt| {
-        stmt.query_row(rusqlite::params![path], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-        })
-    }) {
-        Ok(hit) => Ok(Some(hit)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => {
-            log::warn!("thumb cache read failed for {} (tier {:?}): {}", path, tier, e);
-            Ok(None)
-        }
-    }
+fn thumb_status_response(status: u16) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(status)
+        .header("Cache-Control", "no-store")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(Vec::new())
+        .unwrap()
 }
 
 /// Fast synchronous path for `lightview://thumb/<tier>/<path>`. Returns a
@@ -128,130 +98,43 @@ fn serve_thumbnail_fast(
     tier: ThumbTier,
     path: &str,
 ) -> Option<tauri::http::Response<Vec<u8>>> {
-    match read_cached_thumbnail(state, tier, path) {
-        Ok(Some((data, format))) => Some(thumb_ok_response(data, &format)),
-        Ok(None) => None,
-        Err(resp) => Some(resp),
+    match thumb_serve::read_cached_thumbnail(state, tier, path) {
+        ThumbOutcome::Hit { data, format } => Some(thumb_ok_response(data, &format)),
+        ThumbOutcome::Miss => None,
+        ThumbOutcome::NoGallery => Some(thumb_status_response(503)),
     }
 }
 
-/// Slow path: no cached bytes for `(path, tier)`. Generate it on the thumb
-/// pool, persist it in SQLite, and return the bytes. Concurrent requests
-/// for the same key coalesce through `AppState::thumb_gen_coalescer` so
-/// only one decode happens per cold-gallery cell.
+/// Slow path: no cached bytes for `(path, tier)`. Delegates to the shared
+/// generate-with-coalescing helper and wraps the outcome in a Tauri response.
 async fn serve_thumbnail_generate(
-    app_handle: AppHandle,
+    state: &AppState,
     tier: ThumbTier,
     path: String,
 ) -> tauri::http::Response<Vec<u8>> {
-    let state = app_handle.state::<AppState>();
-    let key = (path.clone(), tier);
-
-    let (role, notify) = state.thumb_gen_coalescer.acquire(key.clone());
-
-    match role {
-        Role::Generator => {
-            let result =
-                commands::media::generate_and_store_tier(&state, &path, tier).await;
-            state.thumb_gen_coalescer.release(&key);
-            match result {
-                Ok((bytes, format)) => thumb_ok_response(bytes, &format),
-                Err(e) => {
-                    log::warn!("generate-on-miss failed for {} (tier {:?}): {}", path, tier, e);
-                    thumb_miss_response()
-                }
-            }
-        }
-        Role::Waiter => {
-            let listener = notify.notified();
-            tokio::pin!(listener);
-            // Enrol in the wake queue before re-checking the cache to avoid
-            // missing a notify that races with the generator's release.
-            listener.as_mut().enable();
-
-            // If the generator completed between our cache-miss check and
-            // acquiring the slot, the bytes are already in the DB.
-            if let Some(resp) = serve_thumbnail_fast(&state, tier, &path) {
-                return resp;
-            }
-            listener.await;
-
-            match read_cached_thumbnail(&state, tier, &path) {
-                Ok(Some((data, format))) => thumb_ok_response(data, &format),
-                _ => thumb_miss_response(),
-            }
-        }
+    match thumb_serve::get_or_generate(state, tier, path).await {
+        ThumbOutcome::Hit { data, format } => thumb_ok_response(data, &format),
+        ThumbOutcome::NoGallery => thumb_status_response(503),
+        ThumbOutcome::Miss => thumb_miss_response(),
     }
 }
 
-/// Serve a decoded ThumbHash as a tiny PNG. Reads the ~25-byte blob from
-/// SQLite, decodes to RGBA via the `thumbhash` crate, and encodes a PNG.
-/// The PNG is cacheable in the webview because the underlying blob is
-/// immutable for a given path.
-fn serve_thumbhash(
-    ctx: &tauri::UriSchemeContext<'_, tauri::Wry>,
-    path: &str,
-) -> tauri::http::Response<Vec<u8>> {
-    let state = ctx.app_handle().state::<AppState>();
-    let proto_db = state.thumb_protocol_db.lock().unwrap();
-    let conn = match proto_db.as_ref() {
-        Some(c) => c,
-        None => {
-            return tauri::http::Response::builder()
-                .status(503)
-                .body(Vec::new())
-                .unwrap();
-        }
-    };
-
-    let blob: Result<Option<Vec<u8>>, rusqlite::Error> = conn
-        .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")
-        .and_then(|mut stmt| {
-            stmt.query_row(rusqlite::params![path], |row| {
-                row.get::<_, Option<Vec<u8>>>(0)
-            })
-        });
-
-    let Ok(Some(hash)) = blob else {
-        return tauri::http::Response::builder()
-            .status(404)
-            .header("Cache-Control", "no-store")
+/// Serve a decoded ThumbHash as a tiny PNG. The PNG is cacheable in the
+/// webview because the underlying blob is immutable for a given path.
+fn serve_thumbhash(state: &AppState, path: &str) -> tauri::http::Response<Vec<u8>> {
+    match thumb_serve::render_thumbhash_png(state, path) {
+        ThumbhashOutcome::Png(png) => tauri::http::Response::builder()
+            .status(200)
+            .header("Content-Type", "image/png")
+            // ThumbHashes are immutable for a given file mtime — long cache OK.
+            .header("Cache-Control", "public, max-age=31536000, immutable")
             .header("Access-Control-Allow-Origin", "*")
-            .body(Vec::new())
-            .unwrap();
-    };
-
-    let Ok((w, h, rgba)) = thumbhash::thumb_hash_to_rgba(&hash) else {
-        return tauri::http::Response::builder()
-            .status(500)
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Vec::new())
-            .unwrap();
-    };
-
-    // Encode to PNG so the webview can decode with createImageBitmap.
-    let mut png = std::io::Cursor::new(Vec::with_capacity(2048));
-    let enc = image::codecs::png::PngEncoder::new(&mut png);
-    use image::ImageEncoder;
-    if enc
-        .write_image(&rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
-        .is_err()
-    {
-        return tauri::http::Response::builder()
-            .status(500)
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Vec::new())
-            .unwrap();
+            .body(png)
+            .unwrap(),
+        ThumbhashOutcome::NoGallery => thumb_status_response(503),
+        ThumbhashOutcome::Miss => thumb_status_response(404),
+        ThumbhashOutcome::Error => thumb_status_response(500),
     }
-
-    tauri::http::Response::builder()
-        .status(200)
-        .header("Content-Type", "image/png")
-        // ThumbHashes are immutable for a given file mtime — long cache OK.
-        .header("Cache-Control", "public, max-age=31536000, immutable")
-        .header("Access-Control-Allow-Origin", "*")
-        .body(png.into_inner())
-        .unwrap()
 }
 
 fn main() {
@@ -310,13 +193,18 @@ fn main() {
                             return;
                         }
                         // Cache miss: generate on the thumb pool and reply when done.
-                        let app_handle = ctx.app_handle().clone();
+                        // AppState is a cheap Arc-bundle clone, owned by the task.
+                        let state_owned: AppState = (*state).clone();
                         tauri::async_runtime::spawn(async move {
-                            let resp = serve_thumbnail_generate(app_handle, tier, path).await;
+                            let resp =
+                                serve_thumbnail_generate(&state_owned, tier, path).await;
                             responder.respond(resp);
                         });
                     }
-                    Route::ThumbHash => responder.respond(serve_thumbhash(&ctx, &path)),
+                    Route::ThumbHash => {
+                        let state = ctx.app_handle().state::<AppState>();
+                        responder.respond(serve_thumbhash(&state, &path));
+                    }
                     Route::Unknown => responder.respond(
                         tauri::http::Response::builder()
                             .status(404)
@@ -332,14 +220,14 @@ fn main() {
             // because WebKitGTK rejects custom URI schemes for media elements.
             // block_on is safe here: setup runs on the main thread outside the
             // tokio runtime and server startup is a few milliseconds.
+            let app_state: AppState = (*app.state::<AppState>()).clone();
             match tauri::async_runtime::block_on(
-                http_server::start(HttpConfig::local_only()),
+                http_server::start(HttpConfig::local_only(), app_state.clone()),
             ) {
                 Ok(server) => {
                     let url = format!("http://{}", server.addr);
                     log::info!("Media server URL: {}", url);
-                    let state = app.state::<AppState>();
-                    let _ = state.media_server_url.set(url.clone());
+                    let _ = app_state.media_server_url.set(url.clone());
 
                     // Inject the URL into the webview so `videoSrc()` can
                     // synthesize URLs synchronously. Tauri's eval queues the
@@ -453,6 +341,9 @@ fn main() {
             commands::settings::get_hardware_profile,
             commands::settings::get_memory_status,
             commands::settings::get_media_server_url,
+            commands::settings::enable_remote_access,
+            commands::settings::disable_remote_access,
+            commands::settings::get_remote_access_info,
             commands::settings::reindex_gallery,
             commands::settings::rebuild_thumbnails,
             commands::settings::clear_cache,

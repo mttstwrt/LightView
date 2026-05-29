@@ -9,6 +9,10 @@ import {
 } from "../../lib/ipc";
 import type { ThumbnailTierInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
+import { isWeb } from "../../lib/runtime";
+
+// The web client is read-only; editing controls are hidden.
+const readOnly = isWeb();
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -253,8 +257,10 @@ export function InfoPanel(props: { path: string; filename: string }) {
                 <For each={[1, 2, 3, 4, 5]}>
                   {(star) => (
                     <button
-                      class="cursor-pointer text-base transition-colors"
+                      class="text-base transition-colors"
+                      classList={{ "cursor-pointer": !readOnly, "cursor-default": readOnly }}
                       style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
+                      disabled={readOnly}
                       onClick={() => handleSetRating(star)}
                     >
                       &#9733;
@@ -313,19 +319,21 @@ export function InfoPanel(props: { path: string; filename: string }) {
                             >
                               <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-300 bg-neutral-800">
                                 {t.tag}
-                                <button
-                                  class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
-                                  onClick={() => handleRemoveTag(t.tag)}
-                                >
-                                  &times;
-                                </button>
+                                <Show when={!readOnly}>
+                                  <button
+                                    class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
+                                    onClick={() => handleRemoveTag(t.tag)}
+                                  >
+                                    &times;
+                                  </button>
+                                </Show>
                               </span>
                             </Show>
                           )}
                         </For>
                       </div>
                     </Show>
-                    <Show when={namespace === "user"}>
+                    <Show when={namespace === "user" && !readOnly}>
                       <form onSubmit={handleAddTag} class="flex gap-1 mt-2">
                         <input
                           type="text"

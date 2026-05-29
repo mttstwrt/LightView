@@ -21,6 +21,27 @@ pub async fn get_sorted_items(
     sub_sort_field: Option<SortField>,
     sub_sort_order: Option<SortOrder>,
 ) -> Result<SortedResult, String> {
+    get_sorted_items_impl(
+        &state,
+        sort_field,
+        sort_order,
+        group_by,
+        filter_paths,
+        sub_sort_field,
+        sub_sort_order,
+    )
+    .await
+}
+
+pub async fn get_sorted_items_impl(
+    state: &AppState,
+    sort_field: SortField,
+    sort_order: SortOrder,
+    group_by: GroupBy,
+    filter_paths: Option<Vec<String>>,
+    sub_sort_field: Option<SortField>,
+    sub_sort_order: Option<SortOrder>,
+) -> Result<SortedResult, String> {
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;
 
@@ -43,6 +64,13 @@ pub async fn get_sorted_items(
 #[tauri::command]
 pub async fn get_timeline_index(
     state: tauri::State<'_, AppState>,
+    items_per_row: usize,
+) -> Result<Vec<TimelineEntry>, String> {
+    get_timeline_index_impl(&state, items_per_row).await
+}
+
+pub async fn get_timeline_index_impl(
+    state: &AppState,
     items_per_row: usize,
 ) -> Result<Vec<TimelineEntry>, String> {
     let db = state.cache_db.lock().await;

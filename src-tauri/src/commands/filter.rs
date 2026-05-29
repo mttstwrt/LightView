@@ -8,6 +8,13 @@ pub async fn apply_filter(
     state: tauri::State<'_, AppState>,
     query: String,
 ) -> Result<Vec<String>, String> {
+    apply_filter_impl(&state, query).await
+}
+
+pub async fn apply_filter_impl(
+    state: &AppState,
+    query: String,
+) -> Result<Vec<String>, String> {
     let expr = parser::parse_filter(&query).map_err(|e| e.to_string())?;
 
     let db = state.cache_db.lock().await;
@@ -44,6 +51,12 @@ pub async fn apply_filter(
 #[tauri::command]
 pub async fn clear_filter(
     state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    clear_filter_impl(&state).await
+}
+
+pub async fn clear_filter_impl(
+    state: &AppState,
 ) -> Result<Vec<String>, String> {
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;

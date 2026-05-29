@@ -48,6 +48,13 @@ pub async fn get_tags(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<Vec<TagInfo>, String> {
+    get_tags_impl(&state, path).await
+}
+
+pub async fn get_tags_impl(
+    state: &AppState,
+    path: String,
+) -> Result<Vec<TagInfo>, String> {
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;
 

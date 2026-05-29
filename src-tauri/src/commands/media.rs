@@ -1026,6 +1026,13 @@ pub async fn get_media_meta(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<Option<MediaMeta>, String> {
+    get_media_meta_impl(&state, path).await
+}
+
+pub async fn get_media_meta_impl(
+    state: &AppState,
+    path: String,
+) -> Result<Option<MediaMeta>, String> {
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;
 
@@ -1285,6 +1292,13 @@ pub struct ThumbHashResult {
 #[tauri::command]
 pub async fn get_thumbhashes(
     state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<ThumbHashResult>, String> {
+    get_thumbhashes_impl(&state, paths).await
+}
+
+pub async fn get_thumbhashes_impl(
+    state: &AppState,
     paths: Vec<String>,
 ) -> Result<Vec<ThumbHashResult>, String> {
     let db = state.cache_db.lock().await;

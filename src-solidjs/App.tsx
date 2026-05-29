@@ -1,11 +1,12 @@
-import { Show, createSignal, onCleanup } from "solid-js";
+import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { listen } from "@tauri-apps/api/event";
+import { safeListen as listen } from "./lib/runtime";
+import { isTauri, isWeb } from "./lib/runtime";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
-import { openGallery, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, type RecentGallery } from "./lib/ipc";
+import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, type RecentGallery } from "./lib/ipc";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { MapView } from "./components/map/MapView";
 import { MediaViewer } from "./components/viewer/MediaViewer";
@@ -187,6 +188,24 @@ export function App() {
     }
   };
 
+  // Web client: it can't open a folder, so load whatever gallery the desktop
+  // already has open. Read-only path — no openGallery/index write.
+  onMount(async () => {
+    if (!isWeb()) return;
+    try {
+      const info = await getGalleryInfo();
+      if (info) {
+        setGalleryPath(info.path);
+        setTotalCount(info.total_media);
+        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
+        setSortedItems(sorted.items);
+        setDisplayPaths(sorted.items.map((item) => item.path));
+      }
+    } catch (e) {
+      console.error("Failed to load current gallery:", e);
+    }
+  });
+
   // Listen for directory passed via CLI argument
   const unlisten = listen<string>("open-directory", (event) => {
     openPath(event.payload);
@@ -224,6 +243,9 @@ export function App() {
   onCleanup(() => { unlistenFs.then((fn) => fn()); });
 
   const handleOpenFolder = async () => {
+    // The native folder picker only exists on the desktop. The web client
+    // views whatever gallery the desktop has open; it cannot pick a new one.
+    if (isWeb()) return;
     try {
       const selected = await open({ directory: true, multiple: false });
       if (selected) {
@@ -280,6 +302,7 @@ export function App() {
         toggleInfoPanel();
       } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
         if (typingInInput) return;
+        if (isWeb()) return; // read-only: rating is a write operation
         e.preventDefault();
         const paths = displayPaths();
         const idx = viewerIndex();
@@ -298,7 +321,7 @@ export function App() {
         selectAll(displayPaths());
       }
     }
-    if (e.key === "F11") {
+    if (e.key === "F11" && isTauri()) {
       e.preventDefault();
       const win = getCurrentWindow();
       win.isDecorated().then((decorated) => win.setDecorations(!decorated));
@@ -333,6 +356,7 @@ export function App() {
             onBackgroundClick={clearSelection}
             selectedPaths={selectedPaths()}
             onItemContextMenu={(e, path, index) => {
+              if (isWeb()) return; // context menu is all write actions
               setContextMenu({ x: e.clientX, y: e.clientY, path, index });
             }}
             loading={loading()}
@@ -343,7 +367,7 @@ export function App() {
             indicators={scrollIndicators()}
             getThumbLabel={thumbLabel}
           />
-          <Show when={selectedPaths().size > 0}>
+          <Show when={selectedPaths().size > 0 && !isWeb()}>
             <SelectionBar
               selectedPaths={selectedPaths()}
               onClear={clearSelection}
@@ -374,6 +398,7 @@ export function App() {
             onNext={() => nextImage(displayPaths().length)}
             onPrev={prevImage}
             onContextMenu={(e, path, index) => {
+              if (isWeb()) return; // context menu is all write actions
               setContextMenu({ x: e.clientX, y: e.clientY, path, index });
             }}
           />
@@ -531,10 +556,25 @@ function WelcomeScreen(props: { onOpen: () => void; onOpenPath: (path: string) =
   const [error, setError] = createSignal("");
   const [recents, setRecents] = createSignal<RecentGallery[]>([]);
 
-  // Load recent galleries on mount
-  getRecentGalleries()
-    .then(setRecents)
-    .catch(() => {});
+  // Load recent galleries on mount (desktop only — not exposed to the web client)
+  if (!isWeb()) {
+    getRecentGalleries()
+      .then(setRecents)
+      .catch(() => {});
+  }
+
+  // The web client can't open or pick galleries — it mirrors the desktop's
+  // currently-open one. If none is open, there's nothing to show.
+  if (isWeb()) {
+    return (
+      <div class="h-screen w-full flex flex-col items-center justify-center gap-4">
+        <h1 class="text-3xl font-light text-neutral-300">LightView</h1>
+        <p class="text-sm text-neutral-500">
+          No gallery is open. Open one in the LightView desktop app.
+        </p>
+      </div>
+    );
+  }
 
   const handleSubmit = (e: Event) => {
     e.preventDefault();

@@ -7,7 +7,7 @@
 // scroll-driven repaints, and selection overlays.
 
 import { Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { safeListen as listen, type UnlistenFn } from "../../lib/runtime";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, thumbhashUrl, mediaUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";

@@ -10,10 +10,11 @@
 //! remote access lands, flipping `bind` to `0.0.0.0` and setting
 //! `AuthMode::BearerToken(_)` is the whole change.
 
+pub mod api;
 pub mod config;
 pub mod middleware;
 pub mod routes;
 pub mod server;
 
 pub use config::{AuthMode, HttpConfig};
-pub use server::start;
+pub use server::{start, RemoteAccess, RunningServer};

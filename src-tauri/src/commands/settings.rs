@@ -1,6 +1,8 @@
 use serde::Serialize;
+use std::path::PathBuf;
 
 use crate::hardware::{HardwareProfile, MemoryStatus};
+use crate::http_server::{self, HttpConfig, RemoteAccess};
 use crate::pipeline::thumbnailer::STANDARD_THUMB_SIZE;
 use crate::{AppState, RecentGallery};
 
@@ -55,6 +57,165 @@ pub async fn get_media_server_url(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     Ok(state.media_server_url.get().cloned().unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Remote (LAN) web access
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteAccessInfo {
+    /// The bound port (OS-assigned).
+    pub port: u16,
+    /// Bearer token required by every remote data request.
+    pub token: String,
+    /// Detected LAN IPv4, if any (best-effort).
+    pub lan_ip: Option<String>,
+    /// Ready-to-open URL with the token embedded, or None if no LAN IP found.
+    pub url: Option<String>,
+    /// Count of requests seen from non-loopback peers. Non-zero proves an
+    /// external device actually reached the server.
+    pub clients_seen: u64,
+    /// Firewall guidance for this port, if a firewall appears to be active.
+    pub firewall_hint: Option<String>,
+}
+
+/// Best-effort detection of the LAN IP used for the default route. Opens a UDP
+/// socket "connected" to a public address (no packets are sent) and reads back
+/// the local address the OS would route through.
+fn detect_lan_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
+/// If a host firewall is active, return a short hint with the command to allow
+/// `port`. Linux-only; other platforms return None (the user manages their own).
+#[cfg(target_os = "linux")]
+fn detect_firewall_hint(port: u16) -> Option<String> {
+    fn is_active(service: &str) -> bool {
+        std::process::Command::new("systemctl")
+            .args(["is-active", service])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+            .unwrap_or(false)
+    }
+
+    if is_active("firewalld") {
+        Some(format!(
+            "firewalld is active. Allow this port:\nsudo firewall-cmd --add-port={port}/tcp"
+        ))
+    } else if is_active("ufw") {
+        Some(format!("ufw is active. Allow this port:\nsudo ufw allow {port}/tcp"))
+    } else if is_active("nftables") || is_active("iptables") {
+        Some(format!(
+            "A firewall (nftables/iptables) is active — you may need to allow inbound TCP on port {port}."
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_firewall_hint(_port: u16) -> Option<String> {
+    None
+}
+
+/// Resolve the built SPA directory (`dist/`). Checks paths relative to the CWD
+/// (dev runs from `src-tauri`) and the executable. Returns None if not built.
+fn resolve_web_root() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("dist"));
+        candidates.push(cwd.join("..").join("dist"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("dist"));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+fn build_info(remote: &RemoteAccess) -> RemoteAccessInfo {
+    let addr_port = remote.addr.port();
+    let lan_ip = detect_lan_ip().map(|ip| ip.to_string());
+    let url = lan_ip
+        .as_ref()
+        .map(|ip| format!("http://{ip}:{addr_port}/?token={}", remote.token));
+    RemoteAccessInfo {
+        port: addr_port,
+        token: remote.token.clone(),
+        lan_ip,
+        url,
+        clients_seen: remote
+            .remote_hits
+            .load(std::sync::atomic::Ordering::Relaxed),
+        firewall_hint: remote.firewall_hint.clone(),
+    }
+}
+
+/// Start LAN-accessible remote web access (bind 0.0.0.0, bearer-token auth,
+/// SPA served from `dist/`). Idempotent: if already running, returns the
+/// current info. The token is generated fresh on each enable.
+#[tauri::command]
+pub async fn enable_remote_access(
+    state: tauri::State<'_, AppState>,
+    port: Option<u16>,
+) -> Result<RemoteAccessInfo, String> {
+    let mut guard = state.remote_server.lock().await;
+
+    if let Some(existing) = guard.as_ref() {
+        return Ok(build_info(existing));
+    }
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let web_root = resolve_web_root();
+    if web_root.is_none() {
+        log::warn!(
+            "No dist/ directory found — remote clients cannot load the app. Run `npm run build`."
+        );
+    }
+
+    let config = HttpConfig::remote(token.clone(), port.unwrap_or(0), web_root);
+    let app_state: AppState = (*state).clone();
+    let server = http_server::start(config, app_state)
+        .await
+        .map_err(|e| format!("Failed to start remote server: {e}"))?;
+
+    log::info!("Remote access enabled on port {}", server.addr.port());
+
+    let remote = RemoteAccess {
+        addr: server.addr,
+        token,
+        handle: server.handle,
+        remote_hits: server.remote_hits,
+        firewall_hint: detect_firewall_hint(server.addr.port()),
+    };
+    let info = build_info(&remote);
+    *guard = Some(remote);
+
+    Ok(info)
+}
+
+/// Stop the remote-access server. No-op if it is not running.
+#[tauri::command]
+pub async fn disable_remote_access(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.remote_server.lock().await;
+    if let Some(remote) = guard.take() {
+        remote.handle.abort();
+        log::info!("Remote access disabled");
+    }
+    Ok(())
+}
+
+/// Current remote-access info, or None if remote access is off.
+#[tauri::command]
+pub async fn get_remote_access_info(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RemoteAccessInfo>, String> {
+    let guard = state.remote_server.lock().await;
+    Ok(guard.as_ref().map(build_info))
 }
 
 /// Trigger a full re-index of all companion files.

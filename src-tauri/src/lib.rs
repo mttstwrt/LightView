@@ -10,6 +10,7 @@ pub mod hardware;
 pub mod commands;
 pub mod util;
 pub mod http_server;
+pub mod thumb_serve;
 pub mod file_clipboard;
 
 use std::sync::Arc;
@@ -37,6 +38,11 @@ pub struct RecentGallery {
 }
 
 /// Shared application state accessible from all Tauri commands.
+///
+/// Every field is `Arc`-wrapped, so `Clone` produces a cheap handle that
+/// shares the same underlying state. This lets the HTTP server hold its own
+/// `AppState` clone and observe the same live gallery as the Tauri commands.
+#[derive(Clone)]
 pub struct AppState {
     /// Active file provider registry (local, SMB, SFTP, S3)
     pub providers: Arc<RwLock<ProviderRegistry>>,
@@ -106,6 +112,11 @@ pub struct AppState {
     /// Set once at startup; `<video>` elements load from this server because
     /// WebKitGTK rejects non-http(s) schemes for media elements.
     pub media_server_url: Arc<std::sync::OnceLock<String>>,
+
+    /// The running remote-access (LAN) server, if enabled. Separate from the
+    /// loopback media server above so enabling remote access never adds auth
+    /// to the desktop webview's own requests.
+    pub remote_server: Arc<Mutex<Option<http_server::RemoteAccess>>>,
 }
 
 impl AppState {
@@ -167,6 +178,7 @@ impl AppState {
             #[cfg(feature = "gpu")]
             gpu_pipeline,
             media_server_url: Arc::new(std::sync::OnceLock::new()),
+            remote_server: Arc::new(Mutex::new(None)),
         }
     }
 
