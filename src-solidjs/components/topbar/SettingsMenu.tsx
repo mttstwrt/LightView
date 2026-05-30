@@ -27,7 +27,7 @@ import QRCode from "qrcode";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
 import { safeListen as listen } from "../../lib/runtime";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { isWeb } from "../../lib/runtime";
+import { isWeb, isMobile } from "../../lib/runtime";
 
 const THUMB_PRESETS = [
   { label: "S", value: 120 },
@@ -35,6 +35,32 @@ const THUMB_PRESETS = [
   { label: "L", value: 300 },
   { label: "XL", value: 400 },
 ] as const;
+
+// On mobile, the thumbnail size picker switches from fixed-pixel buckets to
+// a column-count picker: tapping "3" sets thumbnail_size such that the grid
+// renders exactly 3 columns at the current viewport width. The choice of
+// presets here matches the user's request: 1 column (biggest) → 5 columns.
+const MOBILE_COL_PRESETS = [1, 2, 3, 4, 5] as const;
+
+/** Compute a thumbnail_size in CSS px that lands the grid on `targetCols`
+ *  columns, given the current viewport width and grid gap. Mirrors the math
+ *  in GalleryGrid's ctrl+wheel resize. */
+function thumbSizeForCols(targetCols: number, gap: number): number {
+  const w = typeof window !== "undefined" ? window.innerWidth : 400;
+  // The grid uses `cols = floor((w + g) / (size + g))`. We pick `size` in the
+  // middle of the bucket that yields targetCols so a small viewport change
+  // doesn't flip the column count.
+  const upper = (w + gap) / targetCols - gap;
+  const lower = (w + gap) / (targetCols + 1) - gap;
+  return Math.max(20, Math.round((upper + lower) / 2));
+}
+
+/** Reverse-derive the current effective column count from a saved
+ *  thumbnail_size so the matching preset stays highlighted. */
+function currentColCount(thumbSize: number, gap: number): number {
+  const w = typeof window !== "undefined" ? window.innerWidth : 400;
+  return Math.max(1, Math.floor((w + gap) / (thumbSize + gap)));
+}
 
 const GAP_PRESETS = [
   { label: "None", value: 0 },
@@ -425,46 +451,102 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
         </svg>
       </button>
 
-      {/* Dropdown panel */}
+      {/* Dropdown panel (desktop) / right-side sheet (mobile) */}
       <Show when={open()}>
         {/* Backdrop — click to close */}
         <div class="fixed inset-0 z-40" onClick={() => setOpen(false)} />
 
         <div
-          class="absolute top-full right-0 mt-2 w-72 rounded-lg overflow-hidden shadow-xl z-50"
+          class={
+            isMobile()
+              ? "fixed top-0 right-0 bottom-0 w-[88vw] max-w-sm overflow-hidden shadow-xl z-50 flex flex-col"
+              : "absolute top-full right-0 mt-2 w-72 rounded-lg overflow-hidden shadow-xl z-50"
+          }
           style={{
             background: "rgba(18, 18, 18, 0.96)",
             "backdrop-filter": "blur(16px)",
             border: "1px solid rgba(255,255,255,0.08)",
           }}
         >
-          <div class="px-4 py-3 border-b border-neutral-800/60">
+          <div class="px-4 py-3 border-b border-neutral-800/60 flex items-center justify-between shrink-0">
             <span class="text-sm font-medium text-neutral-200">Settings</span>
+            <Show when={isMobile()}>
+              <button
+                onClick={() => setOpen(false)}
+                class="w-7 h-7 -mr-1 flex items-center justify-center rounded text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 cursor-pointer"
+                title="Close"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </Show>
           </div>
 
-          <div class="px-4 py-3 flex flex-col gap-4 max-h-[70vh] overflow-y-auto hide-scrollbar">
+          <div
+            class="px-4 py-3 flex flex-col gap-4 overflow-y-auto hide-scrollbar"
+            classList={{
+              "flex-1 min-h-0": isMobile(),
+              "max-h-[70vh]": !isMobile(),
+            }}
+          >
             {/* ── Display ── */}
             <Section label="Display">
-              {/* Thumbnail size */}
-              <Field label="Thumbnail size">
-                <div class="flex items-center gap-2">
-                  {/* Preset buttons */}
-                  <div class="flex gap-1">
-                    {THUMB_PRESETS.map((p) => (
-                      <button
-                        class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                          settings().display.thumbnail_size === p.value
-                            ? "bg-teal-700/60 text-teal-200"
-                            : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                        }`}
-                        onClick={() => updateDisplay("thumbnail_size", p.value)}
-                      >
-                        {p.label}
-                      </button>
-                    ))}
+              {/* Thumbnail size — mobile uses a column-count picker so the
+                  presets stay meaningful on a 400px-wide viewport; desktop
+                  keeps the fixed-pixel S/M/L/XL buckets. */}
+              <Show
+                when={isMobile()}
+                fallback={
+                  <Field label="Thumbnail size">
+                    <div class="flex items-center gap-2">
+                      <div class="flex gap-1">
+                        {THUMB_PRESETS.map((p) => (
+                          <button
+                            class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
+                              settings().display.thumbnail_size === p.value
+                                ? "bg-teal-700/60 text-teal-200"
+                                : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+                            }`}
+                            onClick={() => updateDisplay("thumbnail_size", p.value)}
+                          >
+                            {p.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </Field>
+                }
+              >
+                <Field label="Columns">
+                  <div class="flex items-center gap-1.5">
+                    {MOBILE_COL_PRESETS.map((n) => {
+                      const active = () =>
+                        currentColCount(
+                          settings().display.thumbnail_size,
+                          settings().display.grid_gap,
+                        ) === n;
+                      return (
+                        <button
+                          class={`min-w-8 h-8 px-2 text-sm rounded cursor-pointer transition-colors ${
+                            active()
+                              ? "bg-teal-700/60 text-teal-200"
+                              : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+                          }`}
+                          onClick={() =>
+                            updateDisplay(
+                              "thumbnail_size",
+                              thumbSizeForCols(n, settings().display.grid_gap),
+                            )
+                          }
+                        >
+                          {n}
+                        </button>
+                      );
+                    })}
                   </div>
-                </div>
-              </Field>
+                </Field>
+              </Show>
 
               {/* Grid gap */}
               <Field label="Grid spacing">

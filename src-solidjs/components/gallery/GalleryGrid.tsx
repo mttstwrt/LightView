@@ -1,6 +1,6 @@
 import { Index, Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, type UnlistenFn } from "../../lib/runtime";
+import { safeListen as listen, isMobile, type UnlistenFn } from "../../lib/runtime";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
@@ -52,9 +52,22 @@ const THUMB_SIZE_MAX = 600;
 const TIER_MICRO_MAX = 160;
 const TIER_STANDARD_MAX = 400;
 
+// Cap on the DPR multiplier so a 4×-DPR phone doesn't always punt to the
+// largest tier (which would dominate bandwidth on cellular).
+const MAX_DPR_SCALE = 3;
+
 function pickTier(cellPx: number): ThumbTier {
-  if (cellPx <= TIER_MICRO_MAX) return "s";
-  if (cellPx <= TIER_STANDARD_MAX) return "m";
+  // On mobile, a 130px CSS cell paints ~390 device pixels on a high-DPR phone;
+  // serving the "s" tier there is what makes thumbnails look blurry. Scale by
+  // DPR so the tier matches the actual rendered resolution. Desktop is left
+  // alone so its bandwidth profile doesn't change.
+  const dpr =
+    isMobile() && typeof window !== "undefined"
+      ? Math.min(window.devicePixelRatio || 1, MAX_DPR_SCALE)
+      : 1;
+  const effective = cellPx * dpr;
+  if (effective <= TIER_MICRO_MAX) return "s";
+  if (effective <= TIER_STANDARD_MAX) return "m";
   return "l";
 }
 
