@@ -1,8 +1,9 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { safeListen as listen } from "./lib/runtime";
+import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb } from "./lib/runtime";
+import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
@@ -192,6 +193,15 @@ export function App() {
   // already has open. Read-only path — no openGallery/index write.
   onMount(async () => {
     if (!isWeb()) return;
+    // If the server tells us this browser isn't paired, bounce to the pair
+    // page. One-shot — the user comes back via redirect after pairing.
+    const onNotPaired = () => {
+      window.removeEventListener(NOT_PAIRED_EVENT, onNotPaired);
+      window.location.replace("/pair");
+    };
+    window.addEventListener(NOT_PAIRED_EVENT, onNotPaired);
+    onCleanup(() => window.removeEventListener(NOT_PAIRED_EVENT, onNotPaired));
+
     try {
       const info = await getGalleryInfo();
       if (info) {
@@ -415,6 +425,9 @@ export function App() {
       </Show>
       <Show when={thumbGenActivity()}>
         <ThumbnailToast />
+      </Show>
+      <Show when={isWeb()}>
+        <PasswordModal />
       </Show>
     </div>
   );

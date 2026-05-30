@@ -15,8 +15,12 @@ pub struct HttpConfig {
 pub enum AuthMode {
     /// No authentication. Appropriate only for loopback binds.
     None,
-    /// Require `Authorization: Bearer <token>` or `?token=<token>`.
-    BearerToken(String),
+    /// Per-device cookie (`lv_device=<id>.<secret>`) backed by the
+    /// `remote_devices` table in the open gallery's cache.db. Pairing happens
+    /// via `/pair/redeem` (QR token or 6-digit PIN). When an optional gallery
+    /// password is set, the device must re-authenticate after the configured
+    /// inactivity window.
+    DeviceCookie,
 }
 
 impl HttpConfig {
@@ -31,13 +35,13 @@ impl HttpConfig {
         }
     }
 
-    /// LAN-accessible, bearer-token auth, serving the SPA from `web_root`.
+    /// LAN-accessible, per-device cookie auth, serving the SPA from `web_root`.
     /// `port` of 0 lets the OS assign one.
-    pub fn remote(token: String, port: u16, web_root: Option<PathBuf>) -> Self {
+    pub fn remote(port: u16, web_root: Option<PathBuf>) -> Self {
         Self {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port,
-            auth: AuthMode::BearerToken(token),
+            auth: AuthMode::DeviceCookie,
             web_root,
         }
     }

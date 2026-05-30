@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::hardware::{HardwareProfile, MemoryStatus};
+use crate::http_server::devices::{self, DeviceRow, PairingKind, DEFAULT_INACTIVITY_SECS};
 use crate::http_server::{self, HttpConfig, RemoteAccess};
 use crate::pipeline::thumbnailer::STANDARD_THUMB_SIZE;
 use crate::{AppState, RecentGallery};
@@ -67,17 +68,50 @@ pub async fn get_media_server_url(
 pub struct RemoteAccessInfo {
     /// The bound port (OS-assigned).
     pub port: u16,
-    /// Bearer token required by every remote data request.
-    pub token: String,
     /// Detected LAN IPv4, if any (best-effort).
     pub lan_ip: Option<String>,
-    /// Ready-to-open URL with the token embedded, or None if no LAN IP found.
-    pub url: Option<String>,
+    /// Base URL of the running server, or None if no LAN IP found.
+    pub base_url: Option<String>,
     /// Count of requests seen from non-loopback peers. Non-zero proves an
     /// external device actually reached the server.
     pub clients_seen: u64,
     /// Firewall guidance for this port, if a firewall appears to be active.
     pub firewall_hint: Option<String>,
+}
+
+/// Information about a paired device, suitable for the settings UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_seen: i64,
+    pub last_auth_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+impl From<DeviceRow> for DeviceInfo {
+    fn from(row: DeviceRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            created_at: row.created_at,
+            last_seen: row.last_seen,
+            last_auth_at: row.last_auth_at,
+            revoked_at: row.revoked_at,
+        }
+    }
+}
+
+/// A freshly minted pairing code that a phone can redeem at `/pair`.
+/// `pairing_url` is what the QR code encodes — the device opens it,
+/// the SPA's `/pair` page extracts `?code=` and POSTs to `/pair/redeem`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingCode {
+    pub code: String,
+    pub kind: String,
+    pub expires_at: i64,
+    pub pairing_url: Option<String>,
 }
 
 /// Best-effort detection of the LAN IP used for the default route. Opens a UDP
@@ -140,14 +174,13 @@ fn resolve_web_root() -> Option<PathBuf> {
 fn build_info(remote: &RemoteAccess) -> RemoteAccessInfo {
     let addr_port = remote.addr.port();
     let lan_ip = detect_lan_ip().map(|ip| ip.to_string());
-    let url = lan_ip
+    let base_url = lan_ip
         .as_ref()
-        .map(|ip| format!("http://{ip}:{addr_port}/?token={}", remote.token));
+        .map(|ip| format!("http://{ip}:{addr_port}"));
     RemoteAccessInfo {
         port: addr_port,
-        token: remote.token.clone(),
         lan_ip,
-        url,
+        base_url,
         clients_seen: remote
             .remote_hits
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -155,9 +188,10 @@ fn build_info(remote: &RemoteAccess) -> RemoteAccessInfo {
     }
 }
 
-/// Start LAN-accessible remote web access (bind 0.0.0.0, bearer-token auth,
-/// SPA served from `dist/`). Idempotent: if already running, returns the
-/// current info. The token is generated fresh on each enable.
+/// Start LAN-accessible remote web access (bind 0.0.0.0, per-device cookie
+/// auth, SPA served from `dist/`). Idempotent: if already running, returns
+/// the current info. Device pairings live in the open gallery's cache.db, so
+/// they persist across restarts but are scoped to that gallery.
 #[tauri::command]
 pub async fn enable_remote_access(
     state: tauri::State<'_, AppState>,
@@ -169,7 +203,6 @@ pub async fn enable_remote_access(
         return Ok(build_info(existing));
     }
 
-    let token = uuid::Uuid::new_v4().simple().to_string();
     let web_root = resolve_web_root();
     if web_root.is_none() {
         log::warn!(
@@ -177,7 +210,7 @@ pub async fn enable_remote_access(
         );
     }
 
-    let config = HttpConfig::remote(token.clone(), port.unwrap_or(0), web_root);
+    let config = HttpConfig::remote(port.unwrap_or(0), web_root);
     let app_state: AppState = (*state).clone();
     let server = http_server::start(config, app_state)
         .await
@@ -187,7 +220,6 @@ pub async fn enable_remote_access(
 
     let remote = RemoteAccess {
         addr: server.addr,
-        token,
         handle: server.handle,
         remote_hits: server.remote_hits,
         firewall_hint: detect_firewall_hint(server.addr.port()),
@@ -216,6 +248,140 @@ pub async fn get_remote_access_info(
 ) -> Result<Option<RemoteAccessInfo>, String> {
     let guard = state.remote_server.lock().await;
     Ok(guard.as_ref().map(build_info))
+}
+
+// ---------------------------------------------------------------------------
+// Device + password admin (Tauri-only — never exposed over HTTP)
+// ---------------------------------------------------------------------------
+
+/// Full settings snapshot for the Remote Access panel: list of paired
+/// devices plus whether a password is set and the configured inactivity
+/// window.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteAuthState {
+    pub devices: Vec<DeviceInfo>,
+    pub password_set: bool,
+    pub inactivity_secs: i64,
+}
+
+#[tauri::command]
+pub async fn get_remote_auth_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<RemoteAuthState, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    let conn = db.conn();
+    let devices = devices::list_devices(conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(DeviceInfo::from)
+        .collect();
+    let password_set = devices::get_password_hash(conn)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    let inactivity_secs = devices::get_inactivity_secs(conn).unwrap_or(DEFAULT_INACTIVITY_SECS);
+    Ok(RemoteAuthState {
+        devices,
+        password_set,
+        inactivity_secs,
+    })
+}
+
+/// Generate a fresh pairing code. `kind` is either `"qr"` (random hex token,
+/// embedded in the QR URL) or `"pin"` (6 typeable digits).
+#[tauri::command]
+pub async fn generate_pairing_code(
+    state: tauri::State<'_, AppState>,
+    kind: String,
+) -> Result<PairingCode, String> {
+    let parsed_kind = match kind.as_str() {
+        "qr" => PairingKind::Qr,
+        "pin" => PairingKind::Pin,
+        other => return Err(format!("unknown pairing kind: {other}")),
+    };
+
+    // Hold the cache_db lock for the SQL writes; build the URL outside it.
+    let (code, expires_at) = {
+        let db = state.cache_db.lock().await;
+        let db = db.as_ref().ok_or("No gallery open")?;
+        let conn = db.conn();
+        let code = devices::create_pairing(conn, parsed_kind).map_err(|e| e.to_string())?;
+        let expires_at = chrono::Utc::now().timestamp() + devices::PAIRING_TTL_SECS;
+        (code, expires_at)
+    };
+
+    let base_url = {
+        let guard = state.remote_server.lock().await;
+        guard.as_ref().and_then(|r| {
+            detect_lan_ip().map(|ip| format!("http://{ip}:{}", r.addr.port()))
+        })
+    };
+
+    let pairing_url = base_url.map(|b| match parsed_kind {
+        PairingKind::Qr => format!("{}/pair?code={}", b, code),
+        // The PIN flow doesn't pre-fill — user types it on the phone.
+        PairingKind::Pin => format!("{}/pair", b),
+    });
+
+    Ok(PairingCode {
+        code,
+        kind: kind.to_string(),
+        expires_at,
+        pairing_url,
+    })
+}
+
+#[tauri::command]
+pub async fn revoke_remote_device(
+    state: tauri::State<'_, AppState>,
+    device_id: String,
+) -> Result<(), String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    devices::revoke_device(db.conn(), &device_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_remote_device(
+    state: tauri::State<'_, AppState>,
+    device_id: String,
+) -> Result<(), String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    devices::delete_device(db.conn(), &device_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_remote_password(
+    state: tauri::State<'_, AppState>,
+    password: String,
+) -> Result<(), String> {
+    if password.is_empty() {
+        return Err("password cannot be empty".to_string());
+    }
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    devices::set_password(db.conn(), &password).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_remote_password(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    devices::clear_password(db.conn()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_remote_inactivity(
+    state: tauri::State<'_, AppState>,
+    secs: i64,
+) -> Result<(), String> {
+    if secs < 0 {
+        return Err("inactivity must be non-negative".to_string());
+    }
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    devices::set_inactivity_secs(db.conn(), secs).map_err(|e| e.to_string())
 }
 
 /// Trigger a full re-index of all companion files.

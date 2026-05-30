@@ -3,7 +3,27 @@ import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
-import { rebuildThumbnails, listPlugins, installPlugin, runPluginBatch, cancelPluginBatch, enableRemoteAccess, disableRemoteAccess, getRemoteAccessInfo, type RemoteAccessInfo } from "../../lib/ipc";
+import {
+  rebuildThumbnails,
+  listPlugins,
+  installPlugin,
+  runPluginBatch,
+  cancelPluginBatch,
+  enableRemoteAccess,
+  disableRemoteAccess,
+  getRemoteAccessInfo,
+  type RemoteAccessInfo,
+  getRemoteAuthState,
+  generatePairingCode,
+  revokeRemoteDevice,
+  deleteRemoteDevice,
+  setRemotePassword,
+  clearRemotePassword,
+  setRemoteInactivity,
+  type RemoteAuthState,
+  type PairingCode,
+} from "../../lib/ipc";
+import QRCode from "qrcode";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
 import { safeListen as listen } from "../../lib/runtime";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -85,7 +105,28 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
   const [remote, setRemote] = createSignal<RemoteAccessInfo | null>(null);
   const [remoteBusy, setRemoteBusy] = createSignal(false);
   const [remoteError, setRemoteError] = createSignal("");
-  const [copied, setCopied] = createSignal(false);
+
+  // Per-gallery device list, password state, inactivity threshold.
+  const [authState, setAuthState] = createSignal<RemoteAuthState | null>(null);
+
+  // Active short-lived pairing code (one per kind at a time). The QR image is
+  // rendered from `pairingQr.url`.
+  const [pairing, setPairing] = createSignal<PairingCode | null>(null);
+  const [pairingQr, setPairingQr] = createSignal<string>(""); // data URL
+  const [pairingError, setPairingError] = createSignal("");
+
+  // Password form state (separate from authState so we can show "saved").
+  const [passwordInput, setPasswordInput] = createSignal("");
+  const [passwordStatus, setPasswordStatus] = createSignal("");
+
+  // Inactivity selector, in seconds. Keeping the choices coarse so users
+  // don't fiddle endlessly.
+  const INACTIVITY_PRESETS = [
+    { label: "1h", value: 3600 },
+    { label: "6h", value: 6 * 3600 },
+    { label: "24h", value: 24 * 3600 },
+    { label: "Never", value: 365 * 24 * 3600 },
+  ] as const;
 
   // Fixed port persisted in localStorage so a firewall rule made for it keeps
   // working across launches. 0 means "let the OS pick" (ephemeral).
@@ -101,13 +142,21 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     localStorage.setItem(REMOTE_PORT_KEY, String(port));
   };
 
+  const refreshAuthState = () => {
+    if (isWeb()) return;
+    getRemoteAuthState()
+      .then(setAuthState)
+      .catch(() => {});
+  };
+
   onMount(() => {
     if (isWeb()) return;
     getRemoteAccessInfo().then(setRemote).catch(() => {});
+    refreshAuthState();
   });
 
   // While the panel is open and remote access is on, poll status so the
-  // reachability indicator (clients_seen) updates as devices connect.
+  // reachability indicator and device list stay fresh as phones connect.
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   createEffect(() => {
     clearInterval(pollTimer);
@@ -116,6 +165,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
         getRemoteAccessInfo()
           .then((info) => info && setRemote(info))
           .catch(() => {});
+        refreshAuthState();
       }, 3000);
     }
   });
@@ -129,9 +179,12 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
       if (remote()) {
         await disableRemoteAccess();
         setRemote(null);
+        setPairing(null);
+        setPairingQr("");
       } else {
         // 0 → ephemeral (OS-assigned); any other value → fixed port.
         setRemote(await enableRemoteAccess(remotePort() || undefined));
+        refreshAuthState();
       }
     } catch (e) {
       console.error("Remote access toggle failed:", e);
@@ -139,23 +192,94 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
       setRemoteError(
         msg.includes("in use") || msg.includes("address")
           ? `Port ${remotePort()} is unavailable — try another.`
-          : "Failed to start remote access.",
+          : msg.includes("No gallery")
+            ? "Open a gallery first."
+            : "Failed to start remote access.",
       );
     } finally {
       setRemoteBusy(false);
     }
   };
 
-  const copyRemoteUrl = async () => {
-    const url = remote()?.url;
-    if (!url) return;
+  const newPairingCode = async (kind: "qr" | "pin") => {
+    setPairingError("");
+    setPairingQr("");
     try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      const code = await generatePairingCode(kind);
+      setPairing(code);
+      if (kind === "qr" && code.pairing_url) {
+        // Render the QR locally so the desktop never has to round-trip the
+        // image bytes through IPC.
+        const dataUrl = await QRCode.toDataURL(code.pairing_url, {
+          margin: 1,
+          width: 220,
+          color: { dark: "#e5e5e5", light: "#0a0a0a" },
+        });
+        setPairingQr(dataUrl);
+      }
     } catch (e) {
-      console.error("Clipboard write failed:", e);
+      setPairingError(String(e));
     }
+  };
+
+  const handleRevokeDevice = async (id: string) => {
+    try {
+      await revokeRemoteDevice(id);
+      refreshAuthState();
+    } catch (e) {
+      console.error("Revoke failed:", e);
+    }
+  };
+
+  const handleDeleteDevice = async (id: string) => {
+    try {
+      await deleteRemoteDevice(id);
+      refreshAuthState();
+    } catch (e) {
+      console.error("Delete failed:", e);
+    }
+  };
+
+  const handleSetPassword = async () => {
+    if (!passwordInput()) return;
+    try {
+      await setRemotePassword(passwordInput());
+      setPasswordInput("");
+      setPasswordStatus("Saved");
+      setTimeout(() => setPasswordStatus(""), 2000);
+      refreshAuthState();
+    } catch (e) {
+      setPasswordStatus(String(e));
+    }
+  };
+
+  const handleClearPassword = async () => {
+    try {
+      await clearRemotePassword();
+      setPasswordStatus("Cleared");
+      setTimeout(() => setPasswordStatus(""), 2000);
+      refreshAuthState();
+    } catch (e) {
+      setPasswordStatus(String(e));
+    }
+  };
+
+  const handleSetInactivity = async (secs: number) => {
+    try {
+      await setRemoteInactivity(secs);
+      refreshAuthState();
+    } catch (e) {
+      console.error("Set inactivity failed:", e);
+    }
+  };
+
+  const formatRelative = (ts: number) => {
+    if (!ts) return "never";
+    const diff = Math.max(0, Date.now() / 1000 - ts);
+    if (diff < 60) return "just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return `${Math.floor(diff / 86400)}d ago`;
   };
 
   const [rebuilding, setRebuilding] = createSignal(false);
@@ -458,34 +582,183 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 </Show>
                 <Show when={remote()}>
                   {(info) => (
-                    <div class="flex flex-col gap-1.5">
-                      <span class="text-[10px] text-neutral-500">
-                        Open this URL in a browser on another device:
-                      </span>
+                    <div class="flex flex-col gap-3">
                       <Show
-                        when={info().url}
+                        when={info().base_url}
                         fallback={
                           <span class="text-xs text-amber-400">
-                            No LAN IP detected — port {info().port}, token {info().token}
+                            No LAN IP detected — port {info().port}
                           </span>
                         }
                       >
-                        <button
-                          onClick={copyRemoteUrl}
-                          class="text-left px-2 py-1.5 rounded bg-neutral-800 hover:bg-neutral-700 text-[11px] text-teal-300 font-mono break-all cursor-pointer transition-colors"
-                          title="Click to copy"
-                        >
-                          {info().url}
-                        </button>
+                        <span class="text-[10px] text-neutral-500 font-mono">
+                          {info().base_url}
+                        </span>
                       </Show>
-                      <span class="text-[10px] text-neutral-600">
-                        {copied() ? "Copied!" : "Read-only. Anyone with this link can browse the gallery."}
-                      </span>
 
-                      {/* Reachability indicator — the host can't pre-detect a
-                          firewall block, but a connection from a remote device
-                          proves the port is open. */}
-                      <div class="flex items-start gap-1.5 mt-1">
+                      {/* ── Pair a new device ── */}
+                      <div class="flex flex-col gap-1.5">
+                        <span class="text-[11px] text-neutral-400">Pair a device</span>
+                        <div class="flex gap-1.5">
+                          <button
+                            onClick={() => newPairingCode("qr")}
+                            class="px-2 py-1 text-[11px] rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 cursor-pointer transition-colors"
+                          >
+                            QR code
+                          </button>
+                          <button
+                            onClick={() => newPairingCode("pin")}
+                            class="px-2 py-1 text-[11px] rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 cursor-pointer transition-colors"
+                          >
+                            PIN
+                          </button>
+                          <Show when={pairing()}>
+                            <button
+                              onClick={() => { setPairing(null); setPairingQr(""); }}
+                              class="px-2 py-1 text-[11px] rounded text-neutral-500 hover:text-neutral-300 cursor-pointer"
+                            >
+                              Clear
+                            </button>
+                          </Show>
+                        </div>
+                        <Show when={pairingError()}>
+                          <span class="text-[10px] text-red-400">{pairingError()}</span>
+                        </Show>
+                        <Show when={pairing()}>
+                          {(code) => (
+                            <div class="mt-1 px-3 py-2.5 rounded bg-neutral-900 border border-neutral-800 flex flex-col items-center gap-2">
+                              <Show when={code().kind === "qr"}>
+                                <Show when={pairingQr()} fallback={
+                                  <span class="text-[10px] text-neutral-500">Rendering&hellip;</span>
+                                }>
+                                  <img src={pairingQr()} alt="Pairing QR" class="w-44 h-44" />
+                                </Show>
+                                <span class="text-[10px] text-neutral-500 text-center">
+                                  Scan with the phone's camera. Single-use; expires in 10&nbsp;min.
+                                </span>
+                              </Show>
+                              <Show when={code().kind === "pin"}>
+                                <div class="text-3xl font-mono tracking-[0.4em] text-teal-300 pl-[0.4em]">
+                                  {code().code}
+                                </div>
+                                <Show when={code().pairing_url}>
+                                  <span class="text-[10px] text-neutral-500 font-mono break-all text-center">
+                                    {code().pairing_url}
+                                  </span>
+                                </Show>
+                                <span class="text-[10px] text-neutral-500 text-center">
+                                  Open the URL above and enter the PIN. Single-use; expires in 10&nbsp;min.
+                                </span>
+                              </Show>
+                            </div>
+                          )}
+                        </Show>
+                      </div>
+
+                      {/* ── Optional gallery password ── */}
+                      <Show when={authState()}>
+                        {(s) => (
+                          <div class="flex flex-col gap-1.5">
+                            <div class="flex items-center justify-between">
+                              <span class="text-[11px] text-neutral-400">Gallery password</span>
+                              <Show when={s().password_set}>
+                                <span class="text-[10px] text-teal-400">Set</span>
+                              </Show>
+                            </div>
+                            <div class="flex gap-1.5">
+                              <input
+                                type="password"
+                                value={passwordInput()}
+                                onInput={(e) => setPasswordInput(e.currentTarget.value)}
+                                placeholder={s().password_set ? "Replace password" : "Set password"}
+                                class="flex-1 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-[11px] text-neutral-200 outline-none focus:border-neutral-500"
+                              />
+                              <button
+                                onClick={handleSetPassword}
+                                disabled={!passwordInput()}
+                                class="px-2 py-1 text-[11px] rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 disabled:opacity-40 cursor-pointer transition-colors"
+                              >
+                                Save
+                              </button>
+                              <Show when={s().password_set}>
+                                <button
+                                  onClick={handleClearPassword}
+                                  class="px-2 py-1 text-[11px] rounded text-neutral-500 hover:text-red-400 cursor-pointer"
+                                  title="Remove password"
+                                >
+                                  Clear
+                                </button>
+                              </Show>
+                            </div>
+                            <Show when={passwordStatus()}>
+                              <span class="text-[10px] text-neutral-500">{passwordStatus()}</span>
+                            </Show>
+                            <span class="text-[10px] text-neutral-600 leading-snug">
+                              When set, paired devices re-enter it after the inactivity window.
+                            </span>
+
+                            <div class="flex items-center gap-1.5 mt-1">
+                              <span class="text-[10px] text-neutral-500 mr-1">Lock after</span>
+                              {INACTIVITY_PRESETS.map((p) => (
+                                <button
+                                  onClick={() => handleSetInactivity(p.value)}
+                                  class={`px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors ${
+                                    s().inactivity_secs === p.value
+                                      ? "bg-teal-700/60 text-teal-200"
+                                      : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
+                                  }`}
+                                >
+                                  {p.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </Show>
+
+                      {/* ── Paired devices ── */}
+                      <Show when={authState() && authState()!.devices.length > 0}>
+                        <div class="flex flex-col gap-1">
+                          <span class="text-[11px] text-neutral-400">Paired devices</span>
+                          <div class="flex flex-col gap-1">
+                            <For each={authState()!.devices}>
+                              {(d) => (
+                                <div class="flex items-center gap-2 px-2 py-1 rounded bg-neutral-900/60">
+                                  <div class="flex-1 min-w-0">
+                                    <div class={`text-xs truncate ${d.revoked_at ? "text-neutral-500 line-through" : "text-neutral-300"}`}>
+                                      {d.name}
+                                    </div>
+                                    <div class="text-[10px] text-neutral-600">
+                                      seen {formatRelative(d.last_seen)}
+                                    </div>
+                                  </div>
+                                  <Show
+                                    when={!d.revoked_at}
+                                    fallback={
+                                      <button
+                                        onClick={() => handleDeleteDevice(d.id)}
+                                        class="text-[10px] text-neutral-500 hover:text-red-400 cursor-pointer"
+                                      >
+                                        Delete
+                                      </button>
+                                    }
+                                  >
+                                    <button
+                                      onClick={() => handleRevokeDevice(d.id)}
+                                      class="text-[10px] text-neutral-500 hover:text-red-400 cursor-pointer"
+                                    >
+                                      Revoke
+                                    </button>
+                                  </Show>
+                                </div>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+
+                      {/* Reachability indicator + firewall hint, same as before. */}
+                      <div class="flex items-start gap-1.5">
                         <Show
                           when={info().clients_seen > 0}
                           fallback={
@@ -500,14 +773,12 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                         >
                           <span class="text-teal-400 leading-tight">&#9679;</span>
                           <span class="text-[10px] text-neutral-400 leading-tight">
-                            Reachable — a device has connected.
+                            Reachable &mdash; a device has connected.
                           </span>
                         </Show>
                       </div>
-
-                      {/* Firewall guidance, shown until a device connects. */}
                       <Show when={info().firewall_hint && info().clients_seen === 0}>
-                        <pre class="mt-1 px-2 py-1.5 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] text-neutral-400 whitespace-pre-wrap break-all font-mono">
+                        <pre class="px-2 py-1.5 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] text-neutral-400 whitespace-pre-wrap break-all font-mono">
                           {info().firewall_hint}
                         </pre>
                       </Show>

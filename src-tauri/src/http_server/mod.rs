@@ -11,7 +11,9 @@
 //! `AuthMode::BearerToken(_)` is the whole change.
 
 pub mod api;
+pub mod auth_routes;
 pub mod config;
+pub mod devices;
 pub mod middleware;
 pub mod routes;
 pub mod server;

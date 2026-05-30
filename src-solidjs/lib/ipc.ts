@@ -1,6 +1,10 @@
 import { invoke as _rawInvoke } from "@tauri-apps/api/core";
 import { isActive as isPerfActive, recordIpcCall } from "./perfMonitor";
-import { isTauri } from "./runtime";
+import {
+  isTauri,
+  NOT_PAIRED_EVENT,
+  PASSWORD_CHALLENGE_EVENT,
+} from "./runtime";
 import type {
   GalleryOpenResult,
   GalleryStats,
@@ -20,15 +24,56 @@ import type {
 // Transport — Tauri IPC on desktop, HTTP bridge in the browser
 // ---------------------------------------------------------------------------
 
-/** Web-client transport: POST to the read-only `/api/invoke` bridge. The auth
- *  token rides along as a same-origin cookie (set by `initWebAuth`), so no
- *  header is needed here. Only read-only commands are accepted server-side. */
-async function _httpInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const res = await fetch("/api/invoke", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command: cmd, args: args ?? {} }),
+/** Pending password-challenge promise. While set, every 401-LV-Password
+ *  response awaits the same prompt instead of stacking modals.
+ *  Resolves with `true` if the user supplied the right password, `false`
+ *  if they cancelled. */
+let _pendingPasswordChallenge: Promise<boolean> | null = null;
+
+function _requestPassword(): Promise<boolean> {
+  if (_pendingPasswordChallenge) return _pendingPasswordChallenge;
+  _pendingPasswordChallenge = new Promise<boolean>((resolve) => {
+    const onResolved = (e: Event) => {
+      window.removeEventListener("lightview:password-resolved", onResolved);
+      _pendingPasswordChallenge = null;
+      resolve(Boolean((e as CustomEvent<boolean>).detail));
+    };
+    window.addEventListener("lightview:password-resolved", onResolved);
+    window.dispatchEvent(new CustomEvent(PASSWORD_CHALLENGE_EVENT));
   });
+  return _pendingPasswordChallenge;
+}
+
+/** Web-client transport: POST to the read-only `/api/invoke` bridge.
+ *
+ *  Auth handling:
+ *   - The `lv_device` cookie rides along automatically (same-origin).
+ *   - 401 with `WWW-Authenticate: LV-Password` → ask the user for the
+ *     password, then transparently retry. The caller never sees the 401.
+ *   - 401 without that header → device is not paired (or revoked); emit
+ *     `NOT_PAIRED_EVENT` so the router can redirect to `/pair`. */
+async function _httpInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const body = JSON.stringify({ command: cmd, args: args ?? {} });
+  const doFetch = () =>
+    fetch("/api/invoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+
+  let res = await doFetch();
+  if (res.status === 401) {
+    const challenge = res.headers.get("www-authenticate") ?? "";
+    if (challenge.toLowerCase().includes("lv-password")) {
+      const accepted = await _requestPassword();
+      if (accepted) {
+        res = await doFetch();
+      }
+    } else {
+      window.dispatchEvent(new Event(NOT_PAIRED_EVENT));
+    }
+  }
+
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText);
     throw new Error(`invoke ${cmd} failed (${res.status}): ${detail}`);
@@ -411,11 +456,35 @@ export const getMemoryStatus = () =>
 
 export interface RemoteAccessInfo {
   port: number;
-  token: string;
   lan_ip: string | null;
-  url: string | null;
+  /** Base URL of the running server (no path) — e.g. `http://192.168.0.5:8723`. */
+  base_url: string | null;
   clients_seen: number;
   firewall_hint: string | null;
+}
+
+export interface RemoteDeviceInfo {
+  id: string;
+  name: string;
+  created_at: number;
+  last_seen: number;
+  last_auth_at: number;
+  revoked_at: number | null;
+}
+
+export interface RemoteAuthState {
+  devices: RemoteDeviceInfo[];
+  password_set: boolean;
+  inactivity_secs: number;
+}
+
+export interface PairingCode {
+  code: string;
+  kind: "qr" | "pin";
+  expires_at: number;
+  /** URL embedded in the QR code (or pair-page link for PIN flow). Null when
+   *  the server is running but no LAN IP could be detected. */
+  pairing_url: string | null;
 }
 
 export const enableRemoteAccess = (port?: number) =>
@@ -426,6 +495,27 @@ export const disableRemoteAccess = () =>
 
 export const getRemoteAccessInfo = () =>
   invoke<RemoteAccessInfo | null>("get_remote_access_info");
+
+export const getRemoteAuthState = () =>
+  invoke<RemoteAuthState>("get_remote_auth_state");
+
+export const generatePairingCode = (kind: "qr" | "pin") =>
+  invoke<PairingCode>("generate_pairing_code", { kind });
+
+export const revokeRemoteDevice = (deviceId: string) =>
+  invoke<void>("revoke_remote_device", { deviceId });
+
+export const deleteRemoteDevice = (deviceId: string) =>
+  invoke<void>("delete_remote_device", { deviceId });
+
+export const setRemotePassword = (password: string) =>
+  invoke<void>("set_remote_password", { password });
+
+export const clearRemotePassword = () =>
+  invoke<void>("clear_remote_password");
+
+export const setRemoteInactivity = (secs: number) =>
+  invoke<void>("set_remote_inactivity", { secs });
 
 export const reindexGallery = () => invoke<number>("reindex_gallery");
 

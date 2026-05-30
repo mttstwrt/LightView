@@ -2,12 +2,9 @@ import 'solid-devtools';
 import { render } from "solid-js/web";
 import "./styles/global.css";
 import { App } from "./App";
+import { PairApp } from "./components/auth/PairApp";
 import { initMediaServer } from "./lib/ipc";
-import { initWebAuth } from "./lib/runtime";
-
-// Web client only: move the one-time `?token=` from the URL into a cookie so
-// every same-origin request authenticates automatically. No-op under Tauri.
-initWebAuth();
+import { isWeb } from "./lib/runtime";
 
 // Prime the media server URL cache so `videoSrc()` can resolve synchronously
 // by the time the viewer renders. Non-blocking: fails silently if the server
@@ -16,4 +13,12 @@ void initMediaServer().catch((e) =>
   console.warn("Media server init failed:", e),
 );
 
-render(() => <App />, document.getElementById("root")!);
+// Tiny path-based router. The remote SPA's pair page lives at /pair so the
+// QR code can deep-link to a known URL. Everything else is the gallery app.
+const path = typeof window !== "undefined" ? window.location.pathname : "/";
+const isPairRoute = isWeb() && path.startsWith("/pair");
+
+render(
+  () => (isPairRoute ? <PairApp /> : <App />),
+  document.getElementById("root")!,
+);

@@ -54,6 +54,8 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }
+argon2 = "0.5"
+rand = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-clipboard = "0.9"

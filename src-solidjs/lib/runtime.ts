@@ -21,26 +21,17 @@ export function isWeb(): boolean {
   return !isTauri();
 }
 
-const TOKEN_COOKIE = "lv_token";
+/** Event emitted when the server asks the web client to (re-)authenticate
+ *  with the gallery password — i.e. it responded 401 with
+ *  `WWW-Authenticate: LV-Password`. The App listens for this and shows the
+ *  password modal; the modal calls `resolvePasswordChallenge()` once the
+ *  password has been accepted so the pending fetch can be retried. */
+export const PASSWORD_CHALLENGE_EVENT = "lightview:password-challenge";
 
-/** Bootstrap the web client's auth token (web mode only).
- *
- *  The remote-access URL embeds a one-time `?token=`. On first load we move it
- *  into an `lv_token` cookie so the browser attaches it automatically to every
- *  same-origin request (`<img>`, `<video>`, and `fetch`), then strip it from
- *  the visible URL. On later loads the cookie already carries it. */
-export function initWebAuth(): void {
-  if (isTauri() || typeof window === "undefined") return;
-
-  const url = new URL(window.location.href);
-  const fromUrl = url.searchParams.get("token");
-  if (fromUrl) {
-    // Session cookie, scoped to the whole app, not sent cross-site.
-    document.cookie = `${TOKEN_COOKIE}=${fromUrl}; path=/; SameSite=Strict`;
-    url.searchParams.delete("token");
-    window.history.replaceState({}, "", url.toString());
-  }
-}
+/** Event emitted when the server says the device cookie is missing or
+ *  invalid (401 without a password challenge). The router uses this to
+ *  redirect to `/pair`. */
+export const NOT_PAIRED_EVENT = "lightview:not-paired";
 
 /** Tauri event listener that no-ops in web mode (the remote backend can't push
  *  events to a browser). Drop-in for `@tauri-apps/api/event`'s `listen` so call

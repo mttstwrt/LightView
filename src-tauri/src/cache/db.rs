@@ -13,7 +13,7 @@ pub enum CacheError {
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -179,6 +179,35 @@ const MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    // v9: Remote-access auth — per-device cookies and one-time pairing codes.
+    // `remote_devices.token_hash` is an argon2 hash of the random cookie value,
+    // so a database leak alone never grants access.
+    // `remote_pairing` holds short-lived enrollment codes (QR token or 6-digit
+    // PIN); each row is consumed on first redemption.
+    // Companion settings live in gallery_meta: `remote.password_hash`,
+    // `remote.inactivity_secs`.
+    Migration {
+        version: 9,
+        sql: "
+            CREATE TABLE IF NOT EXISTS remote_devices (
+                id            TEXT PRIMARY KEY,
+                name          TEXT NOT NULL,
+                token_hash    TEXT NOT NULL,
+                created_at    INTEGER NOT NULL,
+                last_seen     INTEGER NOT NULL,
+                last_auth_at  INTEGER NOT NULL,
+                revoked_at    INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_pairing (
+                code         TEXT PRIMARY KEY,
+                kind         TEXT NOT NULL,
+                expires_at   INTEGER NOT NULL,
+                consumed_at  INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_pairing_expires ON remote_pairing(expires_at);
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.
@@ -290,6 +319,20 @@ fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
 
     if !has_not_duplicates {
         return 7;
+    }
+
+    // v8 present — check for v9 (remote_devices table).
+    let has_remote_devices: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='remote_devices'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !has_remote_devices {
+        return 8;
     }
 
     // Everything present — fully up to date.

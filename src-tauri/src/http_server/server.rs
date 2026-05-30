@@ -12,6 +12,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 use super::api;
+use super::auth_routes;
 use super::config::HttpConfig;
 use super::middleware as mw;
 use super::routes;
@@ -35,10 +36,11 @@ pub struct RunningServer {
 }
 
 /// A running remote-access server, retained in `AppState` so it can be
-/// queried for status and aborted when remote access is disabled.
+/// queried for status and aborted when remote access is disabled. The
+/// per-device cookies and any optional gallery password live in the open
+/// gallery's cache.db — this struct only tracks the running server.
 pub struct RemoteAccess {
     pub addr: SocketAddr,
-    pub token: String,
     pub handle: JoinHandle<()>,
     pub remote_hits: Arc<AtomicU64>,
     /// Pre-computed firewall guidance for this port, if a firewall is active.
@@ -80,7 +82,7 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
 
     // Data routes carry sensitive content and sit behind the auth layer.
     // Static SPA assets do not — the app shell needs to load before the
-    // client can attach its token to subsequent API/media requests.
+    // client can pair its device and attach the cookie to later requests.
     let protected = Router::new()
         .route("/media/{*path}", get(routes::media))
         .route("/thumb/{tier}/{*path}", get(routes::thumb))
@@ -88,9 +90,18 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
         .route("/api/invoke", post(api::invoke))
         .layer(middleware::from_fn_with_state(state.clone(), mw::auth_layer));
 
+    // Bootstrap endpoints: pair a device, prove the gallery password, or
+    // query auth state. These can't sit behind the auth layer or there's no
+    // way to get past it the first time.
+    let bootstrap = Router::new()
+        .route("/pair/redeem", post(auth_routes::redeem))
+        .route("/auth/password", post(auth_routes::submit_password))
+        .route("/auth/status", get(auth_routes::status));
+
     let mut router = Router::new()
         .route("/healthz", get(routes::healthz))
-        .merge(protected);
+        .merge(protected)
+        .merge(bootstrap);
 
     if let Some(web_root) = state.config.web_root.clone() {
         if web_root.is_dir() {
