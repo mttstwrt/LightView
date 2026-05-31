@@ -45,6 +45,26 @@ if (typeof window !== "undefined") {
 /** Reactive: true on the web client at narrow viewports. False on desktop. */
 export const isMobile = _isMobile;
 
+// Touch-capability detection. Unlike `isMobile()` (a viewport-width heuristic
+// for the web client only), this answers "can the user touch the screen?" — so
+// it's true on phones, tablets, and touchscreen laptops alike, in both the
+// desktop and web builds. Gesture handlers branch on the live pointer's
+// `pointerType` for correctness; this is used to opt CSS (e.g. `touch-action`)
+// and touch-only affordances in/out at render time.
+let _hasTouch: boolean | null = null;
+
+/** True when the device reports a touch input. Cached after first call. */
+export function hasTouch(): boolean {
+  if (_hasTouch !== null) return _hasTouch;
+  if (typeof window === "undefined") return false;
+  _hasTouch =
+    (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0) ||
+    "ontouchstart" in window ||
+    (typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches);
+  return _hasTouch;
+}
+
 /** Event emitted when the server asks the web client to (re-)authenticate
  *  with the gallery password — i.e. it responded 401 with
  *  `WWW-Authenticate: LV-Password`. The App listens for this and shows the

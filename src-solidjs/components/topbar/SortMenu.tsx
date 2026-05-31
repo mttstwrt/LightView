@@ -1,4 +1,5 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
+import { isMobile } from "../../lib/runtime";
 import { sortField, setSortField, sortOrder, setSortOrder, subSortField, setSubSortField, subSortOrder, setSubSortOrder, groupBy } from "../../stores/settingsStore";
 import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
 import { buildFilterQuery } from "../../stores/filterStore";
@@ -95,7 +96,7 @@ export function SortMenu() {
   const subOptions = () => SORT_OPTIONS.filter((o) => o.field !== sortField());
 
   return (
-    <div class="relative">
+    <div class="relative shrink-0">
       <button
         onClick={toggle}
         class="shrink-0 flex items-center gap-1 px-2.5 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors cursor-pointer"
@@ -103,9 +104,13 @@ export function SortMenu() {
       >
         <span>{currentLabel()}</span>
         <span class="text-neutral-500">{orderIcon(sortOrder())}</span>
-        <span class="text-neutral-600 mx-0.5">/</span>
-        <span class="text-neutral-500">{subLabel()}</span>
-        <span class="text-neutral-600">{orderIcon(subSortOrder())}</span>
+        {/* Sub-sort is secondary detail — hidden on mobile to keep the bar
+            narrow enough for the settings/map buttons to fit. */}
+        <Show when={!isMobile()}>
+          <span class="text-neutral-600 mx-0.5">/</span>
+          <span class="text-neutral-500">{subLabel()}</span>
+          <span class="text-neutral-600">{orderIcon(subSortOrder())}</span>
+        </Show>
       </button>
 
       <Show when={open()}>

@@ -1,6 +1,7 @@
 import { Index, Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, isMobile, type UnlistenFn } from "../../lib/runtime";
+import { safeListen as listen, isMobile, hasTouch, type UnlistenFn } from "../../lib/runtime";
+import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
@@ -115,6 +116,15 @@ function DOMGrid(props: GalleryGridProps) {
   const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
 
   let containerRef: HTMLDivElement | undefined;
+  // The virtual-scroll layer we apply the live pinch `scale()` to (so the grid
+  // zooms smoothly under the fingers before committing a new column count).
+  let scrollContainerRef: HTMLDivElement | undefined;
+
+  // Pinch-to-zoom state. `pinchActive` widens the render buffer so scaling the
+  // slice down (zoom out) doesn't reveal blank rows; `pinchScale` is the live
+  // gesture scale, read by recalcRange to size that buffer.
+  const [pinchActive, setPinchActive] = createSignal(false);
+  const [pinchScale, setPinchScale] = createSignal(1);
 
   // -----------------------------------------------------------------------
   // Drag-to-select state
@@ -417,8 +427,18 @@ function DOMGrid(props: GalleryGridProps) {
       const relativeTop = Math.max(0, sy - offset);
       const relativeBottom = relativeTop + vh;
 
-      const bufferTop = scrollDirection === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
-      const bufferBottom = scrollDirection === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+      let bufferTop = scrollDirection === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
+      let bufferBottom = scrollDirection === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+
+      // While pinching, the slice is visually scaled by `pinchScale` about the
+      // focal point. Scaling down (zoom out) makes the viewport show ~1/scale
+      // more rows, so render that many extra rows on both sides to avoid blanks.
+      if (untrack(pinchActive)) {
+        const s = Math.max(0.2, untrack(pinchScale));
+        const extra = Math.min(60, Math.ceil((vh / rh) * (1 / s)) + 2);
+        bufferTop = extra;
+        bufferBottom = extra;
+      }
 
       const newStart = Math.max(0, Math.floor(relativeTop / rh) - bufferTop);
       const newEnd = Math.min(totalRows(), Math.ceil(relativeBottom / rh) + bufferBottom);
@@ -489,57 +509,73 @@ function DOMGrid(props: GalleryGridProps) {
       wheelRafId = requestAnimationFrame(drainWheel);
     };
 
+    // Commit a new thumbnail size, keeping the image under the anchor screen
+    // point pinned in place. Shared by Ctrl+wheel (anchor = cursor), the column
+    // stepper below, and the touch pinch commit (anchor = two-finger midpoint).
+    // No-ops if the resulting column count wouldn't change.
+    const applyThumbSizeAnchored = (rawNext: number, anchorX: number, anchorY: number) => {
+      const w = containerWidth();
+      const g = gap();
+      if (w <= 0) return;
+      const next = Math.max(THUMB_SIZE_MIN, Math.min(THUMB_SIZE_MAX, Math.round(rawNext)));
+      const cur = settings().display.thumbnail_size;
+      const curCols = Math.max(1, Math.floor((w + g) / (cur + g)));
+      const newCols = Math.max(1, Math.floor((w + g) / (next + g)));
+      if (newCols === curCols) return;
+
+      // --- Anchor: keep the anchored image at the same screen position ---
+      const containerTop = containerRef?.offsetTop ?? 0;
+      const curCellSize = (w - (curCols - 1) * g) / curCols;
+      const curRowHeight = curCellSize + g;
+
+      const anchorPageY = anchorY + window.scrollY;
+      const anchorInGrid = anchorPageY - containerTop;
+      const anchorRow = Math.max(0, Math.floor(anchorInGrid / curRowHeight));
+
+      const gridLeft = (containerRef?.getBoundingClientRect().left ?? 0) + g;
+      const anchorInRow = anchorX - gridLeft;
+      const anchorCol = Math.max(0, Math.min(curCols - 1, Math.floor(anchorInRow / (curCellSize + g))));
+      const anchorIndex = Math.min(props.paths.length - 1, anchorRow * curCols + anchorCol);
+
+      // Where the anchored image's row currently is on screen
+      const imagePageY = containerTop + anchorRow * curRowHeight;
+      const imageClientY = imagePageY - window.scrollY;
+
+      setSettings((prev) => ({
+        ...prev,
+        display: { ...prev.display, thumbnail_size: next },
+      }));
+
+      // Compute new position of that image and adjust scroll
+      const newCellSize = (w - (newCols - 1) * g) / newCols;
+      const newRowHeight = newCellSize + g;
+      const newRow = Math.floor(anchorIndex / newCols);
+      const newImagePageY = containerTop + newRow * newRowHeight;
+      window.scrollTo(0, newImagePageY - imageClientY);
+    };
+
+    // Step to `targetCols` columns (Ctrl+wheel): pick a thumb_size in the middle
+    // of the target bucket so the layout snaps cleanly to that column count.
+    const resizeByCols = (targetCols: number, anchorX: number, anchorY: number) => {
+      const w = containerWidth();
+      const g = gap();
+      if (w <= 0 || targetCols < 1) return;
+      const upper = (w + g) / targetCols - g;
+      const lower = (w + g) / (targetCols + 1) - g;
+      applyThumbSizeAnchored((upper + lower) / 2, anchorX, anchorY);
+    };
+
     const onWheel = (e: WheelEvent) => {
-      // Ctrl+wheel resizes thumbnails instead of scrolling. cellSize snaps
-      // to a whole-column layout, so we step the column count by 1 per tick
-      // and pick a thumb_size that lands in the middle of the target bucket.
-      // During a Ctrl+drag selection, fall through to scroll so the user can
-      // extend the drag past the viewport without zooming.
+      // Ctrl+wheel resizes thumbnails instead of scrolling, stepping the column
+      // count by 1 per tick. During a Ctrl+drag selection, fall through to
+      // scroll so the user can extend the drag past the viewport.
       if ((e.ctrlKey || e.metaKey) && !isDragging()) {
         e.preventDefault();
         const w = containerWidth();
         const g = gap();
         if (w <= 0) return;
-        const cur = settings().display.thumbnail_size;
-        const curCols = Math.max(1, Math.floor((w + g) / (cur + g)));
-        const targetCols = e.deltaY < 0 ? curCols - 1 : curCols + 1;
-        if (targetCols < 1) return;
-        const upper = (w + g) / targetCols - g;
-        const lower = (w + g) / (targetCols + 1) - g;
-        let next = Math.round((upper + lower) / 2);
-        next = Math.max(THUMB_SIZE_MIN, Math.min(THUMB_SIZE_MAX, next));
-        const newCols = Math.max(1, Math.floor((w + g) / (next + g)));
-        if (newCols === curCols) return;
-
-        // --- Anchor: keep hovered image at the same screen position ---
-        const containerTop = containerRef?.offsetTop ?? 0;
-        const curCellSize = (w - (curCols - 1) * g) / curCols;
-        const curRowHeight = curCellSize + g;
-
-        const cursorPageY = e.clientY + window.scrollY;
-        const cursorInGrid = cursorPageY - containerTop;
-        const hoverRow = Math.max(0, Math.floor(cursorInGrid / curRowHeight));
-
-        const gridLeft = (containerRef?.getBoundingClientRect().left ?? 0) + g;
-        const cursorInRow = e.clientX - gridLeft;
-        const hoverCol = Math.max(0, Math.min(curCols - 1, Math.floor(cursorInRow / (curCellSize + g))));
-        const hoverIndex = Math.min(props.paths.length - 1, hoverRow * curCols + hoverCol);
-
-        // Where the hovered image's row currently is on screen
-        const imagePageY = containerTop + hoverRow * curRowHeight;
-        const imageClientY = imagePageY - window.scrollY;
-
-        setSettings((prev) => ({
-          ...prev,
-          display: { ...prev.display, thumbnail_size: next },
-        }));
-
-        // Compute new position of that image and adjust scroll
-        const newCellSize = (w - (newCols - 1) * g) / newCols;
-        const newRowHeight = newCellSize + g;
-        const newRow = Math.floor(hoverIndex / newCols);
-        const newImagePageY = containerTop + newRow * newRowHeight;
-        window.scrollTo(0, newImagePageY - imageClientY);
+        const curCols = Math.max(1, Math.floor((w + g) / (settings().display.thumbnail_size + g)));
+        resizeByCols(e.deltaY < 0 ? curCols - 1 : curCols + 1, e.clientX, e.clientY);
         return;
       }
       e.preventDefault();
@@ -549,6 +585,103 @@ function DOMGrid(props: GalleryGridProps) {
       }
     };
     window.addEventListener("wheel", onWheel, { passive: false });
+
+    // -----------------------------------------------------------------------
+    // Touch pinch-to-zoom: two fingers smoothly scale the grid (a cheap CSS
+    // transform on the scroll layer, anchored at the pinch midpoint), then the
+    // new column count is committed once on release. Stepping the columns live
+    // (as Ctrl+wheel does) felt janky and could blank/crash on zoom-out; this
+    // mirrors how Apple Photos scales the grid during the gesture. One-finger
+    // touch still scrolls natively (the container is `touch-action: pan-y`).
+    // -----------------------------------------------------------------------
+    const gridPointers = new Map<number, Point>();
+    let pinchStartDist = 0;
+    let pinchMidX = 0;
+    let pinchMidY = 0;
+    let pinchOriginX = 0;
+    let pinchOriginY = 0;
+
+    const applyPinchTransform = (s: number) => {
+      if (!scrollContainerRef) return;
+      if (s === 1) {
+        scrollContainerRef.style.transform = "";
+        scrollContainerRef.style.transformOrigin = "";
+        scrollContainerRef.style.willChange = "";
+      } else {
+        scrollContainerRef.style.willChange = "transform";
+        scrollContainerRef.style.transformOrigin = `${pinchOriginX}px ${pinchOriginY}px`;
+        scrollContainerRef.style.transform = `scale(${s})`;
+      }
+    };
+
+    const endPinch = () => {
+      if (!untrack(pinchActive)) return;
+      const s = untrack(pinchScale);
+      const cur = settings().display.thumbnail_size;
+      applyPinchTransform(1);
+      setPinchActive(false);
+      setPinchScale(1);
+      // Commit the zoom: a scale of s means the user wants thumbnails s× the
+      // current size (→ fewer/more columns). Anchored at the start midpoint.
+      applyThumbSizeAnchored(cur * s, pinchMidX, pinchMidY);
+      recalcRange?.();
+    };
+
+    const onGridPointerDown = (e: PointerEvent) => {
+      if (e.pointerType !== "touch") return;
+      gridPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (gridPointers.size === 2) {
+        const [a, b] = [...gridPointers.values()];
+        pinchStartDist = pointerDistance(a, b) || 1;
+        const m = pointerMidpoint(a, b);
+        pinchMidX = m.x;
+        pinchMidY = m.y;
+        // transform-origin is relative to the scroll layer's own box.
+        const rect = scrollContainerRef?.getBoundingClientRect();
+        pinchOriginX = m.x - (rect?.left ?? 0);
+        pinchOriginY = m.y - (rect?.top ?? 0);
+        setPinchScale(1);
+        setPinchActive(true);
+        recalcRange?.(); // widen the buffer before scaling begins
+        // Capture both pointers so a re-render (recycled cells under the
+        // fingers) doesn't fire pointercancel and abort the pinch, and so the
+        // browser won't claim the two-finger move as a scroll.
+        for (const id of gridPointers.keys()) {
+          try { containerRef?.setPointerCapture(id); } catch {}
+        }
+      }
+    };
+    const onGridPointerMove = (e: PointerEvent) => {
+      if (e.pointerType !== "touch" || !gridPointers.has(e.pointerId)) return;
+      gridPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (!untrack(pinchActive) || gridPointers.size < 2) return;
+      e.preventDefault();
+      const [a, b] = [...gridPointers.values()];
+      const s = Math.max(0.35, Math.min(3, (pointerDistance(a, b) || 1) / pinchStartDist));
+      setPinchScale(s);
+      applyPinchTransform(s);
+      recalcRange?.(); // grow the buffer as the visible area scales
+    };
+    const onGridPointerEnd = (e: PointerEvent) => {
+      const wasTracked = gridPointers.delete(e.pointerId);
+      try { containerRef?.releasePointerCapture(e.pointerId); } catch {}
+      if (wasTracked && untrack(pinchActive) && gridPointers.size < 2) {
+        endPinch();
+      }
+    };
+
+    if (containerRef) {
+      containerRef.addEventListener("pointerdown", onGridPointerDown);
+      containerRef.addEventListener("pointermove", onGridPointerMove);
+      containerRef.addEventListener("pointerup", onGridPointerEnd);
+      containerRef.addEventListener("pointercancel", onGridPointerEnd);
+      onCleanup(() => {
+        containerRef?.removeEventListener("pointerdown", onGridPointerDown);
+        containerRef?.removeEventListener("pointermove", onGridPointerMove);
+        containerRef?.removeEventListener("pointerup", onGridPointerEnd);
+        containerRef?.removeEventListener("pointercancel", onGridPointerEnd);
+      });
+    }
 
     recalcRange(); // initial
 
@@ -867,7 +1000,7 @@ function DOMGrid(props: GalleryGridProps) {
   // -----------------------------------------------------------------------
 
   return (
-    <div ref={containerRef} class="w-full" style={{ "user-select": isDragging() ? "none" : undefined }} onClick={handleBackgroundClick}>
+    <div ref={containerRef} class="w-full" style={{ "user-select": isDragging() ? "none" : undefined, "touch-action": hasTouch() ? "pan-y" : undefined }} onClick={handleBackgroundClick}>
       <Show when={!props.loading && props.paths.length === 0}>
         <div class="flex items-center justify-center h-screen text-neutral-500 text-sm">
           No media files found
@@ -881,8 +1014,10 @@ function DOMGrid(props: GalleryGridProps) {
       </Show>
 
       <Show when={props.paths.length > 0}>
-        {/* Virtual scroll container: reserves full scroll height */}
+        {/* Virtual scroll container: reserves full scroll height. Also the
+            layer we apply the live pinch `scale()` to (set imperatively). */}
         <div
+          ref={scrollContainerRef}
           style={{
             position: "relative",
             height: `${totalHeight()}px`,

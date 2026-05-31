@@ -28,6 +28,7 @@ import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCanc
 import { safeListen as listen } from "../../lib/runtime";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { isWeb, isMobile } from "../../lib/runtime";
+import { thumbSizeForCols, currentColCount } from "../../lib/gridLayout";
 
 const THUMB_PRESETS = [
   { label: "S", value: 120 },
@@ -41,26 +42,6 @@ const THUMB_PRESETS = [
 // renders exactly 3 columns at the current viewport width. The choice of
 // presets here matches the user's request: 1 column (biggest) → 5 columns.
 const MOBILE_COL_PRESETS = [1, 2, 3, 4, 5] as const;
-
-/** Compute a thumbnail_size in CSS px that lands the grid on `targetCols`
- *  columns, given the current viewport width and grid gap. Mirrors the math
- *  in GalleryGrid's ctrl+wheel resize. */
-function thumbSizeForCols(targetCols: number, gap: number): number {
-  const w = typeof window !== "undefined" ? window.innerWidth : 400;
-  // The grid uses `cols = floor((w + g) / (size + g))`. We pick `size` in the
-  // middle of the bucket that yields targetCols so a small viewport change
-  // doesn't flip the column count.
-  const upper = (w + gap) / targetCols - gap;
-  const lower = (w + gap) / (targetCols + 1) - gap;
-  return Math.max(20, Math.round((upper + lower) / 2));
-}
-
-/** Reverse-derive the current effective column count from a saved
- *  thumbnail_size so the matching preset stays highlighted. */
-function currentColCount(thumbSize: number, gap: number): number {
-  const w = typeof window !== "undefined" ? window.innerWidth : 400;
-  return Math.max(1, Math.floor((w + gap) / (thumbSize + gap)));
-}
 
 const GAP_PRESETS = [
   { label: "None", value: 0 },

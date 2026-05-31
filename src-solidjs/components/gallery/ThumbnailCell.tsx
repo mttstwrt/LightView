@@ -75,11 +75,14 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       }}
       onClick={(e) => props.onClick(e)}
       onMouseDown={(e) => props.onMouseDown?.(e)}
-      onMouseEnter={(e) => {
-        setHovered(true);
-        props.onMouseEnter?.(e);
-      }}
-      onMouseLeave={() => setHovered(false)}
+      onMouseEnter={(e) => props.onMouseEnter?.(e)}
+      // Hover preview (e.g. GIF → animated) is a mouse-only affordance. Touch
+      // synthesizes a mouseenter that never gets a matching leave, which would
+      // leave a cell stuck "hovered" mid-pinch — so drive it from pointer
+      // events gated on a real mouse instead.
+      onPointerEnter={(e) => { if (e.pointerType === "mouse") setHovered(true); }}
+      onPointerLeave={() => setHovered(false)}
+      onPointerCancel={() => setHovered(false)}
       onContextMenu={(e) => {
         if (props.onContextMenu) {
           e.preventDefault();

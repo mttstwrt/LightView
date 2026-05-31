@@ -1,4 +1,5 @@
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, Show, onMount, onCleanup } from "solid-js";
+import { isMobile } from "../../lib/runtime";
 import {
   acQuery, setAcQuery,
   acSuggestions, setAcSuggestions,
@@ -20,6 +21,20 @@ interface FilterBarProps {
 export function FilterBar(props: FilterBarProps) {
   let inputRef: HTMLInputElement | undefined;
   let debounceTimer: number | undefined;
+
+  // Mobile: the five inline rating stars don't fit alongside sort/settings, so
+  // they collapse into a single star button that opens a small popover.
+  const [ratingMenuOpen, setRatingMenuOpen] = createSignal(false);
+  let ratingRef: HTMLDivElement | undefined;
+  onMount(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (ratingMenuOpen() && ratingRef && !ratingRef.contains(e.target as Node)) {
+        setRatingMenuOpen(false);
+      }
+    };
+    document.addEventListener("click", onDocClick);
+    onCleanup(() => document.removeEventListener("click", onDocClick));
+  });
 
   // Extract the last "word" being typed (the token after the last space/operator)
   const getCurrentToken = (value: string, cursorPos: number): { token: string; start: number } => {
@@ -175,39 +190,91 @@ export function FilterBar(props: FilterBarProps) {
     await applyCurrentFilter();
   };
 
-  return (
-    <div class="flex-1 relative">
-      <div class="flex items-center gap-1 bg-neutral-800/60 rounded px-2 py-1 border border-neutral-700/40">
-        {/* Rating filter pill */}
-        <Show when={ratingFilter()}>
-          <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-amber-900/40 text-amber-300">
-            {ratingFilter()!.op}{ratingFilter()!.value}&#9733;
-            <button
-              class="text-amber-400/60 hover:text-amber-200 cursor-pointer ml-0.5"
-              onClick={handleClearRatingFilter}
-            >
-              &times;
-            </button>
-          </span>
-        </Show>
+  // The five 1–5 star buttons, shared by the desktop inline row and the mobile
+  // popover. `closeAfter` dismisses the mobile popover once a star is tapped.
+  const ratingStars = (closeAfter: boolean) => (
+    <For each={[1, 2, 3, 4, 5]}>
+      {(star) => (
+        <button
+          class="cursor-pointer text-sm transition-colors leading-none"
+          style={{
+            color: ratingFilter() && star <= ratingFilter()!.value ? "#f59e0b" : "#525252",
+          }}
+          onClick={() => {
+            handleSetRatingFilter(star);
+            if (closeAfter) setRatingMenuOpen(false);
+          }}
+          title={`Filter: rating >= ${star}`}
+        >
+          &#9733;
+        </button>
+      )}
+    </For>
+  );
 
-        {/* Rating star quick-filter */}
-        <div class="flex items-center gap-0 ml-0.5">
-          <For each={[1, 2, 3, 4, 5]}>
-            {(star) => (
-              <button
-                class="cursor-pointer text-sm transition-colors leading-none"
+  return (
+    <div class="flex-1 relative min-w-0">
+      <div class="flex items-center gap-1 bg-neutral-800/60 rounded px-2 py-1 border border-neutral-700/40">
+        <Show
+          when={isMobile()}
+          fallback={
+            <>
+              {/* Rating filter pill */}
+              <Show when={ratingFilter()}>
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-amber-900/40 text-amber-300">
+                  {ratingFilter()!.op}{ratingFilter()!.value}&#9733;
+                  <button
+                    class="text-amber-400/60 hover:text-amber-200 cursor-pointer ml-0.5"
+                    onClick={handleClearRatingFilter}
+                  >
+                    &times;
+                  </button>
+                </span>
+              </Show>
+
+              {/* Rating star quick-filter */}
+              <div class="flex items-center gap-0 ml-0.5">{ratingStars(false)}</div>
+            </>
+          }
+        >
+          {/* Mobile: single star button opening a compact popover. */}
+          <div class="relative shrink-0" ref={ratingRef}>
+            <button
+              class="flex items-center gap-0.5 px-1.5 py-0.5 rounded cursor-pointer leading-none text-sm"
+              classList={{
+                "text-amber-300 bg-amber-900/30": !!ratingFilter(),
+                "text-neutral-500": !ratingFilter(),
+              }}
+              onClick={() => setRatingMenuOpen((v) => !v)}
+              title="Filter by rating"
+            >
+              <span>&#9733;</span>
+              <Show when={ratingFilter()}>
+                <span class="text-xs">{ratingFilter()!.value}</span>
+              </Show>
+            </button>
+            <Show when={ratingMenuOpen()}>
+              <div
+                class="absolute top-full left-0 mt-1 p-1.5 rounded shadow-lg z-50 flex items-center gap-0.5"
                 style={{
-                  color: ratingFilter() && star <= ratingFilter()!.value ? "#f59e0b" : "#525252",
+                  background: "rgba(20, 20, 20, 0.97)",
+                  "backdrop-filter": "blur(12px)",
+                  border: "1px solid rgba(255,255,255,0.08)",
                 }}
-                onClick={() => handleSetRatingFilter(star)}
-                title={`Filter: rating >= ${star}`}
               >
-                &#9733;
-              </button>
-            )}
-          </For>
-        </div>
+                {ratingStars(true)}
+                <Show when={ratingFilter()}>
+                  <button
+                    class="text-neutral-400 hover:text-neutral-200 text-xs ml-1 cursor-pointer"
+                    onClick={() => { handleClearRatingFilter(); setRatingMenuOpen(false); }}
+                  >
+                    &times;
+                  </button>
+                </Show>
+              </div>
+            </Show>
+          </div>
+        </Show>
 
         <input
           ref={(el) => { inputRef = el; props.onInputRef?.(el); }}
@@ -222,7 +289,7 @@ export function FilterBar(props: FilterBarProps) {
             setTimeout(() => setAcOpen(false), 200);
           }}
           placeholder="Filter... (e.g. user AND example, NOT auto::indoor)"
-          class="flex-1 bg-transparent border-none outline-none text-sm text-neutral-200 placeholder-neutral-500 min-w-[80px]"
+          class="flex-1 bg-transparent border-none outline-none text-sm text-neutral-200 placeholder-neutral-500 min-w-0"
         />
 
         <Show when={filterQuery() || ratingFilter()}>
