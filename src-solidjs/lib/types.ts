@@ -187,6 +187,11 @@ export interface AppSettings {
   storage: {
     companion_location: CompanionLocation;
   };
+  // Filter query applied automatically when a gallery is first opened (app or web).
+  default_filter: {
+    enabled: boolean;
+    query: string;
+  };
   external_apps: ExternalApp[];
 }
 

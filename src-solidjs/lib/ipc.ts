@@ -535,6 +535,10 @@ export const saveGallerySettings = (settingsJson: string) =>
 export const loadGallerySettings = () =>
   invoke<string | null>("load_gallery_settings");
 
+/** Gallery-wide default filter (shared by desktop and LAN web clients). */
+export const getGalleryDefaultFilter = () =>
+  invoke<{ enabled: boolean; query: string } | null>("get_gallery_default_filter");
+
 export interface RecentGallery {
   path: string;
   last_opened: number;

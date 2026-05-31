@@ -359,6 +359,7 @@ fn main() {
             commands::settings::get_perf_snapshot,
             commands::settings::save_gallery_settings,
             commands::settings::load_gallery_settings,
+            commands::settings::get_gallery_default_filter,
             commands::settings::get_recent_galleries,
             commands::settings::remove_recent_gallery,
             commands::settings::open_with,

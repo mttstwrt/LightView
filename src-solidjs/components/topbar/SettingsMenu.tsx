@@ -125,6 +125,16 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     }));
   };
 
+  const updateDefaultFilter = <K extends keyof AppSettings["default_filter"]>(
+    key: K,
+    value: AppSettings["default_filter"][K],
+  ) => {
+    setSettings((prev) => ({
+      ...prev,
+      default_filter: { ...prev.default_filter, [key]: value },
+    }));
+  };
+
   // ── Remote (LAN) web access ──
   const REMOTE_PORT_KEY = "lv_remote_port";
   const DEFAULT_REMOTE_PORT = 8723;
@@ -460,7 +470,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
           class={
             isMobile()
               ? "fixed top-0 right-0 bottom-0 w-[88vw] max-w-sm overflow-hidden shadow-xl z-50 flex flex-col"
-              : "absolute top-full right-0 mt-2 w-72 rounded-lg overflow-hidden shadow-xl z-50"
+              : "absolute top-full right-0 mt-2 w-72 rounded-lg overflow-hidden shadow-xl z-50 flex flex-col max-h-[calc(100vh-5rem)]"
           }
           style={{
             background: "rgba(18, 18, 18, 0.96)",
@@ -484,10 +494,10 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
           </div>
 
           <div
-            class="px-4 py-3 flex flex-col gap-4 overflow-y-auto hide-scrollbar"
+            class="px-4 py-3 flex flex-col gap-4 overflow-y-auto flex-1 min-h-0"
             classList={{
-              "flex-1 min-h-0": isMobile(),
-              "max-h-[70vh]": !isMobile(),
+              "hide-scrollbar": isMobile(),
+              "dupes-scroll": !isMobile(),
             }}
           >
             {/* ── Display ── */}
@@ -634,6 +644,30 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 </div>
               </Field>
             </Section>
+
+            {/* ── Default filter (desktop-managed; LAN clients inherit it) ── */}
+            <Show when={!isWeb()}>
+            <Section label="Default Filter">
+              <Toggle
+                label="Apply on gallery open"
+                checked={settings().default_filter?.enabled ?? false}
+                onChange={(v) => updateDefaultFilter("enabled", v)}
+              />
+              <Show when={settings().default_filter?.enabled}>
+                <input
+                  type="text"
+                  value={settings().default_filter?.query ?? ""}
+                  onInput={(e) => updateDefaultFilter("query", e.currentTarget.value)}
+                  placeholder="e.g. rating>=3 AND NOT auto::indoor"
+                  class="w-full px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
+                />
+                <span class="text-[10px] text-neutral-600 leading-snug">
+                  Applied automatically the next time this gallery is opened — including
+                  from LAN web clients.
+                </span>
+              </Show>
+            </Section>
+            </Show>
 
             {/* ── Remote access (desktop only) ── */}
             <Show when={!isWeb()}>
