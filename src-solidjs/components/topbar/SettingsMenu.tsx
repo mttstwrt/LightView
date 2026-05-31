@@ -1,6 +1,7 @@
 import { createSignal, createEffect, Show, For, onCleanup, onMount } from "solid-js";
+import { Portal, Dynamic } from "solid-js/web";
 import { settings, setSettings } from "../../stores/settingsStore";
-import { displayPaths } from "../../stores/galleryStore";
+import { displayPaths, setSettingsOpen } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
 import {
@@ -52,6 +53,11 @@ const GAP_PRESETS = [
 
 export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onRequestShow?: () => void }) {
   const [open, setOpen] = createSignal(false);
+
+  // Mirror open state into the store so App can hide the grid behind the
+  // full-screen mobile settings page. Cleared on unmount.
+  createEffect(() => setSettingsOpen(open()));
+  onCleanup(() => setSettingsOpen(false));
 
   const toggle = () => setOpen((v) => !v);
 
@@ -442,22 +448,41 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
         </svg>
       </button>
 
-      {/* Dropdown panel (desktop) / right-side sheet (mobile) */}
+      {/* Dropdown panel (desktop) / full-screen page (mobile) */}
       <Show when={open()}>
-        {/* Backdrop — click to close */}
-        <div class="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+        {/* Backdrop — click to close (desktop only; the mobile page is opaque
+            and covers the whole viewport, so there's nothing to click behind). */}
+        <Show when={!isMobile()}>
+          <div class="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+        </Show>
 
+        {/* On mobile the panel is a full-screen, fully-opaque page rather than a
+            translucent drawer over the gallery: phones don't reliably honor
+            `backdrop-filter`, so the gallery used to bleed through and the panel
+            read as empty/cut-off.
+
+            The mobile page is portalled to <body> so its `position: fixed`
+            resolves against the viewport. Rendered in place it would be trapped
+            by the top bar's `backdrop-filter`, which establishes a containing
+            block for fixed descendants and clips the page to the bar's height.
+            Desktop stays in place — its `absolute` panel is positioned by the
+            gear's `relative` wrapper. */}
+        <Dynamic component={isMobile() ? Portal : InPlace}>
         <div
           class={
             isMobile()
-              ? "fixed top-0 right-0 bottom-0 w-[88vw] max-w-sm overflow-hidden shadow-xl z-50 flex flex-col"
+              ? "fixed inset-0 z-[60] overflow-hidden flex flex-col"
               : "absolute top-full right-0 mt-2 w-72 rounded-lg overflow-hidden shadow-xl z-50 flex flex-col max-h-[calc(100vh-5rem)]"
           }
-          style={{
-            background: "rgba(18, 18, 18, 0.96)",
-            "backdrop-filter": "blur(16px)",
-            border: "1px solid rgba(255,255,255,0.08)",
-          }}
+          style={
+            isMobile()
+              ? { background: "#121212" }
+              : {
+                  background: "rgba(18, 18, 18, 0.96)",
+                  "backdrop-filter": "blur(16px)",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                }
+          }
         >
           <div class="px-4 py-3 border-b border-neutral-800/60 flex items-center justify-between shrink-0">
             <span class="text-sm font-medium text-neutral-200">Settings</span>
@@ -997,12 +1022,19 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             </Show>
           </div>
         </div>
+        </Dynamic>
       </Show>
     </div>
   );
 }
 
 // ── Helpers ──
+
+/** Renders children where they sit (no portal). Paired with `Dynamic` so the
+ *  desktop settings dropdown stays in place while the mobile page portals out. */
+function InPlace(props: { children: any }) {
+  return props.children;
+}
 
 function Section(props: { label: string; children: any }) {
   return (

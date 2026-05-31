@@ -2,9 +2,9 @@ import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
-import { isTauri, isWeb } from "./lib/runtime";
+import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
@@ -165,6 +165,11 @@ export function App() {
   const [duplicatesOpen, setDuplicatesOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
+
+  // On mobile the settings panel is a full-screen page; the WebGL/canvas grid
+  // composites above the DOM panel on some mobile browsers, so we stop rendering
+  // the gallery content entirely while settings is open there.
+  const contentHidden = () => isMobile() && settingsOpen();
 
   // Scrollbar sort indicators
   const scrollIndicators = () => buildScrollIndicators(sortedItems(), sortField());
@@ -381,7 +386,7 @@ export function App() {
         fallback={<WelcomeScreen onOpen={handleOpenFolder} onOpenPath={openPath} />}
       >
         <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} />
-        <Show when={viewMode() === "grid"}>
+        <Show when={viewMode() === "grid" && !contentHidden()}>
           <GalleryGrid
             paths={displayPaths()}
             onItemClick={(index) => {
@@ -424,7 +429,7 @@ export function App() {
             }}
           />
         </Show>
-        <Show when={viewMode() === "map"}>
+        <Show when={viewMode() === "map" && !contentHidden()}>
           <MapView />
         </Show>
         <Show when={viewerOpen()}>

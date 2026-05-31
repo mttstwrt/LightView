@@ -35,6 +35,11 @@ const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
 export type ViewMode = "grid" | "map";
 const [viewMode, setViewMode] = createSignal<ViewMode>("grid");
 
+// Whether the settings panel is open. On mobile the panel is a full-screen
+// page, so App uses this to stop rendering the grid behind it (the WebGL/canvas
+// grid composites above the DOM panel on some mobile browsers otherwise).
+const [settingsOpen, setSettingsOpen] = createSignal(false);
+
 export {
   galleryPath, setGalleryPath,
   totalCount, setTotalCount,
@@ -47,6 +52,7 @@ export {
   timeline, setTimeline,
   selectedPaths, setSelectedPaths,
   viewMode, setViewMode,
+  settingsOpen, setSettingsOpen,
 };
 
 // ---------------------------------------------------------------------------
