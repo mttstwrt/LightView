@@ -1,5 +1,5 @@
 use crate::companion::schema::CompanionFile;
-use crate::filter::ast::{FilterExpr, RatingOp, TagNamespace};
+use crate::filter::ast::{CompareOp, FilterExpr, TagNamespace};
 
 /// Evaluate a filter expression against a single companion file (in-memory path).
 /// Returns true if the companion file matches the filter.
@@ -39,9 +39,9 @@ pub fn evaluate(expr: &FilterExpr, companion: &CompanionFile) -> bool {
                 .and_then(|c| c.rating)
                 .unwrap_or(0);
             match op {
-                RatingOp::Gte => rating >= *value,
-                RatingOp::Lte => rating <= *value,
-                RatingOp::Eq => rating == *value,
+                CompareOp::Gte => rating >= *value,
+                CompareOp::Lte => rating <= *value,
+                CompareOp::Eq => rating == *value,
             }
         }
 
@@ -83,6 +83,13 @@ pub fn evaluate(expr: &FilterExpr, companion: &CompanionFile) -> bool {
                 .is_some();
             has == *present
         }
+
+        // Date columns (date_taken/date_added/last_viewed) and numeric columns
+        // (width/height/file_size) live in media_meta, not in the companion
+        // file, so the in-memory path can't evaluate them. Treat as a no-op
+        // pass-through; these filters run through `to_sql` (the production path
+        // — `evaluate` is only used in tests).
+        FilterExpr::DateRange { .. } | FilterExpr::Numeric { .. } => true,
     }
 }
 
@@ -150,12 +157,7 @@ pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
         FilterExpr::Rating { op, value } => {
             params.push(value.to_string());
             let idx = params.len();
-            let op_str = match op {
-                RatingOp::Gte => ">=",
-                RatingOp::Lte => "<=",
-                RatingOp::Eq => "=",
-            };
-            format!("m.rating {} ?{}", op_str, idx)
+            format!("m.rating {} ?{}", op.as_sql(), idx)
         }
 
         FilterExpr::MediaType { value } => {
@@ -219,6 +221,37 @@ pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
                 "m.gps_lat IS NULL".to_string()
             }
         }
+
+        FilterExpr::DateRange { field, from, to } => {
+            // Column name comes from a fixed enum, not user input — safe to
+            // interpolate. Bounds are bound as parameters.
+            let col = field.column();
+            let mut clauses = vec![format!("m.{} IS NOT NULL", col)];
+            if let Some(from) = from {
+                params.push(from.to_string());
+                clauses.push(format!("m.{} >= ?{}", col, params.len()));
+            }
+            if let Some(to) = to {
+                params.push(to.to_string());
+                clauses.push(format!("m.{} <= ?{}", col, params.len()));
+            }
+            format!("({})", clauses.join(" AND "))
+        }
+
+        FilterExpr::Numeric { field, op, value } => {
+            // Column name comes from a fixed enum, not user input — safe to
+            // interpolate. The bound is a parameter. width/height are nullable,
+            // so guard against NULL matching.
+            let col = field.column();
+            params.push(value.to_string());
+            format!(
+                "(m.{} IS NOT NULL AND m.{} {} ?{})",
+                col,
+                col,
+                op.as_sql(),
+                params.len()
+            )
+        }
     }
 }
 
@@ -227,6 +260,44 @@ mod tests {
     use super::*;
     use crate::companion::schema::{CompanionFile, MediaType as MT};
     use crate::filter::parser::parse_filter;
+
+    #[test]
+    fn test_to_sql_date_range_both_bounds() {
+        // date=2024 → closed range against date_taken, two bound params.
+        let expr = parse_filter("date=2024").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert_eq!(
+            sql,
+            "(m.date_taken IS NOT NULL AND m.date_taken >= ?1 AND m.date_taken <= ?2)"
+        );
+        assert_eq!(params, vec!["1704067200".to_string(), "1735689599".to_string()]);
+    }
+
+    #[test]
+    fn test_to_sql_numeric() {
+        let expr = parse_filter("width>=1920").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert_eq!(sql, "(m.width IS NOT NULL AND m.width >= ?1)");
+        assert_eq!(params, vec!["1920".to_string()]);
+
+        let expr = parse_filter("size<=5mb").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert_eq!(sql, "(m.file_size IS NOT NULL AND m.file_size <= ?1)");
+        assert_eq!(params, vec![(5 * 1024 * 1024).to_string()]);
+    }
+
+    #[test]
+    fn test_to_sql_date_range_field_and_open_end() {
+        // viewed>=2024-01-01 → single lower bound against last_viewed.
+        let expr = parse_filter("viewed>=2024-01-01").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert_eq!(sql, "(m.last_viewed IS NOT NULL AND m.last_viewed >= ?1)");
+        assert_eq!(params.len(), 1);
+    }
 
     fn make_companion(user_tags: &[&str]) -> CompanionFile {
         let mut c = CompanionFile::new("test.jpg", MT::Image);

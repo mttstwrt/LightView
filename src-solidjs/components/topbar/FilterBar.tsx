@@ -288,7 +288,7 @@ export function FilterBar(props: FilterBarProps) {
           onBlur={() => {
             setTimeout(() => setAcOpen(false), 200);
           }}
-          placeholder="Filter... (e.g. user AND example, NOT auto::indoor)"
+          placeholder="Filter... (e.g. user AND example, date>=2024-01-01, width>=1920, size>=10mb)"
           class="flex-1 bg-transparent border-none outline-none text-sm text-neutral-200 placeholder-neutral-500 min-w-0"
         />
 

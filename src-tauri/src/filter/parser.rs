@@ -1,5 +1,7 @@
+use chrono::NaiveDate;
+
 use crate::companion::schema::MediaType;
-use crate::filter::ast::{FilterExpr, RatingOp, TagNamespace};
+use crate::filter::ast::{CompareOp, DateField, FilterExpr, NumericField, TagNamespace};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -13,6 +15,10 @@ pub enum ParseError {
     UnknownMediaType(String),
     #[error("Invalid geo filter: {0}")]
     InvalidGeo(String),
+    #[error("Invalid date filter: {0}")]
+    InvalidDate(String),
+    #[error("Invalid numeric filter: {0}")]
+    InvalidNumeric(String),
 }
 
 /// Parse a filter query string into a FilterExpr.
@@ -25,6 +31,11 @@ pub enum ParseError {
 ///   user::vacation OR user::travel              → boolean OR
 ///   NOT auto:indoor                             → boolean NOT
 ///   rating>=4                                   → rating filter
+///   date>=2024-01-01                            → capture date on/after
+///   date=2024                                   → captured during 2024
+///   added<=2024-06 / viewed>=2023               → date added / last viewed
+///   width>=1920 / height<=1080                  → pixel dimensions
+///   size>=10mb / size<=500kb                    → file size (b/kb/mb/gb)
 ///   type:video                                  → media type filter
 ///   has::user                                   → namespace existence
 ///   (user::a OR user::b) AND NOT auto::indoor   → grouped expression
@@ -156,6 +167,17 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
         return parse_rating(token, rest);
     }
 
+    // Date filter: date>=2024-01-01, added<=2024-12, viewed=2024
+    // (`date` = capture date, `added` = date added, `viewed` = last viewed).
+    if let Some(expr) = parse_date(token)? {
+        return Ok((expr, rest));
+    }
+
+    // Numeric metadata filter: width>=1920, height<=1080, size>=10mb
+    if let Some(expr) = parse_numeric(token)? {
+        return Ok((expr, rest));
+    }
+
     // Media type filter: type:video, type:image, type:gif
     if let Some(type_val) = token.strip_prefix("type:") {
         let media_type = match type_val.to_lowercase().as_str() {
@@ -268,11 +290,11 @@ fn parse_geo_bbox<'a>(bbox_str: &str, rest: &'a [String]) -> ParseResult<'a> {
 
 fn parse_rating<'a>(token: &str, rest: &'a [String]) -> ParseResult<'a> {
     let (op, val_str) = if let Some(v) = token.strip_prefix("rating>=") {
-        (RatingOp::Gte, v)
+        (CompareOp::Gte, v)
     } else if let Some(v) = token.strip_prefix("rating<=") {
-        (RatingOp::Lte, v)
+        (CompareOp::Lte, v)
     } else if let Some(v) = token.strip_prefix("rating=") {
-        (RatingOp::Eq, v)
+        (CompareOp::Eq, v)
     } else {
         return Err(ParseError::InvalidRating(token.to_string()));
     };
@@ -282,6 +304,126 @@ fn parse_rating<'a>(token: &str, rest: &'a [String]) -> ParseResult<'a> {
         .map_err(|_| ParseError::InvalidRating(val_str.to_string()))?;
 
     Ok((FilterExpr::Rating { op, value }, rest))
+}
+
+/// Try to parse a date-range filter token (`date`/`added`/`viewed` followed by
+/// `>=`, `<=`, or `=`). Returns `Ok(None)` if the token isn't a date filter so
+/// the caller can fall through to tag parsing; `Err` if it looks like one but
+/// carries an invalid date literal.
+fn parse_date(token: &str) -> Result<Option<FilterExpr>, ParseError> {
+    // Check two-char operators before "=" so it doesn't shadow ">=" / "<=".
+    for op in ["<=", ">=", "="] {
+        let Some(pos) = token.find(op) else { continue };
+        let field = match &token[..pos] {
+            "date" => DateField::Taken,
+            "added" => DateField::Added,
+            "viewed" => DateField::Viewed,
+            _ => return Ok(None), // not a date filter — let tag parsing handle it
+        };
+        let (lo, hi) = parse_date_literal(&token[pos + op.len()..])?;
+        let (from, to) = match op {
+            ">=" => (Some(lo), None),
+            "<=" => (None, Some(hi)),
+            _ => (Some(lo), Some(hi)), // "=" matches the whole period
+        };
+        return Ok(Some(FilterExpr::DateRange { field, from, to }));
+    }
+    Ok(None)
+}
+
+/// Parse a date literal into an inclusive `(start, end)` pair of Unix-second
+/// timestamps (UTC), matching how the rest of the app interprets stored dates.
+/// Accepts `YYYY` (whole year), `YYYY-MM` (whole month), or `YYYY-MM-DD` (one
+/// day). A partial date denotes the full period it covers.
+fn parse_date_literal(s: &str) -> Result<(i64, i64), ParseError> {
+    let err = || ParseError::InvalidDate(s.to_string());
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts[0].len() != 4 {
+        return Err(err());
+    }
+    let year: i32 = parts[0].parse().map_err(|_| err())?;
+
+    // `start` is the first instant of the period; `next` is the first instant
+    // of the following period, so the inclusive end is `next - 1 second`.
+    let (start, next) = match parts.len() {
+        1 => (
+            NaiveDate::from_ymd_opt(year, 1, 1).ok_or_else(err)?,
+            NaiveDate::from_ymd_opt(year + 1, 1, 1).ok_or_else(err)?,
+        ),
+        2 => {
+            let month: u32 = parts[1].parse().map_err(|_| err())?;
+            let start = NaiveDate::from_ymd_opt(year, month, 1).ok_or_else(err)?;
+            let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+            let next = NaiveDate::from_ymd_opt(ny, nm, 1).ok_or_else(err)?;
+            (start, next)
+        }
+        3 => {
+            let month: u32 = parts[1].parse().map_err(|_| err())?;
+            let day: u32 = parts[2].parse().map_err(|_| err())?;
+            let start = NaiveDate::from_ymd_opt(year, month, day).ok_or_else(err)?;
+            (start, start.succ_opt().ok_or_else(err)?)
+        }
+        _ => return Err(err()),
+    };
+
+    let lo = start.and_hms_opt(0, 0, 0).ok_or_else(err)?.and_utc().timestamp();
+    let hi = next.and_hms_opt(0, 0, 0).ok_or_else(err)?.and_utc().timestamp() - 1;
+    Ok((lo, hi))
+}
+
+/// Try to parse a numeric-metadata filter token (`width`/`height`/`size`/
+/// `filesize` followed by `>=`, `<=`, or `=`). Returns `Ok(None)` if the token
+/// isn't a numeric filter so the caller can fall through to tag parsing; `Err`
+/// if it looks like one but carries an invalid value.
+fn parse_numeric(token: &str) -> Result<Option<FilterExpr>, ParseError> {
+    // Check two-char operators before "=" so it doesn't shadow ">=" / "<=".
+    for op_str in ["<=", ">=", "="] {
+        let Some(pos) = token.find(op_str) else { continue };
+        let field = match &token[..pos] {
+            "width" => NumericField::Width,
+            "height" => NumericField::Height,
+            "size" | "filesize" => NumericField::FileSize,
+            _ => return Ok(None), // not a numeric filter — let tag parsing handle it
+        };
+        let op = match op_str {
+            ">=" => CompareOp::Gte,
+            "<=" => CompareOp::Lte,
+            _ => CompareOp::Eq,
+        };
+        let raw = &token[pos + op_str.len()..];
+        let value = match field {
+            NumericField::FileSize => parse_size(raw)?,
+            _ => raw
+                .parse::<i64>()
+                .map_err(|_| ParseError::InvalidNumeric(token.to_string()))?,
+        };
+        return Ok(Some(FilterExpr::Numeric { field, op, value }));
+    }
+    Ok(None)
+}
+
+/// Parse a byte-size literal into a number of bytes. Accepts a plain number
+/// (bytes) or a `b`/`kb`/`mb`/`gb` suffix (base-1024, matching how the viewer's
+/// InfoPanel formats sizes). Fractional values like `1.5mb` are allowed.
+fn parse_size(s: &str) -> Result<i64, ParseError> {
+    let err = || ParseError::InvalidNumeric(s.to_string());
+    let lower = s.trim().to_lowercase();
+    let (num_str, mult): (&str, i64) = if let Some(n) = lower.strip_suffix("gb") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let num: f64 = num_str.trim().parse().map_err(|_| err())?;
+    if num < 0.0 || !num.is_finite() {
+        return Err(err());
+    }
+    Ok((num * mult as f64) as i64)
 }
 
 /// Check if a bare token is a namespace name rather than a tag value.
@@ -349,7 +491,7 @@ mod tests {
         let expr = parse_filter("rating>=4").unwrap();
         match expr {
             FilterExpr::Rating { op, value } => {
-                assert!(matches!(op, RatingOp::Gte));
+                assert!(matches!(op, CompareOp::Gte));
                 assert_eq!(value, 4);
             }
             _ => panic!("Expected Rating"),
@@ -458,6 +600,149 @@ mod tests {
         // Grouping parentheses (space-separated) should still work.
         let expr = parse_filter("(vacation OR travel) AND family").unwrap();
         assert!(matches!(expr, FilterExpr::And { .. }));
+    }
+
+    #[test]
+    fn test_date_gte_full_day() {
+        // date>=2024-03-15 → from = start of that day (UTC), to open.
+        let expr = parse_filter("date>=2024-03-15").unwrap();
+        match expr {
+            FilterExpr::DateRange { field, from, to } => {
+                assert_eq!(field, DateField::Taken);
+                assert_eq!(from, Some(1710460800)); // 2024-03-15T00:00:00Z
+                assert_eq!(to, None);
+            }
+            _ => panic!("Expected DateRange, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_date_eq_whole_year() {
+        // date=2024 → inclusive [2024-01-01T00:00:00Z, 2024-12-31T23:59:59Z].
+        let expr = parse_filter("date=2024").unwrap();
+        match expr {
+            FilterExpr::DateRange { field, from, to } => {
+                assert_eq!(field, DateField::Taken);
+                assert_eq!(from, Some(1704067200)); // 2024-01-01T00:00:00Z
+                assert_eq!(to, Some(1735689599)); // 2024-12-31T23:59:59Z
+            }
+            _ => panic!("Expected DateRange, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_date_lte_whole_month_and_field() {
+        // added<=2024-02 → to = end of Feb (leap year → 29th), from open.
+        let expr = parse_filter("added<=2024-02").unwrap();
+        match expr {
+            FilterExpr::DateRange { field, from, to } => {
+                assert_eq!(field, DateField::Added);
+                assert_eq!(from, None);
+                assert_eq!(to, Some(1709251199)); // 2024-02-29T23:59:59Z
+            }
+            _ => panic!("Expected DateRange, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_date_viewed_field() {
+        let expr = parse_filter("viewed>=2023").unwrap();
+        assert!(matches!(
+            expr,
+            FilterExpr::DateRange { field: DateField::Viewed, .. }
+        ));
+    }
+
+    #[test]
+    fn test_date_composes_with_tag() {
+        let expr = parse_filter("user::vacation AND date>=2024-01-01").unwrap();
+        match expr {
+            FilterExpr::And { left, right } => {
+                assert!(matches!(left.as_ref(), FilterExpr::Tag { .. }));
+                assert!(matches!(right.as_ref(), FilterExpr::DateRange { .. }));
+            }
+            _ => panic!("Expected And, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_date_invalid_literal() {
+        assert!(parse_filter("date>=notadate").is_err());
+        assert!(parse_filter("date=2024-13").is_err()); // no month 13
+        assert!(parse_filter("date>=24-01-01").is_err()); // year must be 4 digits
+    }
+
+    #[test]
+    fn test_numeric_width_height() {
+        let expr = parse_filter("width>=1920").unwrap();
+        match expr {
+            FilterExpr::Numeric { field, op, value } => {
+                assert_eq!(field, NumericField::Width);
+                assert!(matches!(op, CompareOp::Gte));
+                assert_eq!(value, 1920);
+            }
+            _ => panic!("Expected Numeric, got {:?}", expr),
+        }
+
+        let expr = parse_filter("height<=1080").unwrap();
+        assert!(matches!(
+            expr,
+            FilterExpr::Numeric { field: NumericField::Height, op: CompareOp::Lte, value: 1080 }
+        ));
+    }
+
+    #[test]
+    fn test_numeric_size_units() {
+        // size>=10mb → 10 * 1024 * 1024 bytes
+        let expr = parse_filter("size>=10mb").unwrap();
+        match expr {
+            FilterExpr::Numeric { field, op, value } => {
+                assert_eq!(field, NumericField::FileSize);
+                assert!(matches!(op, CompareOp::Gte));
+                assert_eq!(value, 10 * 1024 * 1024);
+            }
+            _ => panic!("Expected Numeric, got {:?}", expr),
+        }
+
+        // Fractional + alias `filesize`, kb/gb, bare bytes
+        assert!(matches!(
+            parse_filter("filesize<=1.5gb").unwrap(),
+            FilterExpr::Numeric { value, .. } if value == (1.5 * 1024.0 * 1024.0 * 1024.0) as i64
+        ));
+        assert!(matches!(
+            parse_filter("size=500kb").unwrap(),
+            FilterExpr::Numeric { value: 512000, .. }
+        ));
+        assert!(matches!(
+            parse_filter("size>=2048").unwrap(),
+            FilterExpr::Numeric { value: 2048, .. }
+        ));
+    }
+
+    #[test]
+    fn test_numeric_invalid() {
+        assert!(parse_filter("width>=lots").is_err());
+        assert!(parse_filter("size>=10tb").is_err()); // tb unsupported → not a number
+    }
+
+    #[test]
+    fn test_numeric_composes() {
+        let expr = parse_filter("width>=1920 AND height>=1080 AND size<=5mb").unwrap();
+        // Left-associative: ((w AND h) AND size)
+        assert!(matches!(expr, FilterExpr::And { .. }));
+    }
+
+    #[test]
+    fn test_non_date_equals_falls_through_to_tag() {
+        // A bare token with "=" that isn't a date field stays a tag.
+        let expr = parse_filter("foo=bar").unwrap();
+        match expr {
+            FilterExpr::Tag { namespace, value } => {
+                assert_eq!(namespace, TagNamespace::Any);
+                assert_eq!(value, "foo=bar");
+            }
+            _ => panic!("Expected Tag, got {:?}", expr),
+        }
     }
 
     #[test]
