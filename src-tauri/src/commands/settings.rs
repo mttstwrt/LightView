@@ -638,6 +638,47 @@ pub async fn load_gallery_settings(
         .map_err(|e| e.to_string())
 }
 
+/// The gallery-wide default filter, shared by the desktop app and any LAN
+/// web client. Lives inside the full app-settings blob, but is exposed on its
+/// own so the read-only web bridge can read it without leaking the rest of the
+/// local settings (display prefs, external app commands, etc.).
+#[derive(Serialize)]
+pub struct DefaultFilter {
+    pub enabled: bool,
+    pub query: String,
+}
+
+/// Read just the `default_filter` field out of the gallery's stored settings.
+/// Returns `None` when no gallery settings have been saved yet.
+pub async fn get_gallery_default_filter_impl(
+    state: &AppState,
+) -> Result<Option<DefaultFilter>, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    let Some(json) = db.get_gallery_meta("app_settings").map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    let Some(df) = value.get("default_filter") else {
+        return Ok(None);
+    };
+    Ok(Some(DefaultFilter {
+        enabled: df.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+        query: df
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }))
+}
+
+#[tauri::command]
+pub async fn get_gallery_default_filter(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<DefaultFilter>, String> {
+    get_gallery_default_filter_impl(&state).await
+}
+
 /// Get gallery statistics.
 #[tauri::command]
 pub async fn get_gallery_stats(

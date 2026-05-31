@@ -7,7 +7,8 @@ import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
-import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, type RecentGallery } from "./lib/ipc";
+import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
+import { setFilterQuery } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { MapView } from "./components/map/MapView";
 import { MediaViewer } from "./components/viewer/MediaViewer";
@@ -169,6 +170,30 @@ export function App() {
   const scrollIndicators = () => buildScrollIndicators(sortedItems(), sortField());
   const thumbLabel = (fraction: number) => getThumbLabelForItems(sortedItems(), sortField(), fraction);
 
+  // Apply the gallery-wide default filter (if enabled) when a gallery first
+  // opens. Seeds the FilterBar so the active query is visible/editable and
+  // returns the matching paths to feed the initial sort. Returns undefined
+  // when no default filter is set (→ all items).
+  //
+  // The default filter lives in the gallery's saved settings so every client
+  // honours it. On desktop, settings() already mirrors those after
+  // loadSettingsFromGallery(); the web client has no local gallery settings,
+  // so it reads the gallery-wide value straight from the backend.
+  const applyDefaultFilter = async (): Promise<string[] | undefined> => {
+    const df = isWeb()
+      ? await getGalleryDefaultFilter().catch(() => null)
+      : settings().default_filter;
+    const query = df?.enabled ? (df.query ?? "").trim() : "";
+    if (!query) return undefined;
+    setFilterQuery(query);
+    try {
+      return await applyFilter(query);
+    } catch (e) {
+      console.error("Default filter failed:", e);
+      return undefined;
+    }
+  };
+
   const openPath = async (path: string) => {
     setLoading(true);
     try {
@@ -179,7 +204,8 @@ export function App() {
       // Restore per-gallery settings from .lightview folder
       await loadSettingsFromGallery();
 
-      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
+      const filtered = await applyDefaultFilter();
+      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filtered, subSortField(), subSortOrder());
       setSortedItems(sorted.items);
       setDisplayPaths(sorted.items.map((item) => item.path));
     } catch (e) {
@@ -207,7 +233,8 @@ export function App() {
       if (info) {
         setGalleryPath(info.path);
         setTotalCount(info.total_media);
-        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
+        const filtered = await applyDefaultFilter();
+        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filtered, subSortField(), subSortOrder());
         setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
       }

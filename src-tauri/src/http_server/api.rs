@@ -73,10 +73,14 @@ fn ok<T: Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
 }
 
 async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, DispatchError> {
-    use crate::commands::{autocomplete, filter, gallery, geo, media, sort, tags};
+    use crate::commands::{autocomplete, filter, gallery, geo, media, settings, sort, tags};
 
     match command {
         "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
+
+        "get_gallery_default_filter" => {
+            ok(settings::get_gallery_default_filter_impl(app).await)
+        }
 
         "get_sorted_items" => {
             #[derive(Deserialize)]

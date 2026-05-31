@@ -22,6 +22,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   storage: {
     companion_location: "lightview_folder",
   },
+  default_filter: {
+    enabled: false,
+    query: "",
+  },
   external_apps: [
     { label: "Gwenview", command: "gwenview", args: ["{file}"] },
     { label: "GIMP", command: "gimp", args: ["{file}"] },
