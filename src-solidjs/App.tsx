@@ -423,8 +423,32 @@ export function App() {
             onFilesRemoved={(removed) => {
               const removedSet = new Set(removed);
               setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+              setSortedItems(sortedItems().filter((item) => !removedSet.has(item.path)));
               clearSelection();
               setTotalCount((c) => Math.max(0, c - removed.length));
+            }}
+            onFilesMoved={(moved) => {
+              // Files stayed in the gallery — re-key the cells to their new
+              // paths instead of removing them, so data and thumbnails persist.
+              const rename = new Map(moved.map((m) => [m.from, m.to]));
+              setDisplayPaths(displayPaths().map((p) => rename.get(p) ?? p));
+              setSortedItems(
+                sortedItems().map((item) =>
+                  rename.has(item.path)
+                    ? { ...item, path: rename.get(item.path)! }
+                    : item,
+                ),
+              );
+              setSelectedPaths((prev) => {
+                let changed = false;
+                const next = new Set<string>();
+                for (const p of prev) {
+                  const to = rename.get(p);
+                  if (to) changed = true;
+                  next.add(to ?? p);
+                }
+                return changed ? next : prev;
+              });
             }}
           />
         </Show>

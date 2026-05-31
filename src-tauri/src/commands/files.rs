@@ -17,6 +17,23 @@ pub struct FileOpError {
     pub error: String,
 }
 
+/// Result of a move operation. Files whose destination stays inside the current
+/// gallery are reported in `moved` (old path -> new path) so the frontend can
+/// re-key the existing grid cells; files that left the gallery are reported in
+/// `removed` so the frontend drops them from the view.
+#[derive(Debug, Serialize)]
+pub struct MoveResult {
+    pub moved: Vec<MovedFile>,
+    pub removed: Vec<String>,
+    pub failed: Vec<FileOpError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MovedFile {
+    pub from: String,
+    pub to: String,
+}
+
 /// Copy media files (and their companion files) to a destination directory.
 #[tauri::command]
 pub async fn copy_files(
@@ -71,13 +88,27 @@ pub async fn move_files(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
     destination: String,
-) -> Result<FileOpResult, String> {
+) -> Result<MoveResult, String> {
     let dest = Path::new(&destination);
     if !dest.is_dir() {
         return Err(format!("Destination is not a directory: {}", destination));
     }
 
-    let mut succeeded = Vec::new();
+    // If the destination lives inside the current gallery, the files stay in the
+    // gallery — re-key their cached rows to the new path so tags, ratings, and
+    // the already-generated thumbnails are preserved, and tell the frontend to
+    // re-key the cells. Otherwise they've left the gallery, so drop the rows and
+    // tell the frontend to remove the cells.
+    let dest_in_gallery = state
+        .current_gallery
+        .read()
+        .await
+        .as_deref()
+        .map(|root| dest.starts_with(root))
+        .unwrap_or(false);
+
+    // Successful moves as (old path, new path) pairs.
+    let mut succeeded: Vec<(String, String)> = Vec::new();
     let mut failed = Vec::new();
 
     for src_path in &paths {
@@ -104,7 +135,7 @@ pub async fn move_files(
             Ok(_) => {
                 // Move companion file (tags/ratings) alongside the media file.
                 move_companion(src, &dst);
-                succeeded.push(src_path.clone());
+                succeeded.push((src_path.clone(), dst.to_string_lossy().to_string()));
             }
             Err(e) => {
                 failed.push(FileOpError {
@@ -117,18 +148,6 @@ pub async fn move_files(
 
     // Update the cache DB for the moved files.
     if !succeeded.is_empty() {
-        // If the destination lives inside the current gallery, the files stay in
-        // the gallery — re-key their cached rows to the new path so tags,
-        // ratings, and the already-generated thumbnails are preserved. Otherwise
-        // they've left the gallery, so drop the rows entirely.
-        let dest_in_gallery = state
-            .current_gallery
-            .read()
-            .await
-            .as_deref()
-            .map(|root| dest.starts_with(root))
-            .unwrap_or(false);
-
         // All thumbnail LOD tiers are keyed by path.
         const THUMB_TABLES: [&str; 4] = [
             "thumbnails",
@@ -140,12 +159,8 @@ pub async fn move_files(
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
             let conn = db.conn();
-            for old_path in &succeeded {
+            for (old_path, new_path) in &succeeded {
                 if dest_in_gallery {
-                    let Some(file_name) = Path::new(old_path).file_name() else {
-                        continue;
-                    };
-                    let new_path = dest.join(file_name).to_string_lossy().to_string();
                     let _ = conn.execute(
                         "UPDATE media_meta SET path = ?1 WHERE path = ?2",
                         rusqlite::params![new_path, old_path],
@@ -175,7 +190,22 @@ pub async fn move_files(
         }
     }
 
-    Ok(FileOpResult { succeeded, failed })
+    let (moved, removed) = if dest_in_gallery {
+        let moved = succeeded
+            .into_iter()
+            .map(|(from, to)| MovedFile { from, to })
+            .collect();
+        (moved, Vec::new())
+    } else {
+        let removed = succeeded.into_iter().map(|(from, _)| from).collect();
+        (Vec::new(), removed)
+    };
+
+    Ok(MoveResult {
+        moved,
+        removed,
+        failed,
+    })
 }
 
 /// Send media files (and their companion files) to the system trash/recycle bin.

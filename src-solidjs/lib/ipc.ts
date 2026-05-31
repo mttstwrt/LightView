@@ -403,11 +403,24 @@ export interface FileOpResult {
   failed: { path: string; error: string }[];
 }
 
+export interface MovedFile {
+  from: string;
+  to: string;
+}
+
+export interface MoveResult {
+  /** Files that stayed in the gallery (old path -> new path); re-key the cells. */
+  moved: MovedFile[];
+  /** Files that left the gallery; remove the cells. */
+  removed: string[];
+  failed: { path: string; error: string }[];
+}
+
 export const copyFiles = (paths: string[], destination: string) =>
   invoke<FileOpResult>("copy_files", { paths, destination });
 
 export const moveFiles = (paths: string[], destination: string) =>
-  invoke<FileOpResult>("move_files", { paths, destination });
+  invoke<MoveResult>("move_files", { paths, destination });
 
 export const trashFiles = (paths: string[]) =>
   invoke<FileOpResult>("trash_files", { paths });

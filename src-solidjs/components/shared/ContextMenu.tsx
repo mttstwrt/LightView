@@ -2,6 +2,7 @@ import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { safeListen as listen } from "../../lib/runtime";
 import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard } from "../../lib/ipc";
+import type { MovedFile } from "../../lib/ipc";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
@@ -20,6 +21,7 @@ interface ContextMenuProps {
   paths: string[];
   selectedPaths?: Set<string>;
   onFilesRemoved?: (removed: string[]) => void;
+  onFilesMoved?: (moved: MovedFile[]) => void;
   hideViewOption?: boolean;
 }
 
@@ -229,8 +231,11 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
     try {
       const result = await moveFiles(paths, dest as string);
-      if (result.succeeded.length > 0) {
-        props.onFilesRemoved?.(result.succeeded);
+      if (result.moved.length > 0) {
+        props.onFilesMoved?.(result.moved);
+      }
+      if (result.removed.length > 0) {
+        props.onFilesRemoved?.(result.removed);
       }
       if (result.failed.length > 0) {
         console.error("Move failures:", result.failed);
