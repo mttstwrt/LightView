@@ -102,8 +102,8 @@ pub async fn move_files(
 
         match move_result {
             Ok(_) => {
-                // Move companion file too
-                move_companion(src, dest);
+                // Move companion file (tags/ratings) alongside the media file.
+                move_companion(src, &dst);
                 succeeded.push(src_path.clone());
             }
             Err(e) => {
@@ -115,15 +115,61 @@ pub async fn move_files(
         }
     }
 
-    // Remove moved files from the cache DB
+    // Update the cache DB for the moved files.
     if !succeeded.is_empty() {
+        // If the destination lives inside the current gallery, the files stay in
+        // the gallery — re-key their cached rows to the new path so tags,
+        // ratings, and the already-generated thumbnails are preserved. Otherwise
+        // they've left the gallery, so drop the rows entirely.
+        let dest_in_gallery = state
+            .current_gallery
+            .read()
+            .await
+            .as_deref()
+            .map(|root| dest.starts_with(root))
+            .unwrap_or(false);
+
+        // All thumbnail LOD tiers are keyed by path.
+        const THUMB_TABLES: [&str; 4] = [
+            "thumbnails",
+            "thumbnails_micro",
+            "thumbnails_large",
+            "thumbnails_preview",
+        ];
+
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
             let conn = db.conn();
-            for path in &succeeded {
-                let _ = conn.execute("DELETE FROM media_meta WHERE path = ?1", rusqlite::params![path]);
-                let _ = conn.execute("DELETE FROM thumbnails WHERE path = ?1", rusqlite::params![path]);
-                let _ = conn.execute("DELETE FROM tag_index WHERE path = ?1", rusqlite::params![path]);
+            for old_path in &succeeded {
+                if dest_in_gallery {
+                    let Some(file_name) = Path::new(old_path).file_name() else {
+                        continue;
+                    };
+                    let new_path = dest.join(file_name).to_string_lossy().to_string();
+                    let _ = conn.execute(
+                        "UPDATE media_meta SET path = ?1 WHERE path = ?2",
+                        rusqlite::params![new_path, old_path],
+                    );
+                    let _ = conn.execute(
+                        "UPDATE tag_index SET path = ?1 WHERE path = ?2",
+                        rusqlite::params![new_path, old_path],
+                    );
+                    for table in THUMB_TABLES {
+                        let _ = conn.execute(
+                            &format!("UPDATE {table} SET path = ?1 WHERE path = ?2"),
+                            rusqlite::params![new_path, old_path],
+                        );
+                    }
+                } else {
+                    let _ = conn.execute("DELETE FROM media_meta WHERE path = ?1", rusqlite::params![old_path]);
+                    let _ = conn.execute("DELETE FROM tag_index WHERE path = ?1", rusqlite::params![old_path]);
+                    for table in THUMB_TABLES {
+                        let _ = conn.execute(
+                            &format!("DELETE FROM {table} WHERE path = ?1"),
+                            rusqlite::params![old_path],
+                        );
+                    }
+                }
             }
             let _ = db.rebuild_tag_counts();
         }
@@ -208,16 +254,21 @@ fn copy_companion(media_src: &Path) {
     }
 }
 
-/// Move the companion file for a media file if it exists (alongside variant).
-fn move_companion(media_src: &Path, dest_dir: &Path) {
-    let companion_name = format!(
-        "{}{}",
-        media_src.file_name().unwrap_or_default().to_string_lossy(),
-        COMPANION_EXTENSION
-    );
-    let companion_src = media_src.with_file_name(&companion_name);
-    if companion_src.exists() {
-        let companion_dst = dest_dir.join(&companion_name);
+/// Move the companion file (tags, ratings, etc.) for a media file from its old
+/// path to its new one. Handles both the default `.lightview/companions/`
+/// layout and the alongside variant (`photo.jpg.lightview.json`).
+fn move_companion(media_src: &Path, media_dst: &Path) {
+    use crate::companion::reader::{companion_path, CompanionLocation};
+
+    for location in [CompanionLocation::LightviewFolder, CompanionLocation::Alongside] {
+        let companion_src = companion_path(media_src, location);
+        if !companion_src.exists() {
+            continue;
+        }
+        let companion_dst = companion_path(media_dst, location);
+        if let Some(parent) = companion_dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::rename(&companion_src, &companion_dst).or_else(|_| {
             std::fs::copy(&companion_src, &companion_dst)
                 .and_then(|_| std::fs::remove_file(&companion_src))
