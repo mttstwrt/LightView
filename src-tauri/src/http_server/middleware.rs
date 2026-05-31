@@ -1,6 +1,6 @@
 use axum::{
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -29,6 +29,29 @@ pub async fn track_remote_hits(
         state.remote_hits.fetch_add(1, Ordering::Relaxed);
     }
     next.run(request).await
+}
+
+/// Cache policy for the statically-served SPA.
+///
+/// Build assets carry a content hash in their filename (`main-<hash>.js`), so a
+/// given URL is immutable — cache it for a year. The app shell, by contrast,
+/// must be revalidated on every load: with no policy, a phone's home-screen
+/// web-app keeps a stale `index.html` that still points at an old bundle and
+/// never picks up new builds (the exact failure that motivated this). `no-cache`
+/// lets the browser keep a copy but forces an `If-Modified-Since` revalidation,
+/// which is a cheap 304 when nothing changed.
+pub async fn static_cache_control(request: axum::extract::Request, next: Next) -> Response {
+    let immutable = request.uri().path().starts_with("/assets/");
+    let mut response = next.run(request).await;
+    let value = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(value));
+    response
 }
 
 /// Per-device cookie auth. Pass-through when `AuthMode::None`.

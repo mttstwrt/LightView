@@ -106,8 +106,13 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     if let Some(web_root) = state.config.web_root.clone() {
         if web_root.is_dir() {
             let index = web_root.join("index.html");
-            router = router
-                .fallback_service(ServeDir::new(&web_root).fallback(ServeFile::new(index)));
+            // Wrap the static file service in its own router so the cache-policy
+            // middleware applies only to SPA assets — not to media/thumb/api,
+            // which have their own caching needs. See `mw::static_cache_control`.
+            let static_files = Router::new()
+                .fallback_service(ServeDir::new(&web_root).fallback(ServeFile::new(index)))
+                .layer(middleware::from_fn(mw::static_cache_control));
+            router = router.fallback_service(static_files);
             log::info!("Serving web app from {}", web_root.display());
         } else {
             log::warn!(
