@@ -13,7 +13,7 @@ import {
   DISMISS_MIN_SCALE,
   type Point,
 } from "../../lib/touch";
-import { infoPanelOpen } from "../../stores/viewerStore";
+import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, thumbUrl, ensureTierThumbnails } from "../../lib/ipc";
 import { ViewerImageCache } from "../../lib/viewerCache";
@@ -262,6 +262,7 @@ export function MediaViewer(props: MediaViewerProps) {
     | "pending" // single finger, axis not yet locked
     | "horizontal" // swipe to navigate
     | "vertical" // swipe down to dismiss
+    | "info" // swipe up to open the info panel
     | "pan" // single finger drag while zoomed in
     | "pinch";
   let gestureMode: GestureMode = "none";
@@ -420,12 +421,7 @@ export function MediaViewer(props: MediaViewerProps) {
       if (Math.hypot(dx, dy) < AXIS_LOCK_PX) return;
       if (Math.abs(dx) > Math.abs(dy)) gestureMode = "horizontal";
       else if (dy > 0) gestureMode = "vertical";
-      else {
-        // Upward swipe: nothing mapped — cancel so it isn't read as a tap.
-        gestureMoved = true;
-        gestureMode = "none";
-        return;
-      }
+      else gestureMode = "info"; // upward swipe reveals the info panel
       gestureMoved = true;
     }
 
@@ -444,6 +440,10 @@ export function MediaViewer(props: MediaViewerProps) {
       const p = Math.min(1, d / (SWIPE_DISMISS_PX * 1.6));
       setDragScale(1 - p * (1 - DISMISS_MIN_SCALE));
       setBackdropAlpha(1 - p * 0.7);
+    } else if (gestureMode === "info") {
+      e.preventDefault();
+      // Damped upward lift of the photo, hinting at the sheet rising below.
+      setDragY(Math.min(0, dy) * 0.5);
     }
   };
 
@@ -475,6 +475,15 @@ export function MediaViewer(props: MediaViewerProps) {
     } else {
       snapDragReset();
     }
+  };
+
+  const finishInfo = () => {
+    const dy = lastY - startY; // negative for an upward swipe
+    const vy = (lastY - prevY) / Math.max(1, lastT - prevT);
+    if (-dy > SWIPE_DISMISS_PX * 0.6 || -vy > SWIPE_VELOCITY) {
+      setInfoPanelOpen(true);
+    }
+    snapDragReset(); // photo always eases back to its resting position
   };
 
   const handleTap = (e: PointerEvent) => {
@@ -518,13 +527,14 @@ export function MediaViewer(props: MediaViewerProps) {
     gestureMode = "none";
     if (m === "horizontal") finishHorizontal();
     else if (m === "vertical") finishVertical();
+    else if (m === "info") finishInfo();
     else if ((m === "pending" || m === "pan") && !gestureMoved) handleTap(e);
   };
 
   const onPointerCancel = (e: PointerEvent) => {
     if (e.pointerType !== "touch" || !pointers.has(e.pointerId)) return;
     pointers.delete(e.pointerId);
-    if (gestureMode === "horizontal" || gestureMode === "vertical") snapDragReset();
+    if (gestureMode === "horizontal" || gestureMode === "vertical" || gestureMode === "info") snapDragReset();
     else if (gestureMode === "pinch" && zoom() <= 1) snapZoomReset();
     if (pointers.size === 0) {
       gestureMode = "none";

@@ -78,6 +78,14 @@ pub async fn add_user_tag(
     path: String,
     tag: String,
 ) -> Result<(), String> {
+    add_user_tag_impl(&state, path, tag).await
+}
+
+pub async fn add_user_tag_impl(
+    state: &AppState,
+    path: String,
+    tag: String,
+) -> Result<(), String> {
     let tag_clone = tag.clone();
     let companion = modify_companion(&path, |c| {
         if !c.tags.user.contains(&tag_clone) {
@@ -102,6 +110,14 @@ pub async fn add_user_tag(
 #[tauri::command]
 pub async fn remove_user_tag(
     state: tauri::State<'_, AppState>,
+    path: String,
+    tag: String,
+) -> Result<(), String> {
+    remove_user_tag_impl(&state, path, tag).await
+}
+
+pub async fn remove_user_tag_impl(
+    state: &AppState,
     path: String,
     tag: String,
 ) -> Result<(), String> {
@@ -236,6 +252,14 @@ pub async fn set_rating_batch(
 #[tauri::command]
 pub async fn set_rating(
     state: tauri::State<'_, AppState>,
+    path: String,
+    rating: u8,
+) -> Result<(), String> {
+    set_rating_impl(&state, path, rating).await
+}
+
+pub async fn set_rating_impl(
+    state: &AppState,
     path: String,
     rating: u8,
 ) -> Result<(), String> {

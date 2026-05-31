@@ -3,9 +3,16 @@
 //! A remote browser has no Tauri IPC, so `POST /api/invoke` maps a
 //! `{ command, args }` payload to the same domain logic the `#[tauri::command]`
 //! handlers use (the shared `*_impl` functions). Only the commands in the
-//! `dispatch` match are reachable — any write command (tagging, ratings, file
-//! ops, plugins) is rejected with 403 even if a client forges the name. This
-//! is the security boundary that keeps remote access read-only.
+//! `dispatch` match are reachable — anything not listed is rejected with 403
+//! even if a client forges the name.
+//!
+//! The allowlist is mostly read-only, plus a small set of per-item metadata
+//! writes (tag add/remove, rating) so a paired device can edit from the
+//! viewer. Destructive and host-level operations — file ops (copy/move/
+//! delete), plugins, and batch mutations — remain off the list. Remote write
+//! access is gated by the auth layer (device pairing + optional password);
+//! this allowlist is the second boundary that bounds *what* a paired device
+//! can do.
 //!
 //! Arg structs use `rename_all = "camelCase"` so the JSON the frontend already
 //! builds for Tauri's `invoke()` (which camelCases snake_case params) works
@@ -187,6 +194,37 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
         }
 
         "get_recent_tags" => ok(autocomplete::get_recent_tags_impl(app).await),
+
+        // --- Per-item metadata writes (allowed for paired devices) ---------
+        "add_user_tag" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+                tag: String,
+            }
+            let a: A = parse(args)?;
+            ok(tags::add_user_tag_impl(app, a.path, a.tag).await)
+        }
+
+        "remove_user_tag" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+                tag: String,
+            }
+            let a: A = parse(args)?;
+            ok(tags::remove_user_tag_impl(app, a.path, a.tag).await)
+        }
+
+        "set_rating" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+                rating: u8,
+            }
+            let a: A = parse(args)?;
+            ok(tags::set_rating_impl(app, a.path, a.rating).await)
+        }
 
         _ => Err(DispatchError::NotAllowed),
     }

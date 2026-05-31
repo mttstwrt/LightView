@@ -344,7 +344,6 @@ export function App() {
         toggleInfoPanel();
       } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
         if (typingInInput) return;
-        if (isWeb()) return; // read-only: rating is a write operation
         e.preventDefault();
         const paths = displayPaths();
         const idx = viewerIndex();

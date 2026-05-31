@@ -1,4 +1,4 @@
-import { Show, For, createSignal, createEffect, on, onCleanup } from "solid-js";
+import { Show, For, createSignal, createEffect, on, onCleanup, onMount } from "solid-js";
 import {
   getMediaMeta,
   getTags,
@@ -9,10 +9,13 @@ import {
 } from "../../lib/ipc";
 import type { ThumbnailTierInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
-import { isWeb } from "../../lib/runtime";
+import { hasTouch } from "../../lib/runtime";
+import { setInfoPanelOpen } from "../../stores/viewerStore";
+import { SWIPE_DISMISS_PX, SWIPE_VELOCITY } from "../../lib/touch";
 
-// The web client is read-only; editing controls are hidden.
-const readOnly = isWeb();
+// On touch devices the panel is an Apple-Photos–style opaque bottom sheet that
+// slides up and can be flicked down to dismiss; on desktop it's the side panel.
+const sheetMode = hasTouch();
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -165,22 +168,59 @@ export function InfoPanel(props: { path: string; filename: string }) {
 
   let panelRef: HTMLDivElement | undefined;
 
-  return (
-    <div
-      class="fixed right-0 top-0 h-full w-80 z-[60]"
-      style={{
-        background: "rgba(10, 10, 10, 0.75)",
-        "backdrop-filter": "blur(12px)",
-        "border-left": "1px solid rgba(255,255,255,0.05)",
-      }}
-      onClick={(e) => e.stopPropagation()}
-    >
-      <div
-        ref={panelRef}
-        class="h-full w-full p-4 overflow-y-auto hide-scrollbar"
-      >
-        <h3 class="text-sm font-medium text-neutral-300 mb-4">Info</h3>
-        <div class="text-xs text-neutral-400 space-y-3">
+  // --- Bottom-sheet drag-to-dismiss (touch) ------------------------------
+  // `entered` drives the slide-up on mount; `dragY` follows a downward flick;
+  // `smooth` toggles the CSS transition off mid-drag so the sheet tracks the
+  // finger 1:1 and eases on release.
+  const [entered, setEntered] = createSignal(false);
+  const [dragY, setDragY] = createSignal(0);
+  const [smooth, setSmooth] = createSignal(true);
+  onMount(() => requestAnimationFrame(() => setEntered(true)));
+
+  let dragging = false;
+  let dragStartY = 0;
+  let dragLastY = 0;
+  let dragPrevY = 0;
+  let dragLastT = 0;
+  let dragPrevT = 0;
+
+  const onHandleDown = (e: PointerEvent) => {
+    if (e.pointerType !== "touch") return;
+    dragging = true;
+    dragStartY = dragLastY = dragPrevY = e.clientY;
+    dragLastT = dragPrevT = e.timeStamp;
+    setSmooth(false);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  };
+  const onHandleMove = (e: PointerEvent) => {
+    if (!dragging) return;
+    dragPrevY = dragLastY;
+    dragPrevT = dragLastT;
+    dragLastY = e.clientY;
+    dragLastT = e.timeStamp;
+    setDragY(Math.max(0, e.clientY - dragStartY));
+  };
+  const onHandleUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    setSmooth(true);
+    const dy = dragLastY - dragStartY;
+    const vy = (dragLastY - dragPrevY) / Math.max(1, dragLastT - dragPrevT);
+    if (dy > SWIPE_DISMISS_PX || vy > SWIPE_VELOCITY) {
+      setDragY(window.innerHeight); // slide fully down, then unmount
+      window.setTimeout(() => setInfoPanelOpen(false), 250);
+    } else {
+      setDragY(0);
+    }
+  };
+
+  const sheetTransform = () => {
+    if (!entered()) return "translateY(100%)";
+    return dragY() > 0 ? `translateY(${dragY()}px)` : "translateY(0)";
+  };
+
+  const fields = () => (
+    <div class="text-xs text-neutral-400 space-y-3">
           <InfoRow label="File" value={props.filename} breakAll />
           <InfoRow label="Path" value={props.path} breakAll />
 
@@ -257,10 +297,8 @@ export function InfoPanel(props: { path: string; filename: string }) {
                 <For each={[1, 2, 3, 4, 5]}>
                   {(star) => (
                     <button
-                      class="text-base transition-colors"
-                      classList={{ "cursor-pointer": !readOnly, "cursor-default": readOnly }}
+                      class="text-base transition-colors cursor-pointer"
                       style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
-                      disabled={readOnly}
                       onClick={() => handleSetRating(star)}
                     >
                       &#9733;
@@ -319,21 +357,19 @@ export function InfoPanel(props: { path: string; filename: string }) {
                             >
                               <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-300 bg-neutral-800">
                                 {t.tag}
-                                <Show when={!readOnly}>
-                                  <button
-                                    class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
-                                    onClick={() => handleRemoveTag(t.tag)}
-                                  >
-                                    &times;
-                                  </button>
-                                </Show>
+                                <button
+                                  class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
+                                  onClick={() => handleRemoveTag(t.tag)}
+                                >
+                                  &times;
+                                </button>
                               </span>
                             </Show>
                           )}
                         </For>
                       </div>
                     </Show>
-                    <Show when={namespace === "user" && !readOnly}>
+                    <Show when={namespace === "user"}>
                       <form onSubmit={handleAddTag} class="flex gap-1 mt-2">
                         <input
                           type="text"
@@ -356,6 +392,64 @@ export function InfoPanel(props: { path: string; filename: string }) {
             )}
           </For>
         </div>
+  );
+
+  // --- Touch: opaque bottom sheet ----------------------------------------
+  if (sheetMode) {
+    return (
+      <>
+        {/* Tap-catcher backdrop above the sheet; fades as the sheet is dragged. */}
+        <div
+          class="fixed inset-0 z-[59]"
+          style={{
+            background: `rgba(0,0,0,${0.4 * Math.max(0, 1 - dragY() / 300)})`,
+            transition: smooth() ? "background 0.25s ease-out" : "none",
+          }}
+          onClick={() => setInfoPanelOpen(false)}
+        />
+        <div
+          class="fixed left-0 right-0 bottom-0 z-[60] rounded-t-2xl flex flex-col max-h-[85vh] shadow-2xl"
+          style={{
+            // Opaque — Apple-Photos info sheet, not a translucent overlay.
+            background: "#1c1c1e",
+            transform: sheetTransform(),
+            transition: smooth() ? "transform 0.3s ease-out" : "none",
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Drag handle / grab area — flick down here to dismiss. */}
+          <div
+            class="shrink-0 pt-2.5 pb-1 cursor-grab touch-none"
+            onPointerDown={onHandleDown}
+            onPointerMove={onHandleMove}
+            onPointerUp={onHandleUp}
+            onPointerCancel={onHandleUp}
+          >
+            <div class="mx-auto h-1 w-9 rounded-full bg-neutral-600" />
+            <h3 class="text-center text-sm font-medium text-neutral-300 mt-2">Info</h3>
+          </div>
+          <div class="px-4 pb-6 overflow-y-auto hide-scrollbar">
+            {fields()}
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // --- Desktop: side panel -----------------------------------------------
+  return (
+    <div
+      class="fixed right-0 top-0 h-full w-80 z-[60]"
+      style={{
+        background: "rgba(10, 10, 10, 0.75)",
+        "backdrop-filter": "blur(12px)",
+        "border-left": "1px solid rgba(255,255,255,0.05)",
+      }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div ref={panelRef} class="h-full w-full p-4 overflow-y-auto hide-scrollbar">
+        <h3 class="text-sm font-medium text-neutral-300 mb-4">Info</h3>
+        {fields()}
       </div>
       <Show when={panelRef}>
         <ScrollBar
