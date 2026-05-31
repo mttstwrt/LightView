@@ -10,7 +10,7 @@ import {
 import type { ThumbnailTierInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
 import { hasTouch } from "../../lib/runtime";
-import { setInfoPanelOpen } from "../../stores/viewerStore";
+import { setInfoPanelOpen, setInfoPanelHeight } from "../../stores/viewerStore";
 import { SWIPE_DISMISS_PX, SWIPE_VELOCITY } from "../../lib/touch";
 
 // On touch devices the panel is an Apple-Photos–style opaque bottom sheet that
@@ -175,7 +175,24 @@ export function InfoPanel(props: { path: string; filename: string }) {
   const [entered, setEntered] = createSignal(false);
   const [dragY, setDragY] = createSignal(0);
   const [smooth, setSmooth] = createSignal(true);
-  onMount(() => requestAnimationFrame(() => setEntered(true)));
+
+  // Report the sheet's height so the viewer can shrink the photo into the space
+  // above it (Apple-Photos style). Observed because the height depends on the
+  // variable content. Cleared on unmount so the photo re-centers full-screen.
+  let sheetRef: HTMLDivElement | undefined;
+  onMount(() => {
+    requestAnimationFrame(() => setEntered(true));
+    if (!sheetRef) return;
+    const ro = new ResizeObserver(() => {
+      if (sheetRef) setInfoPanelHeight(sheetRef.offsetHeight);
+    });
+    ro.observe(sheetRef);
+    setInfoPanelHeight(sheetRef.offsetHeight);
+    onCleanup(() => {
+      ro.disconnect();
+      setInfoPanelHeight(0);
+    });
+  });
 
   let dragging = false;
   let dragStartY = 0;
@@ -398,16 +415,18 @@ export function InfoPanel(props: { path: string; filename: string }) {
   if (sheetMode) {
     return (
       <>
-        {/* Tap-catcher backdrop above the sheet; fades as the sheet is dragged. */}
+        {/* Dimming layer over the photo area; fades as the sheet is dragged.
+            pointer-events-none so the viewer keeps handling gestures above the
+            sheet (tap or swipe-down on the photo closes the panel). */}
         <div
-          class="fixed inset-0 z-[59]"
+          class="fixed inset-0 z-[59] pointer-events-none"
           style={{
             background: `rgba(0,0,0,${0.4 * Math.max(0, 1 - dragY() / 300)})`,
             transition: smooth() ? "background 0.25s ease-out" : "none",
           }}
-          onClick={() => setInfoPanelOpen(false)}
         />
         <div
+          ref={sheetRef}
           class="fixed left-0 right-0 bottom-0 z-[60] rounded-t-2xl flex flex-col max-h-[85vh] shadow-2xl"
           style={{
             // Opaque — Apple-Photos info sheet, not a translucent overlay.

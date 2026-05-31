@@ -1,4 +1,4 @@
-import { Show, createSignal, createEffect, on, onCleanup } from "solid-js";
+import { Show, createSignal, createEffect, on, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { isWeb, hasTouch } from "../../lib/runtime";
 import {
@@ -13,7 +13,7 @@ import {
   DISMISS_MIN_SCALE,
   type Point,
 } from "../../lib/touch";
-import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
+import { infoPanelOpen, setInfoPanelOpen, infoPanelHeight } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, thumbUrl, ensureTierThumbnails } from "../../lib/ipc";
 import { ViewerImageCache } from "../../lib/viewerCache";
@@ -41,6 +41,9 @@ export function MediaViewer(props: MediaViewerProps) {
 
   // Container ref for direct DOM image swapping
   let imageContainerRef: HTMLDivElement | undefined;
+  // The horizontally-translating filmstrip track holding prev/current/next
+  // slots. Only `dragX` (swipe-to-navigate) transforms this element.
+  let trackRef: HTMLDivElement | undefined;
 
   // Zoom and pan state
   const [zoom, setZoom] = createSignal(1);
@@ -64,6 +67,10 @@ export function MediaViewer(props: MediaViewerProps) {
   const [dragScale, setDragScale] = createSignal(1);
   const [backdropAlpha, setBackdropAlpha] = createSignal(1);
   const [chromeVisible, setChromeVisible] = createSignal(true);
+  // True while a horizontal swipe (or its commit animation) is in flight. Gates
+  // the prev/next filmstrip slides so the (pressure-managed) full-res neighbour
+  // images are only mounted in the DOM during navigation, not while idle.
+  const [swiping, setSwiping] = createSignal(false);
 
   const currentPath = () => props.paths[props.currentIndex] || "";
 
@@ -78,8 +85,37 @@ export function MediaViewer(props: MediaViewerProps) {
     return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
   };
 
-  const isVideo = () =>
-    ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"].includes(ext());
+  const VIDEO_EXTS = ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"];
+  const isVideoPath = (path: string) => {
+    const dot = path.lastIndexOf(".");
+    return dot >= 0 && VIDEO_EXTS.includes(path.slice(dot + 1).toLowerCase());
+  };
+  const isVideo = () => isVideoPath(currentPath());
+
+  // Adjacent paths for the filmstrip neighbour slots (undefined past the ends).
+  const prevPath = () => props.paths[props.currentIndex - 1];
+  const nextPath = () => props.paths[props.currentIndex + 1];
+  // What to render in a neighbour slide: the full image, or a poster thumb for
+  // videos (which can't be swiped into anyway, but want a preview while sliding).
+  const neighbourSrc = (path: string) =>
+    isVideoPath(path) ? thumbUrl(path, "p") : mediaUrl(path);
+
+  // When the info panel is open on touch, the photo shrinks + lifts to fill the
+  // space above the sheet. Returns the uniform scale + vertical shift, or null
+  // when no fit applies. Shared by the current image and the neighbour slides so
+  // swiping between photos with the panel open keeps them the same size.
+  const infoFit = (): { scale: number; ty: number } | null => {
+    if (!(infoPanelOpen() && hasTouch())) return null;
+    const h = window.innerHeight;
+    const ph = infoPanelHeight();
+    if (ph <= 0 || ph >= h) return null;
+    return { scale: (h - ph) / h, ty: -ph / 2 };
+  };
+  const neighbourTransform = (dir: number): string => {
+    const base = `translateX(${dir * 100}vw)`;
+    const f = infoFit();
+    return f ? `${base} translateY(${f.ty}px) scale(${f.scale})` : base;
+  };
 
   // WebKitGTK's <video> element only handles a narrow set of containers
   // reliably (H.264/AAC in MP4, VP8/9 in WebM). MKV/AVI/WMV/FLV will fail
@@ -295,26 +331,72 @@ export function MediaViewer(props: MediaViewerProps) {
   const ptList = (): Point[] => [...pointers.values()];
 
   // Snap-back animation: briefly enable a CSS transition on the image
-  // container / backdrop so released swipes ease home instead of jumping.
+  // container (zoom/pan/vertical) and/or the filmstrip track (horizontal swipe)
+  // so released gestures ease home instead of jumping.
   let snapTimer: number | null = null;
-  const cancelSnap = () => {
+  const clearTransitions = () => {
     if (imageContainerRef) imageContainerRef.style.transition = "none";
+    if (trackRef) trackRef.style.transition = "none";
+  };
+  const armSnapClear = () => {
+    if (snapTimer !== null) clearTimeout(snapTimer);
+    snapTimer = window.setTimeout(() => {
+      clearTransitions();
+      snapTimer = null;
+    }, 300);
+  };
+  const cancelSnap = () => {
+    clearTransitions();
     if (snapTimer !== null) {
       clearTimeout(snapTimer);
       snapTimer = null;
     }
   };
   const animateContainer = () => {
-    if (!imageContainerRef) return;
-    imageContainerRef.style.transition = "transform 0.22s ease-out";
-    if (snapTimer !== null) clearTimeout(snapTimer);
-    snapTimer = window.setTimeout(() => {
-      if (imageContainerRef) imageContainerRef.style.transition = "none";
-      snapTimer = null;
-    }, 240);
+    if (imageContainerRef) imageContainerRef.style.transition = "transform 0.22s ease-out";
+    armSnapClear();
   };
+  const animateTrack = () => {
+    if (trackRef) trackRef.style.transition = "transform 0.28s ease-out";
+    armSnapClear();
+  };
+
+  // A pending swipe-navigation commit: the track is mid-slide toward a
+  // neighbour; once it lands we flip the index and snap the track back to zero
+  // in the same synchronous batch so the (identical) image doesn't flicker.
+  let navCommit: (() => void) | null = null;
+  let navTimer: number | null = null;
+  const runNavCommit = () => {
+    if (navTimer !== null) { clearTimeout(navTimer); navTimer = null; }
+    const fn = navCommit;
+    navCommit = null;
+    if (!fn) return;
+    if (trackRef) trackRef.style.transition = "none";
+    // One batch: snap the track home, flip the index, and drop the strip — the
+    // neighbour we slid to becomes the current slide with no intermediate frame.
+    batch(() => { setDragX(0); setSwiping(false); fn(); });
+  };
+  const scheduleNavCommit = (fn: () => void) => {
+    navCommit = fn;
+    if (navTimer !== null) clearTimeout(navTimer);
+    navTimer = window.setTimeout(runNavCommit, 280);
+  };
+
+  // Keep the neighbour slides mounted until the track has settled, then drop
+  // them so idle memory isn't held by adjacent full-res images.
+  let swipeEndTimer: number | null = null;
+  const beginSwipe = () => {
+    if (swipeEndTimer !== null) { clearTimeout(swipeEndTimer); swipeEndTimer = null; }
+    setSwiping(true);
+  };
+  const endSwipeSoon = () => {
+    if (swipeEndTimer !== null) clearTimeout(swipeEndTimer);
+    swipeEndTimer = window.setTimeout(() => { setSwiping(false); swipeEndTimer = null; }, 320);
+  };
+
   const snapDragReset = () => {
     animateContainer();
+    animateTrack();
     setDragX(0);
     setDragY(0);
     setDragScale(1);
@@ -353,6 +435,9 @@ export function MediaViewer(props: MediaViewerProps) {
     if (e.pointerType !== "touch" || isVideo()) return;
     const t = e.target as HTMLElement;
     if (t.closest("button, video, input, a")) return;
+    // If a swipe-navigation is still mid-flight, land it now so the new gesture
+    // operates on the settled index rather than racing the pending commit.
+    runNavCommit();
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (pointers.size === 2) {
@@ -419,7 +504,7 @@ export function MediaViewer(props: MediaViewerProps) {
 
     if (gestureMode === "pending") {
       if (Math.hypot(dx, dy) < AXIS_LOCK_PX) return;
-      if (Math.abs(dx) > Math.abs(dy)) gestureMode = "horizontal";
+      if (Math.abs(dx) > Math.abs(dy)) { gestureMode = "horizontal"; beginSwipe(); }
       else if (dy > 0) gestureMode = "vertical";
       else gestureMode = "info"; // upward swipe reveals the info panel
       gestureMoved = true;
@@ -437,13 +522,18 @@ export function MediaViewer(props: MediaViewerProps) {
       e.preventDefault();
       const d = Math.max(0, dy);
       setDragY(d);
-      const p = Math.min(1, d / (SWIPE_DISMISS_PX * 1.6));
-      setDragScale(1 - p * (1 - DISMISS_MIN_SCALE));
-      setBackdropAlpha(1 - p * 0.7);
+      // With the info panel open a downward swipe just closes the panel, so
+      // keep the photo full-bright; otherwise it shrinks + fades to dismiss.
+      if (!infoPanelOpen()) {
+        const p = Math.min(1, d / (SWIPE_DISMISS_PX * 1.6));
+        setDragScale(1 - p * (1 - DISMISS_MIN_SCALE));
+        setBackdropAlpha(1 - p * 0.7);
+      }
     } else if (gestureMode === "info") {
       e.preventDefault();
       // Damped upward lift of the photo, hinting at the sheet rising below.
-      setDragY(Math.min(0, dy) * 0.5);
+      // No-op once the panel is already open (it's at its resting gap position).
+      if (!infoPanelOpen()) setDragY(Math.min(0, dy) * 0.5);
     }
   };
 
@@ -456,21 +546,29 @@ export function MediaViewer(props: MediaViewerProps) {
     const goNext =
       (dx < -W * SWIPE_NAV_RATIO || vx < -SWIPE_VELOCITY) &&
       props.currentIndex < props.paths.length - 1;
-    if (goPrev) {
-      setDragX(0); // index effect remounts the (centred) new image
-      props.onPrev();
-    } else if (goNext) {
-      setDragX(0);
-      props.onNext();
+    if (goPrev || goNext) {
+      // Slide the whole filmstrip a full screen so the neighbour glides to
+      // centre, then commit the index + reset the track in one batch.
+      animateTrack();
+      setDragX(goNext ? -W : W);
+      scheduleNavCommit(goNext ? props.onNext : props.onPrev);
     } else {
       snapDragReset();
+      endSwipeSoon();
     }
   };
 
   const finishVertical = () => {
     const dy = lastY - startY;
     const vy = (lastY - prevY) / Math.max(1, lastT - prevT);
-    if (dy > SWIPE_DISMISS_PX || vy > SWIPE_VELOCITY) {
+    if (infoPanelOpen()) {
+      // First stage: a downward swipe closes the panel and re-centres the
+      // photo full-screen (a second swipe-down then dismisses the viewer).
+      if (dy > SWIPE_DISMISS_PX * 0.5 || vy > SWIPE_VELOCITY) {
+        setInfoPanelOpen(false);
+      }
+      snapDragReset();
+    } else if (dy > SWIPE_DISMISS_PX || vy > SWIPE_VELOCITY) {
       props.onClose();
     } else {
       snapDragReset();
@@ -478,6 +576,10 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   const finishInfo = () => {
+    if (infoPanelOpen()) {
+      snapDragReset();
+      return;
+    }
     const dy = lastY - startY; // negative for an upward swipe
     const vy = (lastY - prevY) / Math.max(1, lastT - prevT);
     if (-dy > SWIPE_DISMISS_PX * 0.6 || -vy > SWIPE_VELOCITY) {
@@ -489,6 +591,11 @@ export function MediaViewer(props: MediaViewerProps) {
   const handleTap = (e: PointerEvent) => {
     // A real backdrop tap shouldn't also fire the click-to-close handler.
     suppressBackdropClick = true;
+    // While the info panel is open, a tap on the photo dismisses it.
+    if (infoPanelOpen()) {
+      setInfoPanelOpen(false);
+      return;
+    }
     const now = e.timeStamp;
     const near = Math.abs(e.clientX - lastTapX) < 40 && Math.abs(e.clientY - lastTapY) < 40;
     if (now - lastTapT < DOUBLE_TAP_MS && near) {
@@ -534,8 +641,10 @@ export function MediaViewer(props: MediaViewerProps) {
   const onPointerCancel = (e: PointerEvent) => {
     if (e.pointerType !== "touch" || !pointers.has(e.pointerId)) return;
     pointers.delete(e.pointerId);
-    if (gestureMode === "horizontal" || gestureMode === "vertical" || gestureMode === "info") snapDragReset();
-    else if (gestureMode === "pinch" && zoom() <= 1) snapZoomReset();
+    if (gestureMode === "horizontal" || gestureMode === "vertical" || gestureMode === "info") {
+      snapDragReset();
+      if (gestureMode === "horizontal") endSwipeSoon();
+    } else if (gestureMode === "pinch" && zoom() <= 1) snapZoomReset();
     if (pointers.size === 0) {
       gestureMode = "none";
       gestureMoved = false;
@@ -545,6 +654,8 @@ export function MediaViewer(props: MediaViewerProps) {
   onCleanup(() => {
     if (singleTapTimer !== null) clearTimeout(singleTapTimer);
     if (snapTimer !== null) clearTimeout(snapTimer);
+    if (navTimer !== null) clearTimeout(navTimer);
+    if (swipeEndTimer !== null) clearTimeout(swipeEndTimer);
   });
 
   // Load full media when index changes, using cache + preloading. Declared
@@ -568,6 +679,8 @@ export function MediaViewer(props: MediaViewerProps) {
         pointers.clear();
         gestureMode = "none";
         gestureMoved = false;
+        if (swipeEndTimer !== null) { clearTimeout(swipeEndTimer); swipeEndTimer = null; }
+        setSwiping(false);
 
         const path = props.paths[idx];
         setVideoStarted(false);
@@ -584,8 +697,8 @@ export function MediaViewer(props: MediaViewerProps) {
           mountImage(cached, true);
         } else {
           const img = new Image();
-          img.style.maxWidth = "90vw";
-          img.style.maxHeight = "90vh";
+          img.style.maxWidth = "100vw";
+          img.style.maxHeight = "100vh";
           img.style.objectFit = "contain";
           img.draggable = false;
           img.alt = filename();
@@ -608,19 +721,43 @@ export function MediaViewer(props: MediaViewerProps) {
     ),
   );
 
-  // Apply CSS transform reactively. Composes the persistent zoom/pan with the
-  // transient touch-gesture offsets (swipe follow, dismiss shrink).
+  // Filmstrip track transform — horizontal swipe-to-navigate only. The track
+  // holds the prev/current/next slots; sliding it moves all three together.
+  createEffect(() => {
+    if (!trackRef) return;
+    const dx = dragX();
+    trackRef.style.transform = dx === 0 ? "" : `translateX(${dx}px)`;
+  });
+
+  // Current image transform. Composes persistent zoom/pan with the transient
+  // vertical-gesture offsets (dismiss follow + shrink) and, when the info panel
+  // is open on touch, a uniform shrink + lift so the photo fills the space
+  // above the sheet (Apple-Photos style) instead of sitting centred behind it.
   createEffect(() => {
     if (!imageContainerRef) return;
-    const z = zoom() * dragScale();
-    const px = panX() + dragX();
-    const py = panY() + dragY();
+    let z = zoom() * dragScale();
+    const px = panX();
+    let py = panY() + dragY();
+    const f = infoFit();
+    if (f && zoom() === 1) {
+      z *= f.scale;
+      py += f.ty;
+    }
     if (z === 1 && px === 0 && py === 0) {
       imageContainerRef.style.transform = "";
     } else {
       imageContainerRef.style.transform = `translate(${px}px, ${py}px) scale(${z})`;
     }
   });
+
+  // Ease the photo into / out of its info-panel position whenever the panel
+  // toggles (so opening or closing the sheet animates the shrink, not just the
+  // gesture-driven path). Deferred so it doesn't fire on initial mount.
+  createEffect(
+    on(infoPanelOpen, () => {
+      if (hasTouch()) animateContainer();
+    }, { defer: true }),
+  );
 
   // Pixel ratio: effective physical display width / natural width
   // Accounts for devicePixelRatio so 1:1 = one image pixel per physical screen pixel
@@ -680,9 +817,9 @@ export function MediaViewer(props: MediaViewerProps) {
         </button>
       </Show>
 
-      {/* Media display */}
-      <div class="max-w-[90vw] max-h-[90vh] flex items-center justify-center">
-        <Show when={isVideo()}>
+      {/* Media display — video */}
+      <Show when={isVideo()}>
+        <div class="absolute inset-0 flex items-center justify-center">
           <Show when={isBrowserPlayableVideo() && !videoError()} fallback={
             <div class="text-neutral-400 text-sm text-center" onClick={(e) => e.stopPropagation()}>
               <button
@@ -697,12 +834,12 @@ export function MediaViewer(props: MediaViewerProps) {
           }>
             <Show when={videoStarted()} fallback={
               <div
-                class="relative max-w-[90vw] max-h-[90vh] flex items-center justify-center"
+                class="relative max-w-[100vw] max-h-[100vh] flex items-center justify-center"
                 onClick={(e) => e.stopPropagation()}
               >
                 <img
                   src={thumbUrl(currentPath(), "p")}
-                  class="max-w-[90vw] max-h-[90vh] object-contain"
+                  class="max-w-[100vw] max-h-[100vh] object-contain"
                   draggable={false}
                   onError={(e) => {
                     (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
@@ -719,7 +856,7 @@ export function MediaViewer(props: MediaViewerProps) {
             }>
               <video
                 src={mediaUrl(currentPath())}
-                class="max-w-[90vw] max-h-[90vh] outline-none"
+                class="max-w-[100vw] max-h-[100vh] outline-none"
                 controls
                 autoplay
                 loop={settings().display.video_autoplay_loop}
@@ -746,48 +883,84 @@ export function MediaViewer(props: MediaViewerProps) {
               />
             </Show>
           </Show>
-        </Show>
+        </div>
+      </Show>
 
-        {/* Preview tier underlay — shown while the full-resolution image
-            is still decoding. Uses the lazy 1600 px preview cached by
-            ensureTierThumbnails above. Fails silently (404) until the
-            tier is ready, at which point a natural re-render swaps it in. */}
-        <Show when={!isVideo() && !loaded()}>
-          <img
-            src={thumbUrl(currentPath(), "p")}
-            class="absolute max-w-[90vw] max-h-[90vh] object-contain pointer-events-none"
-            style={{ filter: "blur(2px)" }}
-            draggable={false}
-            onError={(e) => {
-              // Hide the broken-image icon if the preview isn't ready yet.
-              (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
-            }}
-          />
-        </Show>
+      {/* Media display — image filmstrip. A horizontally-sliding track holds
+          the previous / current / next photos so a swipe glides between them
+          (neighbours are only mounted during a swipe). Only the current slide
+          carries the imperative cache-swapped <img> plus zoom/pan. The track is
+          click-through except the current photo, so a backdrop tap/click in the
+          surrounding margin still closes the viewer. */}
+      <Show when={!isVideo()}>
+        <div ref={trackRef} class="absolute inset-0 pointer-events-none">
+          {/* Previous neighbour slide */}
+          <Show when={swiping() && prevPath()}>
+            <div class="absolute inset-0 flex items-center justify-center" style={{ transform: neighbourTransform(-1) }}>
+              <img
+                src={neighbourSrc(prevPath()!)}
+                class="max-w-[100vw] max-h-[100vh] object-contain"
+                draggable={false}
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }}
+              />
+            </div>
+          </Show>
 
-        {/* Image container — preloaded Image elements are swapped in directly */}
-        <Show when={!isVideo()}>
-          <div ref={imageContainerRef} class="max-w-[90vw] max-h-[90vh] flex items-center justify-center" />
-        </Show>
+          {/* Current slide */}
+          <div class="absolute inset-0 flex items-center justify-center">
+            {/* Preview tier underlay — shown while the full-resolution image
+                is still decoding. Fails silently (404) until the tier is
+                ready, then a natural re-render swaps it in. Sized to contain
+                in the full viewport so it aligns with the full image. */}
+            <Show when={!loaded()}>
+              <img
+                src={thumbUrl(currentPath(), "p")}
+                class="absolute inset-0 w-full h-full object-contain pointer-events-none"
+                style={{ filter: "blur(2px)" }}
+                draggable={false}
+                onError={(e) => {
+                  (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
+                }}
+              />
+            </Show>
 
-        <Show when={!isVideo() && !loaded()}>
-          <svg
-            width="48"
-            height="48"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="text-white/20"
-          >
-            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-            <circle cx="8.5" cy="8.5" r="1.5" />
-            <polyline points="21 15 16 10 5 21" />
-          </svg>
-        </Show>
-      </div>
+            {/* Image container — preloaded Image elements are swapped in
+                directly. pointer-events-auto so a click/tap on the photo
+                doesn't fall through to the backdrop's click-to-close. */}
+            <div ref={imageContainerRef} class="flex items-center justify-center pointer-events-auto" />
+
+            <Show when={!loaded()}>
+              <svg
+                width="48"
+                height="48"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="text-white/20 pointer-events-none"
+              >
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                <circle cx="8.5" cy="8.5" r="1.5" />
+                <polyline points="21 15 16 10 5 21" />
+              </svg>
+            </Show>
+          </div>
+
+          {/* Next neighbour slide */}
+          <Show when={swiping() && nextPath()}>
+            <div class="absolute inset-0 flex items-center justify-center" style={{ transform: neighbourTransform(1) }}>
+              <img
+                src={neighbourSrc(nextPath()!)}
+                class="max-w-[100vw] max-h-[100vh] object-contain"
+                draggable={false}
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }}
+              />
+            </div>
+          </Show>
+        </div>
+      </Show>
 
       {/* Navigation — right. Hidden on touch (swipe navigates instead). */}
       <Show when={!hasTouch()}>

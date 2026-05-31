@@ -139,8 +139,8 @@ export class ViewerImageCache {
 
     const img = new Image();
     // Apply same styling as the viewer <img> so layout doesn't shift
-    img.style.maxWidth = "90vw";
-    img.style.maxHeight = "90vh";
+    img.style.maxWidth = "100vw";
+    img.style.maxHeight = "100vh";
     img.style.objectFit = "contain";
     img.draggable = false;
 
