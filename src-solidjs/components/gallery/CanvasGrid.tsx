@@ -15,6 +15,7 @@ import { initGPU } from "../../lib/gpu";
 import { recordCacheMiss, setImageCountSource } from "../../lib/perfMonitor";
 import { Canvas2DRenderer } from "../../lib/renderer/Canvas2DRenderer";
 import { WebGLRenderer } from "../../lib/renderer/WebGLRenderer";
+import { markWebglInitStarted, markWebglStable } from "../../lib/renderer/webglGuard";
 import { ImageLoader, type DecodePriority } from "../../lib/renderer/ImageLoader";
 import { MemoryPressureMonitor } from "../../lib/memoryPressure";
 import type { GridRenderer, GridLayout, GridItem } from "../../lib/renderer/types";
@@ -249,9 +250,20 @@ export function CanvasGrid(props: CanvasGridProps) {
   function createRenderer(mode: RendererMode): GridRenderer {
     if (mode === "webgl") {
       try {
-        return new WebGLRenderer();
-      } catch {
-        console.warn("WebGL unavailable, falling back to Canvas2D");
+        // Persist a crash-guard flag *before* touching WebGL. If init hard-
+        // crashes the page (e.g. OOM on a phone), the flag survives and the
+        // next launch downgrades to Canvas2D instead of boot-looping.
+        markWebglInitStarted();
+        const r = new WebGLRenderer();
+        // Survived construction — if the context keeps running for a few
+        // seconds without taking down the page, consider WebGL stable.
+        setTimeout(markWebglStable, 5000);
+        return r;
+      } catch (e) {
+        // Clean, caught failure (no usable context) is not a crash — clear the
+        // guard so we don't needlessly downgrade a working canvas next launch.
+        markWebglStable();
+        console.warn("WebGL unavailable, falling back to Canvas2D", e);
       }
     }
     return new Canvas2DRenderer();

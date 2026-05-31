@@ -14,6 +14,32 @@ import type { GridRenderer, GridLayout, GridItem, HitTestResult } from "./types"
 // Pool configuration
 const SLOT_SIZE = 512; // pixels per slot for the main thumbnail pool
 
+// Never allocate a pool narrower than this many slots per row — guarantees a
+// usable handful of slots even on a tiny memory budget.
+const MIN_SLOTS_PER_ROW = 6;
+
+// Pick a GPU-memory budget (in MiB) for the main thumbnail pool based on the
+// device. The pool is a single RGBA texture sized `dim × dim`, costing
+// `dim² × 4` bytes — at the GPU's typical 16384 max that's ~1 GiB, which
+// OOM-crashes the GPU process on phones. The pool only needs enough 512px slots
+// to cover the viewport plus headroom; ImageLoader's LRU re-uploads anything
+// evicted, so a smaller pool degrades to slightly more upload work, not a crash.
+function poolBudgetMB(): number {
+  const mem = (navigator as any).deviceMemory as number | undefined; // GiB, Chromium-only
+  const coarsePointer =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+  const minScreen =
+    typeof window !== "undefined" && window.screen
+      ? Math.min(window.screen.width, window.screen.height)
+      : Infinity;
+  const constrained = coarsePointer || minScreen < 820 || (mem !== undefined && mem <= 4);
+  if (constrained) return 96; // ~81 MiB pool → ~81 slots, plenty for a viewport
+  if (mem !== undefined && mem <= 8) return 256;
+  return 384; // ~360 slots, comfortably above ImageLoader's 300-item cache
+}
+
 // ThumbHash pool configuration — ThumbHash decodes to ≤32 px per side;
 // 64 px slots give headroom so linear filtering never samples across slot
 // boundaries. 2048×2048 atlas at 64 px = 32×32 = 1024 slots.
@@ -224,7 +250,15 @@ export class WebGLRenderer implements GridRenderer {
     // 16384/512 = 32 per row → 1024 slots, well above ImageLoader's 300 cache
     // ---------------------------------------------------------------------------
     const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
-    this.poolSize = Math.min(maxTexSize, 16384);
+    // Size the pool to a memory budget rather than the GPU's maximum texture
+    // size (a 16384² RGBA texture is ~1 GiB and OOM-crashes phones). Snap down
+    // to a whole number of slots, clamp to the GPU limit, and keep a floor so we
+    // always have a usable handful of slots.
+    const budgetDim = Math.floor(Math.sqrt((poolBudgetMB() * 1024 * 1024) / 4));
+    this.poolSize = Math.max(
+      SLOT_SIZE * MIN_SLOTS_PER_ROW,
+      Math.min(maxTexSize, Math.floor(budgetDim / SLOT_SIZE) * SLOT_SIZE),
+    );
     this.slotsPerRow = Math.floor(this.poolSize / SLOT_SIZE);
     this.totalSlots = this.slotsPerRow * this.slotsPerRow;
 

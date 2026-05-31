@@ -1,6 +1,7 @@
 import { createSignal } from "solid-js";
 import type { AppSettings, SortField, SortOrder, GroupBy } from "../lib/types";
 import { saveGallerySettings, loadGallerySettings } from "../lib/ipc";
+import { webglPreviouslyCrashed, markWebglStable } from "../lib/renderer/webglGuard";
 
 const DEFAULT_SETTINGS: AppSettings = {
   display: {
@@ -32,14 +33,29 @@ const DEFAULT_SETTINGS: AppSettings = {
   ],
 };
 
+/** If WebGL crashed on the previous launch, downgrade the saved renderer to
+ *  Canvas2D so we don't boot-loop. Consumes the crash guard so a later manual
+ *  re-enable gets a fresh attempt. No-op for any other renderer/state. */
+function applyRendererSafeMode(s: AppSettings): AppSettings {
+  if (s.display.renderer_mode === "webgl" && webglPreviouslyCrashed()) {
+    markWebglStable();
+    console.warn("WebGL crashed on the previous launch — falling back to Canvas2D");
+    return { ...s, display: { ...s.display, renderer_mode: "canvas" } };
+  }
+  return s;
+}
+
 function loadSettings(): AppSettings {
+  let s = DEFAULT_SETTINGS;
   try {
     const stored = localStorage.getItem("gallery-settings");
     if (stored) {
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
+      s = { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
     }
   } catch {}
-  return DEFAULT_SETTINGS;
+  const safe = applyRendererSafeMode(s);
+  if (safe !== s) saveSettings(safe); // persist the downgrade
+  return safe;
 }
 
 function saveSettings(s: AppSettings) {
@@ -77,7 +93,7 @@ export async function loadSettingsFromGallery() {
     const json = await loadGallerySettings();
     if (json) {
       const stored = JSON.parse(json) as Partial<AppSettings>;
-      const merged = { ...DEFAULT_SETTINGS, ...stored };
+      const merged = applyRendererSafeMode({ ...DEFAULT_SETTINGS, ...stored });
       setSettingsRaw(() => merged);
       saveSettings(merged); // sync localStorage with gallery settings
     } else {
