@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-WD Eva02 Large Tagger v3 plugin for LightView.
+Camie Tagger v2 plugin for LightView.
 
-Uses the SmilingWolf/wd-eva02-large-tagger-v3 ONNX model to predict
-danbooru-style tags for images. The model and label files are downloaded
+Uses the Camais03/camie-tagger-v2 model — a 143M-parameter Vision Transformer
+with an initial-prediction → top-K candidate-selection → cross-attention
+refinement pipeline — in its ONNX build. It predicts danbooru-style tags across
+a 70,527-tag vocabulary spanning general, character, copyright, artist, meta,
+year, and rating categories. The model and tag-metadata file are downloaded
 from HuggingFace on first run and cached locally.
 
 Streaming protocol (newline-delimited JSON):
-  Stdin (host → plugin):  one request per line
+  Stdin (host -> plugin):  one request per line
       {"action": "tag", "path": "/abs/path/img.jpg"}
-  Stdout (plugin → host): one result per line, in any order
+  Stdout (plugin -> host): one result per line, in any order
       {"path": "...", "tags": [...], "meta": {...}}
       {"path": "...", "tags": [], "error": "..."}
 
 The plugin reads stdin to EOF, batches images for parallel GPU inference,
 and runs videos one at a time (each video has its own per-frame loop).
+
+Preprocessing matches the model card's onnx_inference.py: aspect-preserving
+LANCZOS resize, center-pad to 512x512 with the ImageNet mean color, ImageNet
+normalization, channels-first (NCHW) RGB input. The ONNX graph emits three
+outputs; the second (refined logits) is the one used for tagging.
 """
 
 import ctypes
@@ -58,15 +66,39 @@ for _pattern in _CUDA_PRELOAD:
 import huggingface_hub
 import numpy as np
 import onnxruntime as rt
-import pandas as pd
 from PIL import Image
 
-MODEL_REPO = "SmilingWolf/wd-eva02-large-tagger-v3"
-MODEL_FILENAME = "model.onnx"
-LABEL_FILENAME = "selected_tags.csv"
+MODEL_REPO = "Camais03/camie-tagger-v2"
+MODEL_FILENAME = "camie-tagger-v2.onnx"
+METADATA_FILENAME = "camie-tagger-v2-metadata.json"
 
-GENERAL_THRESHOLD = 0.35
-CHARACTER_THRESHOLD = 0.85
+# Default detection threshold. The model card publishes two tuned profiles:
+#   macro-optimized (recall-leaning) = 0.492, micro-optimized = 0.614.
+# We default to the macro profile and let the user override per category.
+DEFAULT_THRESHOLD = 0.492
+# Per-category thresholds. Characters/copyright/artist are higher-confidence
+# signals, so we keep them stricter to limit false positives.
+CATEGORY_THRESHOLDS = {
+    "general": 0.492,
+    "character": 0.75,
+    "copyright": 0.75,
+    "artist": 0.75,
+    "meta": 0.492,
+    "year": 0.492,
+    "rating": 0.0,  # rating handled separately (argmax over the rating tags)
+}
+
+# Categories that are emitted with a "<category>:" tag prefix; "general" tags
+# are emitted bare. "rating" is collapsed to a single best label.
+PREFIXED_CATEGORIES = ("character", "copyright", "artist", "meta", "year")
+
+# The model expects a fixed 512x512 input (overridable from metadata).
+TARGET_SIZE = 512
+# ImageNet normalization.
+NORM_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+NORM_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Center-pad fill ≈ ImageNet mean color.
+PAD_COLOR = (124, 116, 104)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv"}
 VIDEO_FRAME_SAMPLES = 5
@@ -82,47 +114,89 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def download_model():
-    csv_path = os.path.join(PLUGIN_DIR, LABEL_FILENAME)
+    meta_path = os.path.join(PLUGIN_DIR, METADATA_FILENAME)
     model_path = os.path.join(PLUGIN_DIR, MODEL_FILENAME)
-    if not os.path.isfile(csv_path):
-        downloaded = huggingface_hub.hf_hub_download(MODEL_REPO, LABEL_FILENAME)
-        shutil.copy2(downloaded, csv_path)
+    if not os.path.isfile(meta_path):
+        downloaded = huggingface_hub.hf_hub_download(MODEL_REPO, METADATA_FILENAME)
+        shutil.copy2(downloaded, meta_path)
     if not os.path.isfile(model_path):
         downloaded = huggingface_hub.hf_hub_download(MODEL_REPO, MODEL_FILENAME)
         shutil.copy2(downloaded, model_path)
-    return csv_path, model_path
+    return meta_path, model_path
 
 
-def load_labels(csv_path):
-    df = pd.read_csv(csv_path)
-    names = df["name"].map(
-        lambda x: x.replace("_", " ") if x not in KAOMOJIS else x
-    ).tolist()
-    rating_idxs = list(np.where(df["category"] == 9)[0])
-    general_idxs = list(np.where(df["category"] == 0)[0])
-    character_idxs = list(np.where(df["category"] == 4)[0])
-    return names, rating_idxs, general_idxs, character_idxs
+def _normalize_tag(name):
+    return name.replace("_", " ") if name not in KAOMOJIS else name
+
+
+def load_labels(meta_path):
+    """Parse the nested metadata.json into ordered (name, category) arrays.
+
+    Structure:
+      metadata["dataset_info"]["tag_mapping"]["idx_to_tag"]      {"0": "tag", ...}
+      metadata["dataset_info"]["tag_mapping"]["tag_to_category"] {"tag": "general", ...}
+      metadata["model_info"]["img_size"]                          int
+    """
+    with open(meta_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    tag_mapping = metadata["dataset_info"]["tag_mapping"]
+    idx_to_tag = tag_mapping["idx_to_tag"]
+    tag_to_category = tag_mapping["tag_to_category"]
+
+    num_tags = len(idx_to_tag)
+    names = [""] * num_tags
+    raw_names = [""] * num_tags
+    categories = [""] * num_tags
+    for idx_str, raw in idx_to_tag.items():
+        idx = int(idx_str)
+        if idx >= num_tags:
+            continue
+        raw_names[idx] = raw
+        names[idx] = _normalize_tag(raw)
+        categories[idx] = tag_to_category.get(raw, "general")
+
+    img_size = metadata.get("model_info", {}).get("img_size", TARGET_SIZE)
+    return names, raw_names, categories, img_size
 
 
 def prepare_image(image, target_size):
-    image = image.convert("RGBA")
-    canvas = Image.new("RGBA", image.size, (255, 255, 255))
-    canvas.alpha_composite(image)
-    image = canvas.convert("RGB")
+    """Aspect-preserving LANCZOS resize, center-pad to square, ImageNet-normalize.
 
-    max_dim = max(image.size)
-    pad_left = (max_dim - image.size[0]) // 2
-    pad_top = (max_dim - image.size[1]) // 2
-    padded = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
-    padded.paste(image, (pad_left, pad_top))
+    Returns an NCHW float32 array shaped [1, 3, target_size, target_size].
+    """
+    if image.mode != "RGB":
+        # Composite transparency onto the pad color so alpha doesn't bleed black.
+        if image.mode in ("RGBA", "LA", "P"):
+            rgba = image.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, PAD_COLOR + (255,))
+            bg.alpha_composite(rgba)
+            image = bg.convert("RGB")
+        else:
+            image = image.convert("RGB")
 
-    if max_dim != target_size:
-        padded = padded.resize((target_size, target_size), Image.BICUBIC)
+    w, h = image.size
+    aspect = w / h if h else 1.0
+    if aspect > 1:
+        new_w = target_size
+        new_h = max(1, int(round(target_size / aspect)))
+    else:
+        new_h = target_size
+        new_w = max(1, int(round(target_size * aspect)))
 
-    arr = np.asarray(padded, dtype=np.float32)
-    # RGB -> BGR (model expects BGR)
-    arr = arr[:, :, ::-1]
+    resized = image.resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new("RGB", (target_size, target_size), PAD_COLOR)
+    canvas.paste(resized, ((target_size - new_w) // 2, (target_size - new_h) // 2))
+
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
+    arr = (arr - NORM_MEAN) / NORM_STD
+    # HWC -> CHW, add batch dim -> NCHW
+    arr = np.transpose(arr, (2, 0, 1))
     return np.expand_dims(arr, axis=0)
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
 
 def is_video(path):
@@ -175,8 +249,9 @@ class Tagger:
     """Holds a loaded ONNX model and label data; processes images one or many at a time."""
 
     def __init__(self):
-        csv_path, model_path = download_model()
-        self.tag_names, self.rating_idxs, self.general_idxs, self.character_idxs = load_labels(csv_path)
+        meta_path, model_path = download_model()
+        self.tag_names, self.raw_names, self.categories, meta_img_size = load_labels(meta_path)
+        self.rating_idxs = [i for i, c in enumerate(self.categories) if c == "rating"]
 
         providers = []
         available = rt.get_available_providers()
@@ -207,54 +282,80 @@ class Tagger:
             os.close(saved_fd)
 
         active_providers = self.model.get_providers()
-        sys.stderr.write(f"wd-tagger: providers = {active_providers}\n")
+        sys.stderr.write(f"camie-tagger: providers = {active_providers}\n")
         sys.stderr.flush()
 
-        input_shape = self.model.get_inputs()[0].shape  # [batch, H, W, C]
-        _, height, width, _ = input_shape
-        self.target_size = height
+        # Input is NCHW: [batch, channels, height, width].
+        input_shape = self.model.get_inputs()[0].shape
+        height = input_shape[2] if isinstance(input_shape[2], int) else meta_img_size
+        self.target_size = height or TARGET_SIZE
         self.input_name = self.model.get_inputs()[0].name
-        self.label_name = self.model.get_outputs()[0].name
+
+        # The graph emits initial logits, refined logits, and selected candidates.
+        # We score on the refined logits (output index 1 when >1 output exists).
+        self.output_names = [o.name for o in self.model.get_outputs()]
+        self.refined_idx = 1 if len(self.output_names) >= 2 else 0
 
         # Detect whether the model accepts a dynamic batch dimension.
         # ONNX dynamic dims show up as strings (symbolic) or non-int.
         self.batch_supported = not isinstance(input_shape[0], int) or input_shape[0] != 1
 
+    def _run(self, arr):
+        outputs = self.model.run(None, {self.input_name: arr})
+        return outputs[self.refined_idx]
+
     def _infer_one(self, image):
         arr = prepare_image(image, self.target_size)
-        return self.model.run([self.label_name], {self.input_name: arr})[0][0].astype(float)
+        logits = self._run(arr)[0].astype(float)
+        return sigmoid(logits)
 
     def _infer_batch(self, images):
-        """Run inference on N images at once; returns [N, num_labels]."""
+        """Run inference on N images at once; returns [N, num_labels] of probabilities."""
         batch = np.concatenate([prepare_image(img, self.target_size) for img in images], axis=0)
-        return self.model.run([self.label_name], {self.input_name: batch})[0]
+        logits = self._run(batch)
+        return sigmoid(logits)
 
     def _scores_to_tags(self, preds):
-        labels = list(zip(self.tag_names, preds))
-        rating_labels = {labels[i][0]: labels[i][1] for i in self.rating_idxs}
-        top_rating = max(rating_labels, key=rating_labels.get)
-        general_tags = sorted(
-            [(labels[i][0], labels[i][1]) for i in self.general_idxs if labels[i][1] > GENERAL_THRESHOLD],
-            key=lambda x: x[1], reverse=True,
-        )
-        character_tags = sorted(
-            [(labels[i][0], labels[i][1]) for i in self.character_idxs if labels[i][1] > CHARACTER_THRESHOLD],
-            key=lambda x: x[1], reverse=True,
-        )
-        return general_tags, character_tags, top_rating, rating_labels
+        """Group thresholded predictions by category; each value is a sorted list."""
+        by_category = {}
+        for i, prob in enumerate(preds):
+            category = self.categories[i]
+            if category == "rating":
+                continue  # handled via argmax below
+            thr = CATEGORY_THRESHOLDS.get(category, DEFAULT_THRESHOLD)
+            if prob > thr:
+                by_category.setdefault(category, []).append((self.tag_names[i], prob))
+        for category in by_category:
+            by_category[category].sort(key=lambda x: x[1], reverse=True)
+        return by_category
+
+    def _top_rating(self, preds):
+        if not self.rating_idxs:
+            return None, {}
+        scores = {self.raw_names[i]: float(preds[i]) for i in self.rating_idxs}
+        top = max(scores, key=scores.get)
+        return top, scores
 
     def _build_response(self, path, scores):
-        general_tags, character_tags, top_rating, rating_scores = self._scores_to_tags(scores)
-        tags = [f"rating:{top_rating}"]
-        tags.extend(f"character:{name}" for name, _ in character_tags)
-        tags.extend(name for name, _ in general_tags)
+        by_category = self._scores_to_tags(scores)
+        top_rating, rating_scores = self._top_rating(scores)
+
+        tags = []
+        if top_rating is not None:
+            tags.append(f"rating:{top_rating}")
+        for category in PREFIXED_CATEGORIES:
+            for name, _ in by_category.get(category, []):
+                tags.append(f"{category}:{name}")
+        for name, _ in by_category.get("general", []):
+            tags.append(name)
+
         meta = {
             "model": MODEL_REPO,
-            "rating_scores": {k: round(float(v), 4) for k, v in rating_scores.items()},
-            "general_threshold": GENERAL_THRESHOLD,
-            "character_threshold": CHARACTER_THRESHOLD,
+            "thresholds": CATEGORY_THRESHOLDS,
             "tag_count": len(tags),
         }
+        if rating_scores:
+            meta["rating_scores"] = {k: round(v, 4) for k, v in rating_scores.items()}
         return {"path": path, "tags": tags, "meta": meta}
 
     def predict_image(self, path):
@@ -287,7 +388,7 @@ class Tagger:
             except Exception as e:
                 # The model may have advertised dynamic batch but rejected the call.
                 # Disable batching for the remainder of the run and process per-image.
-                sys.stderr.write(f"wd-tagger: batched inference failed ({e}), falling back\n")
+                sys.stderr.write(f"camie-tagger: batched inference failed ({e}), falling back\n")
                 sys.stderr.flush()
                 self.batch_supported = False
                 for idx in indices:
@@ -425,18 +526,18 @@ def estimate_per_instance_vram_mb():
         size_mb = os.path.getsize(model_path) / (1024 * 1024)
     except OSError:
         # Model not yet downloaded (first run); fall back to a conservative guess
-        # for wd-eva02-large.
-        size_mb = 1300
+        # for camie-tagger-v2 (~789 MB on disk).
+        size_mb = 800
     return int(math.ceil(size_mb * VRAM_INFLATION)) + RUNTIME_OVERHEAD_MB
 
 
 def decide_instance_count(num_images):
     """How many model instances to spin up, given workload + free VRAM."""
-    forced = os.environ.get("WDTAGGER_INSTANCES")
+    forced = os.environ.get("CAMIE_TAGGER_INSTANCES")
     if forced:
         try:
             n = max(1, int(forced))
-            sys.stderr.write(f"wd-tagger: instances={n} (forced via WDTAGGER_INSTANCES)\n")
+            sys.stderr.write(f"camie-tagger: instances={n} (forced via CAMIE_TAGGER_INSTANCES)\n")
             sys.stderr.flush()
             return n
         except ValueError:
@@ -445,14 +546,14 @@ def decide_instance_count(num_images):
     if num_images <= 1:
         return 1
     if not has_gpu_provider():
-        sys.stderr.write("wd-tagger: no GPU provider available, using 1 instance (CPU fallback)\n")
+        sys.stderr.write("camie-tagger: no GPU provider available, using 1 instance (CPU fallback)\n")
         sys.stderr.flush()
         return 1
 
     free_mb = get_free_vram_mb()
     if free_mb is None:
         sys.stderr.write(
-            "wd-tagger: could not measure free VRAM (non-NVIDIA/AMD GPU or vendor "
+            "camie-tagger: could not measure free VRAM (non-NVIDIA/AMD GPU or vendor "
             "tools missing), using 1 instance\n"
         )
         sys.stderr.flush()
@@ -465,7 +566,7 @@ def decide_instance_count(num_images):
     n = max(1, min(int(by_vram), by_work, MAX_INSTANCES))
 
     sys.stderr.write(
-        f"wd-tagger: free_vram={free_mb}MB, per_instance≈{per_instance}MB, "
+        f"camie-tagger: free_vram={free_mb}MB, per_instance≈{per_instance}MB, "
         f"images={num_images}, instances={n} (vram_cap={by_vram}, work_cap={by_work})\n"
     )
     sys.stderr.flush()
@@ -509,12 +610,12 @@ def run_image_workers(taggers, paths, batch_size):
 
 def main():
     # Block on model download before any sizing decision. The VRAM heuristic
-    # reads model.onnx's actual file size, so it must exist on disk first.
+    # reads the model's actual file size, so it must exist on disk first.
     # download_model() is idempotent — a no-op once files are cached.
-    csv_path = os.path.join(PLUGIN_DIR, LABEL_FILENAME)
+    meta_path = os.path.join(PLUGIN_DIR, METADATA_FILENAME)
     model_path = os.path.join(PLUGIN_DIR, MODEL_FILENAME)
-    if not os.path.isfile(csv_path) or not os.path.isfile(model_path):
-        sys.stderr.write("wd-tagger: downloading model from HuggingFace (first run, this may take a while)...\n")
+    if not os.path.isfile(meta_path) or not os.path.isfile(model_path):
+        sys.stderr.write("camie-tagger: downloading model from HuggingFace (first run, this may take a while)...\n")
         sys.stderr.flush()
     download_model()
 
@@ -551,16 +652,16 @@ def main():
         try:
             taggers.append(Tagger())
             if n_instances > 1:
-                sys.stderr.write(f"wd-tagger: instance {i+1}/{n_instances} ready\n")
+                sys.stderr.write(f"camie-tagger: instance {i+1}/{n_instances} ready\n")
                 sys.stderr.flush()
         except Exception as e:
-            sys.stderr.write(f"wd-tagger: instance {i+1}/{n_instances} failed: {e}\n")
+            sys.stderr.write(f"camie-tagger: instance {i+1}/{n_instances} failed: {e}\n")
             sys.stderr.flush()
             if not taggers:
                 raise
             break  # carry on with however many we got
 
-    batch_size = max(1, int(os.environ.get("WDTAGGER_BATCH_SIZE", "8")))
+    batch_size = max(1, int(os.environ.get("CAMIE_TAGGER_BATCH_SIZE", "8")))
 
     # Images run on the worker pool; videos run sequentially on instance 0
     # afterwards (each video is its own per-frame loop and doesn't batch).

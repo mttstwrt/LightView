@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-WD Eva02 Large Tagger v3 plugin for LightView.
+PixAI Tagger v0.9 plugin for LightView.
 
-Uses the SmilingWolf/wd-eva02-large-tagger-v3 ONNX model to predict
-danbooru-style tags for images. The model and label files are downloaded
-from HuggingFace on first run and cached locally.
+Uses the pixai-labs/pixai-tagger-v0.9 model (EVA02 backbone, classification
+head fine-tuned by PixAI) in the ONNX build published by deepghs
+(deepghs/pixai-tagger-v0.9-onnx). It predicts danbooru-style tags across a
+13,461-tag vocabulary split into "general" and "character" categories. The
+model and label files are downloaded from HuggingFace on first run and cached
+locally.
 
 Streaming protocol (newline-delimited JSON):
-  Stdin (host → plugin):  one request per line
+  Stdin (host -> plugin):  one request per line
       {"action": "tag", "path": "/abs/path/img.jpg"}
-  Stdout (plugin → host): one result per line, in any order
+  Stdout (plugin -> host): one result per line, in any order
       {"path": "...", "tags": [...], "meta": {...}}
       {"path": "...", "tags": [], "error": "..."}
 
 The plugin reads stdin to EOF, batches images for parallel GPU inference,
 and runs videos one at a time (each video has its own per-frame loop).
+
+Unlike the WD tagger, this model expects channels-first (NCHW) input,
+RGB order, and [-1, 1] normalization (mean/std = 0.5).
 """
 
 import ctypes
@@ -61,12 +67,23 @@ import onnxruntime as rt
 import pandas as pd
 from PIL import Image
 
-MODEL_REPO = "SmilingWolf/wd-eva02-large-tagger-v3"
+MODEL_REPO = "deepghs/pixai-tagger-v0.9-onnx"
 MODEL_FILENAME = "model.onnx"
 LABEL_FILENAME = "selected_tags.csv"
 
-GENERAL_THRESHOLD = 0.35
+# Category codes used in selected_tags.csv (danbooru convention).
+GENERAL_CATEGORY = 0
+CHARACTER_CATEGORY = 4
+
+# Thresholds shipped with the model (thresholds.csv).
+GENERAL_THRESHOLD = 0.30
 CHARACTER_THRESHOLD = 0.85
+
+# The model expects a fixed 448x448 input (see meta.json / preprocess.json).
+TARGET_SIZE = 448
+# Normalization: to_tensor -> [0,1], then (x - 0.5) / 0.5 -> [-1, 1].
+NORM_MEAN = 0.5
+NORM_STD = 0.5
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv"}
 VIDEO_FRAME_SAMPLES = 5
@@ -94,35 +111,40 @@ def download_model():
 
 
 def load_labels(csv_path):
-    df = pd.read_csv(csv_path)
+    # keep_default_na=False: the vocab contains a padding slot (tag_id -1) with a
+    # blank name; without this pandas parses it as NaN (a float) and the
+    # underscore-replace below crashes. We then drop blank-named slots entirely
+    # so they can never be emitted as an empty tag.
+    df = pd.read_csv(csv_path, keep_default_na=False)
     names = df["name"].map(
         lambda x: x.replace("_", " ") if x not in KAOMOJIS else x
     ).tolist()
-    rating_idxs = list(np.where(df["category"] == 9)[0])
-    general_idxs = list(np.where(df["category"] == 0)[0])
-    character_idxs = list(np.where(df["category"] == 4)[0])
-    return names, rating_idxs, general_idxs, character_idxs
+    general_idxs = [i for i in np.where(df["category"] == GENERAL_CATEGORY)[0] if names[i]]
+    character_idxs = [i for i in np.where(df["category"] == CHARACTER_CATEGORY)[0] if names[i]]
+    return names, general_idxs, character_idxs
 
 
 def prepare_image(image, target_size):
+    """Squash-resize to target_size, normalize to [-1, 1], return NCHW float32."""
     image = image.convert("RGBA")
     canvas = Image.new("RGBA", image.size, (255, 255, 255))
     canvas.alpha_composite(image)
     image = canvas.convert("RGB")
 
-    max_dim = max(image.size)
-    pad_left = (max_dim - image.size[0]) // 2
-    pad_top = (max_dim - image.size[1]) // 2
-    padded = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
-    padded.paste(image, (pad_left, pad_top))
+    # The packaged preprocess.json resizes directly to (target_size, target_size)
+    # with bilinear interpolation — no aspect-ratio padding.
+    if image.size != (target_size, target_size):
+        image = image.resize((target_size, target_size), Image.BILINEAR)
 
-    if max_dim != target_size:
-        padded = padded.resize((target_size, target_size), Image.BICUBIC)
-
-    arr = np.asarray(padded, dtype=np.float32)
-    # RGB -> BGR (model expects BGR)
-    arr = arr[:, :, ::-1]
+    arr = np.asarray(image, dtype=np.float32) / 255.0
+    arr = (arr - NORM_MEAN) / NORM_STD
+    # HWC -> CHW, add batch dim -> NCHW
+    arr = np.transpose(arr, (2, 0, 1))
     return np.expand_dims(arr, axis=0)
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
 
 def is_video(path):
@@ -176,7 +198,7 @@ class Tagger:
 
     def __init__(self):
         csv_path, model_path = download_model()
-        self.tag_names, self.rating_idxs, self.general_idxs, self.character_idxs = load_labels(csv_path)
+        self.tag_names, self.general_idxs, self.character_idxs = load_labels(csv_path)
 
         providers = []
         available = rt.get_available_providers()
@@ -207,14 +229,29 @@ class Tagger:
             os.close(saved_fd)
 
         active_providers = self.model.get_providers()
-        sys.stderr.write(f"wd-tagger: providers = {active_providers}\n")
+        sys.stderr.write(f"pixai-tagger: providers = {active_providers}\n")
         sys.stderr.flush()
 
-        input_shape = self.model.get_inputs()[0].shape  # [batch, H, W, C]
-        _, height, width, _ = input_shape
+        # Input is NCHW: [batch, channels, height, width].
+        input_shape = self.model.get_inputs()[0].shape
+        height = input_shape[2] if isinstance(input_shape[2], int) else TARGET_SIZE
         self.target_size = height
         self.input_name = self.model.get_inputs()[0].name
-        self.label_name = self.model.get_outputs()[0].name
+
+        # The graph emits three outputs: "embedding" [batch, 1024],
+        # "logits" [batch, 13461], and "prediction" [batch, 13461]. We score on
+        # the raw logits (we apply sigmoid ourselves). Prefer the output named
+        # "logits"; otherwise fall back to whichever output is as wide as the
+        # tag vocabulary, and finally to the first output.
+        outputs = self.model.get_outputs()
+        num_labels = len(self.tag_names)
+        self.label_name = next((o.name for o in outputs if o.name == "logits"), None)
+        if self.label_name is None:
+            self.label_name = next(
+                (o.name for o in outputs
+                 if isinstance(o.shape[-1], int) and o.shape[-1] == num_labels),
+                outputs[0].name,
+            )
 
         # Detect whether the model accepts a dynamic batch dimension.
         # ONNX dynamic dims show up as strings (symbolic) or non-int.
@@ -222,35 +259,32 @@ class Tagger:
 
     def _infer_one(self, image):
         arr = prepare_image(image, self.target_size)
-        return self.model.run([self.label_name], {self.input_name: arr})[0][0].astype(float)
+        logits = self.model.run([self.label_name], {self.input_name: arr})[0][0].astype(float)
+        return sigmoid(logits)
 
     def _infer_batch(self, images):
-        """Run inference on N images at once; returns [N, num_labels]."""
+        """Run inference on N images at once; returns [N, num_labels] of probabilities."""
         batch = np.concatenate([prepare_image(img, self.target_size) for img in images], axis=0)
-        return self.model.run([self.label_name], {self.input_name: batch})[0]
+        logits = self.model.run([self.label_name], {self.input_name: batch})[0]
+        return sigmoid(logits)
 
     def _scores_to_tags(self, preds):
-        labels = list(zip(self.tag_names, preds))
-        rating_labels = {labels[i][0]: labels[i][1] for i in self.rating_idxs}
-        top_rating = max(rating_labels, key=rating_labels.get)
         general_tags = sorted(
-            [(labels[i][0], labels[i][1]) for i in self.general_idxs if labels[i][1] > GENERAL_THRESHOLD],
+            [(self.tag_names[i], preds[i]) for i in self.general_idxs if preds[i] > GENERAL_THRESHOLD],
             key=lambda x: x[1], reverse=True,
         )
         character_tags = sorted(
-            [(labels[i][0], labels[i][1]) for i in self.character_idxs if labels[i][1] > CHARACTER_THRESHOLD],
+            [(self.tag_names[i], preds[i]) for i in self.character_idxs if preds[i] > CHARACTER_THRESHOLD],
             key=lambda x: x[1], reverse=True,
         )
-        return general_tags, character_tags, top_rating, rating_labels
+        return general_tags, character_tags
 
     def _build_response(self, path, scores):
-        general_tags, character_tags, top_rating, rating_scores = self._scores_to_tags(scores)
-        tags = [f"rating:{top_rating}"]
-        tags.extend(f"character:{name}" for name, _ in character_tags)
+        general_tags, character_tags = self._scores_to_tags(scores)
+        tags = [f"character:{name}" for name, _ in character_tags]
         tags.extend(name for name, _ in general_tags)
         meta = {
             "model": MODEL_REPO,
-            "rating_scores": {k: round(float(v), 4) for k, v in rating_scores.items()},
             "general_threshold": GENERAL_THRESHOLD,
             "character_threshold": CHARACTER_THRESHOLD,
             "tag_count": len(tags),
@@ -287,7 +321,7 @@ class Tagger:
             except Exception as e:
                 # The model may have advertised dynamic batch but rejected the call.
                 # Disable batching for the remainder of the run and process per-image.
-                sys.stderr.write(f"wd-tagger: batched inference failed ({e}), falling back\n")
+                sys.stderr.write(f"pixai-tagger: batched inference failed ({e}), falling back\n")
                 sys.stderr.flush()
                 self.batch_supported = False
                 for idx in indices:
@@ -425,18 +459,18 @@ def estimate_per_instance_vram_mb():
         size_mb = os.path.getsize(model_path) / (1024 * 1024)
     except OSError:
         # Model not yet downloaded (first run); fall back to a conservative guess
-        # for wd-eva02-large.
+        # for pixai-tagger-v0.9 (~1.27 GB on disk).
         size_mb = 1300
     return int(math.ceil(size_mb * VRAM_INFLATION)) + RUNTIME_OVERHEAD_MB
 
 
 def decide_instance_count(num_images):
     """How many model instances to spin up, given workload + free VRAM."""
-    forced = os.environ.get("WDTAGGER_INSTANCES")
+    forced = os.environ.get("PIXAI_TAGGER_INSTANCES")
     if forced:
         try:
             n = max(1, int(forced))
-            sys.stderr.write(f"wd-tagger: instances={n} (forced via WDTAGGER_INSTANCES)\n")
+            sys.stderr.write(f"pixai-tagger: instances={n} (forced via PIXAI_TAGGER_INSTANCES)\n")
             sys.stderr.flush()
             return n
         except ValueError:
@@ -445,14 +479,14 @@ def decide_instance_count(num_images):
     if num_images <= 1:
         return 1
     if not has_gpu_provider():
-        sys.stderr.write("wd-tagger: no GPU provider available, using 1 instance (CPU fallback)\n")
+        sys.stderr.write("pixai-tagger: no GPU provider available, using 1 instance (CPU fallback)\n")
         sys.stderr.flush()
         return 1
 
     free_mb = get_free_vram_mb()
     if free_mb is None:
         sys.stderr.write(
-            "wd-tagger: could not measure free VRAM (non-NVIDIA/AMD GPU or vendor "
+            "pixai-tagger: could not measure free VRAM (non-NVIDIA/AMD GPU or vendor "
             "tools missing), using 1 instance\n"
         )
         sys.stderr.flush()
@@ -465,7 +499,7 @@ def decide_instance_count(num_images):
     n = max(1, min(int(by_vram), by_work, MAX_INSTANCES))
 
     sys.stderr.write(
-        f"wd-tagger: free_vram={free_mb}MB, per_instance≈{per_instance}MB, "
+        f"pixai-tagger: free_vram={free_mb}MB, per_instance≈{per_instance}MB, "
         f"images={num_images}, instances={n} (vram_cap={by_vram}, work_cap={by_work})\n"
     )
     sys.stderr.flush()
@@ -514,7 +548,7 @@ def main():
     csv_path = os.path.join(PLUGIN_DIR, LABEL_FILENAME)
     model_path = os.path.join(PLUGIN_DIR, MODEL_FILENAME)
     if not os.path.isfile(csv_path) or not os.path.isfile(model_path):
-        sys.stderr.write("wd-tagger: downloading model from HuggingFace (first run, this may take a while)...\n")
+        sys.stderr.write("pixai-tagger: downloading model from HuggingFace (first run, this may take a while)...\n")
         sys.stderr.flush()
     download_model()
 
@@ -551,16 +585,16 @@ def main():
         try:
             taggers.append(Tagger())
             if n_instances > 1:
-                sys.stderr.write(f"wd-tagger: instance {i+1}/{n_instances} ready\n")
+                sys.stderr.write(f"pixai-tagger: instance {i+1}/{n_instances} ready\n")
                 sys.stderr.flush()
         except Exception as e:
-            sys.stderr.write(f"wd-tagger: instance {i+1}/{n_instances} failed: {e}\n")
+            sys.stderr.write(f"pixai-tagger: instance {i+1}/{n_instances} failed: {e}\n")
             sys.stderr.flush()
             if not taggers:
                 raise
             break  # carry on with however many we got
 
-    batch_size = max(1, int(os.environ.get("WDTAGGER_BATCH_SIZE", "8")))
+    batch_size = max(1, int(os.environ.get("PIXAI_TAGGER_BATCH_SIZE", "8")))
 
     # Images run on the worker pool; videos run sequentially on instance 0
     # afterwards (each video is its own per-frame loop and doesn't batch).
