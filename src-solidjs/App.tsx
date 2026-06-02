@@ -284,6 +284,23 @@ export function App() {
   });
   onCleanup(() => { unlistenFs.then((fn) => fn()); });
 
+  // Companion tags are indexed in the background after a gallery opens, so the
+  // grid can render immediately. Once indexing finishes, re-apply the default
+  // filter and re-sort so any tag-based default view (and autocomplete) reflects
+  // the freshly indexed tags.
+  const unlistenTags = listen("gallery:tags-indexed", async () => {
+    if (!galleryPath()) return;
+    try {
+      const filtered = await applyDefaultFilter();
+      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filtered, subSortField(), subSortOrder());
+      setSortedItems(sorted.items);
+      setDisplayPaths(sorted.items.map((item) => item.path));
+    } catch (e) {
+      console.error("Failed to refresh after tag indexing:", e);
+    }
+  });
+  onCleanup(() => { unlistenTags.then((fn) => fn()); });
+
   const handleOpenFolder = async () => {
     // The native folder picker only exists on the desktop. The web client
     // views whatever gallery the desktop has open; it cannot pick a new one.

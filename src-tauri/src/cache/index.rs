@@ -39,6 +39,26 @@ impl CacheDb {
         Ok(())
     }
 
+    /// Load the entire `index_state` table into a map for in-memory mtime
+    /// checks. Avoids one `SELECT` round-trip per companion during a full
+    /// gallery scan.
+    pub fn load_index_state(
+        &self,
+    ) -> Result<std::collections::HashMap<String, u64>, CacheError> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT path, companion_mtime FROM index_state")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (path, mtime) = row?;
+            map.insert(path, mtime);
+        }
+        Ok(map)
+    }
+
     /// Check if a companion file needs re-indexing (mtime changed).
     pub fn needs_reindex(&self, path: &str, current_mtime: u64) -> Result<bool, CacheError> {
         let mut stmt = self

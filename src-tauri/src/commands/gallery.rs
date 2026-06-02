@@ -172,74 +172,143 @@ fn backfill_gps_meta(db: &CacheDb) -> Result<(), String> {
 /// written by plugins or carried over from previous sessions.
 fn index_companions(db: &CacheDb, gallery_path: &str) {
     let ext = crate::companion::schema::COMPANION_EXTENSION;
-    let mut indexed = 0u64;
-    let mut skipped = 0u64;
+
+    // Load the whole index_state table once so the per-companion freshness
+    // check is an in-memory lookup rather than a SQL round-trip per file.
+    let index_state = db.load_index_state().unwrap_or_default();
+
+    // Gather companion files without walking the media tree through .lightview.
+    // Two sources:
+    //   1. the dedicated `.lightview/companions/` directory (default location,
+    //      where plugin output lands) — scanned directly.
+    //   2. side-by-side companions in the media tree — found by walking the
+    //      gallery while pruning the entire `.lightview` subtree so we don't
+    //      re-stat the cache db, atlas, thumbnails, or the companions dir.
+    let mut companions: Vec<walkdir::DirEntry> = Vec::new();
+
+    let companions_dir = Path::new(gallery_path).join(".lightview").join("companions");
+    if companions_dir.is_dir() {
+        for entry in walkdir::WalkDir::new(&companions_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().to_string_lossy().ends_with(ext) {
+                companions.push(entry);
+            }
+        }
+    }
 
     for entry in walkdir::WalkDir::new(gallery_path)
         .into_iter()
+        .filter_entry(|e| e.file_name() != ".lightview")
         .filter_map(|e| e.ok())
     {
-        let path = entry.path();
-        let path_str = path.to_string_lossy();
-        if !path_str.ends_with(ext) {
-            continue;
+        if entry.path().to_string_lossy().ends_with(ext) {
+            companions.push(entry);
         }
+    }
 
-        // Reconstruct the media file path from the companion path.
-        let companion_str = path_str.to_string();
-        let base = companion_str.strip_suffix(ext).unwrap_or(&companion_str);
+    // Index everything inside a single transaction. Without this each tag
+    // insert is its own implicit commit, which dominates startup after a
+    // tagging run touches thousands of companions.
+    let tx = match db.conn().unchecked_transaction() {
+        Ok(tx) => tx,
+        Err(e) => {
+            log::warn!("Failed to begin companion index transaction: {}", e);
+            return;
+        }
+    };
 
-        let media_path_str = if let Some(parent) = path.parent() {
-            let parent_name = parent
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if parent_name == "companions" {
-                // .lightview/companions/photo.jpg.lightview.json → ../../photo.jpg
-                if let Some(lightview_dir) = parent.parent() {
-                    if let Some(gallery_dir) = lightview_dir.parent() {
-                        let filename = std::path::Path::new(base)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(base);
-                        gallery_dir.join(filename).to_string_lossy().to_string()
-                    } else {
-                        base.to_string()
-                    }
+    let mut indexed = 0u64;
+    let mut skipped = 0u64;
+
+    {
+        let mut del_stmt = match tx.prepare_cached("DELETE FROM tag_index WHERE path = ?1") {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to prepare delete statement: {}", e);
+                return;
+            }
+        };
+        let mut ins_stmt = match tx.prepare_cached(
+            "INSERT OR IGNORE INTO tag_index (path, namespace, tag) VALUES (?1, ?2, ?3)",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to prepare insert statement: {}", e);
+                return;
+            }
+        };
+        let mut state_stmt = match tx.prepare_cached(
+            "INSERT OR REPLACE INTO index_state (path, companion_mtime) VALUES (?1, ?2)",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to prepare index_state statement: {}", e);
+                return;
+            }
+        };
+
+        for entry in &companions {
+            let path = entry.path();
+            let companion_str = path.to_string_lossy().to_string();
+            let base = companion_str.strip_suffix(ext).unwrap_or(&companion_str);
+
+            // Reconstruct the media file path from the companion path.
+            let media_path_str = if let Some(parent) = path.parent() {
+                let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if parent_name == "companions" {
+                    // .lightview/companions/photo.jpg.lightview.json → ../../photo.jpg
+                    parent
+                        .parent()
+                        .and_then(|lightview_dir| lightview_dir.parent())
+                        .map(|gallery_dir| {
+                            let filename = Path::new(base)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(base);
+                            gallery_dir.join(filename).to_string_lossy().to_string()
+                        })
+                        .unwrap_or_else(|| base.to_string())
                 } else {
                     base.to_string()
                 }
             } else {
                 base.to_string()
-            }
-        } else {
-            base.to_string()
-        };
+            };
 
-        // Skip unchanged companions — use mtime to avoid re-indexing files
-        // that haven't been modified since last open.
-        let companion_mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            // Skip unchanged companions — compare mtime against the cached
+            // index_state loaded above.
+            let companion_mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
 
-        if companion_mtime > 0 {
-            if let Ok(false) = db.needs_reindex(&media_path_str, companion_mtime) {
+            if companion_mtime > 0 && index_state.get(&media_path_str) == Some(&companion_mtime) {
                 skipped += 1;
                 continue;
             }
-        }
 
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            if let Ok(companion) = crate::companion::reader::parse_companion(&contents) {
-                let _ = db.reindex_tags_for_file(&media_path_str, &companion);
-                let _ = db.set_index_state(&media_path_str, companion_mtime);
-                indexed += 1;
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if let Ok(companion) = crate::companion::reader::parse_companion(&contents) {
+                    let _ = del_stmt.execute(rusqlite::params![media_path_str]);
+                    for (namespace, tag) in companion.all_tags() {
+                        let _ =
+                            ins_stmt.execute(rusqlite::params![media_path_str, namespace, tag]);
+                    }
+                    let _ = state_stmt.execute(rusqlite::params![media_path_str, companion_mtime]);
+                    indexed += 1;
+                }
             }
         }
+    }
+
+    if let Err(e) = tx.commit() {
+        log::warn!("Failed to commit companion index transaction: {}", e);
+        return;
     }
 
     if indexed > 0 {
@@ -297,7 +366,6 @@ fn start_fs_watcher(
     let cancel = Arc::clone(&state.fs_watch_cancel);
     let fs_watcher = Arc::clone(&state.fs_watcher);
     let cache_db = Arc::clone(&state.cache_db);
-    let gallery = gallery_path.to_string();
 
     tauri::async_runtime::spawn(async move {
         use notify::EventKind;
@@ -503,31 +571,10 @@ pub async fn open_gallery(
     // Populate media_meta table so sorting works immediately
     populate_media_meta(&cache_db, &entries)?;
 
-    // Best-effort EXIF GPS backfill — only touches rows where gps_lat IS NULL,
-    // so subsequent opens of the same gallery skip already-extracted files.
-    if let Err(e) = backfill_gps_meta(&cache_db) {
-        log::warn!("GPS backfill failed: {}", e);
-    }
-
-    // Re-index all companion files so the tag_index and tag_counts tables
-    // reflect what's on disk.  This makes tags from previous sessions (and
-    // from plugins) available for filtering and autocomplete immediately.
-    // Only re-indexes companions whose mtime changed since last open.
-    index_companions(&cache_db, &path);
-
-    // Checkpoint WAL after bulk writes to keep the WAL file small.
-    // This runs before opening the read-only protocol connection so there's
-    // no reader blocking the checkpoint.
-    if let Err(e) = cache_db.checkpoint() {
-        log::warn!("WAL checkpoint after indexing failed: {}", e);
-    }
-
-    if let Ok(counts) = cache_db.query_all_tag_counts() {
-        if !counts.is_empty() {
-            log::info!("Loaded {} unique tags into autocomplete", counts.len());
-            state.autocomplete.refresh(counts).await;
-        }
-    }
+    // Companion indexing + EXIF GPS backfill are deferred to a background task
+    // (see below) so the grid can render from media_meta immediately. Tags,
+    // autocomplete, and map coordinates light up once that task finishes and
+    // emits `gallery:tags-indexed`.
 
     // Open a second read-only connection for the thumbnail protocol handler.
     // SQLite WAL mode supports concurrent readers.
@@ -593,7 +640,51 @@ pub async fn open_gallery(
     state.add_recent_gallery(&path).await;
 
     // Start watching for external file changes
-    start_fs_watcher(app_handle, &state, &path);
+    start_fs_watcher(app_handle.clone(), &state, &path);
+
+    // Index companion tags + backfill GPS in the background so the grid renders
+    // immediately. The DB is now stored in `state`, so the task locks it, does
+    // the heavy work, refreshes autocomplete, and notifies the frontend.
+    {
+        let cache_db = Arc::clone(&state.cache_db);
+        let autocomplete = Arc::clone(&state.autocomplete);
+        let gallery = path.clone();
+        tauri::async_runtime::spawn(async move {
+            let counts = {
+                let db_guard = cache_db.lock().await;
+                let db = match db_guard.as_ref() {
+                    Some(db) => db,
+                    None => return,
+                };
+
+                // Best-effort EXIF GPS backfill — only touches rows where
+                // gps_lat IS NULL, so later opens skip already-extracted files.
+                if let Err(e) = backfill_gps_meta(db) {
+                    log::warn!("GPS backfill failed: {}", e);
+                }
+
+                // Re-index companions so tag_index/tag_counts reflect disk.
+                index_companions(db, &gallery);
+
+                // Consolidate the WAL written by the bulk indexing above.
+                if let Err(e) = db.checkpoint() {
+                    log::warn!("WAL checkpoint after indexing failed: {}", e);
+                }
+
+                db.query_all_tag_counts().ok()
+            };
+
+            if let Some(counts) = counts {
+                if !counts.is_empty() {
+                    log::info!("Loaded {} unique tags into autocomplete", counts.len());
+                    autocomplete.refresh(counts).await;
+                }
+            }
+
+            // Tell the frontend tags are ready so it can refresh the view.
+            let _ = app_handle.emit("gallery:tags-indexed", ());
+        });
+    }
 
     Ok(GalleryOpenResult {
         path,
