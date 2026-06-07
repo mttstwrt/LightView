@@ -3,6 +3,7 @@ import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, isMobile, hasTouch, type UnlistenFn } from "../../lib/runtime";
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { settings, setSettings } from "../../stores/settingsStore";
+import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { initGPU } from "../../lib/gpu";
@@ -73,7 +74,12 @@ function pickTier(cellPx: number): ThumbTier {
 }
 
 export function GalleryGrid(props: GalleryGridProps) {
-  const mode = () => settings().display.renderer_mode ?? "dom";
+  // Canvas/WebGL renderers are temporarily disabled — they're causing more
+  // problems than they solve. Force DOM regardless of the saved setting. The
+  // CanvasGrid/WebGLRenderer code is kept intact; to re-enable, restore the
+  // line below and the Renderer toggle in SettingsMenu.
+  const mode = () => "dom" as const;
+  // const mode = () => settings().display.renderer_mode ?? "dom";
 
   return (
     <Show
@@ -81,6 +87,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       fallback={
         <CanvasGrid
           paths={props.paths}
+          durationByPath={durationByPath()}
           onItemClick={props.onItemClick}
           onItemSelect={props.onItemSelect}
           onDragSelect={props.onDragSelect}
@@ -488,24 +495,43 @@ function DOMGrid(props: GalleryGridProps) {
 
     window.addEventListener("scroll", onScroll, { passive: true });
 
-    // WebKitGTK doesn't propagate wheel events to window scroll natively.
-    // Intercept wheel events and translate them into window.scrollBy calls
-    // with momentum-like smoothing for a natural feel.
-    let wheelAccumulator = 0;
+    // WebKitGTK doesn't propagate wheel events to window scroll natively, so we
+    // intercept them and drive the scroll ourselves with momentum smoothing.
+    // Two WebKitGTK quirks (vs. Chromium in the web client) need handling:
+    //   1. Traditional mouse wheels arrive as DOM_DELTA_LINE (deltaY ±1 per
+    //      notch), not pixels — so we normalize by deltaMode, mapping one line
+    //      to one grid row (= one column width, cells are square).
+    //   2. Fractional window.scrollBy() steps get rounded away every frame, so
+    //      relative stepping silently drops the tail of each gesture by an
+    //      amount that varies with frame timing. We instead animate an absolute
+    //      float target and keep our own float position, immune to rounding.
+    let wheelTargetY = 0; // absolute scroll target (float)
+    let wheelCurrentY = 0; // our float view of scrollY, immune to engine rounding
+    let wheelAnimating = false;
     let wheelRafId = 0;
-    const WHEEL_DECAY = 0.85;
-    const WHEEL_THRESHOLD = 0.5;
+    const WHEEL_DECAY = 0.8; // fraction of remaining distance covered per frame
+    const WHEEL_SETTLE = 0.5; // px from target at which we snap and stop
+
+    // Convert a wheel delta to pixels. Line mode maps one line to one row so a
+    // single notch advances exactly one column width; page mode → viewport.
+    const wheelDeltaPx = (e: WheelEvent) => {
+      if (e.deltaMode === 1) return e.deltaY * rowHeight();
+      if (e.deltaMode === 2) return e.deltaY * window.innerHeight;
+      return e.deltaY;
+    };
 
     const drainWheel = () => {
-      if (Math.abs(wheelAccumulator) < WHEEL_THRESHOLD) {
-        wheelAccumulator = 0;
+      const diff = wheelTargetY - wheelCurrentY;
+      if (Math.abs(diff) < WHEEL_SETTLE) {
+        wheelCurrentY = wheelTargetY;
+        window.scrollTo(0, Math.round(wheelTargetY));
+        wheelAnimating = false;
         wheelRafId = 0;
         scheduleFetch(); // Wheel scroll settled — fetch now
         return;
       }
-      const step = wheelAccumulator * (1 - WHEEL_DECAY);
-      wheelAccumulator -= step;
-      window.scrollBy(0, step);
+      wheelCurrentY += diff * (1 - WHEEL_DECAY);
+      window.scrollTo(0, Math.round(wheelCurrentY));
       wheelRafId = requestAnimationFrame(drainWheel);
     };
 
@@ -579,7 +605,22 @@ function DOMGrid(props: GalleryGridProps) {
         return;
       }
       e.preventDefault();
-      wheelAccumulator += e.deltaY;
+      // At the start of a gesture, re-sync our float position from the DOM so
+      // we pick up any scrollbar drag / keyboard scroll that happened between
+      // gestures. While animating we keep accumulating into wheelTargetY.
+      if (!wheelAnimating) {
+        wheelCurrentY = window.scrollY;
+        wheelTargetY = window.scrollY;
+        wheelAnimating = true;
+      }
+      const maxScroll = Math.max(
+        0,
+        document.documentElement.scrollHeight - window.innerHeight,
+      );
+      wheelTargetY = Math.max(
+        0,
+        Math.min(maxScroll, wheelTargetY + wheelDeltaPx(e)),
+      );
       if (!wheelRafId) {
         wheelRafId = requestAnimationFrame(drainWheel);
       }
@@ -1048,6 +1089,8 @@ function DOMGrid(props: GalleryGridProps) {
                   <ThumbnailCell
                     path={item().path}
                     thumbSrc={thumbMap[item().path] ?? null}
+                    tier={tier()}
+                    durationSec={durationByPath().get(item().path) ?? null}
                     selected={effectiveSelected().has(item().path)}
                     onClick={(e: MouseEvent) => handleItemClick(item(), e)}
                     onMouseDown={(e: MouseEvent) => handleDragStart(item().index, e)}

@@ -507,7 +507,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             }}
           >
             {/* ── Display ── */}
-            <Section label="Display">
+            <Section label="Display" order={4}>
               {/* Thumbnail size — mobile uses a column-count picker so the
                   presets stay meaningful on a 400px-wide viewport; desktop
                   keeps the fixed-pixel S/M/L/XL buckets. */}
@@ -608,6 +608,29 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 onChange={(v) => updateDisplay("gif_autoplay_grid", v)}
               />
               <Toggle
+                label="Autoplay short videos in grid"
+                checked={settings().display.video_autoplay_grid}
+                onChange={(v) => updateDisplay("video_autoplay_grid", v)}
+              />
+              <Show when={settings().display.video_autoplay_grid}>
+                <Field label="Max video length (seconds)">
+                  <input
+                    type="number"
+                    min="1"
+                    max="3600"
+                    value={settings().display.video_autoplay_max_seconds}
+                    onInput={(e) => {
+                      const n = parseInt(e.currentTarget.value, 10);
+                      if (Number.isFinite(n) && n > 0) {
+                        updateDisplay("video_autoplay_max_seconds", n);
+                      }
+                    }}
+                    class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
+                    title="Videos at or under this length autoplay in the grid"
+                  />
+                </Field>
+              </Show>
+              <Toggle
                 label="Video hover preview"
                 checked={settings().display.video_hover_preview}
                 onChange={(v) => updateDisplay("video_hover_preview", v)}
@@ -628,7 +651,11 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 onChange={(v) => updateDisplay("map_dark_mode", v)}
               />
 
-              {/* Renderer mode */}
+              {/* Renderer mode — Canvas/WebGL temporarily disabled, so the
+                  picker is hidden and DOM is forced (see GalleryGrid). Kept here
+                  for easy re-enable; restore the <Show when={false}> to <Show
+                  when={true}> (or remove the wrapper) to bring it back. */}
+              <Show when={false}>
               <Field label="Renderer">
                 <div class="flex gap-1">
                   {([
@@ -649,11 +676,12 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                   ))}
                 </div>
               </Field>
+              </Show>
             </Section>
 
             {/* ── Default filter (desktop-managed; LAN clients inherit it) ── */}
             <Show when={!isWeb()}>
-            <Section label="Default Filter">
+            <Section label="Default Filter" order={5}>
               <Toggle
                 label="Apply on gallery open"
                 checked={settings().default_filter?.enabled ?? false}
@@ -677,7 +705,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
             {/* ── Remote access (desktop only) ── */}
             <Show when={!isWeb()}>
-              <Section label="Remote Access">
+              <Section label="Remote Access" order={2}>
                 <Toggle
                   label="Enable LAN web access"
                   checked={remote() !== null}
@@ -912,7 +940,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
             {/* ── Thumbnails (desktop only — write op) ── */}
             <Show when={!isWeb()}>
-              <Section label="Thumbnails">
+              <Section label="Thumbnails" order={6}>
                 <button
                   onClick={handleRebuild}
                   disabled={rebuilding()}
@@ -925,7 +953,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
             {/* ── Storage (desktop only) ── */}
             <Show when={!isWeb()}>
-            <Section label="Storage">
+            <Section label="Storage" order={7}>
               <Field label="Companion file location">
                 <div class="flex gap-1">
                   {([
@@ -950,7 +978,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
             {/* ── Plugins (desktop only) ── */}
             <Show when={!isWeb()}>
-            <Section label="Plugins">
+            <Section label="Plugins" order={3}>
               <div class="flex flex-col gap-2">
                 <For each={plugins()}>
                   {(plugin) => (
@@ -996,7 +1024,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
             {/* ── Deduplication (desktop only) ── */}
             <Show when={!isWeb()}>
-            <Section label="Deduplication">
+            <Section label="Deduplication" order={1}>
               <button
                 onClick={() => {
                   setOpen(false);
@@ -1011,7 +1039,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
             {/* ── Gallery ── */}
             <Show when={props.onOpenFolder && !isWeb()}>
-              <div class="border-t border-neutral-800/60 pt-3">
+              <div class="border-t border-neutral-800/60 pt-3" style={{ order: 8 }}>
                 <button
                   onClick={() => { props.onOpenFolder!(); setOpen(false); }}
                   class="w-full px-3 py-2 text-xs text-neutral-300 hover:text-neutral-100 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors cursor-pointer text-left"
@@ -1036,9 +1064,15 @@ function InPlace(props: { children: any }) {
   return props.children;
 }
 
-function Section(props: { label: string; children: any }) {
+function Section(props: { label: string; children: any; order?: number }) {
+  // `order` controls visual position within the flex-column settings panel
+  // independently of source order, so frequently-used sections (Deduplication,
+  // Remote Access, Plugins) can sit at the top while their JSX stays put.
   return (
-    <div class="flex flex-col gap-2.5">
+    <div
+      class="flex flex-col gap-2.5"
+      style={props.order != null ? { order: props.order } : undefined}
+    >
       <span class="text-[11px] uppercase tracking-wider text-neutral-500 font-medium">
         {props.label}
       </span>
