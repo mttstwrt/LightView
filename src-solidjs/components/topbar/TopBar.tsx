@@ -2,8 +2,9 @@ import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
+import { TitleBar } from "./TitleBar";
 import { viewMode, setViewMode } from "../../stores/galleryStore";
-import { isMobile } from "../../lib/runtime";
+import { isMobile, isTauri } from "../../lib/runtime";
 
 interface TopBarProps {
   onOpenFolder: () => void;
@@ -24,12 +25,24 @@ export function TopBar(props: TopBarProps) {
   // On desktop the bar is hover-gated; on mobile it follows scroll direction.
   const visible = () => (isMobile() ? !scrollHidden() : hoverVisible());
 
+  // Frameless (decorations: false) desktop gets a custom titlebar row above the
+  // filter row; both reveal together off the same hover state.
+  const frameless = () => isTauri() && !isMobile();
+
+  // Debounce the hide so the pointer can travel across the gap between the
+  // titlebar and filter rows without the chrome collapsing mid-move.
+  let hideTimer: number | undefined;
   const handleMouseEnter = () => {
-    if (!isMobile()) setHoverVisible(true);
+    if (isMobile()) return;
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = undefined; }
+    setHoverVisible(true);
   };
   const handleMouseLeave = () => {
-    if (!isMobile()) setHoverVisible(false);
+    if (isMobile()) return;
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = window.setTimeout(() => setHoverVisible(false), 100);
   };
+  onCleanup(() => { if (hideTimer) clearTimeout(hideTimer); });
 
   const handleGlobalKeyDown = (e: KeyboardEvent) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "f") {
@@ -81,6 +94,15 @@ export function TopBar(props: TopBarProps) {
         />
       </Show>
 
+      {/* Custom window titlebar — only when the native frame is hidden. */}
+      <Show when={frameless()}>
+        <TitleBar
+          visible={visible()}
+          onMouseEnter={handleMouseEnter}
+          onMouseLeave={handleMouseLeave}
+        />
+      </Show>
+
       {/* The bar itself. We slide via `top` (not `transform`) so the bar
           doesn't establish a containing block for fixed descendants —
           otherwise SettingsMenu's mobile drawer (`position: fixed; inset…`)
@@ -90,7 +112,8 @@ export function TopBar(props: TopBarProps) {
         style={{
           background: "rgba(10, 10, 10, 0.85)",
           "backdrop-filter": "blur(12px)",
-          top: visible() ? "0" : "-3rem",
+          // Sits below the 2rem titlebar row when the native frame is hidden.
+          top: visible() ? (frameless() ? "2rem" : "0") : "-3rem",
           opacity: visible() ? "1" : "0",
         }}
         onMouseEnter={handleMouseEnter}

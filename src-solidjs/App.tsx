@@ -6,13 +6,15 @@ import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
-import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery } from "./stores/settingsStore";
+import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
 import { setFilterQuery } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { MapView } from "./components/map/MapView";
 import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
+import { TitleBar } from "./components/topbar/TitleBar";
+import { WindowResizeGrips } from "./components/WindowResizeGrips";
 import { ContextMenu, type ContextMenuState } from "./components/shared/ContextMenu";
 import { SelectionBar } from "./components/gallery/SelectionBar";
 import { pluginActivity, type PluginActivity } from "./stores/pluginStore";
@@ -284,6 +286,13 @@ export function App() {
   });
   onCleanup(() => { unlistenFs.then((fn) => fn()); });
 
+  // Hot-reload settings when settings.toml is hand-edited outside the app.
+  // Backend emits this only for genuine external edits, not the app's own saves.
+  const unlistenSettings = listen<string>("settings:changed", (event) => {
+    applyExternalSettings(event.payload);
+  });
+  onCleanup(() => { unlistenSettings.then((fn) => fn()); });
+
   // Companion tags are indexed in the background after a gallery opens, so the
   // grid can render immediately. Once indexing finishes, re-apply the default
   // filter and re-sort so any tag-based default view (and autocomplete) reflects
@@ -397,9 +406,24 @@ export function App() {
       class="min-h-screen w-screen relative"
       style={{ background: settings().display.background_color }}
     >
+      {/* Custom resize borders for the frameless window (incl. the welcome
+          screen, so it's resizable before a gallery is opened). */}
+      <Show when={isTauri() && !isMobile()}>
+        <WindowResizeGrips />
+      </Show>
+
       <Show
         when={galleryPath()}
-        fallback={<WelcomeScreen onOpen={handleOpenFolder} onOpenPath={openPath} />}
+        fallback={
+          <>
+            {/* No TopBar on the welcome screen, so give the frameless window a
+                static titlebar here for window controls + dragging. */}
+            <Show when={isTauri() && !isMobile()}>
+              <TitleBar visible={true} />
+            </Show>
+            <WelcomeScreen onOpen={handleOpenFolder} onOpenPath={openPath} />
+          </>
+        }
       >
         <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} />
         <Show when={viewMode() === "grid" && !contentHidden()}>
