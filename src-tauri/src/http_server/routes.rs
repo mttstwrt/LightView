@@ -50,7 +50,82 @@ pub async fn media(
     }
 
     let mime = mime_for(&ext);
-    serve_file(&path, mime, &headers).await
+    // Range streaming exists so multi-hundred-MB videos don't get buffered into
+    // memory. Images (incl. animated GIFs) are small and must arrive as one
+    // complete body: WebKitGTK mishandles a chunked/Range-served animated GIF —
+    // it re-pulls the source every loop (fast, inconsistent playback + a leaked
+    // decode per pass) and a truncated chunk shows as a black frame. Buffer them
+    // fully, like the thumbnail route, and serve a complete cacheable resource.
+    if mime.starts_with("video/") {
+        return serve_file(&path, mime, &headers).await;
+    }
+    serve_image(&path, mime).await
+}
+
+/// Reads a whole image into memory and serves it as one complete, cacheable
+/// body — no Range, no chunked streaming. This is what lets WebKitGTK decode an
+/// animated GIF once and loop it from cache at the correct frame rate.
+async fn serve_image(path: &str, mime: &'static str) -> Response<Body> {
+    let data = match tokio::fs::read(path).await {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("Failed to read image file {}: {}", path, e);
+            return error(StatusCode::NOT_FOUND);
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
+        .header(header::CONTENT_LENGTH, data.len().to_string())
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(data))
+        .unwrap()
+}
+
+/// `GET /gif-atlas/{tier}/{*rel}` — serves a pre-rendered GIF frame atlas: a PNG
+/// sprite sheet of every frame plus `X-Gif-*` metadata headers for canvas
+/// playback. Generated on a miss and cached in SQLite (keyed by path+tier+mtime).
+/// See `crate::gif_serve` for why GIFs are rendered this way on WebKitGTK.
+pub async fn gif_atlas(
+    State(state): State<ServerState>,
+    Path((tier, rel)): Path<(String, String)>,
+) -> Response<Body> {
+    let Some(tier) = ThumbTier::from_segment(&tier) else {
+        return error(StatusCode::BAD_REQUEST);
+    };
+    if rel.is_empty() {
+        return error(StatusCode::BAD_REQUEST);
+    }
+    let path = format!("/{}", rel);
+    if !path_in_gallery(&state, &path).await {
+        return error(StatusCode::NOT_FOUND);
+    }
+
+    match crate::gif_serve::get_or_generate(&state.app, tier, path).await {
+        Ok(atlas) => {
+            let delays = atlas
+                .delays
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/png")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header("X-Gif-Frame-Count", atlas.frame_count.to_string())
+                .header("X-Gif-Frame-Width", atlas.frame_w.to_string())
+                .header("X-Gif-Frame-Height", atlas.frame_h.to_string())
+                .header("X-Gif-Cols", atlas.cols.to_string())
+                .header("X-Gif-Delays", delays)
+                .body(Body::from(atlas.png))
+                .unwrap()
+        }
+        Err(e) => {
+            log::warn!("gif atlas generation failed: {e}");
+            error(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// `GET /thumb/{tier}/{*rel}` — serves a cached thumbnail, generating it on a

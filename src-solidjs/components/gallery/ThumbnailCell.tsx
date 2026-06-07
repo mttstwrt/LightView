@@ -1,11 +1,18 @@
-import { createSignal, createEffect, on } from "solid-js";
+import { createSignal, createEffect, on, onMount, onCleanup, Show } from "solid-js";
 import { settings } from "../../stores/settingsStore";
-import { mediaUrl } from "../../lib/ipc";
+import { mediaUrl, gifAtlasUrl, type ThumbTier } from "../../lib/ipc";
+import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
+import { isTauri } from "../../lib/runtime";
+import { GifCanvas } from "../GifCanvas";
 
 interface ThumbnailCellProps {
   path: string;
   /** Protocol URL for the thumbnail image. */
   thumbSrc: string | null;
+  /** LOD tier for this cell — used to request a matching GIF frame atlas. */
+  tier: ThumbTier;
+  /** Video duration in seconds, if known — gates short-video grid autoplay. */
+  durationSec?: number | null;
   selected: boolean;
   onClick: (e: MouseEvent) => void;
   onMouseDown?: (e: MouseEvent) => void;
@@ -18,6 +25,75 @@ interface ThumbnailCellProps {
 // Module-level set of URLs that have already been loaded at least once.
 // Survives cell recycling so a revisited thumbnail won't re-fade.
 const loadedUrls = new Set<string>();
+
+// --- Grid GIF autoplay budget -------------------------------------------
+// Autoplaying a GIF swaps the cell's <img> to the full-resolution original,
+// which WebKitGTK decodes at native size × every frame and caches in full to
+// loop. A handful of large GIFs is gigabytes. Two guards keep that bounded:
+//   1. Only cells actually intersecting the viewport are allowed to animate
+//      (the virtual-scroll buffer renders extra off-screen rows we must not
+//      let play), and off-screen cells fall back to their static thumbnail so
+//      WebKit can release the decoded frames.
+//   2. A soft cap on how many may animate at once, so a wall of small GIF
+//      cells on a large display can't all decode simultaneously.
+// This bounds the *count* of decoding GIFs; per-GIF cost still scales with the
+// original's resolution — that needs downscaled animated previews to fix.
+const MAX_AUTOPLAY_GIFS = 16;
+const autoplayingGifs = new Set<symbol>();
+
+/** Reserve an autoplay slot for `token`. Returns whether one is held. */
+function acquireGifSlot(token: symbol): boolean {
+  if (autoplayingGifs.has(token)) return true;
+  if (autoplayingGifs.size >= MAX_AUTOPLAY_GIFS) return false;
+  autoplayingGifs.add(token);
+  return true;
+}
+
+/** Release the autoplay slot held by `token`, if any. */
+function releaseGifSlot(token: symbol): void {
+  autoplayingGifs.delete(token);
+}
+
+// Grid video autoplay shares the same idea as GIFs but with a tighter cap: a
+// decoding <video> is heavier than an animated GIF, so fewer may run at once.
+const MAX_AUTOPLAY_VIDEOS = 8;
+const autoplayingVideos = new Set<symbol>();
+
+function acquireVideoSlot(token: symbol): boolean {
+  if (autoplayingVideos.has(token)) return true;
+  if (autoplayingVideos.size >= MAX_AUTOPLAY_VIDEOS) return false;
+  autoplayingVideos.add(token);
+  return true;
+}
+
+function releaseVideoSlot(token: symbol): void {
+  autoplayingVideos.delete(token);
+}
+
+// Shared IntersectionObserver routing visibility to per-cell callbacks. One
+// observer for the whole grid is far cheaper than one per cell.
+type InViewCb = (inView: boolean) => void;
+let sharedObserver: IntersectionObserver | null = null;
+const inViewCallbacks = new WeakMap<Element, InViewCb>();
+
+function observeInView(el: Element, cb: InViewCb): () => void {
+  if (!sharedObserver) {
+    sharedObserver = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          inViewCallbacks.get(e.target)?.(e.isIntersecting);
+        }
+      },
+      { root: null, rootMargin: "0px", threshold: 0 },
+    );
+  }
+  inViewCallbacks.set(el, cb);
+  sharedObserver.observe(el);
+  return () => {
+    sharedObserver?.unobserve(el);
+    inViewCallbacks.delete(el);
+  };
+}
 
 export function ThumbnailCell(props: ThumbnailCellProps) {
   const [errored, setErrored] = createSignal(false);
@@ -41,13 +117,93 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
 
   const isGif = () => ext() === "gif";
 
-  // When hovering a GIF, swap to the full animated file via media protocol.
+  // Browser-decodable video subset — only these are worth a hover preview.
+  const isPlayableVideo = () =>
+    ["mp4", "mov", "webm", "m4v"].includes(ext());
+
+  // Whether this cell is actually intersecting the viewport. Drives GIF
+  // autoplay so the virtual-scroll buffer's off-screen rows don't decode.
+  const [inView, setInView] = createSignal(false);
+  let cellRef: HTMLDivElement | undefined;
+  onMount(() => {
+    if (!cellRef) return;
+    onCleanup(observeInView(cellRef, setInView));
+  });
+
+  // Whether this cell currently holds an autoplay slot. Gated on being a GIF,
+  // having a thumbnail, the setting being on, and being on-screen; the cap is
+  // applied when claiming a slot. Re-evaluated whenever those inputs change
+  // (notably scrolling toggles inView, which frees/claims slots).
+  const playToken = Symbol("gif-autoplay");
+  const [canAutoplay, setCanAutoplay] = createSignal(false);
+  createEffect(() => {
+    const want =
+      isGif() &&
+      !!props.thumbSrc &&
+      settings().display.gif_autoplay_grid &&
+      inView();
+    if (!want) {
+      releaseGifSlot(playToken);
+      setCanAutoplay(false);
+      return;
+    }
+    setCanAutoplay(acquireGifSlot(playToken));
+  });
+  onCleanup(() => releaseGifSlot(playToken));
+
+  // A GIF should animate when hovered (always allowed — one visible cell) or
+  // when it holds an autoplay slot.
+  const gifActive = () => isGif() && !!props.thumbSrc && (hovered() || canAutoplay());
+
+  // A playable video counts as "short" (GIF-like) when its known duration is at
+  // or under the configured threshold. Unknown duration (not yet probed) never
+  // qualifies, so it falls back to the static thumbnail + hover preview.
+  const isShortVideo = () => {
+    if (!isPlayableVideo()) return false;
+    const d = props.durationSec;
+    return d != null && d <= settings().display.video_autoplay_max_seconds;
+  };
+
+  // Mirror the GIF autoplay slot logic for short videos, gated on its own
+  // setting, a known-short duration, and on-screen visibility. Re-evaluated as
+  // scrolling toggles inView (claiming/freeing slots), capped separately.
+  const videoToken = Symbol("video-autoplay");
+  const [canVideoAutoplay, setCanVideoAutoplay] = createSignal(false);
+  createEffect(() => {
+    const want =
+      isShortVideo() &&
+      !!props.thumbSrc &&
+      settings().display.video_autoplay_grid &&
+      inView();
+    if (!want) {
+      releaseVideoSlot(videoToken);
+      setCanVideoAutoplay(false);
+      return;
+    }
+    setCanVideoAutoplay(acquireVideoSlot(videoToken));
+  });
+  onCleanup(() => releaseVideoSlot(videoToken));
+
+  // On the desktop webview (WebKitGTK) we render GIFs on a <canvas> from a
+  // backend frame atlas — its `<img>` GIF animation is broken (too fast + leaks).
+  // A real browser (web client) animates `<img>` GIFs fine, so swap there.
+  const useCanvasGif = () => isTauri();
+  const showGifCanvas = () => useCanvasGif() && gifActive();
+
+  // The base <img> shows the static thumbnail (and acts as the poster under the
+  // canvas). On the web client it swaps to the full animated GIF when active.
   const effectiveSrc = () => {
-    if (isGif() && hovered() && props.thumbSrc) {
+    if (!useCanvasGif() && gifActive()) {
       return mediaUrl(props.path);
     }
     return props.thumbSrc;
   };
+
+  // Show a muted looping video preview while hovering (when enabled), or
+  // continuously for short videos when grid autoplay is on / they hold a slot.
+  const showVideoPreview = () =>
+    (isPlayableVideo() && hovered() && settings().display.video_hover_preview) ||
+    (isShortVideo() && canVideoAutoplay());
 
   // Whether this cell's current image has finished loading (for fade-in).
   // Starts true if the URL was already seen, so recycled cells don't re-fade.
@@ -66,6 +222,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
 
   return (
     <div
+      ref={cellRef}
       class="thumb-cell relative aspect-square overflow-hidden cursor-pointer"
       style={{
         background: "#1a1a1a",
@@ -121,6 +278,38 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           props.onError?.(props.path);
         }}
       />
+
+      {/* Canvas GIF playback (desktop), layered over the static thumbnail.
+          Keyed on the URL so recycling to a different GIF restarts cleanly. */}
+      <Show when={showGifCanvas()}>
+        <GifCanvas
+          url={gifAtlasUrl(props.path, props.tier)}
+          class="absolute inset-0 w-full h-full object-cover"
+        />
+      </Show>
+
+      {/* Muted video hover preview, layered over the static thumbnail. */}
+      <Show when={showVideoPreview()}>
+        <video
+          src={mediaUrl(props.path)}
+          class="absolute inset-0 w-full h-full object-cover"
+          muted
+          autoplay
+          preload="auto"
+          // Resume where this clip last left off, so scrolling it out of view
+          // and back doesn't restart it from the beginning.
+          ref={(el) => restoreVideoPosition(el, props.path)}
+          onTimeUpdate={(e) => saveVideoPosition(e.currentTarget, props.path)}
+          // Manual flushing-seek restart instead of native `loop` — see
+          // MediaViewer: native looping drifts the clock and stalls the
+          // streamed HTTP source on WebKitGTK.
+          onEnded={(e) => {
+            const v = e.currentTarget;
+            try { v.currentTime = 0; } catch { /* not seekable yet */ }
+            void v.play().catch(() => {});
+          }}
+        />
+      </Show>
 
       {/* Selection check indicator — always present, toggled via display */}
       <div

@@ -211,6 +211,21 @@ export function mediaUrl(path: string): string {
  *  documents intent. */
 export const videoSrc = mediaUrl;
 
+/** Build a URL for a GIF frame atlas (PNG sprite sheet + `X-Gif-*` headers),
+ *  served only by the axum HTTP server so the frontend can `fetch()` the body
+ *  and metadata together. Used for canvas GIF playback — see `GifCanvas`. */
+export function gifAtlasUrl(path: string, tier: ThumbTier = "m"): string {
+  const rel = path.startsWith("/") ? path.slice(1) : path;
+  if (!isTauri()) {
+    return `/gif-atlas/${tier}/${encodeMediaPath(rel)}`;
+  }
+  if (!_mediaServerUrl) {
+    _mediaServerUrl = (globalThis as any).__LV_MEDIA_URL__ ?? null;
+  }
+  if (!_mediaServerUrl) return "";
+  return `${_mediaServerUrl}/gif-atlas/${tier}/${encodeMediaPath(rel)}`;
+}
+
 export interface ThumbHashResult {
   path: string;
   /** Base64-encoded hash bytes, or null if not yet generated. */

@@ -119,6 +119,7 @@ export interface SortedItem {
   last_viewed: number | null;
   date_added: number | null;
   last_rated: number | null;
+  duration?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +176,10 @@ export interface AppSettings {
     video_hover_preview: boolean;
     video_autoplay_loop: boolean;
     gif_autoplay_grid: boolean;
+    /** Autoplay short videos in the grid (muted, looping), like GIFs. */
+    video_autoplay_grid: boolean;
+    /** Max duration (seconds) a video may have to qualify for grid autoplay. */
+    video_autoplay_max_seconds: number;
     scroll_blur: boolean;
     renderer_mode: RendererMode;
     map_dark_mode: boolean;

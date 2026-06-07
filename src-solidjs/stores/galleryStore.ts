@@ -1,4 +1,4 @@
-import { createSignal } from "solid-js";
+import { createSignal, createMemo } from "solid-js";
 import type {
   GalleryMediaItem,
   GroupHeader,
@@ -21,6 +21,17 @@ const [displayPaths, setDisplayPaths] = createSignal<string[]>([]);
 
 // Full sorted item metadata (for scrollbar indicators, etc.)
 const [sortedItems, setSortedItems] = createSignal<SortedItem[]>([]);
+
+// Per-path video duration (seconds) derived from the sorted items, for the grid
+// to gate short-video autoplay without changing its `paths: string[]` contract.
+// Paths with unknown (NULL) duration are simply absent from the map.
+const durationByPath = createMemo(() => {
+  const map = new Map<string, number>();
+  for (const item of sortedItems()) {
+    if (item.duration != null) map.set(item.path, item.duration);
+  }
+  return map;
+});
 
 // Group headers for the current sort/group
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
@@ -48,6 +59,7 @@ export {
   loading, setLoading,
   displayPaths, setDisplayPaths,
   sortedItems, setSortedItems,
+  durationByPath,
   groups, setGroups,
   timeline, setTimeline,
   selectedPaths, setSelectedPaths,

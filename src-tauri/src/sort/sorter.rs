@@ -33,6 +33,8 @@ pub struct SortedItem {
     pub last_viewed: Option<i64>,
     pub date_added: Option<i64>,
     pub last_rated: Option<i64>,
+    /// Video duration in seconds, if known (probed lazily during thumbnailing).
+    pub duration: Option<f64>,
 }
 
 impl CacheDb {
@@ -77,7 +79,7 @@ impl CacheDb {
             order_clause.push_str(&Self::order_expr(sub_field, sub_order));
         }
 
-        let cols = "path, date_taken, file_size, media_type, rating, last_viewed, date_added, last_rated";
+        let cols = "path, date_taken, file_size, media_type, rating, last_viewed, date_added, last_rated, duration";
         let sql = if filter_paths.is_some() {
             format!(
                 "SELECT {} FROM media_meta
@@ -182,5 +184,6 @@ fn map_sorted_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
         last_viewed: row.get(5)?,
         date_added: row.get(6)?,
         last_rated: row.get(7)?,
+        duration: row.get(8)?,
     })
 }

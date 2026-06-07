@@ -1,6 +1,7 @@
 import { Show, createSignal, createEffect, on, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { isWeb, hasTouch } from "../../lib/runtime";
+import { isWeb, hasTouch, isTauri, isMobile } from "../../lib/runtime";
+import { TitleBar } from "../topbar/TitleBar";
 import {
   pointerDistance,
   pointerMidpoint,
@@ -15,7 +16,8 @@ import {
 } from "../../lib/touch";
 import { infoPanelOpen, setInfoPanelOpen, infoPanelHeight } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
-import { mediaUrl, thumbUrl, ensureTierThumbnails } from "../../lib/ipc";
+import { mediaUrl, thumbUrl, ensureTierThumbnails, gifAtlasUrl } from "../../lib/ipc";
+import { GifCanvas } from "../GifCanvas";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { setViewerCacheCountSource } from "../../lib/perfMonitor";
 import { InfoPanel } from "./InfoPanel";
@@ -67,6 +69,22 @@ export function MediaViewer(props: MediaViewerProps) {
   const [dragScale, setDragScale] = createSignal(1);
   const [backdropAlpha, setBackdropAlpha] = createSignal(1);
   const [chromeVisible, setChromeVisible] = createSignal(true);
+
+  // Frameless desktop window: the custom titlebar lives outside this overlay,
+  // so reveal a copy on the top edge here so window controls stay reachable
+  // while viewing an image. Mirrors the hover-reveal used in the grid.
+  const frameless = () => isTauri() && !isMobile();
+  const [titlebarVisible, setTitlebarVisible] = createSignal(false);
+  let titlebarHideTimer: number | undefined;
+  const revealTitlebar = () => {
+    if (titlebarHideTimer) { clearTimeout(titlebarHideTimer); titlebarHideTimer = undefined; }
+    setTitlebarVisible(true);
+  };
+  const hideTitlebar = () => {
+    if (titlebarHideTimer) clearTimeout(titlebarHideTimer);
+    titlebarHideTimer = window.setTimeout(() => setTitlebarVisible(false), 100);
+  };
+  onCleanup(() => { if (titlebarHideTimer) clearTimeout(titlebarHideTimer); });
   // True while a horizontal swipe (or its commit animation) is in flight. Gates
   // the prev/next filmstrip slides so the (pressure-managed) full-res neighbour
   // images are only mounted in the DOM during navigation, not while idle.
@@ -91,6 +109,12 @@ export function MediaViewer(props: MediaViewerProps) {
     return dot >= 0 && VIDEO_EXTS.includes(path.slice(dot + 1).toLowerCase());
   };
   const isVideo = () => isVideoPath(currentPath());
+
+  // Desktop webview renders GIFs on a <canvas> from a backend frame atlas —
+  // WebKitGTK's <img> GIF animation is broken (too fast + leaks). A real
+  // browser (web client) animates GIFs fine, so it uses the normal <img> path.
+  const isGif = () => ext() === "gif";
+  const useGifCanvas = () => isTauri() && isGif();
 
   // Adjacent paths for the filmstrip neighbour slots (undefined past the ends).
   const prevPath = () => props.paths[props.currentIndex - 1];
@@ -252,6 +276,11 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   const handleMouseMove = (e: MouseEvent) => {
+    // Reveal the window titlebar when the cursor nears the top edge.
+    if (frameless()) {
+      if (e.clientY < 40) revealTitlebar();
+      else if (titlebarVisible()) hideTitlebar();
+    }
     if (!isDragging) return;
     const dx = e.clientX - dragStartX;
     const dy = e.clientY - dragStartY;
@@ -691,19 +720,26 @@ export function MediaViewer(props: MediaViewerProps) {
           return;
         }
 
-        // Mount the current image first, before queueing background work.
-        const cached = cache.get(path);
-        if (cached) {
-          mountImage(cached, true);
+        // GIFs (desktop) are drawn declaratively on a <canvas>; skip the
+        // imperative <img> swap and mark loaded so the spinner/underlay clear.
+        if (useGifCanvas()) {
+          if (imageContainerRef) imageContainerRef.replaceChildren();
+          setLoaded(true);
         } else {
-          const img = new Image();
-          img.style.maxWidth = "100vw";
-          img.style.maxHeight = "100vh";
-          img.style.objectFit = "contain";
-          img.draggable = false;
-          img.alt = filename();
-          img.src = mediaUrl(path);
-          mountImage(img, false);
+          // Mount the current image first, before queueing background work.
+          const cached = cache.get(path);
+          if (cached) {
+            mountImage(cached, true);
+          } else {
+            const img = new Image();
+            img.style.maxWidth = "100vw";
+            img.style.maxHeight = "100vh";
+            img.style.objectFit = "contain";
+            img.draggable = false;
+            img.alt = filename();
+            img.src = mediaUrl(path);
+            mountImage(img, false);
+          }
         }
 
         // Defer neighbour preloading + preview-tier generation to idle so
@@ -859,9 +895,21 @@ export function MediaViewer(props: MediaViewerProps) {
                 class="max-w-[100vw] max-h-[100vh] outline-none"
                 controls
                 autoplay
-                loop={settings().display.video_autoplay_loop}
                 preload="auto"
                 onLoadedData={() => setLoaded(true)}
+                onEnded={(e) => {
+                  // Auto-replay. We deliberately avoid the native `loop`
+                  // attribute: on WebKitGTK/GStreamer with our streamed HTTP
+                  // source, looping does a non-flushing segment seek that
+                  // drifts the clock (playback speeds up after the first
+                  // pass) and re-issues a Range request that can stall the
+                  // pipeline (freeze / jump to a random spot). A manual
+                  // flushing seek to 0 followed by play() restarts cleanly.
+                  if (!settings().display.video_autoplay_loop) return;
+                  const v = e.currentTarget;
+                  try { v.currentTime = 0; } catch { /* not seekable yet */ }
+                  void v.play().catch(() => {});
+                }}
                 onError={(e) => {
                   const v = e.currentTarget as HTMLVideoElement;
                   const codeNames: Record<number, string> = {
@@ -929,6 +977,17 @@ export function MediaViewer(props: MediaViewerProps) {
                 doesn't fall through to the backdrop's click-to-close. */}
             <div ref={imageContainerRef} class="flex items-center justify-center pointer-events-auto" />
 
+            {/* Canvas GIF playback (desktop) — replaces the imperative <img>
+                for GIFs. Zoom/pan don't apply here (the transform targets the
+                image container); acceptable for animated GIFs. */}
+            <Show when={useGifCanvas()}>
+              <GifCanvas
+                url={gifAtlasUrl(currentPath(), "p")}
+                class="max-w-[100vw] max-h-[100vh] pointer-events-auto"
+                style={{ "object-fit": "contain" }}
+              />
+            </Show>
+
             <Show when={!loaded()}>
               <svg
                 width="48"
@@ -972,6 +1031,16 @@ export function MediaViewer(props: MediaViewerProps) {
         </button>
       </Show>
 
+      {/* Window titlebar for the frameless desktop window — reveals on the top
+          edge so min/maximize/close + dragging stay reachable while viewing. */}
+      <Show when={frameless()}>
+        <TitleBar
+          visible={titlebarVisible()}
+          onMouseEnter={revealTitlebar}
+          onMouseLeave={hideTitlebar}
+        />
+      </Show>
+
       {/* Bottom info bar — fades with the chrome on a touch tap. */}
       <div
         class="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/40 text-xs font-mono transition-opacity duration-200"
@@ -986,8 +1055,15 @@ export function MediaViewer(props: MediaViewerProps) {
       {/* Close button — fades with the chrome on a touch tap. On touch it's
           larger for an easier hit target. */}
       <button
-        class="absolute top-4 right-4 text-white/40 hover:text-white/80 cursor-pointer transition-opacity duration-200"
-        classList={{ "text-xl": !hasTouch(), "text-3xl p-1": hasTouch() }}
+        class="absolute right-4 text-white/40 hover:text-white/80 cursor-pointer transition-opacity duration-200"
+        classList={{
+          "text-xl": !hasTouch(),
+          "text-3xl p-1": hasTouch(),
+          // Clear the frameless titlebar so it isn't covered (and so the image
+          // close isn't confused with the window close).
+          "top-12": frameless(),
+          "top-4": !frameless(),
+        }}
         style={{
           opacity: chromeVisible() ? undefined : "0",
           "pointer-events": chromeVisible() ? undefined : "none",

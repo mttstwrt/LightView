@@ -11,6 +11,7 @@ pub mod commands;
 pub mod util;
 pub mod http_server;
 pub mod thumb_serve;
+pub mod gif_serve;
 pub mod file_clipboard;
 
 use std::sync::Arc;

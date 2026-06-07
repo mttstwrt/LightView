@@ -78,7 +78,11 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        // The webview fetches this loopback server cross-origin, so custom
+        // response headers (the `X-Gif-*` atlas metadata) must be exposed or
+        // JS can't read them off the fetch Response.
+        .expose_headers(Any);
 
     // Data routes carry sensitive content and sit behind the auth layer.
     // Static SPA assets do not — the app shell needs to load before the
@@ -86,6 +90,7 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     let protected = Router::new()
         .route("/media/{*path}", get(routes::media))
         .route("/thumb/{tier}/{*path}", get(routes::thumb))
+        .route("/gif-atlas/{tier}/{*path}", get(routes::gif_atlas))
         .route("/thumbhash/{*path}", get(routes::thumbhash))
         .route("/api/invoke", post(api::invoke))
         .layer(middleware::from_fn_with_state(state.clone(), mw::auth_layer));

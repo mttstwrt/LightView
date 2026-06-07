@@ -13,7 +13,7 @@ pub enum CacheError {
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -208,6 +208,27 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_pairing_expires ON remote_pairing(expires_at);
         ",
     },
+    // v10: Pre-rendered animated-GIF frame atlases. WebKitGTK 2.52 animates
+    // `<img>` GIFs too fast and leaks decoded frames, so the frontend renders
+    // GIFs on a canvas from a sprite sheet we build here. Keyed by (path, tier)
+    // like thumbnails; `delays` is a comma-separated per-frame ms list.
+    Migration {
+        version: 10,
+        sql: "
+            CREATE TABLE IF NOT EXISTS gif_atlas (
+                path         TEXT NOT NULL,
+                tier         TEXT NOT NULL,
+                mtime        INTEGER NOT NULL,
+                frame_count  INTEGER NOT NULL,
+                frame_w      INTEGER NOT NULL,
+                frame_h      INTEGER NOT NULL,
+                cols         INTEGER NOT NULL,
+                delays       TEXT NOT NULL,
+                atlas        BLOB NOT NULL,
+                PRIMARY KEY (path, tier)
+            );
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.
@@ -333,6 +354,20 @@ fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
 
     if !has_remote_devices {
         return 8;
+    }
+
+    // v9 present — check for v10 (gif_atlas table).
+    let has_gif_atlas: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gif_atlas'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !has_gif_atlas {
+        return 9;
     }
 
     // Everything present — fully up to date.

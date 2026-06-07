@@ -6,7 +6,8 @@
 // Handles: image loading pipeline, mouse events via hit-testing,
 // scroll-driven repaints, and selection overlays.
 
-import { Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
+import { Show, For, createSignal, createMemo, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, type UnlistenFn } from "../../lib/runtime";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, thumbhashUrl, mediaUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
@@ -18,11 +19,14 @@ import { WebGLRenderer } from "../../lib/renderer/WebGLRenderer";
 import { markWebglInitStarted, markWebglStable } from "../../lib/renderer/webglGuard";
 import { ImageLoader, type DecodePriority } from "../../lib/renderer/ImageLoader";
 import { MemoryPressureMonitor } from "../../lib/memoryPressure";
+import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
 import type { GridRenderer, GridLayout, GridItem } from "../../lib/renderer/types";
 import type { RendererMode } from "../../lib/types";
 
 interface CanvasGridProps {
   paths: string[];
+  /** Per-path video duration (seconds) for gating short-video grid autoplay. */
+  durationByPath?: Map<string, number>;
   onItemClick: (index: number) => void;
   onItemSelect: (path: string) => void;
   onDragSelect?: (paths: string[]) => void;
@@ -63,6 +67,11 @@ function pickTier(cellPx: number): ThumbTier {
 }
 
 const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"]);
+
+// Subset of VIDEO_EXTS that WebKitGTK can actually decode (H.264/AAC, VP8/9).
+// Only these are worth mounting a <video> preview for; the rest would just
+// throw a decode error.
+const BROWSER_PLAYABLE_VIDEO = new Set(["mp4", "mov", "webm", "m4v"]);
 
 function getExt(path: string): string {
   const dot = path.lastIndexOf(".");
@@ -138,13 +147,94 @@ export function CanvasGrid(props: CanvasGridProps) {
   let thumbGenTotal = 0;
   let thumbGenDone = 0;
 
-  // GIF hover overlay state
+  // Hover preview overlay state — an animated GIF or a muted <video> drawn on
+  // top of the static canvas thumbnail for the cell under the cursor.
   const [hoveredGif, setHoveredGif] = createSignal<{
     path: string;
+    kind: "gif" | "video";
     x: number;
     y: number;
     size: number;
   } | null>(null);
+
+  // Screen position (relative to the translated slice container) of a cell.
+  const cellRect = (index: number) => {
+    const c = cols();
+    const cs = cellSize();
+    const g = gap();
+    const row = Math.floor(index / c) - startRow();
+    const col = index % c;
+    return { x: col * (cs + g), y: row * (cs + g), size: cs };
+  };
+
+  // Overlay descriptors for in-place autoplay: every visible GIF (when GIF
+  // autoplay is on) and every visible short video (when video autoplay is on).
+  //
+  // The item objects are cached by path and reused across recomputes so the
+  // <For> below keeps the same DOM node for a still-visible cell while
+  // scrolling — otherwise each scroll tick recreates every <img>/<video> and
+  // restarts its animation/playback from the beginning. Only the per-cell rect
+  // changes on scroll, and that lives in a reactive store so the element moves
+  // without being torn down.
+  const MAX_AUTOPLAY_VIDEOS = 8;
+  const overlayItemCache = new Map<string, { path: string }>();
+  const [overlayRects, setOverlayRects] =
+    createStore<Record<string, { x: number; y: number; size: number }>>({});
+
+  const visibleOverlays = createMemo(() => {
+    const gifOn = settings().display.gif_autoplay_grid;
+    const vidOn = settings().display.video_autoplay_grid;
+    const durations = props.durationByPath;
+    const maxSec = settings().display.video_autoplay_max_seconds;
+    const gifs: { path: string }[] = [];
+    const videos: { path: string }[] = [];
+    const rects: Record<string, { x: number; y: number; size: number }> = {};
+    const c = cols();
+    if (c <= 0 || (!gifOn && !vidOn)) {
+      return { gifs, videos, rects };
+    }
+    const paths = props.paths;
+    const first = startRow() * c;
+    const last = Math.min(paths.length - 1, (endRow() + 1) * c - 1);
+    let vidCount = 0;
+    for (let i = first; i <= last; i++) {
+      const p = paths[i];
+      if (!p) continue;
+      const ext = getExt(p);
+      let bucket: { path: string }[] | null = null;
+      if (gifOn && ext === "gif") {
+        bucket = gifs;
+      } else if (vidOn && durations && BROWSER_PLAYABLE_VIDEO.has(ext) && vidCount < MAX_AUTOPLAY_VIDEOS) {
+        const d = durations.get(p);
+        if (d != null && d <= maxSec) {
+          bucket = videos;
+          vidCount++;
+        }
+      }
+      if (!bucket) continue;
+      let item = overlayItemCache.get(p);
+      if (!item) {
+        item = { path: p };
+        overlayItemCache.set(p, item);
+      }
+      rects[p] = cellRect(i);
+      bucket.push(item);
+    }
+    return { gifs, videos, rects };
+  });
+
+  // Push the freshly-computed rects into the reactive store (per-key, so only
+  // moved cells update) and drop cache entries for cells that scrolled away.
+  createEffect(() => {
+    const { rects } = visibleOverlays();
+    setOverlayRects(reconcile(rects));
+    for (const key of overlayItemCache.keys()) {
+      if (!(key in rects)) overlayItemCache.delete(key);
+    }
+  });
+
+  const autoplayGifs = () => visibleOverlays().gifs;
+  const autoplayVideos = () => visibleOverlays().videos;
 
   // Drag-to-select state
   const [isDragging, setIsDragging] = createSignal(false);
@@ -839,21 +929,18 @@ export function CanvasGrid(props: CanvasGridProps) {
     };
 
     const onMouseMove = (e: MouseEvent) => {
-      // GIF hover overlay
+      // Hover preview overlay (animated GIF, or muted video when enabled)
       if (!isDragging()) {
         const hit = hitTestAt(e);
-        if (hit.index >= 0 && hit.path && getExt(hit.path) === "gif") {
-          const c = cols();
-          const cs = cellSize();
-          const g = gap();
-          const sr = startRow();
-          const row = Math.floor(hit.index / c) - sr;
-          const col = hit.index % c;
+        const ext = hit.path ? getExt(hit.path) : "";
+        const isGif = ext === "gif";
+        const isVideoPreview =
+          settings().display.video_hover_preview && BROWSER_PLAYABLE_VIDEO.has(ext);
+        if (hit.index >= 0 && hit.path && (isGif || isVideoPreview)) {
           setHoveredGif({
             path: hit.path,
-            x: col * (cs + g),
-            y: row * (cs + g),
-            size: cs,
+            kind: isGif ? "gif" : "video",
+            ...cellRect(hit.index),
           });
         } else {
           setHoveredGif(null);
@@ -1127,23 +1214,109 @@ export function CanvasGrid(props: CanvasGridProps) {
               "will-change": "transform",
             }}
           >
-            {/* GIF hover overlay: animated GIF on top of the static canvas thumbnail */}
-            <Show when={hoveredGif()}>
-              {(gif) => (
+            {/* Autoplay-all overlays: every visible GIF animated in place.
+                Keyed by stable per-path item objects so scrolling moves the
+                node (via the reactive rect) instead of recreating + restarting
+                it. */}
+            <For each={autoplayGifs()}>
+              {(g) => (
                 <img
-                  src={mediaUrl(gif().path)}
+                  src={mediaUrl(g.path)}
                   style={{
                     position: "absolute",
-                    left: `${gif().x}px`,
-                    top: `${gif().y}px`,
-                    width: `${gif().size}px`,
-                    height: `${gif().size}px`,
+                    left: `${overlayRects[g.path]?.x ?? 0}px`,
+                    top: `${overlayRects[g.path]?.y ?? 0}px`,
+                    width: `${overlayRects[g.path]?.size ?? 0}px`,
+                    height: `${overlayRects[g.path]?.size ?? 0}px`,
                     "object-fit": "cover",
                     "pointer-events": "none",
                   }}
                   draggable={false}
                   decoding="async"
                 />
+              )}
+            </For>
+
+            {/* Autoplay-all overlays: every visible short video looping in
+                place. Same stable-keying as the GIF overlays so playback
+                survives scrolling. */}
+            <For each={autoplayVideos()}>
+              {(v) => (
+                <video
+                  src={mediaUrl(v.path)}
+                  style={{
+                    position: "absolute",
+                    left: `${overlayRects[v.path]?.x ?? 0}px`,
+                    top: `${overlayRects[v.path]?.y ?? 0}px`,
+                    width: `${overlayRects[v.path]?.size ?? 0}px`,
+                    height: `${overlayRects[v.path]?.size ?? 0}px`,
+                    "object-fit": "cover",
+                    "pointer-events": "none",
+                  }}
+                  muted
+                  autoplay
+                  preload="auto"
+                  ref={(el) => restoreVideoPosition(el, v.path)}
+                  onTimeUpdate={(e) => saveVideoPosition(e.currentTarget, v.path)}
+                  // Manual flushing-seek restart instead of native `loop`
+                  // (see MediaViewer): native looping drifts the clock and
+                  // stalls the streamed HTTP source on WebKitGTK.
+                  onEnded={(e) => {
+                    const vid = e.currentTarget;
+                    try { vid.currentTime = 0; } catch { /* not seekable yet */ }
+                    void vid.play().catch(() => {});
+                  }}
+                />
+              )}
+            </For>
+
+            {/* Hover preview: animated GIF or muted video on top of the static
+                canvas thumbnail for the cell under the cursor. */}
+            <Show when={hoveredGif()}>
+              {(preview) => (
+                <Show
+                  when={preview().kind === "video"}
+                  fallback={
+                    <img
+                      src={mediaUrl(preview().path)}
+                      style={{
+                        position: "absolute",
+                        left: `${preview().x}px`,
+                        top: `${preview().y}px`,
+                        width: `${preview().size}px`,
+                        height: `${preview().size}px`,
+                        "object-fit": "cover",
+                        "pointer-events": "none",
+                      }}
+                      draggable={false}
+                      decoding="async"
+                    />
+                  }
+                >
+                  <video
+                    src={mediaUrl(preview().path)}
+                    style={{
+                      position: "absolute",
+                      left: `${preview().x}px`,
+                      top: `${preview().y}px`,
+                      width: `${preview().size}px`,
+                      height: `${preview().size}px`,
+                      "object-fit": "cover",
+                      "pointer-events": "none",
+                    }}
+                    muted
+                    autoplay
+                    preload="auto"
+                    // Manual flushing-seek restart instead of native `loop`
+                    // (see MediaViewer): native looping drifts the clock and
+                    // stalls the streamed HTTP source on WebKitGTK.
+                    onEnded={(e) => {
+                      const v = e.currentTarget;
+                      try { v.currentTime = 0; } catch { /* not seekable yet */ }
+                      void v.play().catch(() => {});
+                    }}
+                  />
+                </Show>
               )}
             </Show>
           </div>

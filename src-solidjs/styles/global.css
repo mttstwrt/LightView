@@ -116,8 +116,10 @@ html, body, #root {
   background: rgba(255,255,255,0.25);
 }
 
-.thumb-cell:hover img {
-  filter: brightness(1.1);
+/* Inset box-shadow (not outline) so it doesn't collide with the inline
+   `outline` that ThumbnailCell sets for selection. */
+.thumb-cell:hover {
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.7);
 }
 
 @keyframes skeleton-pulse {
