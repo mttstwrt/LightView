@@ -366,6 +366,7 @@ fn start_fs_watcher(
     let cancel = Arc::clone(&state.fs_watch_cancel);
     let fs_watcher = Arc::clone(&state.fs_watcher);
     let cache_db = Arc::clone(&state.cache_db);
+    let last_written_settings = Arc::clone(&state.last_written_settings);
 
     tauri::async_runtime::spawn(async move {
         use notify::EventKind;
@@ -374,7 +375,11 @@ fn start_fs_watcher(
         const POLL_MS: u64 = 300;
         const DEBOUNCE_MS: u64 = 500;
 
-        let lightview_suffix = std::path::MAIN_SEPARATOR.to_string() + ".lightview";
+        let sep = std::path::MAIN_SEPARATOR;
+        let lightview_suffix = sep.to_string() + ".lightview";
+        // Hand-editable settings file inside `.lightview` — watched for external
+        // edits and hot-reloaded (see the settings-file branch below).
+        let settings_suffix = format!("{sep}.lightview{sep}settings.toml");
         let companion_ext = crate::companion::schema::COMPANION_EXTENSION;
 
         let mut pending_added: HashSet<String> = HashSet::new();
@@ -400,6 +405,36 @@ fn start_fs_watcher(
             for event in events {
                 for path in &event.paths {
                     let path_str = path.to_string_lossy().to_string();
+
+                    // Settings file lives inside .lightview but, unlike the rest
+                    // of it, should hot-reload on external (hand) edits. Handle
+                    // it before the blanket .lightview skip below.
+                    if path_str.ends_with(&settings_suffix) {
+                        if matches!(
+                            event.kind,
+                            EventKind::Create(_) | EventKind::Modify(_)
+                        ) {
+                            if let Ok(toml_str) = std::fs::read_to_string(path) {
+                                let is_self_write = last_written_settings
+                                    .lock()
+                                    .unwrap()
+                                    .as_deref()
+                                    == Some(toml_str.as_str());
+                                if !is_self_write {
+                                    if let Ok(json) =
+                                        crate::commands::settings::toml_to_json(&toml_str)
+                                    {
+                                        // Remember it so duplicate fs events for
+                                        // this same edit don't re-emit.
+                                        *last_written_settings.lock().unwrap() =
+                                            Some(toml_str);
+                                        let _ = app_handle.emit("settings:changed", json);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
 
                     // Skip .lightview directory and companion files
                     if path_str.contains(&lightview_suffix) || path_str.ends_with(companion_ext)
@@ -542,11 +577,18 @@ fn stop_fs_watcher(state: &AppState) {
 
 /// Open a gallery directory. Initializes the provider, cache DB,
 /// and begins the background scan/thumbnail/index pipeline.
-#[tauri::command]
-pub async fn open_gallery(
-    app_handle: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+/// Open a gallery without any Tauri coupling, so the headless server can reuse
+/// it. Registers the provider, opens/scans the cache, populates media_meta,
+/// wires up the thumbnail protocol DB and BC7 atlas, and spawns background
+/// companion/GPS indexing. `on_tags_indexed` fires once that background task
+/// finishes — the desktop app emits `gallery:tags-indexed`; headless passes a
+/// no-op. The filesystem watcher is intentionally *not* started here: it pushes
+/// changes to the webview over Tauri events, which a headless server has no
+/// channel for. Callers that want it (the desktop command) start it themselves.
+pub async fn open_gallery_impl(
+    state: &AppState,
     path: String,
+    on_tags_indexed: impl FnOnce() + Send + 'static,
 ) -> Result<GalleryOpenResult, String> {
     // Create the local provider
     let provider = Arc::new(LocalProvider::new(&path));
@@ -639,9 +681,6 @@ pub async fn open_gallery(
     // Track as recently opened
     state.add_recent_gallery(&path).await;
 
-    // Start watching for external file changes
-    start_fs_watcher(app_handle.clone(), &state, &path);
-
     // Index companion tags + backfill GPS in the background so the grid renders
     // immediately. The DB is now stored in `state`, so the task locks it, does
     // the heavy work, refreshes autocomplete, and notifies the frontend.
@@ -681,8 +720,8 @@ pub async fn open_gallery(
                 }
             }
 
-            // Tell the frontend tags are ready so it can refresh the view.
-            let _ = app_handle.emit("gallery:tags-indexed", ());
+            // Tell the caller indexing finished (desktop refreshes the view).
+            on_tags_indexed();
         });
     }
 
@@ -691,6 +730,27 @@ pub async fn open_gallery(
         total_media: media_count,
         provider_type: ProviderType::Local,
     })
+}
+
+/// Open a gallery (Tauri command). Thin wrapper over [`open_gallery_impl`] that
+/// also starts the filesystem watcher and emits `gallery:tags-indexed` to the
+/// webview once background indexing completes.
+#[tauri::command]
+pub async fn open_gallery(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<GalleryOpenResult, String> {
+    let emit_handle = app_handle.clone();
+    let result = open_gallery_impl(&state, path.clone(), move || {
+        let _ = emit_handle.emit("gallery:tags-indexed", ());
+    })
+    .await?;
+
+    // Start watching for external file changes (desktop only).
+    start_fs_watcher(app_handle, &state, &path);
+
+    Ok(result)
 }
 
 /// Close the current gallery and release resources.

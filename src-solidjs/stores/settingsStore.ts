@@ -11,8 +11,10 @@ const DEFAULT_SETTINGS: AppSettings = {
     video_hover_preview: false,
     video_autoplay_loop: false,
     gif_autoplay_grid: false,
+    video_autoplay_grid: false,
+    video_autoplay_max_seconds: 30,
     scroll_blur: false,
-    renderer_mode: "canvas",
+    renderer_mode: "dom",
     map_dark_mode: true,
   },
   performance: {
@@ -45,30 +47,17 @@ function applyRendererSafeMode(s: AppSettings): AppSettings {
   return s;
 }
 
-function loadSettings(): AppSettings {
-  let s = DEFAULT_SETTINGS;
-  try {
-    const stored = localStorage.getItem("gallery-settings");
-    if (stored) {
-      s = { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
-    }
-  } catch {}
-  const safe = applyRendererSafeMode(s);
-  if (safe !== s) saveSettings(safe); // persist the downgrade
-  return safe;
-}
-
-function saveSettings(s: AppSettings) {
-  try {
-    localStorage.setItem("gallery-settings", JSON.stringify(s));
-  } catch {}
-}
-
 // ---------------------------------------------------------------------------
 // Exported reactive store
 // ---------------------------------------------------------------------------
+//
+// Settings are persisted per-gallery in each gallery's
+// `.lightview/settings.toml` (the source of truth) and loaded by
+// loadSettingsFromGallery() when a gallery opens. There is no global store:
+// before a gallery is open the only screen is the gallery selector, which no
+// setting affects, so we simply start from in-memory defaults.
 
-const [settings, setSettingsRaw] = createSignal<AppSettings>(loadSettings());
+const [settings, setSettingsRaw] = createSignal<AppSettings>(DEFAULT_SETTINGS);
 
 /** Whether a gallery is currently open (enables backend persistence). */
 let galleryOpen = false;
@@ -76,8 +65,8 @@ let galleryOpen = false;
 export function setSettings(update: Partial<AppSettings> | ((prev: AppSettings) => AppSettings)) {
   setSettingsRaw((prev) => {
     const next = typeof update === "function" ? update(prev) : { ...prev, ...update };
-    saveSettings(next);
-    // Also persist to the gallery's .lightview folder when one is open
+    // Persist to the open gallery's settings.toml. With no gallery open there's
+    // nothing to persist for (the selector screen uses no settings).
     if (galleryOpen) {
       saveGallerySettings(JSON.stringify(next)).catch(() => {});
     }
@@ -85,8 +74,20 @@ export function setSettings(update: Partial<AppSettings> | ((prev: AppSettings) 
   });
 }
 
-/** Load settings stored in the current gallery's .lightview folder and apply them.
- *  Falls back to the current (localStorage) settings if nothing is saved. */
+/** Apply settings pushed from the backend because `settings.toml` was edited
+ *  outside the app (hand edit). Updates the in-memory store only — it must NOT
+ *  write back, or it would clobber the user's edit and fight the fs watcher. */
+export function applyExternalSettings(json: string) {
+  try {
+    const stored = JSON.parse(json) as Partial<AppSettings>;
+    const merged = applyRendererSafeMode({ ...DEFAULT_SETTINGS, ...stored });
+    setSettingsRaw(() => merged);
+  } catch {}
+}
+
+/** Load settings stored in the current gallery's .lightview/settings.toml and
+ *  apply them. A gallery with no saved settings starts from the hard defaults,
+ *  independent of any other gallery's configuration. */
 export async function loadSettingsFromGallery() {
   galleryOpen = true;
   try {
@@ -95,10 +96,11 @@ export async function loadSettingsFromGallery() {
       const stored = JSON.parse(json) as Partial<AppSettings>;
       const merged = applyRendererSafeMode({ ...DEFAULT_SETTINGS, ...stored });
       setSettingsRaw(() => merged);
-      saveSettings(merged); // sync localStorage with gallery settings
     } else {
-      // First open of this gallery — persist current settings into it
-      await saveGallerySettings(JSON.stringify(settings())).catch(() => {});
+      // First open of this gallery — start from hard defaults and seed the
+      // gallery's settings.toml with them, so each gallery is self-contained.
+      setSettingsRaw(() => DEFAULT_SETTINGS);
+      await saveGallerySettings(JSON.stringify(DEFAULT_SETTINGS)).catch(() => {});
     }
   } catch {}
 }

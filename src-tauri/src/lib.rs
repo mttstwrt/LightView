@@ -104,6 +104,11 @@ pub struct AppState {
     /// Cancellation flag for the filesystem watcher background task.
     pub fs_watch_cancel: Arc<std::sync::atomic::AtomicBool>,
 
+    /// The TOML content the app itself last wrote to `settings.toml`. The fs
+    /// watcher compares against this so it only emits `settings:changed` for
+    /// genuine external (hand) edits, not the app's own saves.
+    pub last_written_settings: Arc<std::sync::Mutex<Option<String>>>,
+
     /// Unified GPU pipeline for accelerated thumbnail generation and image transforms.
     /// None when no suitable GPU adapter was found at startup.
     #[cfg(feature = "gpu")]
@@ -176,6 +181,7 @@ impl AppState {
             thumb_gen_coalescer: Arc::new(ThumbGenCoalescer::new()),
             fs_watcher: Arc::new(std::sync::Mutex::new(None)),
             fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_written_settings: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "gpu")]
             gpu_pipeline,
             media_server_url: Arc::new(std::sync::OnceLock::new()),

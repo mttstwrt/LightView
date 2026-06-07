@@ -615,27 +615,95 @@ pub async fn get_debug_info(
     })
 }
 
-/// Save frontend app settings to the current gallery's .lightview folder.
+/// Path to the human-editable settings file inside a gallery's `.lightview`
+/// folder. This file (not the SQLite cache) is the source of truth for app
+/// settings, so it can be inspected and hand-edited.
+fn settings_toml_path(gallery: &str) -> PathBuf {
+    std::path::Path::new(gallery)
+        .join(".lightview")
+        .join("settings.toml")
+}
+
+/// Convert the frontend's JSON settings blob into a pretty TOML document.
+fn json_to_toml(json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    toml::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
+/// Convert a TOML settings document back into the JSON shape the frontend
+/// expects from `load_gallery_settings`. Used by the fs watcher to translate
+/// hand edits into the payload pushed to the frontend.
+pub(crate) fn toml_to_json(toml_str: &str) -> Result<String, String> {
+    let value: serde_json::Value = toml::from_str(toml_str).map_err(|e| e.to_string())?;
+    serde_json::to_string(&value).map_err(|e| e.to_string())
+}
+
+/// Load the gallery's settings as a JSON string, reading `settings.toml` first.
+/// If the file is missing but a legacy `gallery_meta.app_settings` blob exists
+/// (galleries indexed before settings moved to a file), it's migrated to
+/// `settings.toml` and returned. Returns `None` when no settings exist yet.
+async fn load_settings_json(state: &AppState, gallery: &str) -> Result<Option<String>, String> {
+    let path = settings_toml_path(gallery);
+    if path.exists() {
+        let toml_str = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        return Ok(Some(toml_to_json(&toml_str)?));
+    }
+    // Legacy fallback: settings used to live in the SQLite cache. Migrate the
+    // blob out to settings.toml (best-effort) so future reads use the file.
+    let legacy = {
+        let db = state.cache_db.lock().await;
+        let db = db.as_ref().ok_or("No gallery open")?;
+        db.get_gallery_meta("app_settings").map_err(|e| e.to_string())?
+    };
+    if let Some(json) = &legacy {
+        if let Ok(toml_str) = json_to_toml(json) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Record before writing so the fs watcher recognizes this as a
+            // self-write and doesn't echo it back as an external edit.
+            *state.last_written_settings.lock().unwrap() = Some(toml_str.clone());
+            let _ = std::fs::write(&path, toml_str);
+        }
+    }
+    Ok(legacy)
+}
+
+/// Save frontend app settings to the current gallery's `.lightview/settings.toml`.
 #[tauri::command]
 pub async fn save_gallery_settings(
     state: tauri::State<'_, AppState>,
     settings_json: String,
 ) -> Result<(), String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-    db.set_gallery_meta("app_settings", &settings_json)
-        .map_err(|e| e.to_string())
+    let gallery = state
+        .current_gallery
+        .read()
+        .await
+        .clone()
+        .ok_or("No gallery open")?;
+    let toml_str = json_to_toml(&settings_json)?;
+    let path = settings_toml_path(&gallery);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Record before writing so the fs watcher recognizes this as a self-write
+    // and doesn't bounce it back to the frontend as an external edit.
+    *state.last_written_settings.lock().unwrap() = Some(toml_str.clone());
+    std::fs::write(&path, toml_str).map_err(|e| e.to_string())
 }
 
-/// Load frontend app settings from the current gallery's .lightview folder.
+/// Load frontend app settings from the current gallery's `.lightview/settings.toml`.
 #[tauri::command]
 pub async fn load_gallery_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-    db.get_gallery_meta("app_settings")
-        .map_err(|e| e.to_string())
+    let gallery = state
+        .current_gallery
+        .read()
+        .await
+        .clone()
+        .ok_or("No gallery open")?;
+    load_settings_json(&state, &gallery).await
 }
 
 /// The gallery-wide default filter, shared by the desktop app and any LAN
@@ -653,9 +721,13 @@ pub struct DefaultFilter {
 pub async fn get_gallery_default_filter_impl(
     state: &AppState,
 ) -> Result<Option<DefaultFilter>, String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-    let Some(json) = db.get_gallery_meta("app_settings").map_err(|e| e.to_string())? else {
+    let gallery = state
+        .current_gallery
+        .read()
+        .await
+        .clone()
+        .ok_or("No gallery open")?;
+    let Some(json) = load_settings_json(state, &gallery).await? else {
         return Ok(None);
     };
     let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
@@ -831,4 +903,47 @@ pub async fn open_with(
         .spawn()
         .map_err(|e| format!("Failed to launch '{}': {}", command, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod settings_file_tests {
+    use super::{json_to_toml, toml_to_json};
+
+    // Mirrors the frontend DEFAULT_SETTINGS shape (the real serialized payload).
+    const SAMPLE: &str = r##"{
+        "display": {
+            "thumbnail_size": 200,
+            "grid_gap": 2,
+            "background_color": "#0a0a0a",
+            "video_hover_preview": false,
+            "video_autoplay_loop": false,
+            "gif_autoplay_grid": false,
+            "video_autoplay_grid": false,
+            "video_autoplay_max_seconds": 30,
+            "scroll_blur": false,
+            "renderer_mode": "dom",
+            "map_dark_mode": true
+        },
+        "performance": { "preload_count": 3, "lru_cache_size": 5, "thumbnail_threads": 6 },
+        "storage": { "companion_location": "lightview_folder" },
+        "default_filter": { "enabled": false, "query": "" },
+        "external_apps": [
+            { "label": "Gwenview", "command": "gwenview", "args": ["{file}"] },
+            { "label": "GIMP", "command": "gimp", "args": ["{file}"] }
+        ]
+    }"##;
+
+    #[test]
+    fn round_trips_through_toml() {
+        let toml = json_to_toml(SAMPLE).expect("json -> toml");
+        // Spot-check it's actually TOML and hand-readable.
+        assert!(toml.contains("[display]"));
+        assert!(toml.contains("renderer_mode = \"dom\""));
+        assert!(toml.contains("[[external_apps]]"));
+
+        let json = toml_to_json(&toml).expect("toml -> json");
+        let a: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(a, b, "settings must survive a json->toml->json round trip");
+    }
 }
