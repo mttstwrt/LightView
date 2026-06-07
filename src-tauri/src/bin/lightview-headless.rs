@@ -1,0 +1,203 @@
+//! Headless LightView server.
+//!
+//! Boots the same backend the desktop app uses (`AppState` + the axum HTTP
+//! server) without the Tauri webview, so a gallery can be browsed from any
+//! device over the LAN. Device pairings and the optional gallery password live
+//! in the gallery's own `.lightview/cache.db`, so a device paired through the
+//! desktop app stays paired here — subject to the browser scoping the
+//! `lv_device` cookie to the origin (host:port) it paired against.
+//!
+//! Usage:
+//!   lightview-headless serve <gallery-path> [--port <port>]
+//!   lightview-headless pair  <gallery-path>
+//!
+//! `serve` opens the gallery and listens on 0.0.0.0 with per-device cookie auth,
+//! serving the built SPA from `./dist`. `pair` mints a single 6-digit PIN,
+//! prints it, and exits — redeem it at `http://<host>:<port>/pair` on the device.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use lightview_lib::AppState;
+use lightview_lib::cache::db::CacheDb;
+use lightview_lib::commands::gallery::open_gallery_impl;
+use lightview_lib::http_server::devices::{self, PairingKind};
+use lightview_lib::http_server::{self, HttpConfig};
+
+/// Default LAN port. Fixed (not OS-assigned) so the origin stays stable across
+/// restarts — browsers scope the `lv_device` pairing cookie to host:port, so a
+/// changing port would force every device to re-pair.
+const DEFAULT_PORT: u16 = 8787;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    env_logger::init();
+
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("serve") => match parse_serve(&args[2..]) {
+            Ok((path, port)) => serve(path, port).await,
+            Err(e) => {
+                eprintln!("error: {e}\n");
+                usage();
+                ExitCode::from(2)
+            }
+        },
+        Some("pair") => match args.get(2) {
+            Some(path) => pair(Path::new(path)),
+            None => {
+                eprintln!("error: `pair` requires a gallery path\n");
+                usage();
+                ExitCode::from(2)
+            }
+        },
+        Some("-h") | Some("--help") | Some("help") => {
+            usage();
+            ExitCode::SUCCESS
+        }
+        _ => {
+            usage();
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Open the gallery and serve it over the LAN until the server task ends.
+async fn serve(path: PathBuf, port: u16) -> ExitCode {
+    let path = match std::fs::canonicalize(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: cannot resolve gallery path {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    if !path.is_dir() {
+        eprintln!("error: not a directory: {}", path.display());
+        return ExitCode::FAILURE;
+    }
+    let path_str = path.to_string_lossy().to_string();
+
+    let state = AppState::new();
+
+    log::info!("Opening gallery: {path_str}");
+    match open_gallery_impl(&state, path_str.clone(), || {
+        log::info!("Background tag indexing complete");
+    })
+    .await
+    {
+        Ok(info) => log::info!("Gallery opened: {} media files", info.total_media),
+        Err(e) => {
+            eprintln!("error: failed to open gallery: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let web_root = resolve_web_root();
+    if web_root.is_none() {
+        log::warn!(
+            "No dist/ directory found in the CWD or next to the binary — the web \
+             UI will not load. Build it with `npm run build` and place dist/ here."
+        );
+    }
+
+    let config = HttpConfig::remote(port, web_root);
+    let server = match http_server::start(config, state).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to start server on port {port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    log::info!("LightView headless serving on http://0.0.0.0:{}", server.addr.port());
+    log::info!("Pair a device with:  lightview-headless pair {path_str}");
+
+    // Park on the server task — it only resolves if axum::serve returns/errors.
+    if let Err(e) = server.handle.await {
+        log::error!("server task ended unexpectedly: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Mint a one-time pairing PIN for the gallery and print it. The PIN is stored
+/// in the gallery's `.lightview/cache.db`, so the running `serve` process (which
+/// shares that db) will accept it at `/pair/redeem`.
+fn pair(path: &Path) -> ExitCode {
+    let db = match CacheDb::open(path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open gallery cache at {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    match devices::create_pairing(db.conn(), PairingKind::Pin) {
+        Ok(pin) => {
+            println!("Pairing PIN: {pin}");
+            println!(
+                "Single-use, expires in {} minutes. Redeem it at \
+                 http://<host>:<port>/pair on the device.",
+                devices::PAIRING_TTL_SECS / 60
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: failed to create pairing code: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parse `serve` args: a single positional gallery path plus optional
+/// `--port`/`-p`.
+fn parse_serve(args: &[String]) -> Result<(PathBuf, u16), String> {
+    let mut path: Option<PathBuf> = None;
+    let mut port: u16 = DEFAULT_PORT;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" | "-p" => {
+                let v = args.get(i + 1).ok_or("--port requires a value")?;
+                port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                i += 2;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
+            other => {
+                if path.is_some() {
+                    return Err(format!("unexpected extra argument: {other}"));
+                }
+                path = Some(PathBuf::from(other));
+                i += 1;
+            }
+        }
+    }
+    Ok((path.ok_or("`serve` requires a gallery path")?, port))
+}
+
+/// Resolve the built SPA directory (`dist/`). Mirrors the desktop app's lookup:
+/// checks the CWD, its parent, and the directory next to the executable.
+fn resolve_web_root() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("dist"));
+        candidates.push(cwd.join("..").join("dist"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("dist"));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+fn usage() {
+    eprintln!(
+        "LightView headless server\n\n\
+         USAGE:\n  \
+         lightview-headless serve <gallery-path> [--port <port>]\n  \
+         lightview-headless pair  <gallery-path>\n\n\
+         COMMANDS:\n  \
+         serve   Open a gallery and serve it over the LAN (default port {DEFAULT_PORT}).\n  \
+         pair    Mint a one-time 6-digit pairing PIN for the gallery and exit.\n"
+    );
+}
