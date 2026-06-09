@@ -18,12 +18,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::Mutex;
 
-use cache::atlas::ThumbAtlas;
 use cache::coalescer::ThumbGenCoalescer;
 use cache::db::CacheDb;
 use autocomplete::engine::AutocompleteEngine;
 use hardware::HardwareProfile;
-use pipeline::thumbnailer::ThumbFormat;
 use provider::ProviderRegistry;
 use util::fs_watch::FsWatcher;
 
@@ -52,10 +50,6 @@ pub struct AppState {
     /// Uses Mutex (not RwLock) because rusqlite::Connection is Send but not Sync.
     pub cache_db: Arc<Mutex<Option<CacheDb>>>,
 
-    /// BC7 thumbnail atlas (mmap-backed, GPU-direct path).
-    /// None when atlas is not in use (remote galleries, HDD, no GPU).
-    pub thumb_atlas: Arc<Mutex<Option<ThumbAtlas>>>,
-
     /// In-memory tag autocomplete engine
     pub autocomplete: Arc<AutocompleteEngine>,
 
@@ -72,16 +66,6 @@ pub struct AppState {
     /// Bounded to available CPU cores — all thumbnail work is dispatched here
     /// instead of spawning unbounded blocking tasks.
     pub thumb_pool: Arc<rayon::ThreadPool>,
-
-    /// Whether the BC7 atlas path is active for the current gallery.
-    /// Determined by hardware profile (NVMe + discrete GPU).
-    pub use_bc7_atlas: Arc<std::sync::atomic::AtomicBool>,
-
-    /// Thumbnail format override. Standard tier uses JPEG by default;
-    /// L/P tiers use WebP. The BC7 atlas path uses RGBA.
-    /// Uses std::sync::RwLock (not tokio) because it's read from both
-    /// sync (protocol handler) and async (commands) contexts.
-    pub thumb_format_override: Arc<std::sync::RwLock<ThumbFormat>>,
 
     /// Recently opened gallery paths, persisted to disk.
     pub recent_galleries: Arc<Mutex<Vec<RecentGallery>>>,
@@ -145,7 +129,7 @@ impl AppState {
             log::info!("  GPU pipeline:   probing...");
             match pipeline::gpu_pipeline::GpuPipeline::new() {
                 Some(p) => {
-                    log::info!("  GPU pipeline:   ACTIVE (resize, crop+resize, BC7 encode, transform)");
+                    log::info!("  GPU pipeline:   ACTIVE (resize, crop+resize, transform)");
                     Some(Arc::new(p))
                 }
                 None => {
@@ -167,14 +151,11 @@ impl AppState {
         Self {
             providers: Arc::new(RwLock::new(ProviderRegistry::new())),
             cache_db: Arc::new(Mutex::new(None)),
-            thumb_atlas: Arc::new(Mutex::new(None)),
             autocomplete: Arc::new(AutocompleteEngine::new()),
             hardware: Arc::new(hardware),
             current_gallery: Arc::new(RwLock::new(None)),
             thumbnail_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             thumb_pool: Arc::new(thumb_pool),
-            use_bc7_atlas: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            thumb_format_override: Arc::new(std::sync::RwLock::new(ThumbFormat::Jpeg)),
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
             plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thumb_protocol_db: Arc::new(std::sync::Mutex::new(None)),
@@ -187,20 +168,6 @@ impl AppState {
             media_server_url: Arc::new(std::sync::OnceLock::new()),
             remote_server: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// Determine the thumbnail format for the standard tier.
-    /// Always JPEG unless overridden (e.g. RGBA for BC7 atlas path).
-    pub fn thumb_format(&self) -> ThumbFormat {
-        *self.thumb_format_override.read().unwrap()
-    }
-
-    /// Check if BC7 atlas should be used based on hardware profile.
-    /// Called when opening a gallery to decide the thumbnail storage strategy.
-    pub fn should_use_bc7(&self) -> bool {
-        use hardware::StorageType;
-        matches!(self.hardware.storage_type, StorageType::NVMe | StorageType::SSD)
-            && self.hardware.gpu_compute
     }
 
     /// Check if the GPU pipeline is available.

@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::Emitter;
 
-use crate::cache::atlas::ThumbAtlas;
 use crate::cache::db::CacheDb;
 use crate::companion::schema::MediaType;
 use crate::pipeline::exif;
@@ -644,34 +643,6 @@ pub async fn open_gallery_impl(
         *db = Some(cache_db);
     }
 
-    // Initialize BC7 atlas if hardware supports it
-    let lightview_dir = std::path::Path::new(&path).join(".lightview");
-    if state.should_use_bc7() {
-        match ThumbAtlas::open(&lightview_dir) {
-            Ok(atlas) => {
-                log::info!(
-                    "BC7 atlas opened with {} thumbnails",
-                    atlas.len()
-                );
-                let mut a = state.thumb_atlas.lock().await;
-                *a = Some(atlas);
-                state
-                    .use_bc7_atlas
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(e) => {
-                log::warn!("Failed to open BC7 atlas, falling back to JPEG: {}", e);
-                state
-                    .use_bc7_atlas
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    } else {
-        state
-            .use_bc7_atlas
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-
     // Store current gallery path
     {
         let mut current = state.current_gallery.write().await;
@@ -768,18 +739,6 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
         // Remove provider
         let mut reg = state.providers.write().await;
         reg.remove(&path);
-    }
-
-    // Flush and close BC7 atlas
-    {
-        let mut atlas = state.thumb_atlas.lock().await;
-        if let Some(ref mut a) = *atlas {
-            let _ = a.sync();
-        }
-        *atlas = None;
-        state
-            .use_bc7_atlas
-            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Close protocol handler DB FIRST — the read-only connection blocks

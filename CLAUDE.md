@@ -29,7 +29,6 @@ cd src-tauri && cargo test <test_name>
 # Benchmarks (criterion)
 cd src-tauri && cargo bench --bench thumbnailer
 cd src-tauri && cargo bench --bench cache_db
-cd src-tauri && cargo bench --bench atlas
 ```
 
 ## Architecture
@@ -52,7 +51,7 @@ cd src-tauri && cargo bench --bench atlas
 | `commands/` | Tauri command handlers (thin wrappers delegating to domain modules) |
 | `provider/` | `FileProvider` trait + `ProviderRegistry` — abstraction over local/SMB/SFTP/S3 file access |
 | `companion/` | Sidecar `.lightview` JSON companion files for per-image metadata (schema, reader, writer, migration) |
-| `cache/` | SQLite-backed cache: `db` (core), `thumbnails`, `index`, `counts`, `atlas` (BC7 mmap), `duplicates` |
+| `cache/` | SQLite-backed cache: `db` (core), `thumbnails`, `index`, `counts`, `duplicates` |
 | `pipeline/` | Thumbnail generation: CPU `thumbnailer`, optional GPU pipeline (`gpu_pipeline` via wgpu) |
 | `filter/` | Query language for filtering media: `ast` → `parser` → `evaluator` |
 | `sort/` | Sorting + grouping: `sorter`, `grouper`, `timeline` |
@@ -76,8 +75,8 @@ cd src-tauri && cargo bench --bench atlas
 ### Key design patterns
 
 - **Shared state**: Rust `AppState` (in `lib.rs`) holds all cross-command state behind `Arc<RwLock<>>` / `Arc<Mutex<>>`. `rusqlite::Connection` uses `Mutex` (not `RwLock`) because it's `Send` but not `Sync`.
-- **Thumbnail pipeline**: Hardware-adaptive — detects NVMe/SSD, discrete GPU, CPU cores. Uses a bounded `rayon::ThreadPool` (`thumb_pool`). Optional GPU path via `wgpu` (feature `gpu`) for resize + BC7 encoding. BC7 atlas is mmap-backed for GPU-direct reads.
-- **Dependencies in dev builds**: `[profile.dev.package."*"] opt-level = 2` — image codecs, SIMD resize, BC7 encoding, and SQLite are unusably slow at opt-level 0.
+- **Thumbnail pipeline**: Hardware-adaptive — detects NVMe/SSD, discrete GPU, CPU cores. Uses a bounded `rayon::ThreadPool` (`thumb_pool`). Optional GPU path via `wgpu` (feature `gpu`) for fused crop+resize.
+- **Dependencies in dev builds**: `[profile.dev.package."*"] opt-level = 2` — image codecs, SIMD resize, and SQLite are unusably slow at opt-level 0.
 - **Plugin system**: Plugins are directories with a `manifest.json`. Execution is CLI-based (spawned process or long-running daemon). Example: `plugins/wd-tagger/` (ML image tagger).
 
 ### Cargo features

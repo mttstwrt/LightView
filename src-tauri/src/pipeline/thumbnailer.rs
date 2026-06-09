@@ -18,8 +18,6 @@ pub enum ThumbFormat {
     /// JPEG encoded (compressed, 10–50 KB per thumbnail).
     #[default]
     Jpeg,
-    /// Raw RGBA8 pixels (internal use for GPU/BC7 atlas pipeline only).
-    Rgba,
     /// Lossy WebP — ~30% smaller than JPEG at equivalent visual quality.
     /// Preferred for the L/P tiers where file size matters more than
     /// decode speed. Browsers have native WebP support.
@@ -29,10 +27,11 @@ pub enum ThumbFormat {
 impl ThumbFormat {
     /// Cache-row `format` column value. Must match the strings written
     /// into the `thumbnails*` tables so that lookup comparisons work.
+    /// Rows written by old builds may carry format='rgba'; those never
+    /// match a requested format, which triggers regeneration.
     pub fn as_cache_str(self) -> &'static str {
         match self {
             ThumbFormat::Jpeg => "jpeg",
-            ThumbFormat::Rgba => "rgba",
             ThumbFormat::Webp => "webp",
         }
     }
@@ -210,7 +209,7 @@ fn generate_jpeg_thumbnail_inner(path: &Path, filter: ResizeFilter, format: Thum
             let cropped = crop_rgb(&rgb_buf, dw, cx, cy, side, side);
             resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
-        ThumbFormat::Rgba | ThumbFormat::Webp => {
+        ThumbFormat::Webp => {
             let rgba_src = rgb_to_rgba(&rgb_buf);
             let cropped = crop_rgba(&rgba_src, dw, cx, cy, side, side);
             resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
@@ -249,7 +248,7 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
             let cropped = crop_rgb(src_buf, w, cx, cy, side, side);
             resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
-        ThumbFormat::Rgba | ThumbFormat::Webp => {
+        ThumbFormat::Webp => {
             let rgba = img.to_rgba8();
             let src_buf = rgba.as_raw();
             let cropped = crop_rgba(src_buf, w, cx, cy, side, side);
@@ -289,7 +288,7 @@ fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForma
             let cropped = crop_rgb(&rgb, dw, cx, cy, side, side);
             resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
-        ThumbFormat::Rgba | ThumbFormat::Webp => {
+        ThumbFormat::Webp => {
             let cropped = crop_rgba(&rgba_buf, dw, cx, cy, side, side);
             resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
         }
@@ -401,7 +400,7 @@ fn l8_to_rgba(luma: &[u8]) -> Vec<u8> {
 }
 
 /// Encode resized pixel data to the requested output format.
-/// JPEG expects RGB8, WebP + Rgba expect RGBA8; the caller is responsible
+/// JPEG expects RGB8, WebP expects RGBA8; the caller is responsible
 /// for passing the correct layout via `format`.
 fn encode_output(pixels: &[u8], w: u32, h: u32, format: ThumbFormat) -> Result<Vec<u8>, ThumbError> {
     match format {
@@ -412,10 +411,6 @@ fn encode_output(pixels: &[u8], w: u32, h: u32, format: ThumbFormat) -> Result<V
                 .encode(pixels, w, h, image::ExtendedColorType::Rgb8)
                 .map_err(|e| ThumbError::Encode(e.to_string()))?;
             Ok(jpeg_buf.into_inner())
-        }
-        ThumbFormat::Rgba => {
-            // Raw RGBA pixels — caller will BC7-encode.
-            Ok(pixels.to_vec())
         }
         ThumbFormat::Webp => encode_rgba_to_webp(pixels, w, h),
     }
@@ -441,30 +436,11 @@ pub fn encode_rgba_to_webp(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, Thumb
 
 /// Decode an already-encoded thumbnail blob back to RGBA. Used by the
 /// multi-tier / ThumbHash derivation pass to avoid re-decoding the source
-/// file. Input can be JPEG bytes (the default thumbnail format) or raw
-/// RGBA pixels with explicit dimensions.
-pub fn decode_thumb_bytes_to_rgba(
-    data: &[u8],
-    width: u32,
-    height: u32,
-    format: ThumbFormat,
-) -> Result<Vec<u8>, ThumbError> {
-    match format {
-        ThumbFormat::Rgba => {
-            let expected = (width as usize) * (height as usize) * 4;
-            if data.len() >= expected {
-                Ok(data[..expected].to_vec())
-            } else {
-                Err(ThumbError::Decode("RGBA buffer smaller than dims".into()))
-            }
-        }
-        ThumbFormat::Jpeg | ThumbFormat::Webp => {
-            // image crate handles both JPEG and WebP decode via format sniffing.
-            let img = image::load_from_memory(data)
-                .map_err(|e| ThumbError::Decode(format!("codec decode: {e}")))?;
-            Ok(img.to_rgba8().into_raw())
-        }
-    }
+/// file. The image crate sniffs the codec, so JPEG and WebP both work.
+pub fn decode_thumb_bytes_to_rgba(data: &[u8]) -> Result<Vec<u8>, ThumbError> {
+    let img = image::load_from_memory(data)
+        .map_err(|e| ThumbError::Decode(format!("codec decode: {e}")))?;
+    Ok(img.to_rgba8().into_raw())
 }
 
 /// Downsample an RGBA image to a target square size.
@@ -964,7 +940,7 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
                     let cropped = crop_rgb(&rgb, w, cx, cy, side, side);
                     resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
                 }
-                ThumbFormat::Rgba | ThumbFormat::Webp => {
+                ThumbFormat::Webp => {
                     let cropped = crop_rgba(&rgba, w, cx, cy, side, side);
                     resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
                 }
@@ -1164,16 +1140,6 @@ fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, th
     let grey: u8 = 0x3A;
 
     let data = match format {
-        ThumbFormat::Rgba => {
-            let mut buf = vec![0u8; pixel_count * 4];
-            for pixel in buf.chunks_exact_mut(4) {
-                pixel[0] = grey;
-                pixel[1] = grey;
-                pixel[2] = grey;
-                pixel[3] = 255;
-            }
-            buf
-        }
         ThumbFormat::Jpeg => {
             let rgb = vec![grey; pixel_count * 3];
             let mut cursor = std::io::Cursor::new(Vec::with_capacity(4096));

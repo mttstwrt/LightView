@@ -37,18 +37,14 @@ fn encode_b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-/// Get a single thumbnail. Checks BC7 atlas first (if active), then SQLite cache,
-/// then generates on-demand.
+/// Get a single thumbnail. Checks the SQLite cache, then generates on-demand.
 #[tauri::command]
 pub async fn get_thumbnail(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<Option<ThumbnailResult>, String> {
-    let format = state.thumb_format();
+    let format = ThumbFormat::Jpeg;
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
-    let use_atlas = state
-        .use_bc7_atlas
-        .load(std::sync::atomic::Ordering::Relaxed);
     let thumb_size = STANDARD_THUMB_SIZE;
 
     // Check SQLite cache — return as-is if format matches, otherwise regenerate
@@ -77,15 +73,6 @@ pub async fn get_thumbnail(
 
     match result {
         Ok(thumb) => {
-            // If atlas is active, store BC7 in atlas
-            if use_atlas && thumb.format == ThumbFormat::Rgba {
-                let mut atlas = state.thumb_atlas.lock().await;
-                if let Some(atlas) = atlas.as_mut() {
-                    let _ = atlas.upsert(&thumb.path, &thumb.data, thumb.width, thumb.height, 0);
-                    let _ = atlas.remap();
-                }
-            }
-
             let fmt_str = thumb.format.as_cache_str();
 
             // Cache in SQLite in the generated format
@@ -127,8 +114,8 @@ pub async fn get_thumbnail(
     }
 }
 
-/// Get thumbnails for a batch of paths. Uses BC7 atlas when available,
-/// falls back to SQLite cache, then generates missing thumbnails.
+/// Get thumbnails for a batch of paths. Serves from the SQLite cache,
+/// then generates missing thumbnails.
 /// Emits `thumb:streamed` events as individual thumbnails complete.
 #[tauri::command]
 pub async fn get_thumbnails_batch(
@@ -136,11 +123,8 @@ pub async fn get_thumbnails_batch(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<Vec<ThumbnailResult>, String> {
-    let format = state.thumb_format();
+    let format = ThumbFormat::Jpeg;
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
-    let use_atlas = state
-        .use_bc7_atlas
-        .load(std::sync::atomic::Ordering::Relaxed);
     let thumb_w = STANDARD_THUMB_SIZE;
     let thumb_h = STANDARD_THUMB_SIZE;
 
@@ -190,46 +174,29 @@ pub async fn get_thumbnails_batch(
         return Ok(results);
     }
 
-    // Phase 2: Generate missing thumbnails
-    // Try full GPU pipeline (crop+resize+BC7) when atlas is active,
-    // otherwise use GPU crop+resize only, with CPU fallback.
+    // Phase 2: Generate missing thumbnails — GPU crop+resize with CPU fallback.
     #[cfg(feature = "gpu")]
     let gpu_generated = if let Some(ref pipeline) = state.gpu_pipeline {
-        if use_atlas {
-            // Full chained pipeline: crop+resize → BC7 encode on GPU (zero intermediate readback)
-            generate_batch_gpu_full(
-                &state.thumb_pool,
-                pipeline,
-                &uncached_paths,
-                filter,
-                format,
-                thumb_w,
-                thumb_h,
-            )
-            .await
-        } else {
-            // Crop+resize on GPU, encode on CPU
-            generate_batch_gpu(
-                &state.thumb_pool,
-                pipeline,
-                &uncached_paths,
-                filter,
-                format,
-                thumb_w,
-                thumb_h,
-            )
-            .await
-        }
+        generate_batch_gpu(
+            &state.thumb_pool,
+            pipeline,
+            &uncached_paths,
+            filter,
+            format,
+            thumb_w,
+            thumb_h,
+        )
+        .await
     } else {
         None
     };
 
     #[cfg(not(feature = "gpu"))]
-    let gpu_generated: Option<GpuBatchResult> = None;
+    let gpu_generated: Option<Vec<crate::pipeline::thumbnailer::ThumbResult>> = None;
 
     // Unpack GPU results or fall back to CPU
-    let (generated_thumbs, gpu_bc7_data) = if let Some(gpu_result) = gpu_generated {
-        (gpu_result.thumbs, gpu_result.bc7_items)
+    let generated_thumbs = if let Some(thumbs) = gpu_generated {
+        thumbs
     } else {
         // CPU fallback path — stream results as each thumbnail completes
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -253,7 +220,7 @@ pub async fn get_thumbnails_batch(
                 thumbs.push(thumb);
             }
         }
-        (thumbs, Vec::new())
+        thumbs
     };
 
     // Phase 3: Cache results and build response in the requested format
@@ -269,22 +236,9 @@ pub async fn get_thumbnails_batch(
         src_height: u32,
     }
     let mut to_cache = Vec::new();
-    let mut rgba_to_atlas: Vec<(String, Vec<u8>, u32, u32, u64)> = Vec::new();
 
     for thumb in generated_thumbs {
         let fmt_str = thumb.format.as_cache_str().to_string();
-        let needs_atlas = thumb.format == ThumbFormat::Rgba && use_atlas && gpu_bc7_data.is_empty();
-
-        // Queue RGBA for CPU BC7 encoding if atlas is active and no GPU BC7 was produced
-        if needs_atlas {
-            rgba_to_atlas.push((
-                thumb.path.clone(),
-                thumb.data.clone(),
-                thumb.width,
-                thumb.height,
-                0,
-            ));
-        }
 
         to_cache.push(CacheItem {
             path: thumb.path.clone(),
@@ -307,22 +261,6 @@ pub async fn get_thumbnails_batch(
         });
     }
 
-    // Batch-write GPU-encoded BC7 directly to atlas (zero CPU BC7 encoding)
-    if !gpu_bc7_data.is_empty() {
-        let mut atlas = state.thumb_atlas.lock().await;
-        if let Some(atlas) = atlas.as_mut() {
-            let _ = atlas.upsert_bc7_raw_batch(&gpu_bc7_data);
-        }
-    }
-
-    // Batch-write CPU-encoded RGBA to BC7 atlas (fallback when no GPU BC7)
-    if !rgba_to_atlas.is_empty() {
-        let mut atlas = state.thumb_atlas.lock().await;
-        if let Some(atlas) = atlas.as_mut() {
-            let _ = atlas.upsert_batch(&rgba_to_atlas);
-        }
-    }
-
     // -------------------------------------------------------------------
     // Derive ThumbHash + micro (T1) tier bytes in parallel on the CPU pool.
     // Done BEFORE the SQLite transaction so the inserts can include the
@@ -339,20 +277,14 @@ pub async fn get_thumbnails_batch(
     let derived_extras: Vec<DerivedExtras> = {
         use rayon::prelude::*;
         // Capture what the rayon closure needs, without borrowing `to_cache`.
-        let inputs: Vec<(String, Vec<u8>, u32, u32, ThumbFormat)> = to_cache
+        let inputs: Vec<(String, Vec<u8>, u32, u32)> = to_cache
             .iter()
             .map(|item| {
-                let fmt = match item.format.as_str() {
-                    "rgba" => ThumbFormat::Rgba,
-                    "webp" => ThumbFormat::Webp,
-                    _ => ThumbFormat::Jpeg,
-                };
                 (
                     item.path.clone(),
                     item.data.clone(),
                     item.width,
                     item.height,
-                    fmt,
                 )
             })
             .collect();
@@ -361,8 +293,8 @@ pub async fn get_thumbnails_batch(
         state.thumb_pool.spawn(move || {
             let out: Vec<DerivedExtras> = inputs
                 .into_par_iter()
-                .map(|(path, data, w, h, fmt)| {
-                    let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data, w, h, fmt) {
+                .map(|(path, data, w, h)| {
+                    let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data) {
                         Ok(r) => r,
                         Err(_) => {
                             return DerivedExtras {
@@ -475,22 +407,7 @@ pub async fn get_thumbnails_batch(
     Ok(results)
 }
 
-/// Result from GPU batch thumbnail generation.
-#[cfg(feature = "gpu")]
-struct GpuBatchResult {
-    /// Generated thumbnails (with JPEG data for IPC).
-    thumbs: Vec<crate::pipeline::thumbnailer::ThumbResult>,
-    /// Pre-encoded BC7 data for atlas storage: (path, bc7_data, w, h, mtime).
-    bc7_items: Vec<(String, Vec<u8>, u32, u32, u64)>,
-}
-
-#[cfg(not(feature = "gpu"))]
-struct GpuBatchResult {
-    thumbs: Vec<crate::pipeline::thumbnailer::ThumbResult>,
-    bc7_items: Vec<(String, Vec<u8>, u32, u32, u64)>,
-}
-
-/// GPU batch pipeline (crop+resize only, no BC7):
+/// GPU batch pipeline:
 /// 1. Decode on CPU (rayon) — no CPU crop
 /// 2. Fused crop+resize on GPU
 /// 3. Encode to JPEG on CPU (rayon)
@@ -503,7 +420,7 @@ async fn generate_batch_gpu(
     format: ThumbFormat,
     thumb_size_w: u32,
     thumb_size_h: u32,
-) -> Option<GpuBatchResult> {
+) -> Option<Vec<crate::pipeline::thumbnailer::ThumbResult>> {
     use crate::pipeline::gpu_pipeline::CropResizeInput;
     use crate::pipeline::thumbnailer::{
         decode_image, encode_rgba_to_jpeg, DecodedImage, ThumbFormat, ThumbResult,
@@ -538,10 +455,7 @@ async fn generate_batch_gpu(
     }
 
     if gpu_inputs.is_empty() {
-        return Some(GpuBatchResult {
-            thumbs: Vec::new(),
-            bc7_items: Vec::new(),
-        });
+        return Some(Vec::new());
     }
 
     // Phase 2: GPU fused crop+resize
@@ -555,7 +469,7 @@ async fn generate_batch_gpu(
     });
     let resized = rx2.await.ok()?;
 
-    // Phase 3: Encode output on CPU (rayon) — JPEG or raw RGBA depending on format
+    // Phase 3: Encode output on CPU (rayon)
     let (tx3, rx3) = tokio::sync::oneshot::channel();
     let decoded_ref: Vec<Option<DecodedImage>> = decoded;
     pool.spawn(move || {
@@ -574,7 +488,6 @@ async fn generate_batch_gpu(
                         resized.width,
                         resized.height,
                     ),
-                    ThumbFormat::Rgba => Ok(resized.rgba_data.clone()),
                 };
                 match encoded {
                     Ok(data) => {
@@ -598,141 +511,7 @@ async fn generate_batch_gpu(
         let _ = tx3.send(results);
     });
 
-    let thumbs = rx3.await.ok()?;
-    Some(GpuBatchResult {
-        thumbs,
-        bc7_items: Vec::new(),
-    })
-}
-
-/// Full GPU chained pipeline (crop+resize → BC7 encode, zero intermediate readback):
-/// 1. Decode on CPU (rayon) — no CPU crop
-/// 2. Fused crop+resize on GPU → BC7 encode on GPU (single submission)
-/// 3. Readback BC7 + RGBA, encode JPEG on CPU (rayon)
-#[cfg(feature = "gpu")]
-async fn generate_batch_gpu_full(
-    pool: &rayon::ThreadPool,
-    pipeline: &std::sync::Arc<crate::pipeline::gpu_pipeline::GpuPipeline>,
-    paths: &[String],
-    filter: ResizeFilter,
-    format: ThumbFormat,
-    thumb_size_w: u32,
-    thumb_size_h: u32,
-) -> Option<GpuBatchResult> {
-    use crate::pipeline::gpu_pipeline::CropResizeInput;
-    use crate::pipeline::thumbnailer::{
-        decode_image, encode_rgba_to_jpeg, DecodedImage, ThumbFormat, ThumbResult,
-    };
-
-    // Phase 1: Decode on CPU (rayon)
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let paths_owned: Vec<String> = paths.to_vec();
-    pool.spawn(move || {
-        let decoded: Vec<Option<DecodedImage>> = paths_owned
-            .iter()
-            .map(|p| decode_image(std::path::Path::new(p)).ok())
-            .collect();
-        let _ = tx.send(decoded);
-    });
-    let decoded = rx.await.ok()?;
-
-    let mut gpu_inputs = Vec::with_capacity(decoded.len());
-    let mut gpu_indices = Vec::with_capacity(decoded.len());
-    for (i, img) in decoded.iter().enumerate() {
-        if let Some(d) = img {
-            gpu_inputs.push(CropResizeInput {
-                rgba_data: d.rgba.clone(),
-                width: d.width,
-                height: d.height,
-                crop_x: d.crop_x,
-                crop_y: d.crop_y,
-                crop_size: d.crop_size,
-            });
-            gpu_indices.push(i);
-        }
-    }
-
-    if gpu_inputs.is_empty() {
-        return Some(GpuBatchResult {
-            thumbs: Vec::new(),
-            bc7_items: Vec::new(),
-        });
-    }
-
-    // Phase 2: Full GPU pipeline — crop+resize → BC7 encode in one submission
-    // Also readback RGBA for JPEG encoding (needed for IPC + SQLite cache)
-    let bilinear = !matches!(filter, ResizeFilter::Nearest);
-    let pipeline_clone = pipeline.clone();
-    let (tx2, rx2) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_blocking(move || {
-        let gpu_results = pipeline_clone.generate_thumbnails_batch(
-            &gpu_inputs,
-            thumb_size_w,
-            thumb_size_h,
-            bilinear,
-            true, // need RGBA readback for JPEG encoding
-        );
-        let _ = tx2.send(gpu_results);
-    });
-    let gpu_results = rx2.await.ok()?;
-
-    // Phase 3: Encode JPEG on CPU (rayon) and collect BC7 for atlas
-    let (tx3, rx3) = tokio::sync::oneshot::channel();
-    let decoded_ref: Vec<Option<DecodedImage>> = decoded;
-    pool.spawn(move || {
-        let mut thumbs = Vec::new();
-        let mut bc7_items = Vec::new();
-
-        for (gpu_idx, gpu_out) in gpu_results.into_iter().enumerate() {
-            let orig_idx = gpu_indices[gpu_idx];
-            if let (Some(result), Some(img)) = (gpu_out, &decoded_ref[orig_idx]) {
-                // Store BC7 data for atlas
-                bc7_items.push((
-                    img.path.clone(),
-                    result.bc7_data,
-                    result.width,
-                    result.height,
-                    0u64,
-                ));
-
-                // Encode output from RGBA readback for IPC
-                let encoded = match format {
-                    ThumbFormat::Jpeg => encode_rgba_to_jpeg(
-                        &result.rgba_data,
-                        result.width,
-                        result.height,
-                    ),
-                    ThumbFormat::Webp => crate::pipeline::thumbnailer::encode_rgba_to_webp(
-                        &result.rgba_data,
-                        result.width,
-                        result.height,
-                    ),
-                    ThumbFormat::Rgba => Ok(result.rgba_data.clone()),
-                };
-                match encoded {
-                    Ok(data) => {
-                        thumbs.push(ThumbResult {
-                            path: img.path.clone(),
-                            width: result.width,
-                            height: result.height,
-                            data,
-                            media_type: img.media_type.clone(),
-                            src_width: img.src_width,
-                            src_height: img.src_height,
-                            format,
-                        });
-                    }
-                    Err(e) => {
-                        log::warn!("Encode failed for {}: {}", img.path, e);
-                    }
-                }
-            }
-        }
-        let _ = tx3.send((thumbs, bc7_items));
-    });
-
-    let (thumbs, bc7_items) = rx3.await.ok()?;
-    Some(GpuBatchResult { thumbs, bc7_items })
+    rx3.await.ok()
 }
 
 /// Dispatch a single thumbnail generation task to the dedicated thread pool.
@@ -761,19 +540,14 @@ pub(crate) async fn dispatch_thumbnail(
 /// SQLite, decodes to RGBA, downsamples, and writes the micro row + thumbhash.
 async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
     // Read standard-tier bytes from DB
-    let items: Vec<(String, Vec<u8>, u32, u32, ThumbFormat, String)> = {
+    let items: Vec<(String, Vec<u8>, u32, u32, String)> = {
         let db = state.cache_db.lock().await;
         let Some(db) = db.as_ref() else { return };
         paths
             .iter()
             .filter_map(|path| {
                 let row = db.get_thumbnail(path).ok()??;
-                let fmt = match row.format.as_str() {
-                    "rgba" => ThumbFormat::Rgba,
-                    "webp" => ThumbFormat::Webp,
-                    _ => ThumbFormat::Jpeg,
-                };
-                Some((path.clone(), row.thumbnail, row.width, row.height, fmt, row.media_type))
+                Some((path.clone(), row.thumbnail, row.width, row.height, row.media_type))
             })
             .collect()
     };
@@ -796,8 +570,8 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
         use rayon::prelude::*;
         let out: Vec<Derived> = items
             .into_par_iter()
-            .map(|(path, data, w, h, fmt, media_type)| {
-                let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data, w, h, fmt) {
+            .map(|(path, data, w, h, media_type)| {
+                let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data) {
                     Ok(r) => r,
                     Err(_) => {
                         return Derived {
@@ -883,7 +657,7 @@ pub async fn regenerate_thumbnail(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    let format = state.thumb_format();
+    let format = ThumbFormat::Jpeg;
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let thumb_size = STANDARD_THUMB_SIZE;
 
@@ -905,14 +679,6 @@ pub async fn regenerate_thumbnail(
 
     match result {
         Ok(thumb) => {
-            let use_atlas = state.use_bc7_atlas.load(std::sync::atomic::Ordering::Relaxed);
-            if use_atlas && thumb.format == ThumbFormat::Rgba {
-                let mut atlas = state.thumb_atlas.lock().await;
-                if let Some(atlas) = atlas.as_mut() {
-                    let _ = atlas.upsert(&thumb.path, &thumb.data, thumb.width, thumb.height, 0);
-                    let _ = atlas.remap();
-                }
-            }
             let fmt_str = thumb.format.as_cache_str();
             {
                 let db = state.cache_db.lock().await;
@@ -1095,13 +861,10 @@ pub async fn precache_thumbnails(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<PrecacheResult, String> {
-    let format = state.thumb_format();
+    let format = ThumbFormat::Jpeg;
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let thumb_w = STANDARD_THUMB_SIZE;
     let thumb_h = STANDARD_THUMB_SIZE;
-    let use_atlas = state
-        .use_bc7_atlas
-        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Filter to only paths that are uncached or have a format mismatch
     let requested_fmt = format.as_cache_str();
@@ -1148,19 +911,6 @@ pub async fn precache_thumbnails(
         match result {
             Ok(Ok(thumb)) => {
                 let fmt_str = thumb.format.as_cache_str();
-
-                if use_atlas && thumb.format == ThumbFormat::Rgba {
-                    let mut atlas = state.thumb_atlas.lock().await;
-                    if let Some(atlas) = atlas.as_mut() {
-                        let _ = atlas.upsert(
-                            &thumb.path,
-                            &thumb.data,
-                            thumb.width,
-                            thumb.height,
-                            0,
-                        );
-                    }
-                }
 
                 to_cache.push((
                     thumb.path,
@@ -1445,11 +1195,10 @@ async fn derive_standard_extras(
     data: Vec<u8>,
     width: u32,
     height: u32,
-    format: ThumbFormat,
 ) -> StandardExtras {
     let (tx, rx) = tokio::sync::oneshot::channel();
     pool.spawn(move || {
-        let extras = match thumbnailer::decode_thumb_bytes_to_rgba(&data, width, height, format) {
+        let extras = match thumbnailer::decode_thumb_bytes_to_rgba(&data) {
             Ok(rgba) => {
                 let thumbhash = thumbnailer::compute_thumbhash(&rgba, width, height).ok();
                 let micro_size = ThumbTier::Micro.target_size();
@@ -1512,7 +1261,6 @@ pub async fn generate_and_store_tier(
                 thumb.data.clone(),
                 thumb.width,
                 thumb.height,
-                tier_format,
             )
             .await,
         )

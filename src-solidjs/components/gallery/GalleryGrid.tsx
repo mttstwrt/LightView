@@ -6,7 +6,6 @@ import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
-import { initGPU } from "../../lib/gpu";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { ThumbnailCell } from "./ThumbnailCell";
 
@@ -246,11 +245,6 @@ export function GalleryGrid(props: GalleryGridProps) {
       thumbGenProgress(thumbGenDone, thumbGenTotal);
     }
   };
-
-  // Initialize WebGPU on mount (non-blocking, caches result).
-  onMount(() => {
-    initGPU();
-  });
 
   // Listen for streamed thumbnail results — update URLs as each arrives
   // rather than waiting for the full batch to complete.

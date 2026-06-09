@@ -89,26 +89,6 @@ fn bench_png_thumbnail(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_rgba_output(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rgba_output");
-    let (_dir, path) = create_test_jpeg(4000, 3000);
-
-    group.bench_function("4000x3000/nearest/rgba", |b| {
-        b.iter(|| {
-            thumbnailer::generate_image_thumbnail(
-                black_box(&path),
-                ResizeFilter::Nearest,
-                ThumbFormat::Rgba,
-                STANDARD_THUMB_SIZE,
-                STANDARD_THUMB_SIZE,
-            )
-            .expect("thumbnail generation")
-        })
-    });
-
-    group.finish();
-}
-
 fn bench_decode_and_crop(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_and_crop");
 
@@ -187,7 +167,6 @@ criterion_group!(
     benches,
     bench_jpeg_thumbnail,
     bench_png_thumbnail,
-    bench_rgba_output,
     bench_decode_and_crop,
     bench_batch_parallel,
     bench_resize_filters,

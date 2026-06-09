@@ -171,7 +171,6 @@ type PerfSnapshot = {
   disk_write_bytes: number;
   cached_thumbnails: number;
   cache_size_bytes: number;
-  atlas_entries: number;
   thumb_pool_active_threads: number;
 };
 

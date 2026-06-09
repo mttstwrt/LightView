@@ -98,10 +98,7 @@ export function DevtoolsApp() {
               <HwRow label="Filesystem" value={hwInfo()!.filesystem} />
               <HwRow label="CPU" value={`${hwInfo()!.cpu_cores} cores`} />
               <HwRow label="RAM" value={`${hwInfo()!.total_ram_mb} MB`} />
-              <HwRow label="GPU compute" value={hwInfo()!.gpu_compute ? "yes" : "no"} color={hwInfo()!.gpu_compute ? "#4ade80" : "#f87171"} />
               <HwRow label="GPU resize" value={hwInfo()!.gpu_resize_active ? "active" : "inactive"} color={hwInfo()!.gpu_resize_active ? "#4ade80" : "#737373"} />
-              <HwRow label="Thumb format" value={hwInfo()!.thumb_format} />
-              <HwRow label="BC7 atlas" value={hwInfo()!.bc7_atlas_active ? `active (${hwInfo()!.atlas_entry_count} entries)` : "inactive"} color={hwInfo()!.bc7_atlas_active ? "#4ade80" : "#737373"} />
               <HwRow label="SQLite thumbs" value={hwInfo()!.sqlite_thumbnail_count.toString()} />
               <HwRow label="Thumb threads" value={hwInfo()!.thumbnail_threads.toString()} />
               <HwRow label="Prefetch" value={hwInfo()!.prefetch_count.toString()} />

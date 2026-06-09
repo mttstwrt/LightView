@@ -671,15 +671,11 @@ export interface DebugInfo {
   filesystem: string;
   cpu_cores: number;
   total_ram_mb: number;
-  gpu_compute: boolean;
   supports_reflink: boolean;
   thumbnail_threads: number;
   prefetch_count: number;
   lru_cache_size: number;
-  bc7_atlas_active: boolean;
-  thumb_format: string;
   standard_thumb_size: number;
-  atlas_entry_count: number;
   sqlite_thumbnail_count: number;
   gpu_resize_active: boolean;
   gdk_backend: string;
@@ -734,13 +730,6 @@ export const recordView = (path: string) =>
   invoke<void>("record_view", { path });
 
 // ---------------------------------------------------------------------------
-// GPU
-// ---------------------------------------------------------------------------
-
-export const notifyGpuCapabilities = (gpuCompute: boolean, bc7Supported: boolean) =>
-  invoke<void>("notify_gpu_capabilities", { gpuCompute, bc7Supported });
-
-// ---------------------------------------------------------------------------
 // Performance Snapshot (debug overlay)
 // ---------------------------------------------------------------------------
 
@@ -749,7 +738,6 @@ export interface PerfSnapshot {
   disk_write_bytes: number;
   cached_thumbnails: number;
   cache_size_bytes: number;
-  atlas_entries: number;
   thumb_pool_active_threads: number;
 }
 

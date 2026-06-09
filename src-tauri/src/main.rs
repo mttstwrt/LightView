@@ -324,9 +324,6 @@ fn main() {
             commands::viewer::get_transformed_media,
             commands::viewer::record_view,
 
-            // GPU capability notification
-            lightview_lib::pipeline::gpu::notify_gpu_capabilities,
-
             // File operations (copy/move)
             commands::files::copy_files,
             commands::files::move_files,

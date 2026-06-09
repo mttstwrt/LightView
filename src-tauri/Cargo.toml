@@ -38,9 +38,7 @@ base64 = "0.22"
 futures = "0.3"
 fast_image_resize = "6"
 jpeg-decoder = "0.3"
-intel_tex_2 = "0.5"
 memmap2 = "0.9"
-bincode = "1"
 percent-encoding = "2"
 trash = "5"
 bytemuck = { version = "1", features = ["derive"] }
@@ -63,7 +61,7 @@ x11-clipboard = "0.9"
 x11rb = "0.13"
 
 # Optimize dependencies even in dev builds — image codecs, SIMD resize,
-# BC7 encoding, and SQLite are unusably slow at opt-level 0.
+# and SQLite are unusably slow at opt-level 0.
 [profile.dev.package."*"]
 opt-level = 2
 
@@ -84,10 +82,6 @@ harness = false
 
 [[bench]]
 name = "cache_db"
-harness = false
-
-[[bench]]
-name = "atlas"
 harness = false
 
 [profile.release]

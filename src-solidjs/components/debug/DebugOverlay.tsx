@@ -199,10 +199,7 @@ export function DebugOverlay() {
               <div>Filesystem: <span class="text-neutral-100">{hwInfo()!.filesystem}</span></div>
               <div>CPU: <span class="text-neutral-100">{hwInfo()!.cpu_cores} cores</span></div>
               <div>RAM: <span class="text-neutral-100">{hwInfo()!.total_ram_mb} MB</span></div>
-              <div>GPU compute: <span class={hwInfo()!.gpu_compute ? "text-green-400" : "text-red-400"}>{hwInfo()!.gpu_compute ? "yes" : "no"}</span></div>
               <div>GPU resize: <span class={hwInfo()!.gpu_resize_active ? "text-green-400" : "text-neutral-500"}>{hwInfo()!.gpu_resize_active ? "active" : "inactive"}</span></div>
-              <div>Thumb format: <span class="text-neutral-100">{hwInfo()!.thumb_format}</span></div>
-              <div>BC7 atlas: <span class={hwInfo()!.bc7_atlas_active ? "text-green-400" : "text-neutral-500"}>{hwInfo()!.bc7_atlas_active ? `active (${hwInfo()!.atlas_entry_count} entries)` : "inactive"}</span></div>
               <div>SQLite thumbs: <span class="text-neutral-100">{hwInfo()!.sqlite_thumbnail_count}</span></div>
               <div>Thumb threads: <span class="text-neutral-100">{hwInfo()!.thumbnail_threads}</span></div>
               <div>Prefetch: <span class="text-neutral-100">{hwInfo()!.prefetch_count}</span></div>

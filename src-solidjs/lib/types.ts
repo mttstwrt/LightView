@@ -152,7 +152,6 @@ export interface HardwareProfile {
   filesystem: string;
   supports_reflink: boolean;
   cpu_cores: number;
-  gpu_compute: boolean;
   total_ram_mb: number;
 }
 

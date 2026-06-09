@@ -6,7 +6,6 @@ pub struct HardwareProfile {
     pub filesystem: String,
     pub supports_reflink: bool,
     pub cpu_cores: usize,
-    pub gpu_compute: bool,
     pub total_ram_mb: u64,
 }
 
@@ -57,7 +56,6 @@ impl HardwareProfile {
             filesystem,
             supports_reflink,
             cpu_cores,
-            gpu_compute: false, // detected later via WebGPU in frontend
             total_ram_mb,
         }
     }

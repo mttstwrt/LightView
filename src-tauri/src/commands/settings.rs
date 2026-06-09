@@ -15,15 +15,11 @@ pub struct DebugInfo {
     pub filesystem: String,
     pub cpu_cores: usize,
     pub total_ram_mb: u64,
-    pub gpu_compute: bool,
     pub supports_reflink: bool,
     pub thumbnail_threads: usize,
     pub prefetch_count: usize,
     pub lru_cache_size: usize,
-    pub bc7_atlas_active: bool,
-    pub thumb_format: String,
     pub standard_thumb_size: u32,
-    pub atlas_entry_count: usize,
     pub sqlite_thumbnail_count: u64,
     pub gpu_resize_active: bool,
     pub gdk_backend: String,
@@ -509,14 +505,6 @@ pub async fn rebuild_thumbnails(
 
     let cleared = db.clear_thumbnails().map_err(|e| e.to_string())?;
 
-    // Also clear the BC7 atlas if active
-    {
-        let mut atlas = state.thumb_atlas.lock().await;
-        if let Some(ref mut a) = *atlas {
-            a.clear().map_err(|e| e.to_string())?;
-        }
-    }
-
     // TODO: Kick off background thumbnail regeneration pipeline
 
     Ok(cleared as u64)
@@ -538,15 +526,6 @@ pub async fn clear_cache(
         .join(".lightview")
         .join("cache.db");
 
-    // Close the atlas first
-    {
-        let mut atlas = state.thumb_atlas.lock().await;
-        *atlas = None;
-        state
-            .use_bc7_atlas
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-
     // Close the DB
     {
         let mut db = state.cache_db.lock().await;
@@ -558,7 +537,8 @@ pub async fn clear_cache(
         std::fs::remove_file(&cache_path).map_err(|e| e.to_string())?;
     }
 
-    // Delete atlas files
+    // Delete BC7 atlas files left behind by old builds (the atlas itself
+    // was removed; these can linger in galleries opened before that).
     let lightview_dir = std::path::Path::new(&gallery_path).join(".lightview");
     let atlas_bin = lightview_dir.join("thumb_atlas.bin");
     let atlas_idx = lightview_dir.join("thumb_atlas.idx");
@@ -586,14 +566,6 @@ pub async fn get_debug_info(
     state: tauri::State<'_, AppState>,
 ) -> Result<DebugInfo, String> {
     let hw = &*state.hardware;
-    let bc7_active = state
-        .use_bc7_atlas
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    let atlas_entries = {
-        let atlas = state.thumb_atlas.lock().await;
-        atlas.as_ref().map(|a| a.len()).unwrap_or(0)
-    };
 
     let sqlite_thumbs = {
         let db = state.cache_db.lock().await;
@@ -606,18 +578,13 @@ pub async fn get_debug_info(
         }
     };
 
-    let thumb_format = format!("{:?}", state.thumb_format()).to_lowercase();
-
     log::info!("=== Hardware Debug Info ===");
     log::info!("  Storage:      {:?}", hw.storage_type);
     log::info!("  Filesystem:   {}", hw.filesystem);
     log::info!("  CPU cores:    {}", hw.cpu_cores);
     log::info!("  RAM:          {} MB", hw.total_ram_mb);
-    log::info!("  GPU compute:  {}", hw.gpu_compute);
     log::info!("  Reflink:      {}", hw.supports_reflink);
-    log::info!("  Thumb format: {}", &thumb_format);
     log::info!("  Thumb size:   {}x{}", STANDARD_THUMB_SIZE, STANDARD_THUMB_SIZE);
-    log::info!("  BC7 atlas:    {} ({} entries)", bc7_active, atlas_entries);
     let gpu_active = state.has_gpu();
 
     log::info!("  SQLite cache: {} thumbnails", sqlite_thumbs);
@@ -632,15 +599,11 @@ pub async fn get_debug_info(
         filesystem: hw.filesystem.clone(),
         cpu_cores: hw.cpu_cores,
         total_ram_mb: hw.total_ram_mb,
-        gpu_compute: hw.gpu_compute,
         supports_reflink: hw.supports_reflink,
         thumbnail_threads: hw.thumbnail_threads(),
         prefetch_count: hw.prefetch_count(),
         lru_cache_size: hw.lru_cache_size(),
-        bc7_atlas_active: bc7_active,
-        thumb_format,
         standard_thumb_size: STANDARD_THUMB_SIZE,
-        atlas_entry_count: atlas_entries,
         sqlite_thumbnail_count: sqlite_thumbs,
         gpu_resize_active: gpu_active,
         gdk_backend: std::env::var("GDK_BACKEND").unwrap_or_default(),
@@ -839,8 +802,6 @@ pub struct PerfSnapshot {
     pub cached_thumbnails: u64,
     /// Total byte size of cached thumbnail data.
     pub cache_size_bytes: u64,
-    /// Number of entries in the BC7 atlas (0 if inactive).
-    pub atlas_entries: usize,
     /// Current rayon thread pool active thread count (approximate).
     pub thumb_pool_active_threads: usize,
 }
@@ -886,17 +847,11 @@ pub async fn get_perf_snapshot(
         }
     };
 
-    let atlas_entries = {
-        let atlas = state.thumb_atlas.lock().await;
-        atlas.as_ref().map(|a| a.len()).unwrap_or(0)
-    };
-
     Ok(PerfSnapshot {
         disk_read_bytes,
         disk_write_bytes,
         cached_thumbnails,
         cache_size_bytes,
-        atlas_entries,
         thumb_pool_active_threads: state.hardware.thumbnail_threads(),
     })
 }
