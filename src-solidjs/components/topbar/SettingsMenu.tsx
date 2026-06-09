@@ -3,7 +3,7 @@ import { Portal, Dynamic } from "solid-js/web";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths, setSettingsOpen } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
-import type { AppSettings, CompanionLocation, RendererMode, PluginInfo } from "../../lib/types";
+import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
 import {
   rebuildThumbnails,
   listPlugins,
@@ -680,32 +680,6 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 onChange={(v) => updateDisplay("map_dark_mode", v)}
               />
 
-              {/* Renderer mode — Canvas/WebGL temporarily disabled, so the
-                  picker is hidden and DOM is forced (see GalleryGrid). Kept here
-                  for easy re-enable; restore the <Show when={false}> to <Show
-                  when={true}> (or remove the wrapper) to bring it back. */}
-              <Show when={false}>
-              <Field label="Renderer">
-                <div class="flex gap-1">
-                  {([
-                    { value: "dom" as RendererMode, label: "DOM" },
-                    { value: "canvas" as RendererMode, label: "Canvas" },
-                    { value: "webgl" as RendererMode, label: "WebGL" },
-                  ]).map((opt) => (
-                    <button
-                      class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                        (settings().display.renderer_mode ?? "dom") === opt.value
-                          ? "bg-teal-700/60 text-teal-200"
-                          : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                      }`}
-                      onClick={() => updateDisplay("renderer_mode", opt.value)}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </Field>
-              </Show>
             </Section>
 
             {/* ── Default filter (desktop-managed; LAN clients inherit it) ── */}

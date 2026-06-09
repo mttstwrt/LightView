@@ -166,7 +166,6 @@ export interface MemoryStatus {
 // ---------------------------------------------------------------------------
 
 export type CompanionLocation = "lightview_folder" | "alongside";
-export type RendererMode = "dom" | "canvas" | "webgl";
 
 export interface AppSettings {
   display: {
@@ -181,7 +180,6 @@ export interface AppSettings {
     /** Max duration (seconds) a video may have to qualify for grid autoplay. */
     video_autoplay_max_seconds: number;
     scroll_blur: boolean;
-    renderer_mode: RendererMode;
     map_dark_mode: boolean;
   };
   performance: {

@@ -956,7 +956,6 @@ mod settings_file_tests {
             "video_autoplay_grid": false,
             "video_autoplay_max_seconds": 30,
             "scroll_blur": false,
-            "renderer_mode": "dom",
             "map_dark_mode": true
         },
         "performance": { "preload_count": 3, "lru_cache_size": 5, "thumbnail_threads": 6 },
@@ -973,7 +972,7 @@ mod settings_file_tests {
         let toml = json_to_toml(SAMPLE).expect("json -> toml");
         // Spot-check it's actually TOML and hand-readable.
         assert!(toml.contains("[display]"));
-        assert!(toml.contains("renderer_mode = \"dom\""));
+        assert!(toml.contains("scroll_blur = false"));
         assert!(toml.contains("[[external_apps]]"));
 
         let json = toml_to_json(&toml).expect("toml -> json");

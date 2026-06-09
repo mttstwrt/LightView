@@ -47,8 +47,7 @@ export type ViewMode = "grid" | "map";
 const [viewMode, setViewMode] = createSignal<ViewMode>("grid");
 
 // Whether the settings panel is open. On mobile the panel is a full-screen
-// page, so App uses this to stop rendering the grid behind it (the WebGL/canvas
-// grid composites above the DOM panel on some mobile browsers otherwise).
+// page, so App uses this to stop rendering the grid behind it.
 const [settingsOpen, setSettingsOpen] = createSignal(false);
 
 export {

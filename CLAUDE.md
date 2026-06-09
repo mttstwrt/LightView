@@ -30,9 +30,6 @@ cd src-tauri && cargo test <test_name>
 cd src-tauri && cargo bench --bench thumbnailer
 cd src-tauri && cargo bench --bench cache_db
 cd src-tauri && cargo bench --bench atlas
-
-# Frontend renderer benchmark
-npm run bench
 ```
 
 ## Architecture
@@ -70,9 +67,8 @@ npm run bench
 |---|---|
 | `stores/` | SolidJS signals for global state: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `thumbnailProgressStore` |
 | `lib/ipc.ts` | All Tauri `invoke()` calls — the single IPC boundary |
-| `lib/renderer/` | Canvas rendering: `WebGLRenderer`, `Canvas2DRenderer`, `ImageLoader` (with decode worker) |
 | `lib/types.ts` | Shared TypeScript types |
-| `components/gallery/` | Grid views: `GalleryGrid`, `CanvasGrid`, `ThumbnailCell`, `SelectionBar` |
+| `components/gallery/` | Grid views: `GalleryGrid`, `ThumbnailCell`, `SelectionBar` |
 | `components/viewer/` | Full-resolution `MediaViewer` |
 | `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `SettingsMenu` |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |

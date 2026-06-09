@@ -169,9 +169,8 @@ export function App() {
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
 
-  // On mobile the settings panel is a full-screen page; the WebGL/canvas grid
-  // composites above the DOM panel on some mobile browsers, so we stop rendering
-  // the gallery content entirely while settings is open there.
+  // On mobile the settings panel is a full-screen page, so skip rendering the
+  // gallery content behind it entirely.
   const contentHidden = () => isMobile() && settingsOpen();
 
   // Scrollbar sort indicators

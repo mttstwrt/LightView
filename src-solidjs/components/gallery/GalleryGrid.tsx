@@ -9,7 +9,6 @@ import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../store
 import { initGPU } from "../../lib/gpu";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { ThumbnailCell } from "./ThumbnailCell";
-import { CanvasGrid } from "./CanvasGrid";
 
 interface GalleryGridProps {
   paths: string[];
@@ -74,38 +73,6 @@ function pickTier(cellPx: number): ThumbTier {
 }
 
 export function GalleryGrid(props: GalleryGridProps) {
-  // Canvas/WebGL renderers are temporarily disabled — they're causing more
-  // problems than they solve. Force DOM regardless of the saved setting. The
-  // CanvasGrid/WebGLRenderer code is kept intact; to re-enable, restore the
-  // line below and the Renderer toggle in SettingsMenu.
-  const mode = () => "dom" as const;
-  // const mode = () => settings().display.renderer_mode ?? "dom";
-
-  return (
-    <Show
-      when={mode() === "dom"}
-      fallback={
-        <CanvasGrid
-          paths={props.paths}
-          durationByPath={durationByPath()}
-          onItemClick={props.onItemClick}
-          onItemSelect={props.onItemSelect}
-          onDragSelect={props.onDragSelect}
-          onBackgroundClick={props.onBackgroundClick}
-          selectedPaths={props.selectedPaths}
-          onItemContextMenu={props.onItemContextMenu}
-          loading={props.loading}
-          onContentHeight={props.onContentHeight}
-          rendererMode={mode()}
-        />
-      }
-    >
-      <DOMGrid {...props} />
-    </Show>
-  );
-}
-
-function DOMGrid(props: GalleryGridProps) {
   const thumbSize = () => settings().display.thumbnail_size;
   const gap = () => settings().display.grid_gap;
 

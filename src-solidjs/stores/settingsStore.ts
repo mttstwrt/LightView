@@ -1,7 +1,6 @@
 import { createSignal } from "solid-js";
 import type { AppSettings, SortField, SortOrder, GroupBy } from "../lib/types";
 import { saveGallerySettings, loadGallerySettings } from "../lib/ipc";
-import { webglPreviouslyCrashed, markWebglStable } from "../lib/renderer/webglGuard";
 
 const DEFAULT_SETTINGS: AppSettings = {
   display: {
@@ -14,7 +13,6 @@ const DEFAULT_SETTINGS: AppSettings = {
     video_autoplay_grid: false,
     video_autoplay_max_seconds: 30,
     scroll_blur: false,
-    renderer_mode: "dom",
     map_dark_mode: true,
   },
   performance: {
@@ -34,18 +32,6 @@ const DEFAULT_SETTINGS: AppSettings = {
     { label: "GIMP", command: "gimp", args: ["{file}"] },
   ],
 };
-
-/** If WebGL crashed on the previous launch, downgrade the saved renderer to
- *  Canvas2D so we don't boot-loop. Consumes the crash guard so a later manual
- *  re-enable gets a fresh attempt. No-op for any other renderer/state. */
-function applyRendererSafeMode(s: AppSettings): AppSettings {
-  if (s.display.renderer_mode === "webgl" && webglPreviouslyCrashed()) {
-    markWebglStable();
-    console.warn("WebGL crashed on the previous launch — falling back to Canvas2D");
-    return { ...s, display: { ...s.display, renderer_mode: "canvas" } };
-  }
-  return s;
-}
 
 // ---------------------------------------------------------------------------
 // Exported reactive store
@@ -80,8 +66,7 @@ export function setSettings(update: Partial<AppSettings> | ((prev: AppSettings) 
 export function applyExternalSettings(json: string) {
   try {
     const stored = JSON.parse(json) as Partial<AppSettings>;
-    const merged = applyRendererSafeMode({ ...DEFAULT_SETTINGS, ...stored });
-    setSettingsRaw(() => merged);
+    setSettingsRaw(() => ({ ...DEFAULT_SETTINGS, ...stored }));
   } catch {}
 }
 
@@ -94,8 +79,7 @@ export async function loadSettingsFromGallery() {
     const json = await loadGallerySettings();
     if (json) {
       const stored = JSON.parse(json) as Partial<AppSettings>;
-      const merged = applyRendererSafeMode({ ...DEFAULT_SETTINGS, ...stored });
-      setSettingsRaw(() => merged);
+      setSettingsRaw(() => ({ ...DEFAULT_SETTINGS, ...stored }));
     } else {
       // First open of this gallery — start from hard defaults and seed the
       // gallery's settings.toml with them, so each gallery is self-contained.
