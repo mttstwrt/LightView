@@ -13,21 +13,12 @@
 //   - Emergency: cache only current image, no preloading
 
 import { mediaUrl } from "./ipc";
+import { isVideoPath } from "./mediaExts";
 import {
   MemoryPressureMonitor,
   type PressureLevel,
   type PressureState,
 } from "./memoryPressure";
-
-const VIDEO_EXTS = new Set([
-  "mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv",
-]);
-
-function isVideoPath(path: string): boolean {
-  const dot = path.lastIndexOf(".");
-  if (dot < 0) return false;
-  return VIDEO_EXTS.has(path.slice(dot + 1).toLowerCase());
-}
 
 interface CacheEntry {
   img: HTMLImageElement;

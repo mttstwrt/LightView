@@ -2,6 +2,7 @@ use fast_image_resize as fir;
 use fir::images::{Image, ImageRef};
 use image::GenericImageView;
 use memmap2::Mmap;
+use crate::companion::schema::MediaType;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -495,22 +496,20 @@ pub fn generate_image_thumbnail(path: &Path, filter: ResizeFilter, format: Thumb
 
 /// Route a single path to the correct generator based on file extension.
 pub fn generate_for_path(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "gif" => generate_image_thumbnail(path, filter, format, thumb_w, thumb_h).map(|mut r| {
+    match media_type_for_path(path) {
+        Some(MediaType::Gif) => generate_image_thumbnail(path, filter, format, thumb_w, thumb_h).map(|mut r| {
             r.media_type = "gif".to_string();
             r
         }),
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            generate_video_thumbnail(path, filter, format, thumb_w, thumb_h)
-        }
+        Some(MediaType::Video) => generate_video_thumbnail(path, filter, format, thumb_w, thumb_h),
         _ => generate_image_thumbnail(path, filter, format, thumb_w, thumb_h),
     }
+}
+
+/// Media type inferred from a path's extension (None for non-media files).
+fn media_type_for_path(path: &Path) -> Option<MediaType> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    MediaType::from_extension(ext)
 }
 
 /// Compute a center crop region to extract the largest square from an image.
@@ -553,19 +552,18 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
         .unwrap_or("")
         .to_lowercase();
 
-    let media_type = match ext.as_str() {
-        "gif" => "gif",
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => "video",
-        _ => "image",
-    };
+    let media_type = media_type_for_path(path)
+        .map(|m| m.as_str())
+        .unwrap_or("image");
 
-    let (rgba_buf, dw, dh, src_w, src_h) = match ext.as_str() {
-        "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
-        "heic" | "heif" => decode_heic_to_rgba(path)?,
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            decode_video_to_rgba(path)?
+    let (rgba_buf, dw, dh, src_w, src_h) = if media_type == "video" {
+        decode_video_to_rgba(path)?
+    } else {
+        match ext.as_str() {
+            "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
+            "heic" | "heif" => decode_heic_to_rgba(path)?,
+            _ => decode_generic_to_rgba(path)?,
         }
-        _ => decode_generic_to_rgba(path)?,
     };
 
     let (cx, cy, side) = center_crop_square(dw, dh);

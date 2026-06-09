@@ -17,6 +17,7 @@ import {
 import { infoPanelOpen, setInfoPanelOpen, infoPanelHeight } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, thumbUrl, ensureTierThumbnails, gifAtlasUrl } from "../../lib/ipc";
+import { isVideoPath, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { GifCanvas } from "../GifCanvas";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { setViewerCacheCountSource } from "../../lib/perfMonitor";
@@ -103,11 +104,6 @@ export function MediaViewer(props: MediaViewerProps) {
     return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
   };
 
-  const VIDEO_EXTS = ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"];
-  const isVideoPath = (path: string) => {
-    const dot = path.lastIndexOf(".");
-    return dot >= 0 && VIDEO_EXTS.includes(path.slice(dot + 1).toLowerCase());
-  };
   const isVideo = () => isVideoPath(currentPath());
 
   // Desktop webview renders GIFs on a <canvas> from a backend frame atlas —
@@ -146,8 +142,7 @@ export function MediaViewer(props: MediaViewerProps) {
   // to decode regardless of how the bytes are served, so jump straight to
   // the external-player fallback for those instead of mounting <video>
   // and waiting for an error event.
-  const isBrowserPlayableVideo = () =>
-    ["mp4", "mov", "webm", "m4v"].includes(ext());
+  const isBrowserPlayableVideo = () => PLAYABLE_VIDEO_EXTS.has(ext());
 
   // Lazy video mounting: don't attach <video src=...> until the user
   // clicks play. With `preload="metadata"` the browser would still pull

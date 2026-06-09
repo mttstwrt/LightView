@@ -349,10 +349,9 @@ pub async fn get_thumbnails_batch(
         if let Some(db) = db.as_mut() {
             let tx = db.transaction().map_err(|e| e.to_string())?;
             for item in &to_cache {
-                let _ = tx.execute(
-                    "INSERT OR REPLACE INTO thumbnails (path, media_type, mtime, width, height, thumbnail, format, resize_filter)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![item.path, item.media_type, 0u64, item.width, item.height, item.data, item.format, item.resize_filter],
+                let _ = crate::cache::thumbnails::write_standard_row(
+                    &tx, &item.path, &item.media_type, 0, item.width, item.height,
+                    &item.data, &item.format, &item.resize_filter,
                 );
                 let _ = tx.execute(
                     "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
@@ -377,18 +376,9 @@ pub async fn get_thumbnails_batch(
                         .find(|c| c.path == extra.path)
                         .map(|c| c.media_type.clone())
                         .unwrap_or_default();
-                    let _ = tx.execute(
-                        "INSERT OR REPLACE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![
-                            extra.path,
-                            media_type,
-                            0u64,
-                            extra.micro_w,
-                            extra.micro_h,
-                            bytes,
-                            "jpeg"
-                        ],
+                    let _ = crate::cache::thumbnails::write_tier_row(
+                        &tx, ThumbTier::Micro, &extra.path, &media_type, 0,
+                        extra.micro_w, extra.micro_h, bytes, "jpeg",
                     );
                 }
             }
@@ -858,10 +848,8 @@ pub async fn precache_thumbnails(
         if let Some(db) = db.as_mut() {
             let tx = db.transaction().map_err(|e| e.to_string())?;
             for item in &to_cache {
-                let _ = tx.execute(
-                    "INSERT OR REPLACE INTO thumbnails (path, media_type, mtime, width, height, thumbnail, format, resize_filter)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![item.0, item.1, 0u64, item.2, item.3, item.4, item.5, filter.as_str()],
+                let _ = crate::cache::thumbnails::write_standard_row(
+                    &tx, &item.0, &item.1, 0, item.2, item.3, &item.4, &item.5, filter.as_str(),
                 );
                 let _ = tx.execute(
                     "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
@@ -1071,26 +1059,11 @@ pub async fn ensure_tier_thumbnails(
     let txn = db.transaction().map_err(|e| e.to_string())?;
     for (path, thumb) in &results {
         let Some(thumb) = thumb else { continue };
-        let sql = format!(
-            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            tier.table()
-        );
-        let fmt_str = tier_format.as_cache_str();
-        if txn
-            .execute(
-                &sql,
-                rusqlite::params![
-                    path,
-                    thumb.media_type,
-                    0u64,
-                    thumb.width,
-                    thumb.height,
-                    thumb.data,
-                    fmt_str
-                ],
-            )
-            .is_ok()
+        if crate::cache::thumbnails::write_tier_row(
+            &txn, tier, path, &thumb.media_type, 0,
+            thumb.width, thumb.height, &thumb.data, tier_format.as_cache_str(),
+        )
+        .is_ok()
         {
             written += 1;
         }
@@ -1195,19 +1168,9 @@ pub async fn generate_and_store_tier(
 
     if matches!(tier, ThumbTier::Standard) {
         let tx = db.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT OR REPLACE INTO thumbnails (path, media_type, mtime, width, height, thumbnail, format, resize_filter)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                path,
-                thumb.media_type,
-                0u64,
-                thumb.width,
-                thumb.height,
-                thumb.data,
-                fmt_str,
-                filter.as_str(),
-            ],
+        crate::cache::thumbnails::write_standard_row(
+            &tx, path, &thumb.media_type, 0, thumb.width, thumb.height,
+            &thumb.data, &fmt_str, filter.as_str(),
         )
         .map_err(|e| e.to_string())?;
 
@@ -1225,18 +1188,9 @@ pub async fn generate_and_store_tier(
                 );
             }
             if let Some(micro) = &ex.micro_bytes {
-                let _ = tx.execute(
-                    "INSERT OR REPLACE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![
-                        path,
-                        thumb.media_type,
-                        0u64,
-                        ex.micro_size,
-                        ex.micro_size,
-                        micro,
-                        "jpeg",
-                    ],
+                let _ = crate::cache::thumbnails::write_tier_row(
+                    &tx, ThumbTier::Micro, path, &thumb.media_type, 0,
+                    ex.micro_size, ex.micro_size, micro, "jpeg",
                 );
             }
         }
@@ -1247,25 +1201,11 @@ pub async fn generate_and_store_tier(
             populate_video_metadata(db.conn(), path);
         }
     } else {
-        let sql = format!(
-            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            tier.table()
-        );
-        db.conn()
-            .execute(
-                &sql,
-                rusqlite::params![
-                    path,
-                    thumb.media_type,
-                    0u64,
-                    thumb.width,
-                    thumb.height,
-                    thumb.data,
-                    fmt_str
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+        crate::cache::thumbnails::write_tier_row(
+            db.conn(), tier, path, &thumb.media_type, 0,
+            thumb.width, thumb.height, &thumb.data, &fmt_str,
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     Ok((bytes, fmt_str))

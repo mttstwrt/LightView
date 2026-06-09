@@ -70,6 +70,55 @@ impl ThumbTier {
     }
 }
 
+/// Insert or replace a standard-tier thumbnail row. Free function over a raw
+/// connection so both `CacheDb` methods and open transactions
+/// (`Transaction` derefs to `Connection`) share one statement.
+pub fn write_standard_row(
+    conn: &rusqlite::Connection,
+    path: &str,
+    media_type: &str,
+    mtime: u64,
+    width: u32,
+    height: u32,
+    thumbnail: &[u8],
+    format: &str,
+    resize_filter: &str,
+) -> Result<(), CacheError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO thumbnails (path, media_type, mtime, width, height, thumbnail, format, resize_filter)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![path, media_type, mtime, width, height, thumbnail, format, resize_filter],
+    )?;
+    Ok(())
+}
+
+/// Insert or replace a row in a non-standard tier table (micro/large/preview).
+/// The standard tier has an extra `resize_filter` column — use
+/// [`write_standard_row`] for it.
+pub fn write_tier_row(
+    conn: &rusqlite::Connection,
+    tier: ThumbTier,
+    path: &str,
+    media_type: &str,
+    mtime: u64,
+    width: u32,
+    height: u32,
+    thumbnail: &[u8],
+    format: &str,
+) -> Result<(), CacheError> {
+    debug_assert!(!matches!(tier, ThumbTier::Standard));
+    let sql = format!(
+        "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        tier.table()
+    );
+    conn.execute(
+        &sql,
+        rusqlite::params![path, media_type, mtime, width, height, thumbnail, format],
+    )?;
+    Ok(())
+}
+
 impl CacheDb {
     /// Get a cached thumbnail blob.
     pub fn get_thumbnail(&self, path: &str) -> Result<Option<CachedThumbnail>, CacheError> {
@@ -104,12 +153,17 @@ impl CacheDb {
         format: &str,
         resize_filter: &str,
     ) -> Result<(), CacheError> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO thumbnails (path, media_type, mtime, width, height, thumbnail, format, resize_filter)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![path, media_type, mtime, width, height, thumbnail, format, resize_filter],
-        )?;
-        Ok(())
+        write_standard_row(
+            self.conn(),
+            path,
+            media_type,
+            mtime,
+            width,
+            height,
+            thumbnail,
+            format,
+            resize_filter,
+        )
     }
 
     /// Get lightweight metadata about a cached thumbnail (no blob read).

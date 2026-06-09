@@ -1,6 +1,7 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show } from "solid-js";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, gifAtlasUrl, type ThumbTier } from "../../lib/ipc";
+import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
 import { isTauri } from "../../lib/runtime";
 import { GifCanvas } from "../GifCanvas";
@@ -110,16 +111,12 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
     return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
   };
 
-  const isVideo = () => {
-    const e = ext();
-    return ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"].includes(e);
-  };
+  const isVideo = () => VIDEO_EXTS.has(ext());
 
   const isGif = () => ext() === "gif";
 
   // Browser-decodable video subset — only these are worth a hover preview.
-  const isPlayableVideo = () =>
-    ["mp4", "mov", "webm", "m4v"].includes(ext());
+  const isPlayableVideo = () => PLAYABLE_VIDEO_EXTS.has(ext());
 
   // Whether this cell is actually intersecting the viewport. Drives GIF
   // autoplay so the virtual-scroll buffer's off-screen rows don't decode.
