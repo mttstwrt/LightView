@@ -265,82 +265,21 @@ pub async fn get_thumbnails_batch(
     // Derive ThumbHash + micro (T1) tier bytes in parallel on the CPU pool.
     // Done BEFORE the SQLite transaction so the inserts can include the
     // thumbhash blob and the micro row in the same commit path.
+    // `to_cache` is moved into the closure and handed back — the encoded
+    // blobs are large, so we avoid cloning them just for derivation.
     // -------------------------------------------------------------------
-    struct DerivedExtras {
-        path: String,
-        thumbhash: Option<Vec<u8>>,
-        micro_bytes: Option<Vec<u8>>,
-        micro_w: u32,
-        micro_h: u32,
-    }
-
-    let derived_extras: Vec<DerivedExtras> = {
-        use rayon::prelude::*;
-        // Capture what the rayon closure needs, without borrowing `to_cache`.
-        let inputs: Vec<(String, Vec<u8>, u32, u32)> = to_cache
-            .iter()
-            .map(|item| {
-                (
-                    item.path.clone(),
-                    item.data.clone(),
-                    item.width,
-                    item.height,
-                )
-            })
-            .collect();
-
+    let (to_cache, derived_extras): (Vec<CacheItem>, Vec<DerivedExtras>) = {
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.thumb_pool.spawn(move || {
-            let out: Vec<DerivedExtras> = inputs
-                .into_par_iter()
-                .map(|(path, data, w, h)| {
-                    let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            return DerivedExtras {
-                                path,
-                                thumbhash: None,
-                                micro_bytes: None,
-                                micro_w: 0,
-                                micro_h: 0,
-                            };
-                        }
-                    };
-
-                    // ThumbHash — ~25-byte compact placeholder (P1).
-                    let thumbhash = thumbnailer::compute_thumbhash(&rgba, w, h).ok();
-
-                    // Micro tier — 128x128 JPEG from the standard-tier RGBA (P2).
-                    let micro_target = 128u32;
-                    let (micro_bytes, micro_w, micro_h) = match thumbnailer::downsample_rgba_square(
-                        &rgba,
-                        w,
-                        h,
-                        micro_target,
-                    ) {
-                        Ok(resized) => match thumbnailer::encode_rgba_to_jpeg(
-                            &resized,
-                            micro_target,
-                            micro_target,
-                        ) {
-                            Ok(jpeg) => (Some(jpeg), micro_target, micro_target),
-                            Err(_) => (None, 0, 0),
-                        },
-                        Err(_) => (None, 0, 0),
-                    };
-
-                    DerivedExtras {
-                        path,
-                        thumbhash,
-                        micro_bytes,
-                        micro_w,
-                        micro_h,
-                    }
-                })
+            use rayon::prelude::*;
+            let extras: Vec<DerivedExtras> = to_cache
+                .par_iter()
+                .map(|item| derive_extras_from_bytes(&item.data, item.width, item.height))
                 .collect();
-            let _ = tx.send(out);
+            let _ = tx.send((to_cache, extras));
         });
-        rx.await.unwrap_or_default()
+        rx.await
+            .map_err(|_| "Thumbnail derivation task was dropped".to_string())?
     };
 
     // Batch-write thumbnails to SQLite in the generated format (single transaction)
@@ -361,24 +300,19 @@ pub async fn get_thumbnails_batch(
 
             // Write ThumbHash + micro tier rows in the same transaction so
             // queries never observe a split state (standard row present,
-            // placeholder/micro missing).
-            for extra in &derived_extras {
+            // placeholder/micro missing). `derived_extras` is index-aligned
+            // with `to_cache`.
+            for (item, extra) in to_cache.iter().zip(&derived_extras) {
                 if let Some(hash) = &extra.thumbhash {
                     let _ = tx.execute(
                         "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
-                        rusqlite::params![hash, extra.path],
+                        rusqlite::params![hash, item.path],
                     );
                 }
                 if let Some(bytes) = &extra.micro_bytes {
-                    // Find matching to_cache entry for media_type
-                    let media_type = to_cache
-                        .iter()
-                        .find(|c| c.path == extra.path)
-                        .map(|c| c.media_type.clone())
-                        .unwrap_or_default();
                     let _ = crate::cache::thumbnails::write_tier_row(
-                        &tx, ThumbTier::Micro, &extra.path, &media_type, 0,
-                        extra.micro_w, extra.micro_h, bytes, "jpeg",
+                        &tx, ThumbTier::Micro, &item.path, &item.media_type, 0,
+                        extra.micro_size, extra.micro_size, bytes, "jpeg",
                     );
                 }
             }
@@ -547,49 +481,14 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
     }
 
     // Derive micro + thumbhash on the CPU pool
-    struct Derived {
-        path: String,
-        media_type: String,
-        thumbhash: Option<Vec<u8>>,
-        micro_bytes: Option<Vec<u8>>,
-        micro_size: u32,
-    }
-
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.thumb_pool.spawn(move || {
         use rayon::prelude::*;
-        let out: Vec<Derived> = items
+        let out: Vec<(String, String, DerivedExtras)> = items
             .into_par_iter()
             .map(|(path, data, w, h, media_type)| {
-                let rgba = match thumbnailer::decode_thumb_bytes_to_rgba(&data) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return Derived {
-                            path,
-                            media_type,
-                            thumbhash: None,
-                            micro_bytes: None,
-                            micro_size: 0,
-                        };
-                    }
-                };
-
-                let thumbhash = thumbnailer::compute_thumbhash(&rgba, w, h).ok();
-
-                let micro_target = ThumbTier::Micro.target_size();
-                let micro_bytes = thumbnailer::downsample_rgba_square(&rgba, w, h, micro_target)
-                    .ok()
-                    .and_then(|resized| {
-                        thumbnailer::encode_rgba_to_jpeg(&resized, micro_target, micro_target).ok()
-                    });
-
-                Derived {
-                    path,
-                    media_type,
-                    thumbhash,
-                    micro_bytes,
-                    micro_size: micro_target,
-                }
+                let extras = derive_extras_from_bytes(&data, w, h);
+                (path, media_type, extras)
             })
             .collect();
         let _ = tx.send(out);
@@ -604,23 +503,23 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
     let mut db = state.cache_db.lock().await;
     let Some(db) = db.as_mut() else { return };
     let Ok(txn) = db.transaction() else { return };
-    for item in &derived {
-        if let Some(hash) = &item.thumbhash {
+    for (path, media_type, extras) in &derived {
+        if let Some(hash) = &extras.thumbhash {
             let _ = txn.execute(
                 "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2 AND thumbhash IS NULL",
-                rusqlite::params![hash, item.path],
+                rusqlite::params![hash, path],
             );
         }
-        if let Some(bytes) = &item.micro_bytes {
+        if let Some(bytes) = &extras.micro_bytes {
             let _ = txn.execute(
                 "INSERT OR IGNORE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
-                    item.path,
-                    item.media_type,
+                    path,
+                    media_type,
                     0u64,
-                    item.micro_size,
-                    item.micro_size,
+                    extras.micro_size,
+                    extras.micro_size,
                     bytes,
                     "jpeg"
                 ],
@@ -630,7 +529,7 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
     let _ = txn.commit();
     log::info!(
         "Derived micro tier for {} cached thumbnails ({} paths checked)",
-        derived.iter().filter(|d| d.micro_bytes.is_some()).count(),
+        derived.iter().filter(|(_, _, e)| e.micro_bytes.is_some()).count(),
         paths.len(),
     );
 }
@@ -1072,43 +971,49 @@ pub async fn ensure_tier_thumbnails(
     Ok(written)
 }
 
-/// Extras derived from a Standard-tier RGBA: compact placeholder + Micro
-/// tier bytes. Mirrors the derivation step in `get_thumbnails_batch` so a
-/// protocol-triggered Standard generation leaves the DB in the same shape
-/// as the batch path (standard row + thumbhash + micro row all present).
-struct StandardExtras {
+/// Extras derived from a Standard-tier thumbnail: ThumbHash placeholder +
+/// Micro (128px) tier bytes. Every Standard-tier generation path (batch,
+/// cached backfill, protocol miss) derives these so the DB always ends up
+/// in the same shape (standard row + thumbhash + micro row all present).
+struct DerivedExtras {
     thumbhash: Option<Vec<u8>>,
     micro_bytes: Option<Vec<u8>>,
     micro_size: u32,
 }
 
-/// Decode the just-generated Standard-tier bytes back to RGBA, compute the
-/// ThumbHash, and downsample to the 128px Micro tier. Runs on the CPU
-/// thumb pool so the tokio runtime stays responsive.
+impl DerivedExtras {
+    fn empty() -> Self {
+        DerivedExtras { thumbhash: None, micro_bytes: None, micro_size: 0 }
+    }
+}
+
+/// Decode Standard-tier bytes back to RGBA, compute the ThumbHash, and
+/// downsample to the Micro tier. CPU-bound — call from the thumb pool.
+fn derive_extras_from_bytes(data: &[u8], width: u32, height: u32) -> DerivedExtras {
+    let Ok(rgba) = thumbnailer::decode_thumb_bytes_to_rgba(data) else {
+        return DerivedExtras::empty();
+    };
+    let thumbhash = thumbnailer::compute_thumbhash(&rgba, width, height).ok();
+    let micro_size = ThumbTier::Micro.target_size();
+    let micro_bytes = thumbnailer::downsample_rgba_square(&rgba, width, height, micro_size)
+        .ok()
+        .and_then(|resized| thumbnailer::encode_rgba_to_jpeg(&resized, micro_size, micro_size).ok());
+    DerivedExtras { thumbhash, micro_bytes, micro_size }
+}
+
+/// Run [`derive_extras_from_bytes`] for a single thumbnail on the CPU thumb
+/// pool so the tokio runtime stays responsive.
 async fn derive_standard_extras(
     pool: &rayon::ThreadPool,
     data: Vec<u8>,
     width: u32,
     height: u32,
-) -> StandardExtras {
+) -> DerivedExtras {
     let (tx, rx) = tokio::sync::oneshot::channel();
     pool.spawn(move || {
-        let extras = match thumbnailer::decode_thumb_bytes_to_rgba(&data) {
-            Ok(rgba) => {
-                let thumbhash = thumbnailer::compute_thumbhash(&rgba, width, height).ok();
-                let micro_size = ThumbTier::Micro.target_size();
-                let micro_bytes = thumbnailer::downsample_rgba_square(&rgba, width, height, micro_size)
-                    .ok()
-                    .and_then(|resized| {
-                        thumbnailer::encode_rgba_to_jpeg(&resized, micro_size, micro_size).ok()
-                    });
-                StandardExtras { thumbhash, micro_bytes, micro_size }
-            }
-            Err(_) => StandardExtras { thumbhash: None, micro_bytes: None, micro_size: 0 },
-        };
-        let _ = tx.send(extras);
+        let _ = tx.send(derive_extras_from_bytes(&data, width, height));
     });
-    rx.await.unwrap_or(StandardExtras { thumbhash: None, micro_bytes: None, micro_size: 0 })
+    rx.await.unwrap_or_else(|_| DerivedExtras::empty())
 }
 
 /// Generate a single thumbnail for the requested tier, persist it, and
