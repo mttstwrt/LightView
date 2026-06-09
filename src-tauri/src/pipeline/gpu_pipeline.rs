@@ -1,7 +1,6 @@
 //! Unified wgpu GPU pipeline for LightView.
 //!
 //! Hosts all GPU compute pipelines on a single device/queue:
-//! - Resize: bilinear/nearest downsample (ported from gpu_resize.rs)
 //! - Crop+Resize: fused center-crop and downsample in one dispatch
 //! - Image Transform: rotation, exposure, color adjustments for the viewer
 //!
@@ -9,40 +8,6 @@
 //! returns `None` and the app uses the existing CPU paths.
 
 use bytemuck::{Pod, Zeroable};
-
-// ---------------------------------------------------------------------------
-// Resize shader (ported from gpu_resize.rs)
-// ---------------------------------------------------------------------------
-
-const RESIZE_SHADER: &str = r#"
-struct Params {
-    src_width: u32,
-    src_height: u32,
-    dst_width: u32,
-    dst_height: u32,
-}
-
-@group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var<storage, read_write> output: array<u32>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-@compute @workgroup_size(16, 16)
-fn resize(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.dst_width || gid.y >= params.dst_height) {
-        return;
-    }
-
-    let uv = vec2f(
-        (f32(gid.x) + 0.5) / f32(params.dst_width),
-        (f32(gid.y) + 0.5) / f32(params.dst_height),
-    );
-
-    let color = textureSampleLevel(src, samp, uv, 0.0);
-    let idx = gid.y * params.dst_width + gid.x;
-    output[idx] = pack4x8unorm(color);
-}
-"#;
 
 // ---------------------------------------------------------------------------
 // Crop + Resize shader (fused — eliminates CPU center-crop)
@@ -162,15 +127,6 @@ fn transform(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct ResizeParams {
-    src_width: u32,
-    src_height: u32,
-    dst_width: u32,
-    dst_height: u32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
 pub struct CropResizeParams {
     pub src_width: u32,
     pub src_height: u32,
@@ -199,13 +155,6 @@ pub struct TransformParams {
     pub _pad2: f32,
 }
 
-/// Input for a single GPU resize operation.
-pub struct ResizeInput {
-    pub rgba_data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-}
-
 /// Output of a single GPU resize operation.
 pub struct ResizeOutput {
     pub rgba_data: Vec<u8>,
@@ -227,10 +176,6 @@ pub struct CropResizeInput {
 pub struct GpuPipeline {
     device: wgpu::Device,
     queue: wgpu::Queue,
-
-    // Resize (standalone)
-    resize_pipeline: wgpu::ComputePipeline,
-    resize_bgl: wgpu::BindGroupLayout,
 
     // Crop + Resize (fused)
     crop_resize_pipeline: wgpu::ComputePipeline,
@@ -349,14 +294,6 @@ impl GpuPipeline {
             });
 
         // --- Create pipelines ---
-        let resize_pipeline = Self::create_pipeline(
-            &device,
-            "resize",
-            RESIZE_SHADER,
-            "resize",
-            &texture_sample_bgl,
-        );
-
         let crop_resize_pipeline = Self::create_pipeline(
             &device,
             "crop-resize",
@@ -374,7 +311,7 @@ impl GpuPipeline {
         );
 
         log::info!(
-            "GPU pipeline initialised — {} ({}) — resize, crop+resize, transform",
+            "GPU pipeline initialised — {} ({}) — crop+resize, transform",
             info.name,
             info.backend
         );
@@ -382,8 +319,6 @@ impl GpuPipeline {
         Some(Self {
             device,
             queue,
-            resize_pipeline,
-            resize_bgl: texture_sample_bgl.clone(),
             crop_resize_pipeline,
             crop_resize_bgl: texture_sample_bgl.clone(),
             transform_pipeline,
@@ -419,182 +354,6 @@ impl GpuPipeline {
             compilation_options: Default::default(),
             cache: None,
         })
-    }
-
-    // -----------------------------------------------------------------------
-    // Resize (ported from GpuResizer)
-    // -----------------------------------------------------------------------
-
-    /// Resize a batch of RGBA images to `target_w × target_h`.
-    pub fn resize_batch(
-        &self,
-        inputs: &[ResizeInput],
-        target_w: u32,
-        target_h: u32,
-        bilinear: bool,
-    ) -> Vec<Option<ResizeOutput>> {
-        const CHUNK: usize = 32;
-        let mut results = Vec::with_capacity(inputs.len());
-        for chunk in inputs.chunks(CHUNK) {
-            results.extend(self.resize_chunk(chunk, target_w, target_h, bilinear));
-        }
-        results
-    }
-
-    fn resize_chunk(
-        &self,
-        inputs: &[ResizeInput],
-        target_w: u32,
-        target_h: u32,
-        bilinear: bool,
-    ) -> Vec<Option<ResizeOutput>> {
-        use wgpu::util::DeviceExt;
-
-        let output_bytes = (target_w * target_h * 4) as u64;
-        let sampler = if bilinear {
-            &self.sampler_bilinear
-        } else {
-            &self.sampler_nearest
-        };
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("resize-enc"),
-            });
-
-        let mut readbacks: Vec<Option<wgpu::Buffer>> = Vec::with_capacity(inputs.len());
-
-        for input in inputs {
-            let expected = (input.width as usize) * (input.height as usize) * 4;
-            if input.rgba_data.len() < expected || input.width == 0 || input.height == 0 {
-                readbacks.push(None);
-                continue;
-            }
-
-            let tex = self.device.create_texture_with_data(
-                &self.queue,
-                &wgpu::TextureDescriptor {
-                    label: None,
-                    size: wgpu::Extent3d {
-                        width: input.width,
-                        height: input.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                &input.rgba_data[..expected],
-            );
-            let tex_view = tex.create_view(&Default::default());
-
-            let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: output_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: output_bytes,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let params = ResizeParams {
-                src_width: input.width,
-                src_height: input.height,
-                dst_width: target_w,
-                dst_height: target_h,
-            };
-            let param_buf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.resize_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&tex_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: out_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: param_buf.as_entire_binding(),
-                    },
-                ],
-            });
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.resize_pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups((target_w + 15) / 16, (target_h + 15) / 16, 1);
-            }
-
-            encoder.copy_buffer_to_buffer(&out_buf, 0, &readback, 0, output_bytes);
-            readbacks.push(Some(readback));
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        let mut receivers = Vec::with_capacity(readbacks.len());
-        for rb in &readbacks {
-            if let Some(buf) = rb {
-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                    let _ = tx.send(r);
-                });
-                receivers.push(Some(rx));
-            } else {
-                receivers.push(None);
-            }
-        }
-
-        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-
-        let mut results = Vec::with_capacity(readbacks.len());
-        for (rb, rx) in readbacks.into_iter().zip(receivers) {
-            match (rb, rx) {
-                (Some(buf), Some(rx)) => match rx.recv() {
-                    Ok(Ok(())) => {
-                        let data = buf.slice(..).get_mapped_range().to_vec();
-                        buf.unmap();
-                        results.push(Some(ResizeOutput {
-                            rgba_data: data,
-                            width: target_w,
-                            height: target_h,
-                        }));
-                    }
-                    _ => results.push(None),
-                },
-                _ => results.push(None),
-            }
-        }
-
-        results
     }
 
     // -----------------------------------------------------------------------

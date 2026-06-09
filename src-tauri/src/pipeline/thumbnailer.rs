@@ -2,11 +2,8 @@ use fast_image_resize as fir;
 use fir::images::{Image, ImageRef};
 use image::GenericImageView;
 use memmap2::Mmap;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Standard tier thumbnail size (512px square).
 pub const STANDARD_THUMB_SIZE: u32 = 512;
@@ -101,8 +98,6 @@ pub enum ThumbError {
     Encode(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Stale generation (cancelled)")]
-    Cancelled,
 }
 
 /// Memory-map a file for zero-copy reads.
@@ -482,16 +477,6 @@ pub fn compute_thumbhash(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>
     Ok(thumbhash::rgba_to_thumb_hash(sw as usize, sh as usize, &src))
 }
 
-/// Encode RGBA pixels to JPEG. Used when deriving tier bytes for storage.
-pub fn encode_rgba_to_jpeg_tier(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbError> {
-    let rgb = rgba_to_rgb(rgba);
-    let mut buf = std::io::Cursor::new(Vec::with_capacity(16_000));
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
-    enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)
-        .map_err(|e| ThumbError::Encode(e.to_string()))?;
-    Ok(buf.into_inner())
-}
-
 /// Generate a thumbnail for a single image file.
 /// Uses fast JPEG DCT-scaled decode for JPEGs, falls back to image crate for others.
 pub fn generate_image_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
@@ -528,109 +513,13 @@ pub fn generate_for_path(path: &Path, filter: ResizeFilter, format: ThumbFormat,
     }
 }
 
-/// Generate thumbnails for a batch of paths in parallel using rayon.
-pub fn generate_batch_parallel(paths: &[String], filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Vec<(String, Result<ThumbResult, ThumbError>)> {
-    paths
-        .par_iter()
-        .map(|path_str| {
-            let path = Path::new(path_str);
-            let result = generate_for_path(path, filter, format, thumb_w, thumb_h);
-            (path_str.clone(), result)
-        })
-        .collect()
-}
-
-/// Generate thumbnails for a batch of image paths in parallel.
-/// Respects the generation counter — if it changes, workers stop.
-pub fn generate_batch(
-    paths: &[String],
-    filter: ResizeFilter,
-    format: ThumbFormat,
-    thumb_w: u32,
-    thumb_h: u32,
-    generation: Arc<AtomicU64>,
-    expected_gen: u64,
-) -> Vec<Result<ThumbResult, ThumbError>> {
-    paths
-        .par_iter()
-        .map(|path_str| {
-            if generation.load(Ordering::Relaxed) != expected_gen {
-                return Err(ThumbError::Cancelled);
-            }
-            let path = Path::new(path_str);
-            generate_for_path(path, filter, format, thumb_w, thumb_h)
-        })
-        .collect()
-}
-
 /// Compute a center crop region to extract the largest square from an image.
 /// Returns (x_offset, y_offset, side_length).
-pub fn compute_crop_rect(w: u32, h: u32) -> (u32, u32, u32) {
+fn center_crop_square(w: u32, h: u32) -> (u32, u32, u32) {
     let side = w.min(h);
     let x = (w - side) / 2;
     let y = (h - side) / 2;
     (x, y, side)
-}
-
-// Private alias for backward compatibility within this module.
-fn center_crop_square(w: u32, h: u32) -> (u32, u32, u32) {
-    compute_crop_rect(w, h)
-}
-
-// ---------------------------------------------------------------------------
-// GPU batch helpers — decode + crop on CPU, resize on GPU, encode on CPU
-// ---------------------------------------------------------------------------
-
-/// Result of the decode + crop phase (before resize).
-pub struct DecodedCrop {
-    /// Center-cropped RGBA pixels.
-    pub rgba: Vec<u8>,
-    /// Crop dimensions (square).
-    pub crop_side: u32,
-    /// Original source dimensions.
-    pub src_width: u32,
-    pub src_height: u32,
-    /// Media type string.
-    pub media_type: String,
-    /// Original path.
-    pub path: String,
-}
-
-/// Decode an image and center-crop to a square. Returns RGBA pixels ready for resize.
-pub fn decode_and_crop(path: &Path) -> Result<DecodedCrop, ThumbError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let media_type = match ext.as_str() {
-        "gif" => "gif",
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => "video",
-        _ => "image",
-    };
-
-    // Decode to RGBA
-    let (rgba_buf, dw, dh, src_w, src_h) = match ext.as_str() {
-        "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
-        "heic" | "heif" => decode_heic_to_rgba(path)?,
-        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv" => {
-            decode_video_to_rgba(path)?
-        }
-        _ => decode_generic_to_rgba(path)?,
-    };
-
-    let (cx, cy, side) = center_crop_square(dw, dh);
-    let cropped = crop_rgba(&rgba_buf, dw, cx, cy, side, side);
-
-    Ok(DecodedCrop {
-        rgba: cropped,
-        crop_side: side,
-        src_width: src_w,
-        src_height: src_h,
-        media_type: media_type.to_string(),
-        path: path.to_string_lossy().to_string(),
-    })
 }
 
 /// Result of decoding an image without cropping — full RGBA + dimensions + crop rect.
@@ -679,7 +568,7 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
         _ => decode_generic_to_rgba(path)?,
     };
 
-    let (cx, cy, side) = compute_crop_rect(dw, dh);
+    let (cx, cy, side) = center_crop_square(dw, dh);
 
     Ok(DecodedImage {
         rgba: rgba_buf,

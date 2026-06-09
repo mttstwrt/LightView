@@ -69,8 +69,6 @@ opt-level = 2
 default = ["custom-protocol", "gpu"]
 custom-protocol = ["tauri/custom-protocol"]
 gpu = ["dep:wgpu", "dep:pollster"]
-# Legacy alias
-gpu-resize = ["gpu"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

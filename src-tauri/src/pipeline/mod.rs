@@ -3,6 +3,3 @@ pub mod heic_cache;
 pub mod exif;
 #[cfg(feature = "gpu")]
 pub mod gpu_pipeline;
-// Legacy alias — gpu_pipeline supersedes gpu_resize
-#[cfg(all(feature = "gpu-resize", not(feature = "gpu")))]
-pub mod gpu_resize;

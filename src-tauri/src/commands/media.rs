@@ -318,7 +318,7 @@ pub async fn get_thumbnails_batch(
                         h,
                         micro_target,
                     ) {
-                        Ok(resized) => match thumbnailer::encode_rgba_to_jpeg_tier(
+                        Ok(resized) => match thumbnailer::encode_rgba_to_jpeg(
                             &resized,
                             micro_target,
                             micro_target,
@@ -590,7 +590,7 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
                 let micro_bytes = thumbnailer::downsample_rgba_square(&rgba, w, h, micro_target)
                     .ok()
                     .and_then(|resized| {
-                        thumbnailer::encode_rgba_to_jpeg_tier(&resized, micro_target, micro_target).ok()
+                        thumbnailer::encode_rgba_to_jpeg(&resized, micro_target, micro_target).ok()
                     });
 
                 Derived {
@@ -706,84 +706,6 @@ pub async fn regenerate_thumbnail(
         }
         Err(e) => Err(format!("Thumbnail generation failed: {}", e)),
     }
-}
-
-/// Get the full-resolution media file as a base64-encoded data URI.
-///
-/// **Prefer the `lightview://media/` protocol** for loading images — it serves
-/// binary data directly without the ~33% Base64 inflation overhead.  This
-/// command exists as a fallback and imposes a 100 MB file-size limit to
-/// prevent OOM crashes from Base64-encoding very large files.
-#[tauri::command]
-pub async fn get_full_media(
-    state: tauri::State<'_, AppState>,
-    path: String,
-) -> Result<String, String> {
-    /// Maximum file size allowed through this IPC path (100 MB).
-    /// Base64 inflates by ~33%, so a 100 MB file becomes ~133 MB of string.
-    const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
-
-    let gallery_path = state
-        .current_gallery
-        .read()
-        .await
-        .clone()
-        .ok_or("No gallery open")?;
-
-    // Check file size before reading
-    let file_size = std::fs::metadata(&path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    if file_size > MAX_FILE_SIZE {
-        return Err(format!(
-            "File too large for IPC ({:.1} MB). Use the lightview://media/ protocol instead.",
-            file_size as f64 / (1024.0 * 1024.0)
-        ));
-    }
-
-    let ext = std::path::Path::new(&path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    // HEIC/HEIF: transcode to JPEG since browsers can't render HEIC natively.
-    // The transcode cache reads the file itself and is keyed by (path, mtime),
-    // so we skip the provider read on this path.
-    if ext == "heic" || ext == "heif" {
-        let src_path = std::path::Path::new(&path);
-        let jpeg_data = crate::pipeline::heic_cache::get_or_transcode(src_path)
-            .map_err(|e| format!("HEIC transcode failed: {}", e))?;
-        let b64 = encode_b64(&jpeg_data);
-        return Ok(format!("data:image/jpeg;base64,{}", b64));
-    }
-
-    let reg = state.providers.read().await;
-    let provider = reg.get(&gallery_path).ok_or("Provider not found")?;
-
-    let data = provider
-        .read_file(&path)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "avif" => "image/avif",
-        "tiff" | "tif" => "image/tiff",
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "avi" => "video/x-msvideo",
-        "mkv" => "video/x-matroska",
-        "webm" => "video/webm",
-        _ => "application/octet-stream",
-    };
-
-    let b64 = encode_b64(&data);
-    Ok(format!("data:{};base64,{}", mime, b64))
 }
 
 /// Get metadata for a media file from the media_meta cache table.
@@ -1205,7 +1127,7 @@ async fn derive_standard_extras(
                 let micro_bytes = thumbnailer::downsample_rgba_square(&rgba, width, height, micro_size)
                     .ok()
                     .and_then(|resized| {
-                        thumbnailer::encode_rgba_to_jpeg_tier(&resized, micro_size, micro_size).ok()
+                        thumbnailer::encode_rgba_to_jpeg(&resized, micro_size, micro_size).ok()
                     });
                 StandardExtras { thumbhash, micro_bytes, micro_size }
             }

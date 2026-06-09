@@ -277,7 +277,6 @@ fn main() {
             // Media commands
             commands::media::get_thumbnail,
             commands::media::get_thumbnails_batch,
-            commands::media::get_full_media,
             commands::media::get_media_meta,
             commands::media::regenerate_thumbnail,
             commands::media::get_cached_thumbnail_info,

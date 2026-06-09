@@ -258,9 +258,6 @@ export interface PrecacheResult {
 export const precacheThumbnails = (paths: string[]) =>
   invoke<PrecacheResult>("precache_thumbnails", { paths });
 
-export const getFullMedia = (path: string) =>
-  invoke<string>("get_full_media", { path });
-
 export const getMediaMeta = (path: string) =>
   invoke<{
     path: string;

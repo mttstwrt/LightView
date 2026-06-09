@@ -89,48 +89,18 @@ fn bench_png_thumbnail(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_decode_and_crop(c: &mut Criterion) {
-    let mut group = c.benchmark_group("decode_and_crop");
+fn bench_decode_image(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decode_image");
 
     let (_dir_jpg, path_jpg) = create_test_jpeg(4000, 3000);
     let (_dir_png, path_png) = create_test_png(4000, 3000);
 
     group.bench_function("jpeg/4000x3000", |b| {
-        b.iter(|| thumbnailer::decode_and_crop(black_box(&path_jpg)).expect("decode"))
+        b.iter(|| thumbnailer::decode_image(black_box(&path_jpg)).expect("decode"))
     });
 
     group.bench_function("png/4000x3000", |b| {
-        b.iter(|| thumbnailer::decode_and_crop(black_box(&path_png)).expect("decode"))
-    });
-
-    group.finish();
-}
-
-fn bench_batch_parallel(c: &mut Criterion) {
-    let mut group = c.benchmark_group("batch_parallel");
-    group.sample_size(10);
-
-    // Create 50 test images
-    let mut dirs = Vec::new();
-    let mut paths = Vec::new();
-    for i in 0..50 {
-        let w = 1920 + (i % 3) * 500;
-        let h = 1080 + (i % 3) * 400;
-        let (dir, path) = create_test_jpeg(w, h);
-        paths.push(path.to_string_lossy().to_string());
-        dirs.push(dir);
-    }
-
-    group.bench_function("50_images/nearest", |b| {
-        b.iter(|| {
-            thumbnailer::generate_batch_parallel(
-                black_box(&paths),
-                ResizeFilter::Nearest,
-                ThumbFormat::Jpeg,
-                STANDARD_THUMB_SIZE,
-                STANDARD_THUMB_SIZE,
-            )
-        })
+        b.iter(|| thumbnailer::decode_image(black_box(&path_png)).expect("decode"))
     });
 
     group.finish();
@@ -167,8 +137,7 @@ criterion_group!(
     benches,
     bench_jpeg_thumbnail,
     bench_png_thumbnail,
-    bench_decode_and_crop,
-    bench_batch_parallel,
+    bench_decode_image,
     bench_resize_filters,
 );
 criterion_main!(benches);

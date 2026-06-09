@@ -71,21 +71,6 @@ impl ThumbTier {
 }
 
 impl CacheDb {
-    /// Check if a thumbnail is cached and still valid (mtime matches).
-    pub fn thumbnail_is_valid(&self, path: &str, current_mtime: u64) -> Result<bool, CacheError> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached("SELECT mtime FROM thumbnails WHERE path = ?1")?;
-        let mut rows = stmt.query(rusqlite::params![path])?;
-        match rows.next()? {
-            Some(row) => {
-                let cached_mtime: u64 = row.get(0)?;
-                Ok(cached_mtime == current_mtime)
-            }
-            None => Ok(false),
-        }
-    }
-
     /// Get a cached thumbnail blob.
     pub fn get_thumbnail(&self, path: &str) -> Result<Option<CachedThumbnail>, CacheError> {
         let mut stmt = self.conn().prepare_cached(
@@ -127,21 +112,6 @@ impl CacheDb {
         Ok(())
     }
 
-    /// Get all cached thumbnail paths (for checking what needs regeneration).
-    pub fn all_thumbnail_paths(&self) -> Result<Vec<(String, u64)>, CacheError> {
-        let mut stmt = self
-            .conn()
-            .prepare("SELECT path, mtime FROM thumbnails")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
-    }
-
     /// Get lightweight metadata about a cached thumbnail (no blob read).
     pub fn get_thumbnail_info(
         &self,
@@ -178,17 +148,6 @@ impl CacheDb {
     // -------------------------------------------------------------------
     // ThumbHash (P1) — ~25-byte placeholder blob on the `thumbnails` row.
     // -------------------------------------------------------------------
-
-    /// Set the ThumbHash placeholder for a path. Creates/overwrites
-    /// the thumbhash column on the existing thumbnails row (no-op if
-    /// the row doesn't exist yet — upsert_thumbnail will handle that).
-    pub fn set_thumbhash(&self, path: &str, hash: &[u8]) -> Result<(), CacheError> {
-        self.conn().execute(
-            "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
-            rusqlite::params![hash, path],
-        )?;
-        Ok(())
-    }
 
     /// Fetch a single thumbhash blob by path. None if not cached yet.
     pub fn get_thumbhash(&self, path: &str) -> Result<Option<Vec<u8>>, CacheError> {
@@ -227,35 +186,6 @@ impl CacheDb {
     // The Standard tier still lives in `thumbnails`; use the original
     // methods above for that case.
     // -------------------------------------------------------------------
-
-    /// Upsert a non-standard-tier thumbnail (micro / large / preview).
-    pub fn upsert_tier(
-        &self,
-        tier: ThumbTier,
-        path: &str,
-        media_type: &str,
-        mtime: u64,
-        width: u32,
-        height: u32,
-        thumbnail: &[u8],
-        format: &str,
-    ) -> Result<(), CacheError> {
-        if matches!(tier, ThumbTier::Standard) {
-            return self.upsert_thumbnail(
-                path, media_type, mtime, width, height, thumbnail, format, "nearest",
-            );
-        }
-        let sql = format!(
-            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            tier.table()
-        );
-        self.conn().execute(
-            &sql,
-            rusqlite::params![path, media_type, mtime, width, height, thumbnail, format],
-        )?;
-        Ok(())
-    }
 
     /// Get metadata for all cached thumbnail tiers for a given path.
     /// Returns (tier_name, width, height, size_bytes, format, resize_filter_or_none) per tier.
