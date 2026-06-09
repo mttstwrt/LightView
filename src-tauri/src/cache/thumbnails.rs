@@ -1,4 +1,22 @@
 use crate::cache::db::{CacheDb, CacheError};
+use std::collections::{HashMap, HashSet};
+
+/// Maximum number of bound parameters per IN-list query. SQLite's default
+/// variable limit is far higher, but 900 keeps us safely under the old
+/// 999-variable floor.
+const IN_CHUNK: usize = 900;
+
+/// Build "?,?,?" with `n` placeholders.
+fn placeholders(n: usize) -> String {
+    let mut s = String::with_capacity(n * 2);
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('?');
+    }
+    s
+}
 
 /// A cached thumbnail record.
 pub struct CachedThumbnail {
@@ -166,6 +184,42 @@ impl CacheDb {
         )
     }
 
+    /// Bulk metadata lookup for the standard tier. Returns
+    /// `path → (width, height, format, has_micro_row)`; paths without a
+    /// cached thumbnail are absent from the map. One IN-list query per 900
+    /// paths instead of two point queries per path.
+    pub fn get_thumbnail_info_batch(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, (u32, u32, String, bool)>, CacheError> {
+        let mut out = HashMap::with_capacity(paths.len());
+        for chunk in paths.chunks(IN_CHUNK) {
+            let sql = format!(
+                "SELECT t.path, t.width, t.height, t.format,
+                        EXISTS(SELECT 1 FROM thumbnails_micro m WHERE m.path = t.path)
+                 FROM thumbnails t WHERE t.path IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut stmt = self.conn().prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ),
+                ))
+            })?;
+            for row in rows {
+                let (path, info) = row?;
+                out.insert(path, info);
+            }
+        }
+        Ok(out)
+    }
+
     /// Get lightweight metadata about a cached thumbnail (no blob read).
     pub fn get_thumbnail_info(
         &self,
@@ -221,18 +275,24 @@ impl CacheDb {
     /// Bulk-fetch thumbhashes for a list of paths. Returned in the same
     /// order as `paths`; missing/null entries become `None`.
     pub fn get_thumbhashes(&self, paths: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")?;
-        let mut out = Vec::with_capacity(paths.len());
-        for path in paths {
-            let mut rows = stmt.query(rusqlite::params![path])?;
-            out.push(match rows.next()? {
-                Some(row) => row.get::<_, Option<Vec<u8>>>(0)?,
-                None => None,
-            });
+        let mut map: HashMap<String, Vec<u8>> = HashMap::new();
+        for chunk in paths.chunks(IN_CHUNK) {
+            let sql = format!(
+                "SELECT path, thumbhash FROM thumbnails WHERE path IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut stmt = self.conn().prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            })?;
+            for row in rows {
+                let (path, hash) = row?;
+                if let Some(hash) = hash {
+                    map.insert(path, hash);
+                }
+            }
         }
-        Ok(out)
+        Ok(paths.iter().map(|p| map.remove(p)).collect())
     }
 
     // -------------------------------------------------------------------
@@ -300,5 +360,30 @@ impl CacheDb {
         let mut stmt = self.conn().prepare_cached(&sql)?;
         let mut rows = stmt.query(rusqlite::params![path])?;
         Ok(rows.next()?.is_some())
+    }
+
+    /// Which of `paths` already have a row in `tier`'s table. One IN-list
+    /// query per 900 paths instead of a point query per path.
+    pub fn tier_cached_set(
+        &self,
+        tier: ThumbTier,
+        paths: &[String],
+    ) -> Result<HashSet<String>, CacheError> {
+        let mut out = HashSet::with_capacity(paths.len());
+        for chunk in paths.chunks(IN_CHUNK) {
+            let sql = format!(
+                "SELECT path FROM {} WHERE path IN ({})",
+                tier.table(),
+                placeholders(chunk.len())
+            );
+            let mut stmt = self.conn().prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out)
     }
 }

@@ -134,33 +134,34 @@ pub async fn get_thumbnails_batch(
     // These need derivation from the cached standard-tier bytes.
     let mut micro_missing: Vec<String> = Vec::new();
 
-    // Phase 1: Check SQLite cache — return as-is if format matches, otherwise regenerate
+    // Phase 1: Check SQLite cache — return as-is if format matches, otherwise
+    // regenerate. One batched IN-list query covers thumbnail info + micro
+    // presence for the whole batch.
     let requested_fmt = format.as_cache_str();
     {
         let db = state.cache_db.lock().await;
         let db = db.as_ref().ok_or("No gallery open")?;
+        let info = db
+            .get_thumbnail_info_batch(&paths)
+            .map_err(|e| e.to_string())?;
 
         for path in &paths {
-            if let Ok(Some(info)) = db.get_thumbnail_info(path) {
-                let (w, h, _sz, ref fmt, _) = info;
-                if fmt == requested_fmt {
+            match info.get(path) {
+                Some((w, h, fmt, has_micro)) if fmt == requested_fmt => {
                     results.push(ThumbnailResult {
                         path: path.clone(),
-                        width: w,
-                        height: h,
+                        width: *w,
+                        height: *h,
                         media_type: String::new(),
                         format: fmt.clone(),
                     });
-                    // Check if micro tier is missing for this cached path
-                    if !db.tier_is_cached(ThumbTier::Micro, path).unwrap_or(false) {
+                    // Micro tier missing for this cached path — derive it below.
+                    if !has_micro {
                         micro_missing.push(path.clone());
                     }
-                } else {
-                    // Format mismatch — regenerate
-                    uncached_paths.push(path.clone());
                 }
-            } else {
-                uncached_paths.push(path.clone());
+                // Format mismatch or not cached — (re)generate.
+                _ => uncached_paths.push(path.clone()),
             }
         }
     }
@@ -694,14 +695,12 @@ pub async fn precache_thumbnails(
     let uncached: Vec<String> = {
         let db = state.cache_db.lock().await;
         let db = db.as_ref().ok_or("No gallery open")?;
+        let info = db
+            .get_thumbnail_info_batch(&paths)
+            .map_err(|e| e.to_string())?;
         paths
             .into_iter()
-            .filter(|p| {
-                match db.get_thumbnail_info(p) {
-                    Ok(Some((_w, _h, _sz, ref fmt, _))) => fmt != requested_fmt,
-                    _ => true,
-                }
-            })
+            .filter(|p| info.get(p).map(|(_, _, fmt, _)| fmt != requested_fmt).unwrap_or(true))
             .collect()
     };
 
@@ -914,9 +913,10 @@ pub async fn ensure_tier_thumbnails(
     let missing: Vec<String> = {
         let db = state.cache_db.lock().await;
         let db = db.as_ref().ok_or("No gallery open")?;
+        let cached = db.tier_cached_set(tier, &paths).map_err(|e| e.to_string())?;
         paths
             .into_iter()
-            .filter(|p| !db.tier_is_cached(tier, p).unwrap_or(false))
+            .filter(|p| !cached.contains(p))
             .collect()
     };
 
