@@ -350,6 +350,16 @@ async fn generate_batch_gpu(
         decode_image, encode_rgba_to_jpeg, DecodedImage, ThumbFormat, ThumbResult,
     };
 
+    // Per-image metadata carried past the GPU phase. The decoded RGBA is
+    // moved into the GPU input (it can be several MB per image), so only
+    // these few fields survive for phase 3.
+    struct DecodedMeta {
+        path: String,
+        media_type: String,
+        src_width: u32,
+        src_height: u32,
+    }
+
     // Phase 1: Decode on CPU (rayon)
     let (tx, rx) = tokio::sync::oneshot::channel();
     let paths_owned: Vec<String> = paths.to_vec();
@@ -362,20 +372,25 @@ async fn generate_batch_gpu(
     });
     let decoded = rx.await.ok()?;
 
+    // Failed decodes are dropped here, so `gpu_inputs` and `metas` stay
+    // index-aligned with each other and with the GPU output.
     let mut gpu_inputs = Vec::with_capacity(decoded.len());
-    let mut gpu_indices = Vec::with_capacity(decoded.len());
-    for (i, img) in decoded.iter().enumerate() {
-        if let Some(d) = img {
-            gpu_inputs.push(CropResizeInput {
-                rgba_data: d.rgba.clone(),
-                width: d.width,
-                height: d.height,
-                crop_x: d.crop_x,
-                crop_y: d.crop_y,
-                crop_size: d.crop_size,
-            });
-            gpu_indices.push(i);
-        }
+    let mut metas = Vec::with_capacity(decoded.len());
+    for d in decoded.into_iter().flatten() {
+        gpu_inputs.push(CropResizeInput {
+            rgba_data: d.rgba,
+            width: d.width,
+            height: d.height,
+            crop_x: d.crop_x,
+            crop_y: d.crop_y,
+            crop_size: d.crop_size,
+        });
+        metas.push(DecodedMeta {
+            path: d.path,
+            media_type: d.media_type,
+            src_width: d.src_width,
+            src_height: d.src_height,
+        });
     }
 
     if gpu_inputs.is_empty() {
@@ -395,40 +410,37 @@ async fn generate_batch_gpu(
 
     // Phase 3: Encode output on CPU (rayon)
     let (tx3, rx3) = tokio::sync::oneshot::channel();
-    let decoded_ref: Vec<Option<DecodedImage>> = decoded;
     pool.spawn(move || {
         let mut results = Vec::new();
-        for (gpu_idx, resize_out) in resized.into_iter().enumerate() {
-            let orig_idx = gpu_indices[gpu_idx];
-            if let (Some(resized), Some(img)) = (resize_out, &decoded_ref[orig_idx]) {
-                let encoded = match format {
-                    ThumbFormat::Jpeg => encode_rgba_to_jpeg(
-                        &resized.rgba_data,
-                        resized.width,
-                        resized.height,
-                    ),
-                    ThumbFormat::Webp => crate::pipeline::thumbnailer::encode_rgba_to_webp(
-                        &resized.rgba_data,
-                        resized.width,
-                        resized.height,
-                    ),
-                };
-                match encoded {
-                    Ok(data) => {
-                        results.push(ThumbResult {
-                            path: img.path.clone(),
-                            width: resized.width,
-                            height: resized.height,
-                            data,
-                            media_type: img.media_type.clone(),
-                            src_width: img.src_width,
-                            src_height: img.src_height,
-                            format,
-                        });
-                    }
-                    Err(e) => {
-                        log::warn!("Encode failed for {}: {}", img.path, e);
-                    }
+        for (resize_out, meta) in resized.into_iter().zip(metas) {
+            let Some(resized) = resize_out else { continue };
+            let encoded = match format {
+                ThumbFormat::Jpeg => encode_rgba_to_jpeg(
+                    &resized.rgba_data,
+                    resized.width,
+                    resized.height,
+                ),
+                ThumbFormat::Webp => crate::pipeline::thumbnailer::encode_rgba_to_webp(
+                    &resized.rgba_data,
+                    resized.width,
+                    resized.height,
+                ),
+            };
+            match encoded {
+                Ok(data) => {
+                    results.push(ThumbResult {
+                        path: meta.path,
+                        width: resized.width,
+                        height: resized.height,
+                        data,
+                        media_type: meta.media_type,
+                        src_width: meta.src_width,
+                        src_height: meta.src_height,
+                        format,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Encode failed for {}: {}", meta.path, e);
                 }
             }
         }
