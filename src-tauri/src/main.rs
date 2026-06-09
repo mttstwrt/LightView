@@ -351,6 +351,8 @@ fn main() {
             commands::settings::set_remote_password,
             commands::settings::clear_remote_password,
             commands::settings::set_remote_inactivity,
+            commands::settings::get_upload_config,
+            commands::settings::set_upload_config,
             commands::settings::reindex_gallery,
             commands::settings::rebuild_thumbnails,
             commands::settings::clear_cache,

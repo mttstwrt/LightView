@@ -545,6 +545,91 @@ export const clearRemotePassword = () =>
 export const setRemoteInactivity = (secs: number) =>
   invoke<void>("set_remote_inactivity", { secs });
 
+// ---------------------------------------------------------------------------
+// Device uploads (web client → host gallery)
+// ---------------------------------------------------------------------------
+
+/** How uploaded files are foldered under `Uploads/` on the host. Mirrors the
+ *  Rust `UploadScheme`. */
+export type UploadScheme = "year" | "year_month" | "year_album" | "flat";
+
+export interface UploadConfig {
+  enabled: boolean;
+  scheme: UploadScheme;
+}
+
+/** Works in both modes: Tauri command on desktop, `/api/invoke` bridge on the
+ *  web client (the only upload-related command on the read-only allowlist). */
+export const getUploadConfig = () => invoke<UploadConfig>("get_upload_config");
+
+/** Host-only (desktop) — sets the per-gallery upload config. */
+export const setUploadConfig = (enabled: boolean, scheme: UploadScheme) =>
+  invoke<void>("set_upload_config", { enabled, scheme });
+
+export interface UploadResult {
+  uploaded: { original: string; stored: string }[];
+  rejected: { original: string; reason: string }[];
+}
+
+/** Low-level POST to `/api/upload` with upload-progress reporting. Uses
+ *  XMLHttpRequest because `fetch` can't report request-body upload progress. */
+function _postUpload(
+  form: FormData,
+  onProgress?: (fraction: number) => void,
+): Promise<{ status: number; auth: string; text: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload");
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded / e.total);
+      };
+    }
+    xhr.onload = () =>
+      resolve({
+        status: xhr.status,
+        auth: xhr.getResponseHeader("www-authenticate") ?? "",
+        text: xhr.responseText,
+      });
+    xhr.onerror = () => reject(new Error("network error during upload"));
+    xhr.send(form);
+  });
+}
+
+/** Upload media files from the web client into the host gallery. Web-only.
+ *
+ *  `album` is honored only by the host's `year_album` scheme; it is appended
+ *  *before* the files so the server can apply it to them (the backend reads
+ *  fields in order). 401 handling mirrors `_httpInvoke`: an `LV-Password`
+ *  challenge prompts and retries once; any other 401 means the device is no
+ *  longer paired. */
+export async function uploadFiles(
+  files: File[],
+  album?: string,
+  onProgress?: (fraction: number) => void,
+): Promise<UploadResult> {
+  const buildForm = () => {
+    const form = new FormData();
+    if (album && album.trim()) form.append("album", album.trim());
+    for (const f of files) form.append("file", f, f.name);
+    return form;
+  };
+
+  let res = await _postUpload(buildForm(), onProgress);
+  if (res.status === 401) {
+    if (res.auth.toLowerCase().includes("lv-password")) {
+      const accepted = await _requestPassword();
+      if (accepted) res = await _postUpload(buildForm(), onProgress);
+    } else {
+      window.dispatchEvent(new Event(NOT_PAIRED_EVENT));
+    }
+  }
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`upload failed (${res.status}): ${res.text || ""}`);
+  }
+  return JSON.parse(res.text) as UploadResult;
+}
+
 export const reindexGallery = () => invoke<number>("reindex_gallery");
 
 export const rebuildThumbnails = () => invoke<number>("rebuild_thumbnails");

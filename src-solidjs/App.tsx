@@ -23,6 +23,7 @@ import { thumbGenActivity } from "./stores/thumbnailProgressStore";
 import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
 import { DebugOverlay } from "./components/debug/DebugOverlay";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
+import { UploadButton } from "./components/upload/UploadButton";
 import type { SortedItem, SortField } from "./lib/types";
 
 // ---------------------------------------------------------------------------
@@ -249,6 +250,20 @@ export function App() {
       console.error("Failed to load current gallery:", e);
     }
   });
+
+  // Web client: re-fetch items after a device upload so the new photos show
+  // up (the browser gets no fs-watch push from the host). Mirrors the file-
+  // addition branch of the fs-changed handler.
+  const refreshAfterUpload = async () => {
+    try {
+      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
+      setSortedItems(sorted.items);
+      setDisplayPaths(sorted.items.map((item) => item.path));
+      setTotalCount(sorted.items.length);
+    } catch (e) {
+      console.error("Failed to refresh after upload:", e);
+    }
+  };
 
   // Listen for directory passed via CLI argument
   const unlisten = listen<string>("open-directory", (event) => {
@@ -511,6 +526,9 @@ export function App() {
         </Show>
         <Show when={duplicatesOpen()}>
           <DuplicatesPanel onClose={() => setDuplicatesOpen(false)} />
+        </Show>
+        <Show when={isWeb()}>
+          <UploadButton onUploaded={refreshAfterUpload} />
         </Show>
       </Show>
       <Show when={debugOpen()}>

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::hardware::{HardwareProfile, MemoryStatus};
 use crate::http_server::devices::{self, DeviceRow, PairingKind, DEFAULT_INACTIVITY_SECS};
+use crate::http_server::uploads::{self, UploadConfig, UploadScheme};
 use crate::http_server::{self, HttpConfig, RemoteAccess};
 use crate::pipeline::thumbnailer::STANDARD_THUMB_SIZE;
 use crate::{AppState, RecentGallery};
@@ -382,6 +383,40 @@ pub async fn set_remote_inactivity(
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;
     devices::set_inactivity_secs(db.conn(), secs).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Device upload settings (per-gallery)
+// ---------------------------------------------------------------------------
+
+/// Read the per-gallery upload config. Shared by the desktop command and the
+/// web client (over the `/api/invoke` bridge) so the phone knows whether to
+/// show the upload button and the album field.
+pub async fn get_upload_config_impl(state: &AppState) -> Result<UploadConfig, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    uploads::get_config(db.conn()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_upload_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<UploadConfig, String> {
+    get_upload_config_impl(&state).await
+}
+
+/// Set the per-gallery upload config (host-only, via the desktop UI).
+#[tauri::command]
+pub async fn set_upload_config(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+    scheme: String,
+) -> Result<(), String> {
+    let scheme =
+        UploadScheme::from_str(&scheme).ok_or_else(|| format!("unknown upload scheme: {scheme}"))?;
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    uploads::set_config(db.conn(), &UploadConfig { enabled, scheme }).map_err(|e| e.to_string())
 }
 
 /// Trigger a full re-index of all companion files.

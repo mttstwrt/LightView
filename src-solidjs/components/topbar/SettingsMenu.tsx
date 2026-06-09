@@ -21,8 +21,12 @@ import {
   setRemotePassword,
   clearRemotePassword,
   setRemoteInactivity,
+  getUploadConfig,
+  setUploadConfig,
   type RemoteAuthState,
   type PairingCode,
+  type UploadConfig,
+  type UploadScheme,
 } from "../../lib/ipc";
 import QRCode from "qrcode";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
@@ -176,6 +180,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     if (isWeb()) return;
     getRemoteAccessInfo().then(setRemote).catch(() => {});
     refreshAuthState();
+    refreshUploadCfg();
   });
 
   // While the panel is open and remote access is on, poll status so the
@@ -293,6 +298,30 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
       refreshAuthState();
     } catch (e) {
       console.error("Set inactivity failed:", e);
+    }
+  };
+
+  // ── Device uploads (per-gallery) ──
+  const [uploadCfg, setUploadCfg] = createSignal<UploadConfig | null>(null);
+  const UPLOAD_SCHEMES: { label: string; value: UploadScheme }[] = [
+    { label: "Year", value: "year" },
+    { label: "Year & month", value: "year_month" },
+    { label: "Year & album", value: "year_album" },
+    { label: "Flat", value: "flat" },
+  ];
+
+  const refreshUploadCfg = () => {
+    if (isWeb()) return;
+    getUploadConfig().then(setUploadCfg).catch(() => {});
+  };
+
+  const saveUploadCfg = async (next: UploadConfig) => {
+    setUploadCfg(next); // optimistic
+    try {
+      await setUploadConfig(next.enabled, next.scheme);
+    } catch (e) {
+      console.error("Set upload config failed:", e);
+      refreshUploadCfg(); // revert to server truth
     }
   };
 
@@ -862,6 +891,49 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                                 </button>
                               ))}
                             </div>
+                          </div>
+                        )}
+                      </Show>
+
+                      {/* ── Device uploads ── */}
+                      <Show when={uploadCfg()}>
+                        {(cfg) => (
+                          <div class="flex flex-col gap-1.5">
+                            <div class="flex items-center justify-between">
+                              <span class="text-[11px] text-neutral-400">Allow uploads from devices</span>
+                              <button
+                                onClick={() => saveUploadCfg({ ...cfg(), enabled: !cfg().enabled })}
+                                class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                                  cfg().enabled ? "bg-teal-600" : "bg-neutral-700"
+                                }`}
+                                title="Let paired devices upload photos into this gallery"
+                              >
+                                <span
+                                  class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
+                                    cfg().enabled ? "left-[18px]" : "left-0.5"
+                                  }`}
+                                />
+                              </button>
+                            </div>
+                            <Show when={cfg().enabled}>
+                              <div class="flex items-center gap-2 mt-0.5">
+                                <span class="text-[10px] text-neutral-500">Organize into</span>
+                                <select
+                                  value={cfg().scheme}
+                                  onChange={(e) =>
+                                    saveUploadCfg({ ...cfg(), scheme: e.currentTarget.value as UploadScheme })
+                                  }
+                                  class="flex-1 px-2 py-1 text-[11px] rounded bg-neutral-800 text-neutral-300 border border-neutral-700 cursor-pointer focus:outline-none focus:border-teal-600"
+                                >
+                                  <For each={UPLOAD_SCHEMES}>
+                                    {(s) => <option value={s.value}>{s.label}</option>}
+                                  </For>
+                                </select>
+                              </div>
+                              <span class="text-[10px] text-neutral-600 leading-snug">
+                                Uploads land in <span class="font-mono">Uploads/</span> under the gallery, foldered by capture date.
+                              </span>
+                            </Show>
                           </div>
                         )}
                       </Show>

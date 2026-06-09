@@ -1,15 +1,20 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Multipart, Path, State},
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
+    Json,
 };
+use chrono::Datelike;
+use serde::Serialize;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
 
 use super::server::ServerState;
+use super::uploads;
 use crate::cache::thumbnails::ThumbTier;
+use crate::companion::schema::MediaType;
 use crate::thumb_serve::{self, ThumbOutcome, ThumbhashOutcome};
 
 // 64 KiB read chunks. Small enough to keep the WebKitGTK reader fed without
@@ -335,4 +340,269 @@ fn error(status: StatusCode) -> Response<Body> {
 
 pub async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Uploads
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct UploadResult {
+    /// Files written, with their gallery-relative destination paths.
+    uploaded: Vec<UploadedItem>,
+    /// Files refused, each with a human-readable reason.
+    rejected: Vec<RejectedItem>,
+}
+
+#[derive(Serialize)]
+struct UploadedItem {
+    original: String,
+    stored: String,
+}
+
+#[derive(Serialize)]
+struct RejectedItem {
+    original: String,
+    reason: String,
+}
+
+/// `POST /api/upload` — accept one or more media files (multipart/form-data)
+/// from a paired device and file them under `Uploads/` in the open gallery,
+/// foldered by the host's configured scheme.
+///
+/// This is the only route that *writes* files on behalf of a device. It sits
+/// behind the auth layer (paired cookie + optional password) like every other
+/// data route; the additional `upload.enabled` gate lets a host turn it off
+/// per gallery without dropping remote browsing.
+///
+/// Field contract: an optional `album` text field (used only by the
+/// `year_album` scheme) **must precede** the file parts so it applies to them;
+/// all other parts are treated as files. The frontend honors this ordering.
+///
+/// The written files are picked up by the gallery's recursive fs-watcher, so
+/// no explicit indexing happens here.
+pub async fn upload(
+    State(state): State<ServerState>,
+    mut multipart: Multipart,
+) -> Response<Body> {
+    // Resolve and canonicalize the gallery root up front: it gates the whole
+    // request and anchors the path-confinement check.
+    let root = {
+        let guard = state.app.current_gallery.read().await;
+        match guard.as_ref() {
+            Some(r) => r.clone(),
+            None => return error(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    };
+    let root = match tokio::fs::canonicalize(&root).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("upload: cannot canonicalize gallery root {root}: {e}");
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+
+    // Read the per-gallery upload config (enabled + scheme).
+    let scheme = {
+        let guard = state.app.cache_db.lock().await;
+        let Some(db) = guard.as_ref() else {
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        match uploads::get_config(db.conn()) {
+            Ok(cfg) if cfg.enabled => cfg.scheme,
+            Ok(_) => return error(StatusCode::FORBIDDEN),
+            Err(e) => {
+                log::error!("upload: failed to read config: {e}");
+                return error(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    };
+
+    let mut album: Option<String> = None;
+    let mut uploaded = Vec::new();
+    let mut rejected = Vec::new();
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("upload: malformed multipart: {e}");
+                return error(StatusCode::BAD_REQUEST);
+            }
+        };
+
+        // A part with no filename is a plain form field; the only one we read
+        // is `album`. Everything with a filename is treated as a file.
+        let Some(raw_name) = field.file_name().map(|s| s.to_string()) else {
+            if field.name() == Some("album") {
+                album = field.text().await.ok().filter(|s| !s.trim().is_empty());
+            }
+            continue;
+        };
+
+        let ext = std::path::Path::new(&raw_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let media_type = MediaType::from_extension(&ext);
+        if media_type.is_none() {
+            rejected.push(RejectedItem {
+                original: raw_name,
+                reason: "unsupported file type".to_string(),
+            });
+            continue;
+        }
+
+        let bytes = match field.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                rejected.push(RejectedItem {
+                    original: raw_name,
+                    reason: format!("read failed: {e}"),
+                });
+                continue;
+            }
+        };
+
+        // Capture time from EXIF for stills (videos rarely carry it). Drives
+        // both the year/month folder and the file's mtime — which the gallery
+        // indexes as `date_taken`, so an old photo sorts by when it was taken.
+        let capture = match media_type {
+            Some(MediaType::Image) | Some(MediaType::Gif) => {
+                crate::pipeline::exif::capture_datetime_from_bytes(&bytes)
+            }
+            _ => None,
+        };
+        let (year, month) = capture
+            .map(|dt| (dt.year(), dt.month()))
+            .unwrap_or_else(now_year_month);
+        let mtime = capture.and_then(naive_to_system_time);
+
+        let safe_name = uploads::sanitize_component(&raw_name)
+            .unwrap_or_else(|| fallback_name(&ext));
+
+        let rel_dir = uploads::relative_dir(scheme, year, month, album.as_deref());
+        let dir = root.join(&rel_dir);
+
+        if !uploads::confine(&root, &dir) {
+            log::error!("upload: refusing out-of-gallery destination {dir:?}");
+            rejected.push(RejectedItem {
+                original: raw_name,
+                reason: "invalid destination".to_string(),
+            });
+            continue;
+        }
+
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            log::error!("upload: create_dir_all {dir:?} failed: {e}");
+            rejected.push(RejectedItem {
+                original: raw_name,
+                reason: "could not create folder".to_string(),
+            });
+            continue;
+        }
+
+        let dest = uploads::dedupe_path(&dir, &safe_name);
+        match write_atomic(&dir, &dest, &bytes, mtime).await {
+            Ok(()) => {
+                let stored = dest
+                    .strip_prefix(&root)
+                    .unwrap_or(&dest)
+                    .to_string_lossy()
+                    .into_owned();
+                uploaded.push(UploadedItem {
+                    original: raw_name,
+                    stored,
+                });
+            }
+            Err(e) => {
+                log::error!("upload: write {dest:?} failed: {e}");
+                rejected.push(RejectedItem {
+                    original: raw_name,
+                    reason: "write failed".to_string(),
+                });
+            }
+        }
+    }
+
+    Json(UploadResult { uploaded, rejected }).into_response()
+}
+
+/// Write `bytes` to `dest` via a temp file in the same directory plus a rename,
+/// so a reader (or the fs-watcher) never observes a half-written file. When
+/// `mtime` is set, it's applied to the temp file *before* the rename so the
+/// final file already carries the capture time when the watcher first sees it —
+/// otherwise the indexer could record the upload time as `date_taken`.
+async fn write_atomic(
+    dir: &std::path::Path,
+    dest: &std::path::Path,
+    bytes: &[u8],
+    mtime: Option<std::time::SystemTime>,
+) -> std::io::Result<()> {
+    let tmp = dir.join(format!(".lv-upload-{}.tmp", uuid_like()));
+    tokio::fs::write(&tmp, bytes).await?;
+
+    if let Some(t) = mtime {
+        let tmp2 = tmp.clone();
+        // set_modified needs a write-opened std File; do it off the async pool.
+        let res = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp2)
+                .and_then(|f| f.set_modified(t))
+        })
+        .await;
+        // Best-effort: a failed mtime stamp shouldn't abort the upload.
+        if let Ok(Err(e)) = res {
+            log::warn!("upload: failed to set capture mtime on {tmp:?}: {e}");
+        }
+    }
+
+    match tokio::fs::rename(&tmp, dest).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(e)
+        }
+    }
+}
+
+fn now_year_month() -> (i32, u32) {
+    let now = chrono::Local::now();
+    (now.year(), now.month())
+}
+
+/// Convert an EXIF naive (timezone-less) capture time to a `SystemTime`,
+/// interpreting it as the host's local time — the same basis the rest of the
+/// app uses for file mtimes. `None` for ambiguous/pre-epoch values.
+fn naive_to_system_time(dt: chrono::NaiveDateTime) -> Option<std::time::SystemTime> {
+    use chrono::TimeZone;
+    let ts = chrono::Local.from_local_datetime(&dt).single()?.timestamp();
+    if ts < 0 {
+        return None;
+    }
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts as u64))
+}
+
+fn fallback_name(ext: &str) -> String {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    if ext.is_empty() {
+        format!("upload-{ts}")
+    } else {
+        format!("upload-{ts}.{ext}")
+    }
+}
+
+/// Cheap unique-ish suffix for temp files — nanosecond clock plus a random
+/// component. Doesn't need to be a real UUID; it only has to avoid collisions
+/// between concurrent writes in the same directory.
+fn uuid_like() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let rand: u32 = rand::random();
+    format!("{nanos:x}-{rand:x}")
 }

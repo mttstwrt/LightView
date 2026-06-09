@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
     Router,
@@ -87,12 +88,23 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     // Data routes carry sensitive content and sit behind the auth layer.
     // Static SPA assets do not — the app shell needs to load before the
     // client can pair its device and attach the cookie to later requests.
+    // Cap an upload request body. Generous enough for a batch of phone photos
+    // or a short video, bounded so a hostile client can't exhaust memory/disk
+    // in a single request (each file is buffered while being written).
+    const MAX_UPLOAD_BYTES: usize = 512 * 1024 * 1024;
+
     let protected = Router::new()
         .route("/media/{*path}", get(routes::media))
         .route("/thumb/{tier}/{*path}", get(routes::thumb))
         .route("/gif-atlas/{tier}/{*path}", get(routes::gif_atlas))
         .route("/thumbhash/{*path}", get(routes::thumbhash))
         .route("/api/invoke", post(api::invoke))
+        // The body limit applies only to the upload route; the other data
+        // routes keep axum's small default.
+        .route(
+            "/api/upload",
+            post(routes::upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), mw::auth_layer));
 
     // Bootstrap endpoints: pair a device, prove the gallery password, or

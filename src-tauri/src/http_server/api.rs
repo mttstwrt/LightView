@@ -89,6 +89,10 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(settings::get_gallery_default_filter_impl(app).await)
         }
 
+        // Read-only: lets the web client decide whether to show the upload
+        // button and album field. Writing the config remains desktop-only.
+        "get_upload_config" => ok(settings::get_upload_config_impl(app).await),
+
         "get_sorted_items" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]

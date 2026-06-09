@@ -1,10 +1,46 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::Path;
 
 use exif::{In, Tag, Value};
 
 use crate::companion::schema::Location;
+
+/// Extract the capture timestamp from an in-memory image's EXIF
+/// `DateTimeOriginal` (falling back to `DateTime`). Returns the camera's local
+/// wall-clock time as a `NaiveDateTime` — EXIF carries no timezone. `None` when
+/// the bytes have no EXIF block, no date field, or it doesn't parse.
+///
+/// Used by the upload endpoint so a photo is filed under the year it was
+/// *taken* (not uploaded) and its written file gets the original capture time
+/// as its mtime — which is what the gallery indexes as `date_taken`. The bytes
+/// aren't on disk yet, so this reads from a `Cursor` (same containers as
+/// `extract_location`: JPEG, TIFF, HEIF/HEIC, PNG, WebP).
+pub fn capture_datetime_from_bytes(bytes: &[u8]) -> Option<chrono::NaiveDateTime> {
+    let mut cursor = Cursor::new(bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+
+    let field = exif
+        .get_field(Tag::DateTimeOriginal, In::PRIMARY)
+        .or_else(|| exif.get_field(Tag::DateTime, In::PRIMARY))?;
+
+    // EXIF datetimes are ASCII "YYYY:MM:DD HH:MM:SS".
+    let text = match &field.value {
+        Value::Ascii(parts) => parts
+            .first()
+            .map(|p| String::from_utf8_lossy(p).into_owned())?,
+        _ => return None,
+    };
+    parse_exif_datetime(&text)
+}
+
+/// Parse an EXIF `YYYY:MM:DD HH:MM:SS` string. `parse_from_str` validates the
+/// field ranges, so a corrupt value (`0000:00:00 …`) yields `None` rather than
+/// a bogus date.
+fn parse_exif_datetime(text: &str) -> Option<chrono::NaiveDateTime> {
+    let trimmed = text.trim().trim_end_matches('\0').trim();
+    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y:%m:%d %H:%M:%S").ok()
+}
 
 /// Extract a GPS location from a still-image file's EXIF metadata.
 /// Returns `None` if the file has no EXIF block, no GPS fields, or
@@ -92,4 +128,31 @@ fn is_plausible(lat: f64, lon: f64) -> bool {
         && (-180.0..=180.0).contains(&lon)
         // Many cameras write 0,0 when GPS lock failed. Treat as missing.
         && !(lat.abs() < 1e-9 && lon.abs() < 1e-9)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_exif_datetime;
+    use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn parses_standard_exif_datetime() {
+        let dt = parse_exif_datetime("2023:07:14 09:31:05").expect("parses");
+        assert_eq!((dt.year(), dt.month(), dt.day()), (2023, 7, 14));
+        assert_eq!((dt.hour(), dt.minute(), dt.second()), (9, 31, 5));
+    }
+
+    #[test]
+    fn tolerates_trailing_null_and_whitespace() {
+        let dt = parse_exif_datetime(" 2020:01:02 03:04:05\0 ").expect("parses");
+        assert_eq!((dt.year(), dt.month(), dt.day()), (2020, 1, 2));
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_garbage() {
+        assert!(parse_exif_datetime("0000:00:00 00:00:00").is_none());
+        assert!(parse_exif_datetime("2023:13:01 00:00:00").is_none());
+        assert!(parse_exif_datetime("not a date").is_none());
+        assert!(parse_exif_datetime("").is_none());
+    }
 }

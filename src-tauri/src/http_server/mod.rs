@@ -17,6 +17,7 @@ pub mod devices;
 pub mod middleware;
 pub mod routes;
 pub mod server;
+pub mod uploads;
 
 pub use config::{AuthMode, HttpConfig};
 pub use server::{start, RemoteAccess, RunningServer};
