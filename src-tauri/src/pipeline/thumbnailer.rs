@@ -936,14 +936,14 @@ fn probe_video_dimensions(path: &Path) -> Result<(u32, u32), ThumbError> {
     Ok((w, h))
 }
 
-/// Probe video metadata: (width, height, duration_seconds, codec, has_audio, fps).
-pub fn probe_video_metadata(path: &Path) -> Result<(u32, u32, Option<f64>, Option<String>, bool, Option<f64>), ThumbError> {
-    // Video stream info
+/// Probe video metadata: (width, height, duration_seconds). One ffprobe
+/// call — these spawns add up when a folder full of videos is indexed.
+pub fn probe_video_metadata(path: &Path) -> Result<(u32, u32, Option<f64>), ThumbError> {
     let output = std::process::Command::new("ffprobe")
         .args([
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,codec_name,r_frame_rate,duration",
+            "-show_entries", "stream=width,height,duration",
             "-show_entries", "format=duration",
             "-of", "json",
         ])
@@ -982,43 +982,7 @@ pub fn probe_video_metadata(path: &Path) -> Result<(u32, u32, Option<f64>, Optio
                 .and_then(|s| s.parse::<f64>().ok())
         });
 
-    let codec = stream
-        .and_then(|s| s.get("codec_name"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // Parse fps from r_frame_rate (e.g. "30000/1001")
-    let fps = stream
-        .and_then(|s| s.get("r_frame_rate"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| {
-            let parts: Vec<&str> = s.split('/').collect();
-            if parts.len() == 2 {
-                let num: f64 = parts[0].parse().ok()?;
-                let den: f64 = parts[1].parse().ok()?;
-                if den > 0.0 { Some(num / den) } else { None }
-            } else {
-                s.parse::<f64>().ok()
-            }
-        });
-
-    // Check for audio stream
-    let audio_output = std::process::Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name",
-            "-of", "csv=p=0",
-        ])
-        .arg(path.as_os_str())
-        .output()
-        .ok();
-
-    let has_audio = audio_output
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false);
-
-    Ok((w, h, duration, codec, has_audio, fps))
+    Ok((w, h, duration))
 }
 
 /// Grey placeholder fallback when ffmpeg is unavailable.

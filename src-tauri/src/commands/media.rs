@@ -656,7 +656,7 @@ pub async fn get_media_meta_impl(
 /// Extract video metadata via ffprobe and store it in the media_meta table.
 fn populate_video_metadata(conn: &rusqlite::Connection, path: &str) {
     match thumbnailer::probe_video_metadata(Path::new(path)) {
-        Ok((w, h, duration, _codec, _has_audio, _fps)) => {
+        Ok((w, h, duration)) => {
             let _ = conn.execute(
                 "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
                 rusqlite::params![w, h, duration, path],
