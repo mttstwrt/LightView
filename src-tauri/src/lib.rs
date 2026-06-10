@@ -59,6 +59,11 @@ pub struct AppState {
     /// Current gallery path (None if no gallery is open)
     pub current_gallery: Arc<RwLock<Option<String>>>,
 
+    /// Canonicalized gallery root, resolved once at open. Used by the HTTP
+    /// routes for path-confinement checks so they don't have to
+    /// canonicalize the root on every request.
+    pub canonical_gallery_root: Arc<RwLock<Option<std::path::PathBuf>>>,
+
     /// Atomic generation counter for cancelling stale thumbnail work
     pub thumbnail_generation: Arc<std::sync::atomic::AtomicU64>,
 
@@ -154,6 +159,7 @@ impl AppState {
             autocomplete: Arc::new(AutocompleteEngine::new()),
             hardware: Arc::new(hardware),
             current_gallery: Arc::new(RwLock::new(None)),
+            canonical_gallery_root: Arc::new(RwLock::new(None)),
             thumbnail_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             thumb_pool: Arc::new(thumb_pool),
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),

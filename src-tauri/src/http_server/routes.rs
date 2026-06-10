@@ -337,20 +337,18 @@ async fn serve_file(path: &str, mime: &'static str, headers: &HeaderMap) -> Resp
 }
 
 /// True if `path` resolves to a file inside the currently-open gallery root.
-/// Canonicalizes both sides so `..` traversal and symlinks that escape the
+/// The root is canonicalized once at gallery open; the candidate is
+/// canonicalized per request so `..` traversal and symlinks that escape the
 /// root are rejected. False when no gallery is open or the path is missing.
 async fn path_in_gallery(state: &ServerState, path: &str) -> bool {
     let root = {
-        let guard = state.app.current_gallery.read().await;
+        let guard = state.app.canonical_gallery_root.read().await;
         match guard.as_ref() {
             Some(r) => r.clone(),
             None => return false,
         }
     };
-    let (Ok(root), Ok(candidate)) = (
-        tokio::fs::canonicalize(&root).await,
-        tokio::fs::canonicalize(path).await,
-    ) else {
+    let Ok(candidate) = tokio::fs::canonicalize(path).await else {
         return false;
     };
     candidate.starts_with(&root)
@@ -428,20 +426,13 @@ pub async fn upload(
     State(state): State<ServerState>,
     mut multipart: Multipart,
 ) -> Response<Body> {
-    // Resolve and canonicalize the gallery root up front: it gates the whole
-    // request and anchors the path-confinement check.
+    // The canonical gallery root (resolved at open) gates the whole request
+    // and anchors the path-confinement check.
     let root = {
-        let guard = state.app.current_gallery.read().await;
+        let guard = state.app.canonical_gallery_root.read().await;
         match guard.as_ref() {
             Some(r) => r.clone(),
             None => return error(StatusCode::SERVICE_UNAVAILABLE),
-        }
-    };
-    let root = match tokio::fs::canonicalize(&root).await {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("upload: cannot canonicalize gallery root {root}: {e}");
-            return error(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
 

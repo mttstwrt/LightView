@@ -649,6 +649,17 @@ pub async fn open_gallery_impl(
         *current = Some(path.clone());
     }
 
+    // Resolve the canonical root once — the HTTP routes use it for
+    // path-confinement checks on every request.
+    {
+        let canonical = tokio::fs::canonicalize(&path).await.ok();
+        if canonical.is_none() {
+            log::warn!("Failed to canonicalize gallery root {path}");
+        }
+        let mut root = state.canonical_gallery_root.write().await;
+        *root = canonical;
+    }
+
     // Track as recently opened
     state.add_recent_gallery(&path).await;
 
@@ -763,6 +774,10 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
     {
         let mut current = state.current_gallery.write().await;
         *current = None;
+    }
+    {
+        let mut root = state.canonical_gallery_root.write().await;
+        *root = None;
     }
 
     Ok(())
