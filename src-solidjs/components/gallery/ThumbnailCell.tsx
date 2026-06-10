@@ -25,7 +25,15 @@ interface ThumbnailCellProps {
 
 // Module-level set of URLs that have already been loaded at least once.
 // Survives cell recycling so a revisited thumbnail won't re-fade.
+// Capped so a long session browsing huge galleries doesn't accumulate
+// URLs forever; on overflow the set resets and some cells fade once more.
+const LOADED_URLS_CAP = 4096;
 const loadedUrls = new Set<string>();
+
+function markUrlLoaded(url: string): void {
+  if (loadedUrls.size >= LOADED_URLS_CAP) loadedUrls.clear();
+  loadedUrls.add(url);
+}
 
 // --- Grid GIF autoplay budget -------------------------------------------
 // Autoplaying a GIF swaps the cell's <img> to the full-resolution original,
@@ -265,7 +273,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         decoding="async"
         draggable={false}
         onLoad={() => {
-          if (props.thumbSrc) loadedUrls.add(props.thumbSrc);
+          if (props.thumbSrc) markUrlLoaded(props.thumbSrc);
           setLoaded(true);
         }}
         onError={() => {

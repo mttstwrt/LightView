@@ -742,6 +742,11 @@ export function GalleryGrid(props: GalleryGridProps) {
       // but clear the coalesced set so new items can accumulate during next fetch).
       coalescedPaths.clear();
 
+      // Evict far-from-viewport thumbnails up front. Generation/precache
+      // batches below return early, so running eviction last would starve
+      // it for as long as there's work queued — and it's cheap.
+      evictFaraway();
+
       const gen = generation();
 
       // Phase 1: Generate thumbnails that 404'd.
@@ -854,12 +859,8 @@ export function GalleryGrid(props: GalleryGridProps) {
             }
             inFlightFetch = null;
           })();
-          return;
         }
       }
-
-      // Phase 3: Eviction
-      evictFaraway();
     };
 
     // scrollend fires when scrolling stops — replaces manual debounce.
