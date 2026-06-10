@@ -66,7 +66,11 @@ fn thumb_ok_response(data: Vec<u8>, format: &str) -> tauri::http::Response<Vec<u
     tauri::http::Response::builder()
         .status(200)
         .header("Content-Type", mime)
-        .header("Cache-Control", "no-cache")
+        // Cacheable: the frontend bumps a ?v= cache-buster whenever a
+        // thumbnail is (re)generated and bumps an epoch on full rebuilds,
+        // so within a session a URL's bytes never change. max-age bounds
+        // cross-session staleness for plain (un-versioned) URLs.
+        .header("Cache-Control", "public, max-age=3600")
         .header("Access-Control-Allow-Origin", "*")
         .body(data)
         .unwrap()

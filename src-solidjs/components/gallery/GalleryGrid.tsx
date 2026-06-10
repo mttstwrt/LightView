@@ -220,11 +220,26 @@ export function GalleryGrid(props: GalleryGridProps) {
   const coalescedPaths = new Set<string>();
   /** Cache-bust version per path — incremented after IPC generation. */
   const urlVersions = new Map<string, number>();
+  /** Cache-bust epoch for full invalidations (rebuilds). Thumbnail responses
+   *  are served cacheable, so a rebuild must change every URL — bumping this
+   *  shifts the effective version of every path at once. */
+  let versionEpoch = 0;
   /** Reverse index: path → position in props.paths for O(1) eviction lookups. */
   const pathToIndex = new Map<string, number>();
 
   let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
+
+  /** Build the (possibly cache-busted) protocol URL for a path. */
+  const thumbSrcFor = (path: string, t: ThumbTier) => {
+    const v = (urlVersions.get(path) ?? 0) + versionEpoch;
+    return v > 0 ? `${thumbUrl(path, t)}?v=${v}` : thumbUrl(path, t);
+  };
+
+  /** Bump a path's version so its next URL points at fresh bytes. */
+  const bumpVersion = (path: string) => {
+    urlVersions.set(path, (urlVersions.get(path) ?? 0) + 1);
+  };
 
   // Thumbnail generation progress tracking
   let thumbGenTotal = 0;
@@ -253,9 +268,8 @@ export function GalleryGrid(props: GalleryGridProps) {
     listen<ThumbnailResult>("thumb:streamed", (event) => {
       const r = event.payload;
       if (!inFlightSet.has(r.path)) return;
-      const v = (urlVersions.get(r.path) ?? 0) + 1;
-      urlVersions.set(r.path, v);
-      setThumbMap(r.path, `${thumbUrl(r.path, tier())}?v=${v}`);
+      bumpVersion(r.path);
+      setThumbMap(r.path, thumbSrcFor(r.path, tier()));
     }).then((fn) => {
       unlistenStreamed = fn;
     });
@@ -269,10 +283,9 @@ export function GalleryGrid(props: GalleryGridProps) {
   onMount(() => {
     listen<ThumbnailResult>("thumb:regenerated", (event) => {
       const r = event.payload;
-      const v = (urlVersions.get(r.path) ?? 0) + 1;
-      urlVersions.set(r.path, v);
+      bumpVersion(r.path);
       if (assignedSet.has(r.path)) {
-        setThumbMap(r.path, `${thumbUrl(r.path, tier())}?v=${v}`);
+        setThumbMap(r.path, thumbSrcFor(r.path, tier()));
       }
     }).then((fn) => {
       unlistenRegenerated = fn;
@@ -346,9 +359,7 @@ export function GalleryGrid(props: GalleryGridProps) {
     for (const item of items) {
       if (!assignedSet.has(item.path)) {
         assignedSet.add(item.path);
-        const v = urlVersions.get(item.path);
-        const url = v ? `${thumbUrl(item.path, t)}?v=${v}` : thumbUrl(item.path, t);
-        updates.push([item.path, url]);
+        updates.push([item.path, thumbSrcFor(item.path, t)]);
       }
     }
     if (updates.length > 0) {
@@ -777,9 +788,8 @@ export function GalleryGrid(props: GalleryGridProps) {
                 resultPaths = new Set(toGenerate);
                 batch(() => {
                   for (const p of toGenerate) {
-                    const v = (urlVersions.get(p) ?? 0) + 1;
-                    urlVersions.set(p, v);
-                    setThumbMap(p, `${thumbUrl(p, activeTier)}?v=${v}`);
+                    bumpVersion(p);
+                    setThumbMap(p, thumbSrcFor(p, activeTier));
                   }
                 });
                 thumbGenDone += toGenerate.length;
@@ -790,9 +800,8 @@ export function GalleryGrid(props: GalleryGridProps) {
                 resultPaths = new Set(results.map((r) => r.path));
                 batch(() => {
                   for (const r of results) {
-                    const v = (urlVersions.get(r.path) ?? 0) + 1;
-                    urlVersions.set(r.path, v);
-                    setThumbMap(r.path, `${thumbUrl(r.path, activeTier)}?v=${v}`);
+                    bumpVersion(r.path);
+                    setThumbMap(r.path, thumbSrcFor(r.path, activeTier));
                   }
                 });
 
@@ -870,7 +879,9 @@ export function GalleryGrid(props: GalleryGridProps) {
       }),
     );
 
-    // Listen for thumbnail invalidation (e.g. after rebuild)
+    // Listen for thumbnail invalidation (e.g. after rebuild). Thumbnail
+    // responses are cacheable, so bump the epoch: every rebuilt URL must
+    // differ from the one the webview may have cached.
     const onInvalidate = () => {
       setThumbMap(reconcile({}));
       assignedSet.clear();
@@ -878,6 +889,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       inFlightSet.clear();
       failedSet.clear();
       urlVersions.clear();
+      versionEpoch++;
       bgCursor = 0;
       thumbGenTotal = 0;
       thumbGenDone = 0;
@@ -981,7 +993,7 @@ export function GalleryGrid(props: GalleryGridProps) {
         batch(() => {
           for (const item of items) {
             assignedSet.add(item.path);
-            setThumbMap(item.path, thumbUrl(item.path, newTier));
+            setThumbMap(item.path, thumbSrcFor(item.path, newTier));
           }
         });
         setGeneration((g) => g + 1);

@@ -64,13 +64,48 @@ pub async fn media(
     if mime.starts_with("video/") {
         return serve_file(&path, mime, &headers).await;
     }
-    serve_image(&path, mime).await
+    serve_image(&path, mime, &headers).await
+}
+
+/// RFC 7231 HTTP-date for a filesystem mtime.
+fn http_date(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t)
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
 }
 
 /// Reads a whole image into memory and serves it as one complete, cacheable
 /// body — no Range, no chunked streaming. This is what lets WebKitGTK decode an
 /// animated GIF once and loop it from cache at the correct frame rate.
-async fn serve_image(path: &str, mime: &'static str) -> Response<Body> {
+///
+/// Sent with `no-cache` + `Last-Modified` so the webview revalidates with
+/// If-Modified-Since: an unchanged file answers 304 with no body transfer,
+/// while an externally edited file is picked up immediately.
+async fn serve_image(path: &str, mime: &'static str, headers: &HeaderMap) -> Response<Body> {
+    let mtime = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok());
+
+    if let (Some(mtime), Some(ims)) = (
+        mtime,
+        headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        if let Ok(since) = chrono::DateTime::parse_from_rfc2822(ims) {
+            let mtime_secs = chrono::DateTime::<chrono::Utc>::from(mtime).timestamp();
+            if mtime_secs <= since.timestamp() {
+                return Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::LAST_MODIFIED, http_date(mtime))
+                    .body(Body::empty())
+                    .unwrap();
+            }
+        }
+    }
+
     let data = match tokio::fs::read(path).await {
         Ok(d) => d,
         Err(e) => {
@@ -78,13 +113,15 @@ async fn serve_image(path: &str, mime: &'static str) -> Response<Body> {
             return error(StatusCode::NOT_FOUND);
         }
     };
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
         .header(header::CONTENT_LENGTH, data.len().to_string())
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(data))
-        .unwrap()
+        .header(header::CACHE_CONTROL, "no-cache");
+    if let Some(mtime) = mtime {
+        builder = builder.header(header::LAST_MODIFIED, http_date(mtime));
+    }
+    builder.body(Body::from(data)).unwrap()
 }
 
 /// `GET /gif-atlas/{tier}/{*rel}` — serves a pre-rendered GIF frame atlas: a PNG
@@ -117,7 +154,11 @@ pub async fn gif_atlas(
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/png")
-                .header(header::CACHE_CONTROL, "no-cache")
+                // The sprite sheet is multi-MB and GifCanvas remounts on
+                // every hover/autoplay toggle — let the webview cache it.
+                // Server-side it's keyed by (path, tier, mtime), so a
+                // changed GIF produces fresh bytes after at most max-age.
+                .header(header::CACHE_CONTROL, "public, max-age=3600")
                 .header("X-Gif-Frame-Count", atlas.frame_count.to_string())
                 .header("X-Gif-Frame-Width", atlas.frame_w.to_string())
                 .header("X-Gif-Frame-Height", atlas.frame_h.to_string())
@@ -155,10 +196,12 @@ pub async fn thumb(
     }
 
     match thumb_serve::get_or_generate(&state.app, tier, path).await {
+        // Cacheable: mirrors the lightview:// protocol handler — the frontend
+        // cache-busts with ?v= whenever bytes change.
         ThumbOutcome::Hit { data, format } => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, thumb_serve::thumb_mime(&format))
-            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
             .body(Body::from(data))
             .unwrap(),
         ThumbOutcome::NoGallery => error(StatusCode::SERVICE_UNAVAILABLE),
