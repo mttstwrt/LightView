@@ -266,7 +266,7 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
     })
 }
 
-/// Generate a thumbnail for a HEIC/HEIF file using libheif.
+/// Generate a thumbnail for a HEIC/HEIF/AVIF file using libheif.
 ///
 /// Tries the embedded thumbnail first (iPhone HEICs ship a ~320px thumb that
 /// decodes ~100x faster than the full image) and falls back to the primary
@@ -489,7 +489,7 @@ pub fn generate_image_thumbnail(path: &Path, filter: ResizeFilter, format: Thumb
 
     match ext.as_str() {
         "jpg" | "jpeg" => generate_jpeg_thumbnail(path, filter, format, thumb_w, thumb_h),
-        "heic" | "heif" => generate_heic_thumbnail(path, filter, format, thumb_w, thumb_h),
+        "heic" | "heif" | "avif" => generate_heic_thumbnail(path, filter, format, thumb_w, thumb_h),
         _ => generate_generic_thumbnail(path, filter, format, thumb_w, thumb_h),
     }
 }
@@ -561,7 +561,7 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
     } else {
         match ext.as_str() {
             "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
-            "heic" | "heif" => decode_heic_to_rgba(path)?,
+            "heic" | "heif" | "avif" => decode_heic_to_rgba(path)?,
             _ => decode_generic_to_rgba(path)?,
         }
     };
