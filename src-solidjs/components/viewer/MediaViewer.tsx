@@ -456,8 +456,11 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   const onPointerDown = (e: PointerEvent) => {
-    if (e.pointerType !== "touch" || isVideo()) return;
+    if (e.pointerType !== "touch") return;
     const t = e.target as HTMLElement;
+    // Touches that land on the native video controls (or buttons / inputs /
+    // links) are left to them; margin touches drive our gestures even on video
+    // so tap-to-toggle-chrome and swipe-to-dismiss keep working.
     if (t.closest("button, video, input, a")) return;
     // If a swipe-navigation is still mid-flight, land it now so the new gesture
     // operates on the settled index rather than racing the pending commit.
@@ -465,6 +468,9 @@ export function MediaViewer(props: MediaViewerProps) {
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (pointers.size === 2) {
+      // Videos don't zoom, so ignore two-finger pinches on them (otherwise the
+      // pinch would apply a stuck zoom transform to the empty image container).
+      if (isVideo()) { gestureMode = "none"; e.preventDefault(); return; }
       const [a, b] = ptList();
       pinchStartDist = pointerDistance(a, b) || 1;
       pinchStartZoom = zoom();
@@ -850,9 +856,12 @@ export function MediaViewer(props: MediaViewerProps) {
 
       {/* Media display — video */}
       <Show when={isVideo()}>
-        <div class="absolute inset-0 flex items-center justify-center">
+        {/* Click-through wrapper: only the video / play controls capture
+            pointer events, so a click or tap in the surrounding margin still
+            falls through to the backdrop's close handler. */}
+        <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
           <Show when={isBrowserPlayableVideo() && !videoError()} fallback={
-            <div class="text-neutral-400 text-sm text-center" onClick={(e) => e.stopPropagation()}>
+            <div class="text-neutral-400 text-sm text-center pointer-events-auto" onClick={(e) => e.stopPropagation()}>
               <button
                 class="w-20 h-20 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer transition-colors mb-4"
                 onClick={() => openVideoExternal()}
@@ -865,7 +874,7 @@ export function MediaViewer(props: MediaViewerProps) {
           }>
             <Show when={videoStarted()} fallback={
               <div
-                class="relative max-w-[100vw] max-h-[100vh] flex items-center justify-center"
+                class="relative max-w-[100vw] max-h-[100vh] flex items-center justify-center pointer-events-auto"
                 onClick={(e) => e.stopPropagation()}
               >
                 <img
@@ -887,7 +896,7 @@ export function MediaViewer(props: MediaViewerProps) {
             }>
               <video
                 src={mediaUrl(currentPath())}
-                class="max-w-[100vw] max-h-[100vh] outline-none"
+                class="max-w-[100vw] max-h-[100vh] outline-none pointer-events-auto"
                 controls
                 autoplay
                 preload="auto"
