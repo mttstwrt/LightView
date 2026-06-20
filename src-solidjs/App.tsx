@@ -4,12 +4,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen, aspectByPath, groups } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
 import { setFilterQuery } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
+import { JustifiedGrid } from "./components/gallery/JustifiedGrid";
 import { MapView } from "./components/map/MapView";
 import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
@@ -440,24 +441,46 @@ export function App() {
         }
       >
         <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} />
-        <Show when={viewMode() === "grid" && !contentHidden()}>
-          <GalleryGrid
-            paths={displayPaths()}
-            onItemClick={(index) => {
-              clearSelection();
-              openViewer(index);
-            }}
-            onItemSelect={(path) => toggleSelection(path)}
-            onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
-            onBackgroundClick={clearSelection}
-            selectedPaths={selectedPaths()}
-            onItemContextMenu={(e, path, index) => {
-              if (isWeb()) return; // context menu is all write actions
-              setContextMenu({ x: e.clientX, y: e.clientY, path, index });
-            }}
-            loading={loading()}
-            onContentHeight={setGalleryContentHeight}
-          />
+        <Show when={(viewMode() === "grid" || viewMode() === "justified") && !contentHidden()}>
+          <Show when={viewMode() === "grid"}>
+            <GalleryGrid
+              paths={displayPaths()}
+              onItemClick={(index) => {
+                clearSelection();
+                openViewer(index);
+              }}
+              onItemSelect={(path) => toggleSelection(path)}
+              onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
+              onBackgroundClick={clearSelection}
+              selectedPaths={selectedPaths()}
+              onItemContextMenu={(e, path, index) => {
+                if (isWeb()) return; // context menu is all write actions
+                setContextMenu({ x: e.clientX, y: e.clientY, path, index });
+              }}
+              loading={loading()}
+              onContentHeight={setGalleryContentHeight}
+            />
+          </Show>
+          <Show when={viewMode() === "justified"}>
+            <JustifiedGrid
+              paths={displayPaths()}
+              aspects={aspectByPath()}
+              groupStarts={groups().map((g) => g.start_index)}
+              onItemClick={(index) => {
+                clearSelection();
+                openViewer(index);
+              }}
+              onItemSelect={(path) => toggleSelection(path)}
+              onBackgroundClick={clearSelection}
+              selectedPaths={selectedPaths()}
+              onItemContextMenu={(e, path, index) => {
+                if (isWeb()) return; // context menu is all write actions
+                setContextMenu({ x: e.clientX, y: e.clientY, path, index });
+              }}
+              loading={loading()}
+              onContentHeight={setGalleryContentHeight}
+            />
+          </Show>
           <ScrollBar
             contentHeight={galleryContentHeight()}
             indicators={scrollIndicators()}

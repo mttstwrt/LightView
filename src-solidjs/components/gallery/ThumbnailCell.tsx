@@ -21,6 +21,11 @@ interface ThumbnailCellProps {
   onContextMenu?: (e: MouseEvent) => void;
   /** Called when the protocol handler returns 404 (thumbnail not cached). */
   onError?: (path: string) => void;
+  /**
+   * Free-size mode: fill the parent (which sizes the cell explicitly) instead of
+   * forcing a square aspect ratio. Used by the justified gallery view.
+   */
+  freeSize?: boolean;
 }
 
 // Module-level set of URLs that have already been loaded at least once.
@@ -228,7 +233,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
   return (
     <div
       ref={cellRef}
-      class="thumb-cell relative aspect-square overflow-hidden cursor-pointer"
+      class={`thumb-cell relative overflow-hidden cursor-pointer ${props.freeSize ? "w-full h-full" : "aspect-square"}`}
       style={{
         background: "#1a1a1a",
         contain: "layout style paint",

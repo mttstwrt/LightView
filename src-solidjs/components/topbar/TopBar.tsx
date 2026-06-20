@@ -1,4 +1,4 @@
-import { Show, createSignal, onCleanup, onMount } from "solid-js";
+import { Show, For, createSignal, onCleanup, onMount } from "solid-js";
 import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
@@ -121,14 +121,24 @@ export function TopBar(props: TopBarProps) {
       >
         <FilterBar onInputRef={(el) => { filterInputRef = el; }} />
         <SortMenu />
-        <button
-          onClick={() => setViewMode(viewMode() === "grid" ? "map" : "grid")}
-          class="shrink-0 px-2.5 py-1 text-xs rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
-          classList={{ "bg-neutral-700": viewMode() === "map" }}
-          title={viewMode() === "grid" ? "Switch to map view" : "Switch to grid view"}
-        >
-          {viewMode() === "grid" ? "Map" : "Grid"}
-        </button>
+        <div class="shrink-0 flex items-center gap-0.5 p-0.5 rounded bg-neutral-800/60">
+          <For each={[
+            { mode: "grid" as const, label: "Grid", title: "Uniform square grid" },
+            { mode: "justified" as const, label: "Justified", title: "Aspect-preserving rows" },
+            { mode: "map" as const, label: "Map", title: "Geographic map" },
+          ]}>
+            {(v) => (
+              <button
+                onClick={() => setViewMode(v.mode)}
+                class="px-2 py-0.5 text-xs rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
+                classList={{ "bg-neutral-700 text-white": viewMode() === v.mode }}
+                title={v.title}
+              >
+                {v.label}
+              </button>
+            )}
+          </For>
+        </div>
         <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
       </div>
     </>

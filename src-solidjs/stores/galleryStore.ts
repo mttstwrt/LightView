@@ -33,6 +33,19 @@ const durationByPath = createMemo(() => {
   return map;
 });
 
+// Per-path aspect ratio (width / height) derived from the sorted items, for the
+// justified view to lay out cells before thumbnail bytes exist. Paths with
+// unknown dimensions are absent; the layout falls back to 1:1 for those.
+const aspectByPath = createMemo(() => {
+  const map = new Map<string, number>();
+  for (const item of sortedItems()) {
+    if (item.width != null && item.height != null && item.width > 0 && item.height > 0) {
+      map.set(item.path, item.width / item.height);
+    }
+  }
+  return map;
+});
+
 // Group headers for the current sort/group
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 
@@ -42,8 +55,9 @@ const [timeline, setTimeline] = createSignal<TimelineEntry[]>([]);
 // Selected items (multi-select)
 const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
 
-// View mode: grid (default) vs map (geographic browsing).
-export type ViewMode = "grid" | "map";
+// View mode: grid (uniform squares), justified (aspect-preserving rows), or
+// map (geographic browsing).
+export type ViewMode = "grid" | "justified" | "map";
 const [viewMode, setViewMode] = createSignal<ViewMode>("grid");
 
 // Whether the settings panel is open. On mobile the panel is a full-screen
@@ -59,6 +73,7 @@ export {
   displayPaths, setDisplayPaths,
   sortedItems, setSortedItems,
   durationByPath,
+  aspectByPath,
   groups, setGroups,
   timeline, setTimeline,
   selectedPaths, setSelectedPaths,

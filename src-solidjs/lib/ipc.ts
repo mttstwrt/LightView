@@ -131,7 +131,7 @@ export interface ThumbnailResult {
 
 /** LOD tier for thumbnails; see docs/thumbnailStreamingResearch.md and
  *  `ThumbTier` in src-tauri/src/cache/thumbnails.rs. */
-export type ThumbTier = "s" | "m" | "l" | "p";
+export type ThumbTier = "s" | "m" | "l" | "p" | "j";
 
 /** Build a protocol URL for a cached thumbnail at a given tier. The
  *  `lightview://thumb/<tier>/<path>` protocol serves image data directly

@@ -229,6 +229,23 @@ const MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    // v11: Aspect-preserving tier for the justified gallery view. Unlike the
+    // square tiers, rows here store the thumbnail's true (non-square) width and
+    // height; the layout reads source dimensions from media_meta separately.
+    Migration {
+        version: 11,
+        sql: "
+            CREATE TABLE IF NOT EXISTS thumbnails_justified (
+                path         TEXT PRIMARY KEY,
+                media_type   TEXT NOT NULL,
+                mtime        INTEGER NOT NULL,
+                width        INTEGER NOT NULL,
+                height       INTEGER NOT NULL,
+                thumbnail    BLOB NOT NULL,
+                format       TEXT NOT NULL DEFAULT 'webp'
+            );
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.

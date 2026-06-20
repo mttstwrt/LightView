@@ -506,6 +506,62 @@ pub fn generate_for_path(path: &Path, filter: ResizeFilter, format: ThumbFormat,
     }
 }
 
+/// Compute aspect-preserving output dimensions that fit `(sw, sh)` into a box
+/// whose longest edge is `max_edge`, never upscaling past the source. Used by
+/// the justified (non-cropping) tier.
+fn fit_dims(sw: u32, sh: u32, max_edge: u32) -> (u32, u32) {
+    if sw == 0 || sh == 0 {
+        return (max_edge.max(1), max_edge.max(1));
+    }
+    if sw >= sh {
+        let w = max_edge.min(sw).max(1);
+        let h = ((w as f64) * (sh as f64) / (sw as f64)).round().max(1.0) as u32;
+        (w, h)
+    } else {
+        let h = max_edge.min(sh).max(1);
+        let w = ((h as f64) * (sw as f64) / (sh as f64)).round().max(1.0) as u32;
+        (w, h)
+    }
+}
+
+/// Generate an **aspect-preserving** thumbnail (no square crop) that fits within
+/// a `max_edge`×`max_edge` box. Decodes the full image via [`decode_image`] and
+/// resizes the whole frame, so the stored thumbnail keeps the source's true
+/// proportions. Used by the justified gallery tier.
+pub fn generate_for_path_fit(
+    path: &Path,
+    filter: ResizeFilter,
+    format: ThumbFormat,
+    max_edge: u32,
+) -> Result<ThumbResult, ThumbError> {
+    let decoded = decode_image(path)?;
+    let (dw, dh) = (decoded.width, decoded.height);
+    if dw == 0 || dh == 0 {
+        return Err(ThumbError::Decode("Zero decoded dimensions".to_string()));
+    }
+    let (tw, th) = fit_dims(dw, dh, max_edge);
+    let resized = resize_rgba(dw, dh, &decoded.rgba, tw, th, filter)?;
+
+    let data = match format {
+        ThumbFormat::Jpeg => {
+            let rgb = rgba_to_rgb(&resized);
+            encode_output(&rgb, tw, th, format)?
+        }
+        ThumbFormat::Webp => encode_output(&resized, tw, th, format)?,
+    };
+
+    Ok(ThumbResult {
+        path: path.to_string_lossy().to_string(),
+        width: tw,
+        height: th,
+        data,
+        media_type: decoded.media_type,
+        src_width: decoded.src_width,
+        src_height: decoded.src_height,
+        format,
+    })
+}
+
 /// Media type inferred from a path's extension (None for non-media files).
 fn media_type_for_path(path: &Path) -> Option<MediaType> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");

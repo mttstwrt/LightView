@@ -472,6 +472,26 @@ pub(crate) async fn dispatch_thumbnail(
     rx.await.map_err(|_| "Thumbnail task was dropped".to_string())
 }
 
+/// Like [`dispatch_thumbnail`] but uses the aspect-preserving (non-cropping)
+/// generator for the justified tier — fits the source into a `max_edge` box.
+pub(crate) async fn dispatch_thumbnail_fit(
+    pool: &rayon::ThreadPool,
+    path: String,
+    filter: ResizeFilter,
+    format: ThumbFormat,
+    max_edge: u32,
+) -> Result<Result<crate::pipeline::thumbnailer::ThumbResult, crate::pipeline::thumbnailer::ThumbError>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    pool.spawn(move || {
+        let p = std::path::Path::new(&path);
+        let result = crate::pipeline::thumbnailer::generate_for_path_fit(p, filter, format, max_edge);
+        let _ = tx.send(result);
+    });
+
+    rx.await.map_err(|_| "Thumbnail task was dropped".to_string())
+}
+
 /// Derive micro-tier (128px) thumbnails + thumbhash for cached standard-tier
 /// paths that are missing them. Reads the standard thumbnail bytes from
 /// SQLite, decodes to RGBA, downsamples, and writes the micro row + thumbhash.
@@ -929,7 +949,7 @@ pub async fn ensure_tier_thumbnails(
     // L/P tiers use lossy WebP — ~30 % smaller at equivalent quality,
     // which matters a lot at 1024/1600 px. Micro falls back to JPEG.
     let tier_format = match tier {
-        ThumbTier::Large | ThumbTier::Preview => ThumbFormat::Webp,
+        ThumbTier::Large | ThumbTier::Preview | ThumbTier::Justified => ThumbFormat::Webp,
         _ => ThumbFormat::Jpeg,
     };
 
@@ -937,8 +957,11 @@ pub async fn ensure_tier_thumbnails(
     // source, center-crops (for Micro/Standard it also squares), and
     // resizes with the current filter. For Preview (1600 longest edge)
     // we accept the square crop since the viewer scales to fit anyway.
+    // The Justified tier instead uses the aspect-preserving (non-cropping)
+    // path so the gallery can show true proportions.
     let missing_clone = missing.clone();
     let pool = state.thumb_pool.clone();
+    let is_fit = matches!(tier, ThumbTier::Justified);
     let (tx, rx) = tokio::sync::oneshot::channel();
     pool.spawn(move || {
         use rayon::prelude::*;
@@ -946,13 +969,15 @@ pub async fn ensure_tier_thumbnails(
             .par_iter()
             .map(|path_str| {
                 let p = std::path::Path::new(path_str);
-                let res = crate::pipeline::thumbnailer::generate_for_path(
-                    p,
-                    filter,
-                    tier_format,
-                    target,
-                    target,
-                );
+                let res = if is_fit {
+                    crate::pipeline::thumbnailer::generate_for_path_fit(
+                        p, filter, tier_format, target,
+                    )
+                } else {
+                    crate::pipeline::thumbnailer::generate_for_path(
+                        p, filter, tier_format, target, target,
+                    )
+                };
                 (path_str.clone(), res.ok())
             })
             .collect();
@@ -1046,20 +1071,26 @@ pub async fn generate_and_store_tier(
     let target = tier.target_size();
     let filter = thumbnailer::filter_for_size(target);
     let tier_format = match tier {
-        ThumbTier::Large | ThumbTier::Preview => ThumbFormat::Webp,
+        ThumbTier::Large | ThumbTier::Preview | ThumbTier::Justified => ThumbFormat::Webp,
         _ => ThumbFormat::Jpeg,
     };
 
-    let thumb = dispatch_thumbnail(
-        &state.thumb_pool,
-        path.to_string(),
-        filter,
-        tier_format,
-        target,
-        target,
-    )
-    .await?
-    .map_err(|e| format!("thumb gen: {e}"))?;
+    let thumb = if matches!(tier, ThumbTier::Justified) {
+        dispatch_thumbnail_fit(&state.thumb_pool, path.to_string(), filter, tier_format, target)
+            .await?
+            .map_err(|e| format!("thumb gen: {e}"))?
+    } else {
+        dispatch_thumbnail(
+            &state.thumb_pool,
+            path.to_string(),
+            filter,
+            tier_format,
+            target,
+            target,
+        )
+        .await?
+        .map_err(|e| format!("thumb gen: {e}"))?
+    };
 
     let fmt_str = tier_format.as_cache_str().to_string();
     let bytes = thumb.data.clone();

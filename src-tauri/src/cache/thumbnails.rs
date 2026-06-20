@@ -43,6 +43,9 @@ pub enum ThumbTier {
     Large,
     /// ~1600 px longest edge — viewer first-paint, lazy-generated. `thumbnails_preview`.
     Preview,
+    /// ~512 px longest edge, **aspect-preserving** (no square crop) — justified
+    /// gallery view, lazy-generated. `thumbnails_justified`.
+    Justified,
 }
 
 impl ThumbTier {
@@ -53,6 +56,7 @@ impl ThumbTier {
             "m" | "standard" | "" => Some(Self::Standard),
             "l" | "large" => Some(Self::Large),
             "p" | "preview" => Some(Self::Preview),
+            "j" | "justified" => Some(Self::Justified),
             _ => None,
         }
     }
@@ -64,6 +68,7 @@ impl ThumbTier {
             Self::Standard => "m",
             Self::Large => "l",
             Self::Preview => "p",
+            Self::Justified => "j",
         }
     }
 
@@ -74,6 +79,7 @@ impl ThumbTier {
             Self::Standard => "thumbnails",
             Self::Large => "thumbnails_large",
             Self::Preview => "thumbnails_preview",
+            Self::Justified => "thumbnails_justified",
         }
     }
 
@@ -84,6 +90,7 @@ impl ThumbTier {
             Self::Standard => 512,
             Self::Large => 1024,
             Self::Preview => 1600,
+            Self::Justified => 512,
         }
     }
 }
@@ -332,6 +339,7 @@ impl CacheDb {
             ("Micro", ThumbTier::Micro),
             ("Large", ThumbTier::Large),
             ("Preview", ThumbTier::Preview),
+            ("Justified", ThumbTier::Justified),
         ] {
             let sql = format!(
                 "SELECT width, height, LENGTH(thumbnail), format FROM {} WHERE path = ?1",

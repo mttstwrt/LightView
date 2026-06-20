@@ -120,6 +120,8 @@ export interface SortedItem {
   date_added: number | null;
   last_rated: number | null;
   duration?: number | null;
+  width?: number | null;
+  height?: number | null;
 }
 
 // ---------------------------------------------------------------------------
