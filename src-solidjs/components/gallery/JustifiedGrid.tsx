@@ -1,9 +1,10 @@
-import { Index, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, type UnlistenFn } from "../../lib/runtime";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
-import { ensureTierThumbnails, thumbUrl } from "../../lib/ipc";
+import { ensureTierThumbnails, thumbUrl, mediaUrl, type ThumbTier } from "../../lib/ipc";
+import type { MediaMeta } from "../../stores/galleryStore";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { computeJustifiedLayout, rowIndexAtOffset } from "../../lib/justifiedLayout";
@@ -13,6 +14,9 @@ interface JustifiedGridProps {
   paths: string[];
   /** Aspect ratio (w/h) per path; missing entries fall back to 1:1. */
   aspects: Map<string, number>;
+  /** File size + media type per path; drives serve-original-vs-thumbnail at
+   *  high zoom. Missing entries fall back to always thumbnailing. */
+  itemMeta?: Map<string, MediaMeta>;
   /** Indices that begin a new group — force a row break before each. */
   groupStarts?: number[];
   onItemClick: (index: number) => void;
@@ -29,22 +33,116 @@ const BUFFER_AHEAD = 4;
 const BUFFER_BEHIND = 2;
 // Rows beyond the visible+buffer range before thumbnails are evicted.
 const EVICT_ROWS = 12;
+// Rows ahead of the viewport (in scroll direction) to warm the high (jh) tier
+// when zoomed in, so cells aren't cold 404→generate round-trips on reveal.
+const JH_PRECACHE_ROWS = 6;
 // How many paths to generate per IPC batch.
 const BATCH_SIZE = 96;
-// The justified tier is always served at the "j" segment.
-const TIER = "j" as const;
+// Above this scroll speed (px/sec) we stop assigning new <img> srcs so the
+// webview's main thread can keep up with scrolling instead of choking on a
+// wall of image decodes. Srcs are assigned once scrolling settles.
+const FAST_SCROLL_VELOCITY = 2500;
+// Idle gap (ms) after the last fast-scroll frame before scrolling is considered
+// settled and src assignment resumes (in case `scrollend` doesn't fire).
+const SCROLL_SETTLE_MS = 120;
+// Detail levels by zoom. "base" serves the 512px "j" tier. When zoomed in, the
+// view serves the *original file* for cheap native-format images (sharp, no
+// extra storage) and a 2560px "jh" thumbnail for large/non-native ones. The
+// byte cutoff for "serve original" grows with zoom: at "mid" only smaller files
+// stream as originals; at "high" most do. Thresholds compare the rendered row
+// height in *physical* pixels (row height × DPR), so hi-DPI screens step up
+// earlier — exactly where the 512px tier starts to look soft. The gap between
+// each up/down pair is hysteresis to avoid thrashing at a boundary.
+const MID_UP = 360;
+const MID_DOWN = 320;
+const HIGH_UP = 560;
+const HIGH_DOWN = 500;
+// "Serve original" byte cutoffs per level (native image formats only).
+const MID_MAX_BYTES = 1.5 * 1024 * 1024;
+const HIGH_MAX_BYTES = 3 * 1024 * 1024;
+// How much larger than the displayed (physical) cell a source image's longest
+// edge may be before we stop serving it as an original and use the jh tier
+// instead. Decoding a source much bigger than shown stalls the webview's main
+// thread, so we cap the over-decode at this factor.
+const ORIGINAL_SRC_TOLERANCE = 2.5;
+// Image formats the webview decodes natively, so the original can be served
+// directly. HEIC/AVIF/RAW need transcoding/thumbnailing; videos/gifs keep their
+// generated thumbnails.
+const NATIVE_IMG_EXTS = new Set(["jpg", "jpeg", "png", "webp"]);
 // Target-row-height (zoom) bounds, mirroring the grid's thumb-size range.
 const ROW_HEIGHT_MIN = 80;
 const ROW_HEIGHT_MAX = 600;
+
+type DetailLevel = "base" | "mid" | "high";
 
 export function JustifiedGrid(props: JustifiedGridProps) {
   const targetRowHeight = () => settings().display.thumbnail_size;
   const gap = () => settings().display.grid_gap;
 
+  // Current detail level from the (DPR-aware, hysteretic) zoom. "base" when
+  // high-detail is disabled or zoomed out; "mid"/"high" step up as you zoom in.
+  const [detailLevel, setDetailLevel] = createSignal<DetailLevel>("base");
+  createEffect(() => {
+    if (settings().display.justified_high_detail === false) {
+      setDetailLevel("base");
+      return;
+    }
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const px = targetRowHeight() * dpr;
+    setDetailLevel((prev): DetailLevel => {
+      if (prev === "base") return px > HIGH_UP ? "high" : px > MID_UP ? "mid" : "base";
+      if (prev === "mid") return px > HIGH_UP ? "high" : px < MID_DOWN ? "base" : "mid";
+      return px < MID_DOWN ? "base" : px < HIGH_DOWN ? "mid" : "high";
+    });
+  });
+
+  // The thumbnail tier backing the current level (used for cells not served as
+  // an original, and for the GIF atlas request).
+  const thumbTier = (): ThumbTier => (detailLevel() === "base" ? "j" : "jh");
+
+  const extOf = (p: string) => {
+    const i = p.lastIndexOf(".");
+    return i >= 0 ? p.slice(i + 1).toLowerCase() : "";
+  };
+
+  // Whether `path` should be served as its original file at the current level:
+  // a native-format still image that is both small enough to stream cheaply and
+  // not so high-resolution that the webview's full-res decode stalls the main
+  // thread. Otherwise we fall back to the pre-resized "jh" tier.
+  const servesOriginal = (path: string): boolean => {
+    const lvl = detailLevel();
+    if (lvl === "base") return false;
+    const meta = props.itemMeta?.get(path);
+    if (!meta || meta.media_type !== "image") return false;
+    if (!NATIVE_IMG_EXTS.has(extOf(path))) return false;
+    // Transfer-cost ceiling: never stream a very large file as the original.
+    if (meta.size > (lvl === "high" ? HIGH_MAX_BYTES : MID_MAX_BYTES)) return false;
+    // Decode-cost gate: the webview CPU-decodes the original at *full*
+    // resolution (then downscales), so a source far larger than the cell shows
+    // is a big main-thread stall — file bytes alone don't capture that (a
+    // small-but-50MP JPEG is cheap to transfer, ruinous to decode). Only serve
+    // the original when its longest edge is within tolerance of the displayed
+    // size; otherwise the jh tier (pre-resized off the UI thread) is faster and
+    // visually equivalent. Unknown dimensions fall back to the byte ceiling.
+    if (meta.width != null && meta.height != null) {
+      const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+      const aspect = props.aspects.get(path) ?? 1;
+      // Cells are row-height tall; landscape cells are wider, so the displayed
+      // longest edge is rowHeight × max(1, aspect).
+      const physicalLongEdge = targetRowHeight() * Math.max(1, aspect) * dpr;
+      const srcLongEdge = Math.max(meta.width, meta.height);
+      if (srcLongEdge > physicalLongEdge * ORIGINAL_SRC_TOLERANCE) return false;
+    }
+    return true;
+  };
+
   const [containerWidth, setContainerWidth] = createSignal(0);
   const [startRow, setStartRow] = createSignal(0);
   const [endRow, setEndRow] = createSignal(0);
   const [generation, setGeneration] = createSignal(0);
+  // True while scrolling fast enough that we defer assigning new <img> srcs;
+  // flips back to false when scrolling settles, re-running the assignment.
+  const [fastScroll, setFastScroll] = createSignal(false);
   const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
 
   let containerRef: HTMLDivElement | undefined;
@@ -75,8 +173,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
   const totalHeight = () => layout().totalHeight;
 
-  // Cells within the rendered row range, with absolute positions.
-  const visibleCells = () => {
+  // Cells within the rendered row range, with absolute positions. A memo so the
+  // several consumers below (geometry store, visible-path list, src assignment)
+  // share one computation per change.
+  const visibleCells = createMemo(() => {
     const lay = layout();
     const sr = startRow();
     const er = Math.min(endRow(), lay.rows.length);
@@ -89,7 +189,26 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       }
     }
     return out;
-  };
+  });
+
+  // Per-path cell geometry, kept in a fine-grained store so a cell whose
+  // position is unchanged across a scroll step does NOT notify (reconcile
+  // diffs leaves). This is what lets us render with a *path-keyed* <For>:
+  // a cell that stays on screen keeps its exact DOM node and <img src>, so the
+  // webview never re-decodes it — eliminating the per-row scroll flicker that
+  // an index-keyed <Index> caused by rewriting every slot's src.
+  type CellGeom = { x: number; y: number; width: number; height: number };
+  const [geom, setGeom] = createStore<Record<string, CellGeom>>({});
+  createEffect(() => {
+    const cells = visibleCells();
+    const next: Record<string, CellGeom> = {};
+    for (const c of cells) next[c.path] = { x: c.x, y: c.y, width: c.width, height: c.height };
+    setGeom(reconcile(next));
+  });
+
+  // Visible paths in render order. Strings are compared by value, so <For>
+  // preserves the DOM node for any path that remains visible across a scroll.
+  const visiblePaths = createMemo(() => visibleCells().map((c) => c.path));
 
   // -----------------------------------------------------------------------
   // Thumbnail streaming state (lazy "j" tier generation)
@@ -102,21 +221,52 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   const urlVersions = new Map<string, number>();
   let versionEpoch = 0;
   const pathToIndex = new Map<string, number>();
+  // Paths already requested for high-tier (jh) look-ahead precache, so we don't
+  // re-issue IPC for them while zoomed in.
+  const jhPrecached = new Set<string>();
   let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
 
   let thumbGenTotal = 0;
   let thumbGenDone = 0;
 
+  // Clear all streaming state and force a re-stream at the current tier. Used
+  // both for explicit invalidation and when the effective tier changes (zoom).
+  const resetStreaming = () => {
+    setThumbMap(reconcile({}));
+    assignedSet.clear();
+    needsGeneration.clear();
+    inFlightSet.clear();
+    failedSet.clear();
+    urlVersions.clear();
+    jhPrecached.clear();
+    versionEpoch++;
+    bgCursor = 0;
+    thumbGenTotal = 0;
+    thumbGenDone = 0;
+    setGeneration((g) => g + 1);
+  };
+
+  // Re-stream when the detail level changes so visible cells refetch at the new
+  // resolution / source. Deferred so it doesn't fire on initial mount.
+  createEffect(on(detailLevel, () => resetStreaming(), { defer: true }));
+
   const thumbSrcFor = (path: string) => {
+    // Originals are served straight from the media server — no cache-buster
+    // (they never regenerate) and no thumbnail tier.
+    if (servesOriginal(path)) return mediaUrl(path);
     const v = (urlVersions.get(path) ?? 0) + versionEpoch;
-    return v > 0 ? `${thumbUrl(path, TIER)}?v=${v}` : thumbUrl(path, TIER);
+    const tier = thumbTier();
+    return v > 0 ? `${thumbUrl(path, tier)}?v=${v}` : thumbUrl(path, tier);
   };
   const bumpVersion = (path: string) => {
     urlVersions.set(path, (urlVersions.get(path) ?? 0) + 1);
   };
 
   const handleThumbError = (path: string) => {
+    // Cells served their original file aren't thumbnail-backed — a load error
+    // here isn't a cache miss, so don't queue thumbnail generation.
+    if (servesOriginal(path)) return;
     if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path)) return;
     recordCacheMiss();
     needsGeneration.add(path);
@@ -138,9 +288,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
   // Assign protocol URLs as soon as cells become visible. Cached "j" thumbs
   // load instantly; uncached ones 404 → onError → queued for generation.
-  createEffect(on(visibleCells, (cells) => {
+  createEffect(on([visibleCells, fastScroll], ([cells, fast]) => {
+    // While flinging, leave new cells on their placeholder so the main thread
+    // isn't buried under image decodes mid-scroll. When scrolling settles
+    // (fast → false) this re-runs and assigns whatever's now on screen.
+    if (fast) return;
     const updates: [string, string][] = [];
-    for (const cell of cells) {
+    for (const cell of cells as ReturnType<typeof visibleCells>) {
       if (!assignedSet.has(cell.path)) {
         assignedSet.add(cell.path);
         updates.push([cell.path, thumbSrcFor(cell.path)]);
@@ -198,6 +352,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     };
 
     let rafId = 0;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    const markSettled = () => {
+      if (untrack(fastScroll)) setFastScroll(false);
+    };
     const onScroll = () => {
       if (rafId) return;
       rafId = requestAnimationFrame((now) => {
@@ -208,6 +366,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         scrollDirection = y >= lastScrollY ? 1 : -1;
         lastScrollY = y;
         lastTimestamp = now;
+        // Defer src assignment while flinging; resume shortly after it settles.
+        if (currentVelocity > FAST_SCROLL_VELOCITY) {
+          if (!untrack(fastScroll)) setFastScroll(true);
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = setTimeout(markSettled, SCROLL_SETTLE_MS);
+        }
         recalcRange?.();
         rafId = 0;
       });
@@ -250,7 +414,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         e.preventDefault();
         const cur = settings().display.thumbnail_size;
         const step = Math.max(8, Math.round(cur * 0.12));
-        const next = Math.max(ROW_HEIGHT_MIN, Math.min(ROW_HEIGHT_MAX, cur + (e.deltaY < 0 ? step : -step)));
+        const lo = settings().display.thumb_size_min ?? ROW_HEIGHT_MIN;
+        const hi = settings().display.thumb_size_max ?? ROW_HEIGHT_MAX;
+        const next = Math.max(lo, Math.min(hi, cur + (e.deltaY < 0 ? step : -step)));
         if (next !== cur) {
           setSettings((prev) => ({ ...prev, display: { ...prev.display, thumbnail_size: next } }));
         }
@@ -322,7 +488,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
           }
           inFlightFetch = (async () => {
             try {
-              await ensureTierThumbnails(toGenerate, TIER);
+              await ensureTierThumbnails(toGenerate, thumbTier());
               if (fetchAbort || generation() !== gen) return;
               batch(() => {
                 for (const p of toGenerate) {
@@ -349,8 +515,47 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         }
       }
 
-      // Background precache of upcoming items when idle.
-      if (currentVelocity < 500 && bgCursor < props.paths.length) {
+      // Look-ahead precache of the high (jh) tier in the scroll direction when
+      // zoomed in. Without it, every newly-revealed cell at mid/high detail is a
+      // cold 404 → generate → re-request round-trip (the "loads too slowly"
+      // symptom). Warming a bounded window ahead of the viewport means cells are
+      // usually ready by the time they scroll in. Disk stays bounded because the
+      // backend FIFO-evicts the jh tier. Skipped while flinging.
+      if (detailLevel() !== "base" && currentVelocity < 1500) {
+        const lay = layout();
+        const from = scrollDirection === 1 ? endRow() : Math.max(0, startRow() - JH_PRECACHE_ROWS);
+        const to = scrollDirection === 1
+          ? Math.min(lay.rows.length, endRow() + JH_PRECACHE_ROWS)
+          : startRow();
+        const want: string[] = [];
+        for (let r = from; r < to && want.length < BATCH_SIZE; r++) {
+          const row = lay.rows[r];
+          if (!row) continue;
+          for (const cell of row.cells) {
+            const p = props.paths[cell.index];
+            if (!p || jhPrecached.has(p) || failedSet.has(p)) continue;
+            // Originals aren't tier-backed — only jh-served cells need warming.
+            if (servesOriginal(p)) continue;
+            jhPrecached.add(p);
+            want.push(p);
+          }
+        }
+        if (want.length > 0) {
+          const tier = thumbTier();
+          inFlightFetch = (async () => {
+            try { await ensureTierThumbnails(want, tier); }
+            catch (e) { console.error("Justified jh look-ahead failed:", e); }
+            inFlightFetch = null;
+          })();
+          return;
+        }
+      }
+
+      // Background precache of upcoming items when idle. Only the base "j"
+      // tier is precached across the whole gallery — the high "jh" tier is
+      // warmed via the look-ahead above (visible + a window ahead) so its disk
+      // cost stays bounded to what's actually viewed zoomed in.
+      if (detailLevel() === "base" && currentVelocity < 500 && bgCursor < props.paths.length) {
         const bgNeeded: string[] = [];
         while (bgNeeded.length < BATCH_SIZE && bgCursor < props.paths.length) {
           const p = props.paths[bgCursor];
@@ -359,7 +564,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         }
         if (bgNeeded.length > 0) {
           inFlightFetch = (async () => {
-            try { await ensureTierThumbnails(bgNeeded, TIER); }
+            try { await ensureTierThumbnails(bgNeeded, "j"); }
             catch (e) { console.error("Justified background precache failed:", e); }
             inFlightFetch = null;
           })();
@@ -367,7 +572,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       }
     };
 
-    const onScrollEnd = () => scheduleFetch();
+    const onScrollEnd = () => {
+      markSettled();
+      scheduleFetch();
+    };
     window.addEventListener("scrollend", onScrollEnd);
 
     const bgIntervalId = setInterval(() => { if (!inFlightFetch) scheduleFetch(); }, 500);
@@ -377,19 +585,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // Re-run the visible range whenever the layout changes (width / zoom).
     createEffect(on(layout, () => { recalcRange?.(); }));
 
-    const onInvalidate = () => {
-      setThumbMap(reconcile({}));
-      assignedSet.clear();
-      needsGeneration.clear();
-      inFlightSet.clear();
-      failedSet.clear();
-      urlVersions.clear();
-      versionEpoch++;
-      bgCursor = 0;
-      thumbGenTotal = 0;
-      thumbGenDone = 0;
-      setGeneration((g) => g + 1);
-    };
+    const onInvalidate = () => resetStreaming();
     window.addEventListener("lightview:thumbnails-invalidated", onInvalidate);
 
     // Keep the viewed image visible (arrow-key nav from the viewer).
@@ -419,6 +615,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
+      if (settleTimer) clearTimeout(settleTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
     });
@@ -432,6 +629,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     inFlightSet.clear();
     failedSet.clear();
     urlVersions.clear();
+    jhPrecached.clear();
     bgCursor = 0;
     thumbGenTotal = 0;
     thumbGenDone = 0;
@@ -487,31 +685,37 @@ export function JustifiedGrid(props: JustifiedGridProps) {
             contain: "strict",
           }}
         >
-          <Index each={visibleCells()}>
-            {(cell) => (
-              <div
-                style={{
-                  position: "absolute",
-                  top: `${cell().y}px`,
-                  left: `${cell().x}px`,
-                  width: `${cell().width}px`,
-                  height: `${cell().height}px`,
-                }}
-              >
-                <ThumbnailCell
-                  path={cell().path}
-                  thumbSrc={thumbMap[cell().path] ?? null}
-                  tier={TIER}
-                  freeSize={true}
-                  durationSec={durationByPath().get(cell().path) ?? null}
-                  selected={props.selectedPaths.has(cell().path)}
-                  onClick={(e: MouseEvent) => handleItemClick(cell(), e)}
-                  onContextMenu={(e) => props.onItemContextMenu?.(e, cell().path, cell().index)}
-                  onError={handleThumbError}
-                />
-              </div>
-            )}
-          </Index>
+          <For each={visiblePaths()}>
+            {(path) => {
+              const g = () => geom[path];
+              const index = () => pathToIndex.get(path) ?? -1;
+              return (
+                <Show when={g()}>
+                  <div
+                    style={{
+                      position: "absolute",
+                      top: `${g()!.y}px`,
+                      left: `${g()!.x}px`,
+                      width: `${g()!.width}px`,
+                      height: `${g()!.height}px`,
+                    }}
+                  >
+                    <ThumbnailCell
+                      path={path}
+                      thumbSrc={thumbMap[path] ?? null}
+                      tier={thumbTier()}
+                      freeSize={true}
+                      durationSec={durationByPath().get(path) ?? null}
+                      selected={props.selectedPaths.has(path)}
+                      onClick={(e: MouseEvent) => handleItemClick({ path, index: index() }, e)}
+                      onContextMenu={(e) => props.onItemContextMenu?.(e, path, index())}
+                      onError={handleThumbError}
+                    />
+                  </div>
+                </Show>
+              );
+            }}
+          </For>
         </div>
       </Show>
     </div>

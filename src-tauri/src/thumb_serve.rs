@@ -21,20 +21,27 @@ pub enum ThumbOutcome {
 }
 
 /// Read a cached thumbnail directly from SQLite via the read-only protocol
-/// connection. Returns `Miss` on a genuine cache miss.
+/// connection pool. Returns `Miss` on a genuine cache miss. This is a blocking
+/// call (synchronous SQLite read) — call it from the blocking pool, not the UI
+/// thread (see [`read_cached_thumbnail_async`]).
 pub fn read_cached_thumbnail(state: &AppState, tier: ThumbTier, path: &str) -> ThumbOutcome {
-    let proto_db = state.thumb_protocol_db.lock().unwrap();
-    let conn = match proto_db.as_ref() {
-        Some(c) => c,
-        None => return ThumbOutcome::NoGallery,
+    let pool = {
+        let guard = state.thumb_protocol_db.read().unwrap();
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => return ThumbOutcome::NoGallery,
+        }
     };
 
     let sql = format!("SELECT thumbnail, format FROM {} WHERE path = ?1", tier.table());
-    match conn.prepare_cached(&sql).and_then(|mut stmt| {
-        stmt.query_row(rusqlite::params![path], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    let result = pool.with_conn(|conn| {
+        conn.prepare_cached(&sql).and_then(|mut stmt| {
+            stmt.query_row(rusqlite::params![path], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })
         })
-    }) {
+    });
+    match result {
         Ok((data, format)) => ThumbOutcome::Hit { data, format },
         Err(rusqlite::Error::QueryReturnedNoRows) => ThumbOutcome::Miss,
         Err(e) => {
@@ -44,10 +51,26 @@ pub fn read_cached_thumbnail(state: &AppState, tier: ThumbTier, path: &str) -> T
     }
 }
 
+/// Async wrapper around [`read_cached_thumbnail`] that runs the blocking SQLite
+/// read on the blocking thread pool, keeping it off both the UI thread and the
+/// async worker threads. Combined with the connection pool, concurrent reads
+/// fan out across connections instead of serializing.
+pub async fn read_cached_thumbnail_async(
+    state: &AppState,
+    tier: ThumbTier,
+    path: String,
+) -> ThumbOutcome {
+    let state = state.clone();
+    match tokio::task::spawn_blocking(move || read_cached_thumbnail(&state, tier, &path)).await {
+        Ok(outcome) => outcome,
+        Err(_) => ThumbOutcome::Miss,
+    }
+}
+
 /// Full lookup-then-generate. On a cache miss, generates on the thumb pool with
 /// coalescing so concurrent requests for the same key decode only once.
 pub async fn get_or_generate(state: &AppState, tier: ThumbTier, path: String) -> ThumbOutcome {
-    match read_cached_thumbnail(state, tier, &path) {
+    match read_cached_thumbnail_async(state, tier, path.clone()).await {
         ThumbOutcome::Miss => {}
         other => return other,
     }
@@ -93,17 +116,20 @@ pub enum ThumbhashOutcome {
 
 /// Read the ~25-byte ThumbHash blob for a path and decode it into a tiny PNG.
 pub fn render_thumbhash_png(state: &AppState, path: &str) -> ThumbhashOutcome {
-    let proto_db = state.thumb_protocol_db.lock().unwrap();
-    let conn = match proto_db.as_ref() {
-        Some(c) => c,
-        None => return ThumbhashOutcome::NoGallery,
+    let pool = {
+        let guard = state.thumb_protocol_db.read().unwrap();
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => return ThumbhashOutcome::NoGallery,
+        }
     };
 
-    let blob: Result<Option<Vec<u8>>, rusqlite::Error> = conn
-        .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")
-        .and_then(|mut stmt| {
-            stmt.query_row(rusqlite::params![path], |row| row.get::<_, Option<Vec<u8>>>(0))
-        });
+    let blob: Result<Option<Vec<u8>>, rusqlite::Error> = pool.with_conn(|conn| {
+        conn.prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row(rusqlite::params![path], |row| row.get::<_, Option<Vec<u8>>>(0))
+            })
+    });
 
     let Ok(Some(hash)) = blob else {
         return ThumbhashOutcome::Miss;

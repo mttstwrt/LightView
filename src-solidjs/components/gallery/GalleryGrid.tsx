@@ -1,6 +1,6 @@
-import { Index, Show, createSignal, createEffect, on, onMount, onCleanup, batch, untrack } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, isMobile, hasTouch, type UnlistenFn } from "../../lib/runtime";
+import { safeListen as listen, hasTouch, type UnlistenFn } from "../../lib/runtime";
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
@@ -41,33 +41,47 @@ const BG_BATCH_SIZE = 64;
 // Rows beyond the visible+buffer range before thumbnails are evicted from memory.
 const EVICT_ROWS = 15;
 
+// Above this scroll speed (px/sec) we stop assigning new <img> srcs so the
+// webview's main thread can keep up with scrolling instead of choking on a
+// wall of image decodes. Srcs are assigned once scrolling settles.
+const FAST_SCROLL_VELOCITY = 2500;
+// Idle gap (ms) after the last fast-scroll frame before we consider scrolling
+// settled and resume assigning srcs (in case `scrollend` doesn't fire).
+const SCROLL_SETTLE_MS = 120;
+
 
 // Ctrl+wheel thumbnail resize bounds (px). Each tick retargets the column
 // count by ±1 so one scroll notch always produces a visible change.
 const THUMB_SIZE_MIN = 80;
 const THUMB_SIZE_MAX = 600;
 
-// LOD tier thresholds — cellSize buckets used for URL construction.
-// See docs/thumbnailStreamingResearch.md.
-const TIER_MICRO_MAX = 160;
-const TIER_STANDARD_MAX = 400;
+// LOD tier native pixel sizes (longest edge of the square crop).
+const TIER_PX = { s: 128, m: 512, l: 1024 } as const;
+// How much upscale a tier may cover before bumping to the next one up. Slight
+// upscaling of a downsampled thumbnail is visually minor, but decoding a 2×-
+// larger tier than the cell can show is the dominant per-cell cost on
+// WebKitGTK — so we tolerate a little softness to avoid it. 1.25 keeps the
+// micro boundary near the old 160px and lets the 512px tier cover cells up to
+// ~640px instead of punting to 1024.
+const TIER_UPSCALE_TOLERANCE = 1.25;
 
 // Cap on the DPR multiplier so a 4×-DPR phone doesn't always punt to the
 // largest tier (which would dominate bandwidth on cellular).
 const MAX_DPR_SCALE = 3;
 
 function pickTier(cellPx: number): ThumbTier {
-  // On mobile, a 130px CSS cell paints ~390 device pixels on a high-DPR phone;
-  // serving the "s" tier there is what makes thumbnails look blurry. Scale by
-  // DPR so the tier matches the actual rendered resolution. Desktop is left
-  // alone so its bandwidth profile doesn't change.
+  // Match the decoded image to the *rendered* pixel size (cell × DPR), on
+  // desktop too. Serving a far larger tier than the cell shows forces the
+  // webview to decode + downscale a big bitmap per cell — see
+  // docs/thumbnailStreamingResearch.md. DPR is capped so a 4×-DPR phone doesn't
+  // always punt to the largest tier.
   const dpr =
-    isMobile() && typeof window !== "undefined"
+    typeof window !== "undefined"
       ? Math.min(window.devicePixelRatio || 1, MAX_DPR_SCALE)
       : 1;
-  const effective = cellPx * dpr;
-  if (effective <= TIER_MICRO_MAX) return "s";
-  if (effective <= TIER_STANDARD_MAX) return "m";
+  const needed = cellPx * dpr;
+  if (needed <= TIER_PX.s * TIER_UPSCALE_TOLERANCE) return "s";
+  if (needed <= TIER_PX.m * TIER_UPSCALE_TOLERANCE) return "m";
   return "l";
 }
 
@@ -84,6 +98,11 @@ export function GalleryGrid(props: GalleryGridProps) {
 
   // Generation counter — incremented on large jumps or path changes.
   const [generation, setGeneration] = createSignal(0);
+
+  // True while scrolling fast enough that we defer assigning new <img> srcs
+  // (see FAST_SCROLL_VELOCITY). Flips back to false when scrolling settles,
+  // which re-runs the assignment effect for whatever is now visible.
+  const [fastScroll, setFastScroll] = createSignal(false);
 
   // Store for protocol URLs (lightview://thumb/...).
   const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
@@ -331,7 +350,7 @@ export function GalleryGrid(props: GalleryGridProps) {
   // Visible items — derived from startRow/endRow signals (stable references)
   // -----------------------------------------------------------------------
 
-  const visibleItems = () => {
+  const visibleItems = createMemo(() => {
     const sr = startRow();
     const er = endRow();
     const c = cols();
@@ -342,7 +361,14 @@ export function GalleryGrid(props: GalleryGridProps) {
       items.push({ path: props.paths[i], index: i });
     }
     return items;
-  };
+  });
+
+  // Visible paths in grid order. Rendered with a path-keyed <For> so a cell
+  // that stays on screen across a scroll keeps its DOM node and <img src> — no
+  // re-decode, no flicker (an index-keyed <Index> rewrote every slot's src as
+  // the window shifted). CSS grid flow places nodes by order, and <For> moves
+  // existing nodes to keep that order on reorder.
+  const visiblePaths = createMemo(() => visibleItems().map((it) => it.path));
 
   // Y offset for the rendered slice of cells.
   const sliceOffsetY = () => startRow() * rowHeight();
@@ -353,10 +379,15 @@ export function GalleryGrid(props: GalleryGridProps) {
   // Uncached ones 404 → onerror → queued for IPC generation.
   // -----------------------------------------------------------------------
 
-  createEffect(on(visibleItems, (items) => {
+  createEffect(on([visibleItems, fastScroll], ([items, fast]) => {
+    // While flinging, leave new cells on their skeleton/placeholder so the main
+    // thread isn't buried under image decodes mid-scroll. When scrolling
+    // settles (fast → false) this effect re-runs and assigns whatever's now on
+    // screen. Already-assigned cells keep their src, so visible content stays.
+    if (fast) return;
     const t = tier();
     const updates: [string, string][] = [];
-    for (const item of items) {
+    for (const item of items as ReturnType<typeof visibleItems>) {
       if (!assignedSet.has(item.path)) {
         assignedSet.add(item.path);
         updates.push([item.path, thumbSrcFor(item.path, t)]);
@@ -433,6 +464,10 @@ export function GalleryGrid(props: GalleryGridProps) {
     };
 
     let rafId = 0;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    const markSettled = () => {
+      if (untrack(fastScroll)) setFastScroll(false);
+    };
     const onScroll = () => {
       if (rafId) return;
       rafId = requestAnimationFrame((now) => {
@@ -443,6 +478,13 @@ export function GalleryGrid(props: GalleryGridProps) {
         currentVelocity = dt > 0 ? dy / dt : 0;
         currentScrollY = y;
         scrollDirection = y >= lastScrollY ? 1 : -1;
+
+        // Defer src assignment while flinging; resume shortly after it settles.
+        if (currentVelocity > FAST_SCROLL_VELOCITY) {
+          if (!untrack(fastScroll)) setFastScroll(true);
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = setTimeout(markSettled, SCROLL_SETTLE_MS);
+        }
 
         // Jump detection
         if (dy > window.innerHeight * JUMP_FACTOR) {
@@ -515,7 +557,9 @@ export function GalleryGrid(props: GalleryGridProps) {
       const w = containerWidth();
       const g = gap();
       if (w <= 0) return;
-      const next = Math.max(THUMB_SIZE_MIN, Math.min(THUMB_SIZE_MAX, Math.round(rawNext)));
+      const lo = settings().display.thumb_size_min ?? THUMB_SIZE_MIN;
+      const hi = settings().display.thumb_size_max ?? THUMB_SIZE_MAX;
+      const next = Math.max(lo, Math.min(hi, Math.round(rawNext)));
       const cur = settings().display.thumbnail_size;
       const curCols = Math.max(1, Math.floor((w + g) / (cur + g)));
       const newCols = Math.max(1, Math.floor((w + g) / (next + g)));
@@ -865,7 +909,10 @@ export function GalleryGrid(props: GalleryGridProps) {
 
     // scrollend fires when scrolling stops — replaces manual debounce.
     // Also covers native scrollbar drags and programmatic scrollTo().
-    const onScrollEnd = () => scheduleFetch();
+    const onScrollEnd = () => {
+      markSettled();
+      scheduleFetch();
+    };
     window.addEventListener("scrollend", onScrollEnd);
 
     // Background interval for precache/eviction when not actively scrolling.
@@ -926,6 +973,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
+      if (settleTimer) clearTimeout(settleTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
     });
@@ -1058,22 +1106,25 @@ export function GalleryGrid(props: GalleryGridProps) {
                 gap: `${gap()}px`,
               }}
             >
-              <Index each={visibleItems()}>
-                {(item) => (
-                  <ThumbnailCell
-                    path={item().path}
-                    thumbSrc={thumbMap[item().path] ?? null}
-                    tier={tier()}
-                    durationSec={durationByPath().get(item().path) ?? null}
-                    selected={effectiveSelected().has(item().path)}
-                    onClick={(e: MouseEvent) => handleItemClick(item(), e)}
-                    onMouseDown={(e: MouseEvent) => handleDragStart(item().index, e)}
-                    onMouseEnter={() => handleDragEnter(item().index)}
-                    onContextMenu={(e) => props.onItemContextMenu?.(e, item().path, item().index)}
-                    onError={handleThumbError}
-                  />
-                )}
-              </Index>
+              <For each={visiblePaths()}>
+                {(path) => {
+                  const index = () => pathToIndex.get(path) ?? -1;
+                  return (
+                    <ThumbnailCell
+                      path={path}
+                      thumbSrc={thumbMap[path] ?? null}
+                      tier={tier()}
+                      durationSec={durationByPath().get(path) ?? null}
+                      selected={effectiveSelected().has(path)}
+                      onClick={(e: MouseEvent) => handleItemClick({ path, index: index() }, e)}
+                      onMouseDown={(e: MouseEvent) => handleDragStart(index(), e)}
+                      onMouseEnter={() => handleDragEnter(index())}
+                      onContextMenu={(e) => props.onItemContextMenu?.(e, path, index())}
+                      onError={handleThumbError}
+                    />
+                  );
+                }}
+              </For>
             </div>
           </div>
         </div>

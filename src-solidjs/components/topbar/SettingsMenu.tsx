@@ -23,6 +23,9 @@ import {
   setRemoteInactivity,
   getUploadConfig,
   setUploadConfig,
+  getRenderConfig,
+  setRenderConfig,
+  type RenderConfig,
   type RemoteAuthState,
   type PairingCode,
   type UploadConfig,
@@ -334,6 +337,29 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     return `${Math.floor(diff / 86400)}d ago`;
   };
 
+  // Process-level render config (GPU compositing). Global, not per-gallery, so
+  // it's fetched directly rather than from the settings store. Changes take
+  // effect only on restart.
+  const [renderCfg, setRenderCfg] = createSignal<RenderConfig | null>(null);
+  const [renderRestart, setRenderRestart] = createSignal(false);
+  if (!isWeb()) {
+    onMount(async () => {
+      try { setRenderCfg(await getRenderConfig()); } catch { /* ignore */ }
+    });
+  }
+  // Default-off (software path) until the user opts in.
+  const gpuOn = () => renderCfg()?.gpu_acceleration ?? false;
+  const toggleGpu = async (v: boolean) => {
+    const cfg = renderCfg();
+    try {
+      await setRenderConfig(v, cfg?.gtk_backend ?? null);
+      setRenderCfg({ gpu_acceleration: v, gtk_backend: cfg?.gtk_backend ?? null });
+      setRenderRestart(true);
+    } catch (e) {
+      console.error("Failed to save render config:", e);
+    }
+  };
+
   const [rebuilding, setRebuilding] = createSignal(false);
   const handleRebuild = async () => {
     setRebuilding(true);
@@ -613,6 +639,43 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 </div>
               </Field>
 
+              {/* Zoom range — min/max thumbnail (row) size the zoom allows. */}
+              <Field label="Zoom range (px)">
+                <div class="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min="40"
+                    max="2000"
+                    value={settings().display.thumb_size_min ?? 120}
+                    onInput={(e) => {
+                      const n = parseInt(e.currentTarget.value, 10);
+                      if (Number.isFinite(n) && n > 0) {
+                        const max = settings().display.thumb_size_max ?? 700;
+                        updateDisplay("thumb_size_min", Math.min(n, max - 1));
+                      }
+                    }}
+                    class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
+                    title="Smallest thumbnail / row size the zoom control reaches"
+                  />
+                  <span class="text-xs text-neutral-500">to</span>
+                  <input
+                    type="number"
+                    min="40"
+                    max="2000"
+                    value={settings().display.thumb_size_max ?? 700}
+                    onInput={(e) => {
+                      const n = parseInt(e.currentTarget.value, 10);
+                      if (Number.isFinite(n) && n > 0) {
+                        const min = settings().display.thumb_size_min ?? 120;
+                        updateDisplay("thumb_size_max", Math.max(n, min + 1));
+                      }
+                    }}
+                    class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
+                    title="Largest thumbnail / row size the zoom control reaches"
+                  />
+                </div>
+              </Field>
+
               {/* Background color */}
               <Field label="Background">
                 <div class="flex items-center gap-2">
@@ -679,6 +742,15 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 checked={settings().display.map_dark_mode ?? true}
                 onChange={(v) => updateDisplay("map_dark_mode", v)}
               />
+              <Toggle
+                label="High-detail justified zoom"
+                checked={settings().display.justified_high_detail ?? true}
+                onChange={(v) => updateDisplay("justified_high_detail", v)}
+              />
+              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
+                Generates sharper thumbnails when zoomed into the justified view.
+                Uses more disk for the images you view zoomed in.
+              </p>
 
             </Section>
 
@@ -994,6 +1066,21 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 >
                   {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
                 </button>
+                <Toggle
+                  label="GPU acceleration (experimental)"
+                  checked={gpuOn()}
+                  onChange={toggleGpu}
+                />
+                <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
+                  Uses the GPU compositing path for much smoother scrolling and
+                  faster image display. Disabled by default because it can crash
+                  on some drivers. Takes effect after restarting the app.
+                </p>
+                <Show when={renderRestart()}>
+                  <p class="text-[10px] text-amber-400/80 pl-0.5">
+                    Restart LightView to apply the new rendering mode.
+                  </p>
+                </Show>
               </Section>
             </Show>
 

@@ -131,7 +131,7 @@ export interface ThumbnailResult {
 
 /** LOD tier for thumbnails; see docs/thumbnailStreamingResearch.md and
  *  `ThumbTier` in src-tauri/src/cache/thumbnails.rs. */
-export type ThumbTier = "s" | "m" | "l" | "p" | "j";
+export type ThumbTier = "s" | "m" | "l" | "p" | "j" | "jh";
 
 /** Build a protocol URL for a cached thumbnail at a given tier. The
  *  `lightview://thumb/<tier>/<path>` protocol serves image data directly
@@ -644,6 +644,21 @@ export const saveGallerySettings = (settingsJson: string) =>
 
 export const loadGallerySettings = () =>
   invoke<string | null>("load_gallery_settings");
+
+/** Process-level rendering prefs (read at startup; changes need a restart).
+ *  `null` for a field means "use the built-in default". */
+export interface RenderConfig {
+  gpu_acceleration: boolean | null;
+  gtk_backend: string | null;
+}
+
+export const getRenderConfig = () =>
+  invoke<RenderConfig>("get_render_config");
+
+export const setRenderConfig = (
+  gpuAcceleration: boolean | null,
+  gtkBackend: string | null,
+) => invoke<void>("set_render_config", { gpuAcceleration, gtkBackend });
 
 /** Gallery-wide default filter (shared by desktop and LAN web clients). */
 export const getGalleryDefaultFilter = () =>

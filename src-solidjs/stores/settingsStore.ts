@@ -5,6 +5,8 @@ import { saveGallerySettings, loadGallerySettings } from "../lib/ipc";
 const DEFAULT_SETTINGS: AppSettings = {
   display: {
     thumbnail_size: 200,
+    thumb_size_min: 120,
+    thumb_size_max: 700,
     grid_gap: 2,
     background_color: "#0a0a0a",
     video_hover_preview: false,
@@ -14,6 +16,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     video_autoplay_max_seconds: 30,
     scroll_blur: false,
     map_dark_mode: true,
+    justified_high_detail: true,
   },
   performance: {
     preload_count: 3,

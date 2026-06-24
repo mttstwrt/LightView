@@ -412,9 +412,33 @@ fn encode_output(pixels: &[u8], w: u32, h: u32, format: ThumbFormat) -> Result<V
     }
 }
 
-/// Lossy WebP encode at Q75 — ~30% smaller than JPEG at equivalent
-/// perceptual quality, natively supported by WebKit. Input must be
-/// tightly packed RGBA8 of exactly `w * h * 4` bytes.
+/// WebP quality for small outputs (justified base "j" tier, ~512 px). At this
+/// display size the difference from a higher quality is imperceptible, so we
+/// keep files small.
+const WEBP_QUALITY_SMALL: f32 = 78.0;
+/// WebP quality for large outputs (large/preview/justified-high tiers, shown
+/// big on screen at high zoom). Q75 was visibly lossy on detailed images at
+/// these sizes; ~88 is near-transparent while still well under original bytes.
+const WEBP_QUALITY_LARGE: f32 = 88.0;
+/// Longest-edge threshold (px) above which an output counts as "large" and
+/// earns the higher WebP quality. 1024 covers the large/preview/jh tiers while
+/// leaving the 512 px justified base tier on the small setting.
+const WEBP_LARGE_EDGE: u32 = 1024;
+
+/// Pick the WebP quality for an output of the given dimensions. Larger outputs
+/// are shown bigger on screen, so they get the higher quality.
+fn webp_quality_for(w: u32, h: u32) -> f32 {
+    if w.max(h) >= WEBP_LARGE_EDGE {
+        WEBP_QUALITY_LARGE
+    } else {
+        WEBP_QUALITY_SMALL
+    }
+}
+
+/// Lossy WebP encode — ~30% smaller than JPEG at equivalent perceptual quality,
+/// natively supported by WebKit. Quality scales with output size (see
+/// [`webp_quality_for`]). Input must be tightly packed RGBA8 of exactly
+/// `w * h * 4` bytes.
 pub fn encode_rgba_to_webp(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbError> {
     let expected = (w as usize) * (h as usize) * 4;
     if rgba.len() < expected {
@@ -426,7 +450,7 @@ pub fn encode_rgba_to_webp(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, Thumb
         )));
     }
     let encoder = webp::Encoder::from_rgba(&rgba[..expected], w, h);
-    let mem = encoder.encode(75.0);
+    let mem = encoder.encode(webp_quality_for(w, h));
     Ok(mem.to_vec())
 }
 

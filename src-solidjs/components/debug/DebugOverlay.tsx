@@ -10,6 +10,8 @@ import {
   ipcCallRate,
   ipcAvgLatency,
   cacheMisses,
+  imageLoadLatency,
+  imageLoadRate,
   domNodes,
   diskReadRate,
   diskWriteRate,
@@ -160,6 +162,18 @@ export function DebugOverlay() {
             value={() => `${fmtInt(cacheMisses.last)}/s`}
             data={() => { void tick(); return cacheMisses.toArray(); }}
             color="#f43f5e"
+          />
+          <MetricRow
+            label="Img Load"
+            value={() => `${fmt(imageLoadLatency.last)} ms`}
+            data={() => { void tick(); return imageLoadLatency.toArray(); }}
+            color="#a3e635"
+          />
+          <MetricRow
+            label="Img Load Rate"
+            value={() => `${fmtInt(imageLoadRate.last)}/s`}
+            data={() => { void tick(); return imageLoadRate.toArray(); }}
+            color="#84cc16"
           />
           <MetricRow
             label="Disk Read"

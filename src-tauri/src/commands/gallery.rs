@@ -617,22 +617,23 @@ pub async fn open_gallery_impl(
     // autocomplete, and map coordinates light up once that task finishes and
     // emits `gallery:tags-indexed`.
 
-    // Open a second read-only connection for the thumbnail protocol handler.
-    // SQLite WAL mode supports concurrent readers.
+    // Open a pool of read-only connections for the thumbnail protocol handler /
+    // HTTP route. SQLite WAL mode supports concurrent readers, so N connections
+    // let the thumbnail hot path serve reads in parallel instead of one-at-a-
+    // time through a single Mutex'd connection.
     {
         let db_path = std::path::Path::new(&path).join(".lightview").join("cache.db");
-        match rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) {
-            Ok(conn) => {
-                let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
-                let _ = conn.execute_batch("PRAGMA cache_size=-16000;"); // 16MB read cache
-                let mut proto_db = state.thumb_protocol_db.lock().unwrap();
-                *proto_db = Some(conn);
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 6);
+        match crate::ThumbProtocolPool::open(&db_path, n) {
+            Some(pool) => {
+                let mut proto_db = state.thumb_protocol_db.write().unwrap();
+                *proto_db = Some(Arc::new(pool));
             }
-            Err(e) => {
-                log::warn!("Failed to open read-only DB for protocol handler: {}", e);
+            None => {
+                log::warn!("Failed to open read-only DB pool for protocol handler");
             }
         }
     }
@@ -752,10 +753,10 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
         reg.remove(&path);
     }
 
-    // Close protocol handler DB FIRST — the read-only connection blocks
-    // WAL checkpointing, so it must be dropped before we checkpoint.
+    // Close protocol handler DB FIRST — the read-only connections block
+    // WAL checkpointing, so they must be dropped before we checkpoint.
     {
-        let mut proto_db = state.thumb_protocol_db.lock().unwrap();
+        let mut proto_db = state.thumb_protocol_db.write().unwrap();
         *proto_db = None;
     }
 

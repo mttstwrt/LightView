@@ -46,6 +46,30 @@ const aspectByPath = createMemo(() => {
   return map;
 });
 
+// Per-path file size + media type, for the justified view to decide whether a
+// cell can be served as its original file (cheap, native formats) instead of a
+// generated high-detail thumbnail when zoomed in.
+export interface MediaMeta {
+  size: number;
+  media_type: string;
+  /** Source pixel dimensions, when known. Used to gate "serve original" on the
+   *  decode cost (megapixels), not just file bytes. */
+  width: number | null;
+  height: number | null;
+}
+const mediaMetaByPath = createMemo(() => {
+  const map = new Map<string, MediaMeta>();
+  for (const item of sortedItems()) {
+    map.set(item.path, {
+      size: item.file_size,
+      media_type: item.media_type,
+      width: item.width ?? null,
+      height: item.height ?? null,
+    });
+  }
+  return map;
+});
+
 // Group headers for the current sort/group
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 
@@ -74,6 +98,7 @@ export {
   sortedItems, setSortedItems,
   durationByPath,
   aspectByPath,
+  mediaMetaByPath,
   groups, setGroups,
   timeline, setTimeline,
   selectedPaths, setSelectedPaths,

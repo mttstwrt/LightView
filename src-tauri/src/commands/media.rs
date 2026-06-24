@@ -949,7 +949,7 @@ pub async fn ensure_tier_thumbnails(
     // L/P tiers use lossy WebP — ~30 % smaller at equivalent quality,
     // which matters a lot at 1024/1600 px. Micro falls back to JPEG.
     let tier_format = match tier {
-        ThumbTier::Large | ThumbTier::Preview | ThumbTier::Justified => ThumbFormat::Webp,
+        ThumbTier::Large | ThumbTier::Preview | ThumbTier::Justified | ThumbTier::JustifiedHigh => ThumbFormat::Webp,
         _ => ThumbFormat::Jpeg,
     };
 
@@ -961,7 +961,7 @@ pub async fn ensure_tier_thumbnails(
     // path so the gallery can show true proportions.
     let missing_clone = missing.clone();
     let pool = state.thumb_pool.clone();
-    let is_fit = matches!(tier, ThumbTier::Justified);
+    let is_fit = matches!(tier, ThumbTier::Justified | ThumbTier::JustifiedHigh);
     let (tx, rx) = tokio::sync::oneshot::channel();
     pool.spawn(move || {
         use rayon::prelude::*;
@@ -1005,8 +1005,27 @@ pub async fn ensure_tier_thumbnails(
         }
     }
     txn.commit().map_err(|e| e.to_string())?;
+
+    // Cap the high justified tier's footprint. It's generated for whatever you
+    // view zoomed in (visible cells + look-ahead), so without a bound it grows
+    // with everything you've ever scrolled past at high zoom. FIFO-evict the
+    // oldest rows beyond the cap; the working set while browsing is contiguous,
+    // so this drops far-away cells, which regenerate lazily if revisited.
+    if matches!(tier, ThumbTier::JustifiedHigh) {
+        if let Err(e) =
+            crate::cache::thumbnails::evict_tier_fifo(db.conn(), tier, JH_MAX_CACHED_ROWS)
+        {
+            log::warn!("jh tier eviction failed: {e}");
+        }
+    }
+
     Ok(written)
 }
+
+/// Max rows retained in the high justified tier (`thumbnails_justified_high`).
+/// At ~2560 px WebP these run a few hundred KB each, so ~1200 rows bounds the
+/// tier to roughly half a gigabyte.
+const JH_MAX_CACHED_ROWS: u32 = 1200;
 
 /// Extras derived from a Standard-tier thumbnail: ThumbHash placeholder +
 /// Micro (128px) tier bytes. Every Standard-tier generation path (batch,
@@ -1071,11 +1090,11 @@ pub async fn generate_and_store_tier(
     let target = tier.target_size();
     let filter = thumbnailer::filter_for_size(target);
     let tier_format = match tier {
-        ThumbTier::Large | ThumbTier::Preview | ThumbTier::Justified => ThumbFormat::Webp,
+        ThumbTier::Large | ThumbTier::Preview | ThumbTier::Justified | ThumbTier::JustifiedHigh => ThumbFormat::Webp,
         _ => ThumbFormat::Jpeg,
     };
 
-    let thumb = if matches!(tier, ThumbTier::Justified) {
+    let thumb = if matches!(tier, ThumbTier::Justified | ThumbTier::JustifiedHigh) {
         dispatch_thumbnail_fit(&state.thumb_pool, path.to_string(), filter, tier_format, target)
             .await?
             .map_err(|e| format!("thumb gen: {e}"))?

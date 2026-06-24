@@ -107,6 +107,22 @@ export function recordCacheMiss() {
 }
 
 // -------------------------------------------------------------------------
+// Image load latency — wall-clock from <img> src assignment to onload, for
+// freshly-seen URLs only (cached re-displays are skipped). Captures the full
+// fetch + decode cost, so it's directly comparable native (WebKitGTK custom
+// protocol) vs web (browser + HTTP). Averaged per sample tick.
+// -------------------------------------------------------------------------
+
+let imageLoadSum = 0;
+let imageLoadCount = 0;
+
+export function recordImageLoad(durationMs: number) {
+  if (!_active) return;
+  imageLoadSum += durationMs;
+  imageLoadCount++;
+}
+
+// -------------------------------------------------------------------------
 // Image cache tracking (sampled each tick via getter)
 // -------------------------------------------------------------------------
 
@@ -137,6 +153,8 @@ export const diskWriteRate = new RingBuffer(HISTORY_LEN);     // KB/s
 export const visibleImages = new RingBuffer(HISTORY_LEN);     // count
 export const cachedImages = new RingBuffer(HISTORY_LEN);      // count
 export const jsHeapUsed = new RingBuffer(HISTORY_LEN);        // MB
+export const imageLoadLatency = new RingBuffer(HISTORY_LEN);  // ms (avg/sample)
+export const imageLoadRate = new RingBuffer(HISTORY_LEN);     // loads/sec
 
 // -------------------------------------------------------------------------
 // FPS measurement (rAF-based, only runs when active)
@@ -205,6 +223,12 @@ async function sampleTick() {
   prevCacheMissCount = cacheMissCount;
   cacheMisses.push(missDelta / dtSec);
 
+  // Image load latency (avg ms over this tick) + load rate
+  imageLoadLatency.push(imageLoadCount > 0 ? imageLoadSum / imageLoadCount : 0);
+  imageLoadRate.push(imageLoadCount / dtSec);
+  imageLoadSum = 0;
+  imageLoadCount = 0;
+
   // DOM nodes
   domNodes.push(document.querySelectorAll("*").length);
 
@@ -258,6 +282,8 @@ export function startMonitoring() {
   prevIpcCallCount = 0;
   cacheMissCount = 0;
   prevCacheMissCount = 0;
+  imageLoadSum = 0;
+  imageLoadCount = 0;
   prevDiskRead = 0;
   prevDiskWrite = 0;
   prevSampleTime = 0;
@@ -299,4 +325,6 @@ export function stopMonitoring() {
   visibleImages.clear();
   cachedImages.clear();
   jsHeapUsed.clear();
+  imageLoadLatency.clear();
+  imageLoadRate.clear();
 }

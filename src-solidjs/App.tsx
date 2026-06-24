@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen, aspectByPath, groups } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
@@ -465,6 +465,7 @@ export function App() {
             <JustifiedGrid
               paths={displayPaths()}
               aspects={aspectByPath()}
+              itemMeta={mediaMetaByPath()}
               groupStarts={groups().map((g) => g.start_index)}
               onItemClick={(index) => {
                 clearSelection();

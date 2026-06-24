@@ -13,7 +13,7 @@ pub enum CacheError {
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 13;
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -245,6 +245,28 @@ const MIGRATIONS: &[Migration] = &[
                 format       TEXT NOT NULL DEFAULT 'webp'
             );
         ",
+    },
+    // v12: high-resolution justified tier (1600px longest edge), generated
+    // for visible cells only when zoomed in. Same shape as thumbnails_justified.
+    Migration {
+        version: 12,
+        sql: "
+            CREATE TABLE IF NOT EXISTS thumbnails_justified_high (
+                path         TEXT PRIMARY KEY,
+                media_type   TEXT NOT NULL,
+                mtime        INTEGER NOT NULL,
+                width        INTEGER NOT NULL,
+                height       INTEGER NOT NULL,
+                thumbnail    BLOB NOT NULL,
+                format       TEXT NOT NULL DEFAULT 'webp'
+            );
+        ",
+    },
+    // v13: the high justified tier target grew 1600 → 2560, so any rows cached
+    // at the old size are stale. Clear them; they regenerate lazily at 2560.
+    Migration {
+        version: 13,
+        sql: "DELETE FROM thumbnails_justified_high;",
     },
 ];
 

@@ -46,6 +46,10 @@ pub enum ThumbTier {
     /// ~512 px longest edge, **aspect-preserving** (no square crop) — justified
     /// gallery view, lazy-generated. `thumbnails_justified`.
     Justified,
+    /// ~1600 px longest edge, **aspect-preserving** (no square crop) — justified
+    /// gallery view when zoomed in, lazy-generated for visible cells only.
+    /// `thumbnails_justified_high`.
+    JustifiedHigh,
 }
 
 impl ThumbTier {
@@ -57,6 +61,7 @@ impl ThumbTier {
             "l" | "large" => Some(Self::Large),
             "p" | "preview" => Some(Self::Preview),
             "j" | "justified" => Some(Self::Justified),
+            "jh" | "justified_high" => Some(Self::JustifiedHigh),
             _ => None,
         }
     }
@@ -69,6 +74,7 @@ impl ThumbTier {
             Self::Large => "l",
             Self::Preview => "p",
             Self::Justified => "j",
+            Self::JustifiedHigh => "jh",
         }
     }
 
@@ -80,6 +86,7 @@ impl ThumbTier {
             Self::Large => "thumbnails_large",
             Self::Preview => "thumbnails_preview",
             Self::Justified => "thumbnails_justified",
+            Self::JustifiedHigh => "thumbnails_justified_high",
         }
     }
 
@@ -91,6 +98,11 @@ impl ThumbTier {
             Self::Large => 1024,
             Self::Preview => 1600,
             Self::Justified => 512,
+            // High justified tier is used both as a fallback for large/non-native
+            // images (the small, common ones are served as originals) and to give
+            // wide images enough pixels on their long edge. 2560 keeps wide cells
+            // sharp at high zoom without approaching full-res file sizes.
+            Self::JustifiedHigh => 2560,
         }
     }
 }
@@ -142,6 +154,32 @@ pub fn write_tier_row(
         rusqlite::params![path, media_type, mtime, width, height, thumbnail, format],
     )?;
     Ok(())
+}
+
+/// Bound a tier table to its `max_rows` most-recently-inserted rows, deleting
+/// the oldest beyond that. Ordering is by `rowid` (insertion order), so this is
+/// FIFO eviction, not strict LRU — true LRU would need an access-time write on
+/// every cache read, which we deliberately avoid on the hot serve path. Used to
+/// cap the high justified tier, whose 2560 px WebP rows are generated for
+/// whatever you view zoomed in and would otherwise grow without limit.
+/// Returns the number of rows evicted.
+pub fn evict_tier_fifo(
+    conn: &rusqlite::Connection,
+    tier: ThumbTier,
+    max_rows: u32,
+) -> Result<usize, CacheError> {
+    debug_assert!(!matches!(tier, ThumbTier::Standard));
+    // Keep the newest `max_rows` (highest rowids); delete everything older.
+    // `LIMIT -1 OFFSET n` skips the n newest, yielding the rest (the oldest).
+    let sql = format!(
+        "DELETE FROM {} WHERE rowid IN (
+            SELECT rowid FROM {} ORDER BY rowid DESC LIMIT -1 OFFSET ?1
+        )",
+        tier.table(),
+        tier.table(),
+    );
+    let evicted = conn.execute(&sql, rusqlite::params![max_rows])?;
+    Ok(evicted)
 }
 
 impl CacheDb {
@@ -257,6 +295,14 @@ impl CacheDb {
             .conn()
             .execute("DELETE FROM thumbnails_preview", [])
             .unwrap_or(0);
+        count += self
+            .conn()
+            .execute("DELETE FROM thumbnails_justified", [])
+            .unwrap_or(0);
+        count += self
+            .conn()
+            .execute("DELETE FROM thumbnails_justified_high", [])
+            .unwrap_or(0);
         Ok(count)
     }
 
@@ -340,6 +386,7 @@ impl CacheDb {
             ("Large", ThumbTier::Large),
             ("Preview", ThumbTier::Preview),
             ("Justified", ThumbTier::Justified),
+            ("Justified High", ThumbTier::JustifiedHigh),
         ] {
             let sql = format!(
                 "SELECT width, height, LENGTH(thumbnail), format FROM {} WHERE path = ?1",

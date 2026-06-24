@@ -36,6 +36,102 @@ pub struct RecentGallery {
     pub last_opened: i64,
 }
 
+/// Process-level rendering preferences, read at startup *before* GTK/WebKit
+/// init (so they can't be normal per-gallery settings). Changing these
+/// requires an app restart. `None` means "use the built-in default".
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RenderConfig {
+    /// Enable the WebKitGTK DMA-BUF/GPU compositing path. `Some(false)` forces
+    /// the software path (the old crash-avoidance default); `None` → built-in.
+    pub gpu_acceleration: Option<bool>,
+    /// GDK backend ("x11" or "wayland"). `None` → built-in default ("x11").
+    pub gtk_backend: Option<String>,
+}
+
+fn render_config_path() -> std::path::PathBuf {
+    util::paths::data_dir().join("render.json")
+}
+
+/// Load the render config, or defaults if absent/unreadable.
+pub fn load_render_config() -> RenderConfig {
+    match std::fs::read_to_string(render_config_path()) {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+        Err(_) => RenderConfig::default(),
+    }
+}
+
+/// Persist the render config. Best-effort.
+pub fn save_render_config(cfg: &RenderConfig) -> Result<(), String> {
+    let path = render_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+/// A small pool of read-only SQLite connections for serving cached thumbnails.
+///
+/// SQLite WAL mode allows many simultaneous readers, but a single `Connection`
+/// behind a `Mutex` serializes them. This hands each request one of `N`
+/// connections (round-robin, preferring an idle one) so reads on the thumbnail
+/// hot path run in parallel instead of one-at-a-time.
+pub struct ThumbProtocolPool {
+    conns: Vec<std::sync::Mutex<rusqlite::Connection>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ThumbProtocolPool {
+    /// Open `n` read-only WAL connections to `db_path`. Returns `None` if not a
+    /// single connection could be opened.
+    pub fn open(db_path: &std::path::Path, n: usize) -> Option<Self> {
+        let n = n.max(1);
+        let mut conns = Vec::with_capacity(n);
+        for _ in 0..n {
+            match rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(conn) => {
+                    let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                    // 8MB page cache per connection — modest, since N of them
+                    // exist and the OS page cache backs the WAL underneath.
+                    let _ = conn.execute_batch("PRAGMA cache_size=-8000;");
+                    conns.push(std::sync::Mutex::new(conn));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to open read-only DB connection {} for protocol handler: {}",
+                        conns.len(),
+                        e
+                    );
+                }
+            }
+        }
+        if conns.is_empty() {
+            None
+        } else {
+            Some(Self { conns, next: std::sync::atomic::AtomicUsize::new(0) })
+        }
+    }
+
+    /// Run `f` with one of the pool's connections. Picks round-robin, preferring
+    /// an idle connection (`try_lock`); blocks on the chosen one if all are busy.
+    pub fn with_conn<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> T) -> T {
+        let n = self.conns.len();
+        let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
+        for off in 0..n {
+            let idx = (start + off) % n;
+            if let Ok(guard) = self.conns[idx].try_lock() {
+                return f(&guard);
+            }
+        }
+        let guard = self.conns[start].lock().unwrap();
+        f(&guard)
+    }
+}
+
 /// Shared application state accessible from all Tauri commands.
 ///
 /// Every field is `Arc`-wrapped, so `Clone` produces a cheap handle that
@@ -78,9 +174,12 @@ pub struct AppState {
     /// Cancellation flag for plugin batch runs.
     pub plugin_cancelled: Arc<std::sync::atomic::AtomicBool>,
 
-    /// Read-only SQLite connection for the thumbnail protocol handler.
-    /// Uses std::sync::Mutex (not tokio) because protocol handlers are synchronous.
-    pub thumb_protocol_db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
+    /// Pool of read-only SQLite connections for the thumbnail protocol handler
+    /// and the HTTP `/thumb` route. `std::sync::RwLock` (not tokio) because the
+    /// reads are synchronous; readers take the read lock only briefly to clone
+    /// the inner `Arc<ThumbProtocolPool>`, then release it, so they don't
+    /// serialize on the outer lock.
+    pub thumb_protocol_db: Arc<std::sync::RwLock<Option<Arc<ThumbProtocolPool>>>>,
 
     /// Deduplicates concurrent generate-on-miss thumbnail requests coming
     /// from the `lightview://thumb/...` protocol handler.
@@ -164,7 +263,7 @@ impl AppState {
             thumb_pool: Arc::new(thumb_pool),
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
             plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            thumb_protocol_db: Arc::new(std::sync::Mutex::new(None)),
+            thumb_protocol_db: Arc::new(std::sync::RwLock::new(None)),
             thumb_gen_coalescer: Arc::new(ThumbGenCoalescer::new()),
             fs_watcher: Arc::new(std::sync::Mutex::new(None)),
             fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),

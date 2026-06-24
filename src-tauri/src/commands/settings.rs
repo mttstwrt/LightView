@@ -877,6 +877,23 @@ pub async fn remove_recent_gallery(
     Ok(())
 }
 
+/// Read the process-level render config (GPU acceleration / GTK backend).
+/// These env-driven settings take effect only at startup, so the UI must
+/// prompt for a restart after changing them.
+#[tauri::command]
+pub async fn get_render_config() -> Result<crate::RenderConfig, String> {
+    Ok(crate::load_render_config())
+}
+
+/// Persist the render config. Takes effect on the next app start.
+#[tauri::command]
+pub async fn set_render_config(
+    gpu_acceleration: Option<bool>,
+    gtk_backend: Option<String>,
+) -> Result<(), String> {
+    crate::save_render_config(&crate::RenderConfig { gpu_acceleration, gtk_backend })
+}
+
 /// Open a file with an external application.
 /// Spawns the command as a detached process — does not wait for it to exit.
 #[tauri::command]
@@ -911,7 +928,8 @@ mod settings_file_tests {
             "video_autoplay_grid": false,
             "video_autoplay_max_seconds": 30,
             "scroll_blur": false,
-            "map_dark_mode": true
+            "map_dark_mode": true,
+            "justified_high_detail": true
         },
         "performance": { "preload_count": 3, "lru_cache_size": 5, "thumbnail_threads": 6 },
         "storage": { "companion_location": "lightview_folder" },

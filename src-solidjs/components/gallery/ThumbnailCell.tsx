@@ -4,6 +4,7 @@ import { mediaUrl, gifAtlasUrl, type ThumbTier } from "../../lib/ipc";
 import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
 import { isTauri } from "../../lib/runtime";
+import { recordImageLoad, isActive as perfActive } from "../../lib/perfMonitor";
 import { GifCanvas } from "../GifCanvas";
 
 interface ThumbnailCellProps {
@@ -219,10 +220,18 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
   // Starts true if the URL was already seen, so recycled cells don't re-fade.
   const [loaded, setLoaded] = createSignal(false);
 
+  // Wall-clock start for the current (fresh) image load, for perf timing.
+  // 0 means "don't time this load" (no URL, or already-seen URL).
+  let loadStart = 0;
+
   // Clear error/loaded state when a new URL is provided (e.g. after generation + cache-bust).
   createEffect(on(() => props.thumbSrc, (url) => {
     setErrored(false);
-    setLoaded(url ? loadedUrls.has(url) : false);
+    const seen = url ? loadedUrls.has(url) : false;
+    setLoaded(seen);
+    // Only timestamp when the perf monitor is active, so this is zero-cost
+    // (no performance.now() per load) when the debug overlay is closed.
+    loadStart = url && !seen && perfActive() ? performance.now() : 0;
   }));
 
   // Whether we have a valid URL to attempt loading.
@@ -237,6 +246,12 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       style={{
         background: "#1a1a1a",
         contain: "layout style paint",
+        // Let the engine skip rendering/decoding cells that are in the
+        // virtual-scroll buffer but off-screen until they scroll into view.
+        // Cell size is set externally (grid track / explicit), so the
+        // intrinsic-size fallback is only a pre-first-paint placeholder.
+        "content-visibility": "auto",
+        "contain-intrinsic-size": "auto 250px",
         outline: props.selected ? "2px solid #3b82f6" : "none",
         "outline-offset": "-2px",
       }}
@@ -279,6 +294,10 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         draggable={false}
         onLoad={() => {
           if (props.thumbSrc) markUrlLoaded(props.thumbSrc);
+          if (loadStart > 0) {
+            recordImageLoad(performance.now() - loadStart);
+            loadStart = 0;
+          }
           setLoaded(true);
         }}
         onError={() => {
@@ -293,7 +312,9 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           Keyed on the URL so recycling to a different GIF restarts cleanly. */}
       <Show when={showGifCanvas()}>
         <GifCanvas
-          url={gifAtlasUrl(props.path, props.tier)}
+          // Cap the animated-frame atlas at the "j" tier — a 2560px ("jh")
+          // atlas would decode every frame at that size and blow up memory.
+          url={gifAtlasUrl(props.path, props.tier === "jh" ? "j" : props.tier)}
           class="absolute inset-0 w-full h-full object-cover"
         />
       </Show>

@@ -171,6 +171,10 @@ export type CompanionLocation = "lightview_folder" | "alongside";
 export interface AppSettings {
   display: {
     thumbnail_size: number;
+    /** Minimum thumbnail/row size (px) the zoom control allows. */
+    thumb_size_min: number;
+    /** Maximum thumbnail/row size (px) the zoom control allows. */
+    thumb_size_max: number;
     grid_gap: number;
     background_color: string;
     video_hover_preview: boolean;
@@ -182,6 +186,10 @@ export interface AppSettings {
     video_autoplay_max_seconds: number;
     scroll_blur: boolean;
     map_dark_mode: boolean;
+    /** Serve a 1600px aspect-preserving tier in the justified view when zoomed
+     *  in, instead of upscaling the 512px tier. Generated for visible cells
+     *  only, so disk cost scales with what you actually view zoomed in. */
+    justified_high_detail: boolean;
   };
   performance: {
     preload_count: number;

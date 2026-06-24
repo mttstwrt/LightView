@@ -44,6 +44,7 @@ fn extract_route(uri: &str) -> (Route, &str) {
                     ("m/", ThumbTier::Standard),
                     ("l/", ThumbTier::Large),
                     ("p/", ThumbTier::Preview),
+                    ("jh/", ThumbTier::JustifiedHigh),
                     ("j/", ThumbTier::Justified),
                 ] {
                     if let Some(rest) = p.strip_prefix(*seg) {
@@ -95,22 +96,7 @@ fn thumb_status_response(status: u16) -> tauri::http::Response<Vec<u8>> {
         .unwrap()
 }
 
-/// Fast synchronous path for `lightview://thumb/<tier>/<path>`. Returns a
-/// 200 response if the thumbnail is already cached; returns `None` on a
-/// genuine miss so the caller can fall through to the async generator.
-fn serve_thumbnail_fast(
-    state: &AppState,
-    tier: ThumbTier,
-    path: &str,
-) -> Option<tauri::http::Response<Vec<u8>>> {
-    match thumb_serve::read_cached_thumbnail(state, tier, path) {
-        ThumbOutcome::Hit { data, format } => Some(thumb_ok_response(data, &format)),
-        ThumbOutcome::Miss => None,
-        ThumbOutcome::NoGallery => Some(thumb_status_response(503)),
-    }
-}
-
-/// Slow path: no cached bytes for `(path, tier)`. Delegates to the shared
+/// No cached bytes for `(path, tier)` on first read. Delegates to the shared
 /// generate-with-coalescing helper and wraps the outcome in a Tauri response.
 async fn serve_thumbnail_generate(
     state: &AppState,
@@ -143,20 +129,36 @@ fn serve_thumbhash(state: &AppState, path: &str) -> tauri::http::Response<Vec<u8
 }
 
 fn main() {
-    // WebKitGTK can crash with protocol errors on some Wayland compositors.
-    // Falling back to X11 via XWayland avoids this.
+    // Rendering prefs are read here, before GTK/WebKit init. An explicit
+    // environment variable always wins; otherwise the persisted RenderConfig
+    // applies; otherwise the built-in defaults. Changing the config needs a
+    // restart (these env vars only take effect at process start).
+    let render_cfg = lightview_lib::load_render_config();
     // SAFETY: Called before any threads are spawned (start of main).
     unsafe {
+        // WebKitGTK can crash with protocol errors on some Wayland compositors;
+        // x11 (XWayland) is the safe default.
         if std::env::var("GDK_BACKEND").is_err() {
-            std::env::set_var("GDK_BACKEND", "x11");
+            let backend = render_cfg.gtk_backend.as_deref().unwrap_or("x11");
+            std::env::set_var("GDK_BACKEND", backend);
         }
-        // Disable DMA-BUF renderer to avoid GBM buffer allocation failures.
+        // DMA-BUF/GPU compositing is disabled by default to avoid GBM buffer
+        // allocation failures on some systems. Opting in via the config can
+        // dramatically speed up image upload + scrolling where it's stable.
         if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            let disable = match render_cfg.gpu_acceleration {
+                Some(true) => "0",
+                Some(false) | None => "1",
+            };
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", disable);
         }
     }
 
     env_logger::init();
+
+    // TEMP perf instrumentation: record the main (GTK) thread so the thumbnail
+    // handler logs can show whether it runs on it. Remove once measured.
+    log::info!("[perf] main/GTK thread id = {:?}", std::thread::current().id());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -189,26 +191,53 @@ fn main() {
                     return;
                 }
 
+                // TEMP perf instrumentation: which thread does WebKitGTK invoke
+                // this handler on? If it matches the main/GTK thread logged at
+                // startup, the inline-read fix was relevant; if not, the handler
+                // was already off-thread. Remove once measured.
+                log::debug!(
+                    "[perf] scheme handler entry thread={:?} uri={}",
+                    std::thread::current().id(),
+                    uri
+                );
+
                 match route {
                     Route::Thumb(tier) => {
-                        // Fast synchronous DB hit — respond inline, no task spawn.
-                        let state = ctx.app_handle().state::<AppState>();
-                        if let Some(resp) = serve_thumbnail_fast(&state, tier, &path) {
-                            responder.respond(resp);
-                            return;
-                        }
-                        // Cache miss: generate on the thumb pool and reply when done.
-                        // AppState is a cheap Arc-bundle clone, owned by the task.
-                        let state_owned: AppState = (*state).clone();
+                        // Always answer off the GTK main thread. The DB read
+                        // (and any generate-on-miss) runs on the async runtime /
+                        // blocking pool so resource loads never block scrolling
+                        // or painting. AppState is a cheap Arc-bundle clone.
+                        let state_owned: AppState =
+                            (*ctx.app_handle().state::<AppState>()).clone();
+                        // TEMP perf instrumentation.
+                        let log_path = path.clone();
                         tauri::async_runtime::spawn(async move {
+                            let t0 = std::time::Instant::now();
                             let resp =
                                 serve_thumbnail_generate(&state_owned, tier, path).await;
+                            log::debug!(
+                                "[perf] thumb served thread={:?} elapsed={:?} status={} path={}",
+                                std::thread::current().id(),
+                                t0.elapsed(),
+                                resp.status(),
+                                log_path
+                            );
                             responder.respond(resp);
                         });
                     }
                     Route::ThumbHash => {
-                        let state = ctx.app_handle().state::<AppState>();
-                        responder.respond(serve_thumbhash(&state, &path));
+                        // ThumbHash decode + PNG encode is CPU work — run it on
+                        // the blocking pool, not the GTK main thread.
+                        let state_owned: AppState =
+                            (*ctx.app_handle().state::<AppState>()).clone();
+                        tauri::async_runtime::spawn(async move {
+                            let resp = tokio::task::spawn_blocking(move || {
+                                serve_thumbhash(&state_owned, &path)
+                            })
+                            .await
+                            .unwrap_or_else(|_| thumb_status_response(500));
+                            responder.respond(resp);
+                        });
                     }
                     Route::Unknown => responder.respond(
                         tauri::http::Response::builder()
@@ -365,6 +394,8 @@ fn main() {
             commands::settings::get_gallery_default_filter,
             commands::settings::get_recent_galleries,
             commands::settings::remove_recent_gallery,
+            commands::settings::get_render_config,
+            commands::settings::set_render_config,
             commands::settings::open_with,
         ])
         .run(tauri::generate_context!())
