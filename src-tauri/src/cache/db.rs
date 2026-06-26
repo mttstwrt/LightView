@@ -268,6 +268,23 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         sql: "DELETE FROM thumbnails_justified_high;",
     },
+    // v14: intermediate justified tier (1280px longest edge) for mid zoom, so a
+    // mid-detail cell stops decoding the 2560px high tier. Same shape as the
+    // other justified tiers.
+    Migration {
+        version: 14,
+        sql: "
+            CREATE TABLE IF NOT EXISTS thumbnails_justified_mid (
+                path         TEXT PRIMARY KEY,
+                media_type   TEXT NOT NULL,
+                mtime        INTEGER NOT NULL,
+                width        INTEGER NOT NULL,
+                height       INTEGER NOT NULL,
+                thumbnail    BLOB NOT NULL,
+                format       TEXT NOT NULL DEFAULT 'webp'
+            );
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.

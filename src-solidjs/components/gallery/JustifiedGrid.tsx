@@ -8,7 +8,7 @@ import type { MediaMeta } from "../../stores/galleryStore";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { computeJustifiedLayout, rowIndexAtOffset } from "../../lib/justifiedLayout";
-import { ThumbnailCell } from "./ThumbnailCell";
+import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
 interface JustifiedGridProps {
   paths: string[];
@@ -69,6 +69,11 @@ const ORIGINAL_SRC_TOLERANCE = 2.5;
 // directly. HEIC/AVIF/RAW need transcoding/thumbnailing; videos/gifs keep their
 // generated thumbnails.
 const NATIVE_IMG_EXTS = new Set(["jpg", "jpeg", "png", "webp"]);
+// Served-original cells request a backend resize to their longest edge via
+// `?fit=`. Quantizing the requested edge up to this bucket keeps the URL stable
+// across nearby cell sizes / small zoom steps, so the webview's HTTP cache hits
+// instead of re-fetching a near-identical size on every layout tweak.
+const FIT_BUCKET = 256;
 // Target-row-height (zoom) bounds, mirroring the grid's thumb-size range.
 const ROW_HEIGHT_MIN = 80;
 const ROW_HEIGHT_MAX = 600;
@@ -97,33 +102,41 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   });
 
   // The thumbnail tier backing the current level (used for cells not served as
-  // an original, and for the GIF atlas request).
-  const thumbTier = (): ThumbTier => (detailLevel() === "base" ? "j" : "jh");
+  // an original, and for the GIF atlas request). Each detail level maps to a
+  // resolution sized for the cells it shows: base→512 ("j"), mid→1280 ("jm"),
+  // high→2560 ("jh"). The mid tier exists so a mid-zoom cell doesn't decode the
+  // 2560px high image at ~1/4 the displayed size.
+  const thumbTier = (): ThumbTier =>
+    detailLevel() === "base" ? "j" : detailLevel() === "mid" ? "jm" : "jh";
 
   const extOf = (p: string) => {
     const i = p.lastIndexOf(".");
     return i >= 0 ? p.slice(i + 1).toLowerCase() : "";
   };
 
-  // Whether `path` should be served as its original file at the current level:
-  // a native-format still image that is both small enough to stream cheaply and
-  // not so high-resolution that the webview's full-res decode stalls the main
-  // thread. Otherwise we fall back to the pre-resized "jh" tier.
+  // Whether `path` should be served via the media server's cell-fit resize
+  // (`?fit=`) at the current level, rather than the pre-generated "jm"/"jh"
+  // tier. Eligible: a native-format still image that isn't so large the on-
+  // demand resize is wasteful versus the (precached) tier. Otherwise we fall
+  // back to the tier.
   const servesOriginal = (path: string): boolean => {
     const lvl = detailLevel();
     if (lvl === "base") return false;
     const meta = props.itemMeta?.get(path);
     if (!meta || meta.media_type !== "image") return false;
     if (!NATIVE_IMG_EXTS.has(extOf(path))) return false;
-    // Transfer-cost ceiling: never stream a very large file as the original.
+    // Size ceiling: the resize itself is cheap (cell-sized, off the UI thread),
+    // but a very large source decodes slowly on the backend *and* isn't covered
+    // by the tier look-ahead precache. Keep big files on the precached tier so
+    // their reveal stays instant; route the common, smaller files through the
+    // crisper exact-fit resize.
     if (meta.size > (lvl === "high" ? HIGH_MAX_BYTES : MID_MAX_BYTES)) return false;
-    // Decode-cost gate: the webview CPU-decodes the original at *full*
-    // resolution (then downscales), so a source far larger than the cell shows
-    // is a big main-thread stall — file bytes alone don't capture that (a
-    // small-but-50MP JPEG is cheap to transfer, ruinous to decode). Only serve
-    // the original when its longest edge is within tolerance of the displayed
-    // size; otherwise the jh tier (pre-resized off the UI thread) is faster and
-    // visually equivalent. Unknown dimensions fall back to the byte ceiling.
+    // Resolution gate: a source far larger than the cell is expensive to decode
+    // (even on the backend) and gains nothing over the tier — file bytes alone
+    // don't capture that (a small-but-50MP JPEG is cheap to transfer, ruinous to
+    // decode). Only fit-resize when the source's longest edge is within
+    // tolerance of the displayed size; otherwise use the (precached, off-thread)
+    // tier. Unknown dimensions fall back to the byte ceiling.
     if (meta.width != null && meta.height != null) {
       const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
       const aspect = props.aspects.get(path) ?? 1;
@@ -230,17 +243,23 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   let thumbGenTotal = 0;
   let thumbGenDone = 0;
 
-  // Clear all streaming state and force a re-stream at the current tier. Used
-  // both for explicit invalidation and when the effective tier changes (zoom).
-  const resetStreaming = () => {
-    setThumbMap(reconcile({}));
+  // Clear streaming state and force a re-stream at the current tier. With
+  // `keepDisplayed`, the already-shown thumbnails (and their cache-bust state)
+  // are left in place so cells don't blank to a skeleton — used on a zoom
+  // (detail-level) change, where the re-stream double-buffers each cell's new
+  // tier in behind the old image (see the assign effect). A hard invalidation
+  // (bytes changed) clears everything so stale bytes can't linger.
+  const resetStreaming = (keepDisplayed = false) => {
+    if (!keepDisplayed) {
+      setThumbMap(reconcile({}));
+      urlVersions.clear();
+      versionEpoch++;
+    }
     assignedSet.clear();
     needsGeneration.clear();
     inFlightSet.clear();
     failedSet.clear();
-    urlVersions.clear();
     jhPrecached.clear();
-    versionEpoch++;
     bgCursor = 0;
     thumbGenTotal = 0;
     thumbGenDone = 0;
@@ -248,13 +267,26 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   };
 
   // Re-stream when the detail level changes so visible cells refetch at the new
-  // resolution / source. Deferred so it doesn't fire on initial mount.
-  createEffect(on(detailLevel, () => resetStreaming(), { defer: true }));
+  // resolution / source. `keepDisplayed` so the old tier stays visible until the
+  // new one decodes. Deferred so it doesn't fire on initial mount.
+  createEffect(on(detailLevel, () => resetStreaming(true), { defer: true }));
+
+  // Physical longest edge (px) a cell displays at, quantized up to FIT_BUCKET so
+  // the `?fit=` URL stays cache-stable across small layout changes. This is the
+  // resize target the media server fits the source to.
+  const fitEdgeFor = (path: string): number => {
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const aspect = props.aspects.get(path) ?? 1;
+    const physicalLongEdge = targetRowHeight() * Math.max(1, aspect) * dpr;
+    return Math.ceil(physicalLongEdge / FIT_BUCKET) * FIT_BUCKET;
+  };
 
   const thumbSrcFor = (path: string) => {
-    // Originals are served straight from the media server — no cache-buster
-    // (they never regenerate) and no thumbnail tier.
-    if (servesOriginal(path)) return mediaUrl(path);
+    // Served-original cells get a cell-sized backend resize (`?fit=`) instead of
+    // the full file: the webview decodes a small image off its main thread and
+    // transfers far fewer bytes. Cache-stable per (path, fit bucket), so no
+    // ?v= cache-buster and no thumbnail tier.
+    if (servesOriginal(path)) return mediaUrl(path, fitEdgeFor(path));
     const v = (urlVersions.get(path) ?? 0) + versionEpoch;
     const tier = thumbTier();
     return v > 0 ? `${thumbUrl(path, tier)}?v=${v}` : thumbUrl(path, tier);
@@ -286,24 +318,47 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   });
   onCleanup(() => unlistenRegenerated?.());
 
-  // Assign protocol URLs as soon as cells become visible. Cached "j" thumbs
-  // load instantly; uncached ones 404 → onError → queued for generation.
+  // Point a cell at `url`. When the cell has no image yet (first paint, a
+  // freshly scrolled-in row) the URL is assigned directly — a skeleton while it
+  // loads is correct. When the cell *already shows* an image (a zoom swap to a
+  // new tier), the new URL is decoded off-DOM first and only swapped in on
+  // success, so the previous tier stays on screen with no skeleton flash; a cold
+  // new-tier URL (404) leaves the old image up and queues generation, which the
+  // fetch loop swaps in once warm. `markUrlLoaded` before the swap suppresses
+  // the cell's fade-in, since the bytes are already decoded.
+  const assignSrc = (path: string, url: string) => {
+    const current = thumbMap[path];
+    if (!current || current === url) {
+      setThumbMap(path, url);
+      return;
+    }
+    const gen = generation();
+    const img = new Image();
+    img.onload = () => {
+      // Drop the swap if the cell was evicted or the path list changed meanwhile.
+      if (generation() !== gen || !assignedSet.has(path)) return;
+      markUrlLoaded(url);
+      setThumbMap(path, url);
+    };
+    img.onerror = () => {
+      if (generation() !== gen || !assignedSet.has(path)) return;
+      handleThumbError(path);
+    };
+    img.src = url;
+  };
+
+  // Assign protocol URLs as soon as cells become visible. Cached thumbs load
+  // instantly; uncached ones 404 → onError → queued for generation.
   createEffect(on([visibleCells, fastScroll], ([cells, fast]) => {
     // While flinging, leave new cells on their placeholder so the main thread
     // isn't buried under image decodes mid-scroll. When scrolling settles
     // (fast → false) this re-runs and assigns whatever's now on screen.
     if (fast) return;
-    const updates: [string, string][] = [];
     for (const cell of cells as ReturnType<typeof visibleCells>) {
       if (!assignedSet.has(cell.path)) {
         assignedSet.add(cell.path);
-        updates.push([cell.path, thumbSrcFor(cell.path)]);
+        assignSrc(cell.path, thumbSrcFor(cell.path));
       }
-    }
-    if (updates.length > 0) {
-      batch(() => {
-        for (const [path, url] of updates) setThumbMap(path, url);
-      });
     }
   }));
 

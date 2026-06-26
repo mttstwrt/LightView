@@ -45,6 +45,7 @@ fn extract_route(uri: &str) -> (Route, &str) {
                     ("l/", ThumbTier::Large),
                     ("p/", ThumbTier::Preview),
                     ("jh/", ThumbTier::JustifiedHigh),
+                    ("jm/", ThumbTier::JustifiedMid),
                     ("j/", ThumbTier::Justified),
                 ] {
                     if let Some(rest) = p.strip_prefix(*seg) {

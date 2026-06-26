@@ -131,7 +131,7 @@ export interface ThumbnailResult {
 
 /** LOD tier for thumbnails; see docs/thumbnailStreamingResearch.md and
  *  `ThumbTier` in src-tauri/src/cache/thumbnails.rs. */
-export type ThumbTier = "s" | "m" | "l" | "p" | "j" | "jh";
+export type ThumbTier = "s" | "m" | "l" | "p" | "j" | "jm" | "jh";
 
 /** Build a protocol URL for a cached thumbnail at a given tier. The
  *  `lightview://thumb/<tier>/<path>` protocol serves image data directly
@@ -193,18 +193,24 @@ function encodeMediaPath(path: string): string {
  *  local axum HTTP server, which streams the file with Range support — so
  *  large videos don't get buffered into memory and large images don't
  *  block the protocol thread. WebKitGTK also refuses `<video>` from any
- *  non-http(s) URI scheme, so this single path covers both elements. */
-export function mediaUrl(path: string): string {
+ *  non-http(s) URI scheme, so this single path covers both elements.
+ *
+ *  `fitEdge` (px) requests an aspect-preserving backend resize to that longest
+ *  edge for native raster stills, so the webview decodes a cell-sized image off
+ *  its main thread instead of the full original. Omit it for whole-file serving
+ *  (video, GIF playback, non-raster formats). */
+export function mediaUrl(path: string, fitEdge?: number): string {
   const rel = path.startsWith("/") ? path.slice(1) : path;
+  const q = fitEdge && fitEdge > 0 ? `?fit=${Math.round(fitEdge)}` : "";
   // Web client: same-origin HTTP route served by the axum server. Cookie auth.
   if (!isTauri()) {
-    return `/media/${encodeMediaPath(rel)}`;
+    return `/media/${encodeMediaPath(rel)}${q}`;
   }
   if (!_mediaServerUrl) {
     _mediaServerUrl = (globalThis as any).__LV_MEDIA_URL__ ?? null;
   }
   if (!_mediaServerUrl) return "";
-  return `${_mediaServerUrl}/media/${encodeMediaPath(rel)}`;
+  return `${_mediaServerUrl}/media/${encodeMediaPath(rel)}${q}`;
 }
 
 /** Alias for `mediaUrl`. Kept for the `<video>` callsite where the name

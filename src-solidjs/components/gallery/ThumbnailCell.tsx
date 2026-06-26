@@ -36,7 +36,7 @@ interface ThumbnailCellProps {
 const LOADED_URLS_CAP = 4096;
 const loadedUrls = new Set<string>();
 
-function markUrlLoaded(url: string): void {
+export function markUrlLoaded(url: string): void {
   if (loadedUrls.size >= LOADED_URLS_CAP) loadedUrls.clear();
   loadedUrls.add(url);
 }
@@ -312,9 +312,10 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           Keyed on the URL so recycling to a different GIF restarts cleanly. */}
       <Show when={showGifCanvas()}>
         <GifCanvas
-          // Cap the animated-frame atlas at the "j" tier — a 2560px ("jh")
-          // atlas would decode every frame at that size and blow up memory.
-          url={gifAtlasUrl(props.path, props.tier === "jh" ? "j" : props.tier)}
+          // Cap the animated-frame atlas at the "j" tier — a high-res justified
+          // atlas ("jm" 1280px / "jh" 2560px) would decode every frame at that
+          // size and blow up memory.
+          url={gifAtlasUrl(props.path, props.tier === "jm" || props.tier === "jh" ? "j" : props.tier)}
           class="absolute inset-0 w-full h-full object-cover"
         />
       </Show>

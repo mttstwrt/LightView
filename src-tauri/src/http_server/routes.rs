@@ -1,12 +1,12 @@
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
     Json,
 };
 use chrono::Datelike;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
@@ -21,6 +21,26 @@ use crate::thumb_serve::{self, ThumbOutcome, ThumbhashOutcome};
 // stalling on large allocations; large enough to amortize syscall overhead.
 const STREAM_CHUNK: usize = 64 * 1024;
 
+// Upper bound on the `?fit=` longest-edge resize target. Past this the justified
+// grid already uses the `jh` tier (2560px), so a larger fit request would just
+// out-decode it for no benefit; clamp defensively in case one slips through.
+const FIT_MAX_EDGE: u32 = 4096;
+
+/// Query string for `GET /media`. `fit=<px>` requests an aspect-preserving
+/// resize to that longest edge (native raster stills only) instead of the full
+/// file — so the webview decodes a cell-sized image off its main thread.
+#[derive(Debug, Deserialize)]
+pub struct MediaQuery {
+    fit: Option<u32>,
+}
+
+/// Image extensions the resize pipeline (`image` crate) decodes directly, so a
+/// `?fit=` request is cheap. HEIC/AVIF/RAW need the libheif/transcode paths and
+/// are served whole instead.
+fn is_fit_resizable(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "png" | "webp")
+}
+
 /// `GET /media/{*rel}` — serves a full-resolution media file with Range
 /// support. The captured `rel` is the absolute filesystem path with the
 /// leading `/` stripped (the frontend strips it before encoding so axum's
@@ -29,6 +49,7 @@ const STREAM_CHUNK: usize = 64 * 1024;
 pub async fn media(
     State(state): State<ServerState>,
     Path(rel): Path<String>,
+    Query(query): Query<MediaQuery>,
     headers: HeaderMap,
 ) -> Response<Body> {
     if rel.is_empty() {
@@ -49,6 +70,16 @@ pub async fn media(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+
+    // `?fit=<edge>` serves an aspect-preserving resize of a native raster still
+    // to the cell's longest edge: the justified grid uses this in place of the
+    // full original so the webview decodes a cell-sized image off its main
+    // thread (and transfers far fewer bytes — matters for remote providers).
+    if let Some(edge) = query.fit {
+        if edge > 0 && is_fit_resizable(&ext) {
+            return serve_fit_image(&state, &path, edge).await;
+        }
+    }
 
     if ext == "heic" || ext == "heif" {
         return serve_heic(&path).await;
@@ -122,6 +153,58 @@ async fn serve_image(path: &str, mime: &'static str, headers: &HeaderMap) -> Res
         builder = builder.header(header::LAST_MODIFIED, http_date(mtime));
     }
     builder.body(Body::from(data)).unwrap()
+}
+
+/// Serves an aspect-preserving resize of a native raster still to `edge`
+/// (longest-edge) pixels, encoded WebP. The decode + downscale runs on the
+/// shared thumb pool — the same bounded rayon pool the thumbnail tiers use — so
+/// it never upscales (see `fit_dims`) and never oversubscribes the CPU during a
+/// scroll burst. Cached like the thumbnail route (`max-age`, ?fit= makes the URL
+/// content-stable), so the webview holds the resized bytes without a disk cache
+/// on our side. Falls back to the full file if the resize fails.
+async fn serve_fit_image(state: &ServerState, path: &str, edge: u32) -> Response<Body> {
+    let target = edge.clamp(16, FIT_MAX_EDGE);
+    let src = path.to_string();
+    let pool = state.app.thumb_pool.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pool.spawn(move || {
+        let filter = crate::pipeline::thumbnailer::filter_for_size(target);
+        let res = crate::pipeline::thumbnailer::generate_for_path_fit(
+            std::path::Path::new(&src),
+            filter,
+            crate::pipeline::thumbnailer::ThumbFormat::Webp,
+            target,
+        );
+        let _ = tx.send(res);
+    });
+
+    match rx.await {
+        Ok(Ok(thumb)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/webp")
+            .header(header::CONTENT_LENGTH, thumb.data.len().to_string())
+            // Same caching contract as the thumbnail route: the URL is keyed by
+            // path + fit edge, so within a session its bytes don't change; the
+            // max-age bounds cross-session staleness if the source is edited.
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .body(Body::from(thumb.data))
+            .unwrap(),
+        // Resize failed (decode error, dropped task) — fall back to the whole
+        // file so the cell still shows something rather than breaking.
+        other => {
+            if let Ok(Err(e)) = other {
+                log::warn!("fit resize failed for {path}: {e}");
+            }
+            let mime = mime_for(
+                &std::path::Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase(),
+            );
+            serve_image(path, mime, &HeaderMap::new()).await
+        }
+    }
 }
 
 /// `GET /gif-atlas/{tier}/{*rel}` — serves a pre-rendered GIF frame atlas: a PNG

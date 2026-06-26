@@ -46,8 +46,13 @@ pub enum ThumbTier {
     /// ~512 px longest edge, **aspect-preserving** (no square crop) — justified
     /// gallery view, lazy-generated. `thumbnails_justified`.
     Justified,
-    /// ~1600 px longest edge, **aspect-preserving** (no square crop) — justified
-    /// gallery view when zoomed in, lazy-generated for visible cells only.
+    /// ~1280 px longest edge, **aspect-preserving** (no square crop) — justified
+    /// gallery view at *mid* zoom, where a cell is far smaller than the 2560 px
+    /// `JustifiedHigh` image would be, so serving `jh` there is a big over-decode.
+    /// Lazy-generated for visible cells only. `thumbnails_justified_mid`.
+    JustifiedMid,
+    /// ~2560 px longest edge, **aspect-preserving** (no square crop) — justified
+    /// gallery view when zoomed in *high*, lazy-generated for visible cells only.
     /// `thumbnails_justified_high`.
     JustifiedHigh,
 }
@@ -61,6 +66,7 @@ impl ThumbTier {
             "l" | "large" => Some(Self::Large),
             "p" | "preview" => Some(Self::Preview),
             "j" | "justified" => Some(Self::Justified),
+            "jm" | "justified_mid" => Some(Self::JustifiedMid),
             "jh" | "justified_high" => Some(Self::JustifiedHigh),
             _ => None,
         }
@@ -74,6 +80,7 @@ impl ThumbTier {
             Self::Large => "l",
             Self::Preview => "p",
             Self::Justified => "j",
+            Self::JustifiedMid => "jm",
             Self::JustifiedHigh => "jh",
         }
     }
@@ -86,6 +93,7 @@ impl ThumbTier {
             Self::Large => "thumbnails_large",
             Self::Preview => "thumbnails_preview",
             Self::Justified => "thumbnails_justified",
+            Self::JustifiedMid => "thumbnails_justified_mid",
             Self::JustifiedHigh => "thumbnails_justified_high",
         }
     }
@@ -98,6 +106,11 @@ impl ThumbTier {
             Self::Large => 1024,
             Self::Preview => 1600,
             Self::Justified => 512,
+            // Mid justified tier: ~half the linear size of `JustifiedHigh`, so a
+            // quarter the decode/transfer cost. Mid zoom shows cells far smaller
+            // than 2560 px, so this is the right resolution there and avoids the
+            // jh over-decode.
+            Self::JustifiedMid => 1280,
             // High justified tier is used both as a fallback for large/non-native
             // images (the small, common ones are served as originals) and to give
             // wide images enough pixels on their long edge. 2560 keeps wide cells
@@ -301,6 +314,10 @@ impl CacheDb {
             .unwrap_or(0);
         count += self
             .conn()
+            .execute("DELETE FROM thumbnails_justified_mid", [])
+            .unwrap_or(0);
+        count += self
+            .conn()
             .execute("DELETE FROM thumbnails_justified_high", [])
             .unwrap_or(0);
         Ok(count)
@@ -386,6 +403,7 @@ impl CacheDb {
             ("Large", ThumbTier::Large),
             ("Preview", ThumbTier::Preview),
             ("Justified", ThumbTier::Justified),
+            ("Justified Mid", ThumbTier::JustifiedMid),
             ("Justified High", ThumbTier::JustifiedHigh),
         ] {
             let sql = format!(
