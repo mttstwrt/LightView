@@ -361,13 +361,16 @@ async fn generate_batch_gpu(
         src_height: u32,
     }
 
-    // Phase 1: Decode on CPU (rayon)
+    // Phase 1: Decode on CPU (rayon). Decode only as large as the GPU output
+    // needs (longest edge of the square target) so big JPEGs/HEICs DCT-scale
+    // down during decode instead of decoding full-size.
+    let decode_target = thumb_size_w.max(thumb_size_h);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let paths_owned: Vec<String> = paths.to_vec();
     pool.spawn(move || {
         let decoded: Vec<Option<DecodedImage>> = paths_owned
             .iter()
-            .map(|p| decode_image(std::path::Path::new(p)).ok())
+            .map(|p| decode_image(std::path::Path::new(p), decode_target).ok())
             .collect();
         let _ = tx.send(decoded);
     });

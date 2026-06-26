@@ -558,7 +558,7 @@ pub fn generate_for_path_fit(
     format: ThumbFormat,
     max_edge: u32,
 ) -> Result<ThumbResult, ThumbError> {
-    let decoded = decode_image(path)?;
+    let decoded = decode_image(path, max_edge)?;
     let (dw, dh) = (decoded.width, decoded.height);
     if dw == 0 || dh == 0 {
         return Err(ThumbError::Decode("Zero decoded dimensions".to_string()));
@@ -625,7 +625,15 @@ pub struct DecodedImage {
 
 /// Decode an image to full RGBA without cropping. Returns dimensions + crop rect
 /// so the GPU can do the crop in a fused shader.
-pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
+///
+/// `target_edge` is the longest-edge size the caller will ultimately resize to.
+/// Decoders that can scale during decode (JPEG DCT, HEIC embedded thumbnails)
+/// use it to avoid decoding far more pixels than needed — without it, the JPEG
+/// path silently capped every output at the 512px standard size, so the larger
+/// justified/fit tiers (1280/2560) could never reach their resolution. Decoders
+/// that can't scale (generic `image` crate, video frames) decode full-size and
+/// ignore it; the subsequent resize handles the downscale.
+pub fn decode_image(path: &Path, target_edge: u32) -> Result<DecodedImage, ThumbError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -640,8 +648,8 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
         decode_video_to_rgba(path)?
     } else {
         match ext.as_str() {
-            "jpg" | "jpeg" => decode_jpeg_to_rgba(path)?,
-            "heic" | "heif" | "avif" => decode_heic_to_rgba(path)?,
+            "jpg" | "jpeg" => decode_jpeg_to_rgba(path, target_edge)?,
+            "heic" | "heif" | "avif" => decode_heic_to_rgba(path, target_edge)?,
             _ => decode_generic_to_rgba(path)?,
         }
     };
@@ -663,14 +671,14 @@ pub fn decode_image(path: &Path) -> Result<DecodedImage, ThumbError> {
 }
 
 /// Decode a JPEG to RGBA pixels using DCT-scaled decoding, falling back to generic decoder.
-fn decode_jpeg_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
-    match decode_jpeg_to_rgba_inner(path) {
+fn decode_jpeg_to_rgba(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+    match decode_jpeg_to_rgba_inner(path, target_edge) {
         Ok(r) => Ok(r),
         Err(_) => decode_generic_to_rgba(path),
     }
 }
 
-fn decode_jpeg_to_rgba_inner(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+fn decode_jpeg_to_rgba_inner(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
     let mmap = mmap_file(path)?;
     let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&mmap[..]));
 
@@ -682,7 +690,11 @@ fn decode_jpeg_to_rgba_inner(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32
         return Err(ThumbError::Decode("Zero dimension".into()));
     }
 
-    let target = STANDARD_THUMB_SIZE as u16;
+    // DCT-scale to at least the caller's longest-edge target in both axes. The
+    // decoder picks the largest 1/1·1/2·1/4·1/8 factor that keeps both dims >=
+    // the request, so the long edge ends up >= target_edge; the later resize
+    // trims to the exact fit dimensions. Clamp to u16 (decoder API) and never 0.
+    let target = target_edge.clamp(1, u16::MAX as u32) as u16;
     let _ = decoder.scale(target, target);
 
     let pixels = decoder.decode().map_err(|e| ThumbError::Decode(e.to_string()))?;
@@ -738,9 +750,11 @@ pub struct HeicDecode {
     pub src_height: u32,
 }
 
-/// Decode a HEIC/HEIF image to RGBA pixels using libheif (primary image only).
-pub fn decode_heic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
-    let dec = decode_heic_internal(path, None)?;
+/// Decode a HEIC/HEIF image to RGBA pixels using libheif, preferring an embedded
+/// thumbnail large enough for a `target_edge`-pixel output (much faster than the
+/// full primary decode for camera HEICs), falling back to the primary image.
+pub fn decode_heic_to_rgba(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+    let dec = decode_heic_internal(path, Some(target_edge))?;
     Ok(into_rgba_tuple(dec))
 }
 
