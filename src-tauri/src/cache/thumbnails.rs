@@ -98,6 +98,39 @@ impl ThumbTier {
         }
     }
 
+    /// Static `SELECT thumbnail, format ... WHERE path = ?1` for this tier.
+    /// Returned as `&'static str` so the hot serve path (called on every
+    /// thumbnail request) avoids a per-call `format!` allocation and
+    /// `prepare_cached` keys on a stable string.
+    pub fn select_blob_sql(self) -> &'static str {
+        match self {
+            Self::Micro => "SELECT thumbnail, format FROM thumbnails_micro WHERE path = ?1",
+            Self::Standard => "SELECT thumbnail, format FROM thumbnails WHERE path = ?1",
+            Self::Large => "SELECT thumbnail, format FROM thumbnails_large WHERE path = ?1",
+            Self::Preview => "SELECT thumbnail, format FROM thumbnails_preview WHERE path = ?1",
+            Self::Justified => "SELECT thumbnail, format FROM thumbnails_justified WHERE path = ?1",
+            Self::JustifiedMid => {
+                "SELECT thumbnail, format FROM thumbnails_justified_mid WHERE path = ?1"
+            }
+            Self::JustifiedHigh => {
+                "SELECT thumbnail, format FROM thumbnails_justified_high WHERE path = ?1"
+            }
+        }
+    }
+
+    /// Static `SELECT 1 ... WHERE path = ?1` existence check for this tier.
+    pub fn exists_sql(self) -> &'static str {
+        match self {
+            Self::Micro => "SELECT 1 FROM thumbnails_micro WHERE path = ?1",
+            Self::Standard => "SELECT 1 FROM thumbnails WHERE path = ?1",
+            Self::Large => "SELECT 1 FROM thumbnails_large WHERE path = ?1",
+            Self::Preview => "SELECT 1 FROM thumbnails_preview WHERE path = ?1",
+            Self::Justified => "SELECT 1 FROM thumbnails_justified WHERE path = ?1",
+            Self::JustifiedMid => "SELECT 1 FROM thumbnails_justified_mid WHERE path = ?1",
+            Self::JustifiedHigh => "SELECT 1 FROM thumbnails_justified_high WHERE path = ?1",
+        }
+    }
+
     /// Target dimensions (square) for this tier.
     pub fn target_size(self) -> u32 {
         match self {
@@ -429,8 +462,7 @@ impl CacheDb {
 
     /// Check if a non-standard-tier thumbnail exists for this path.
     pub fn tier_is_cached(&self, tier: ThumbTier, path: &str) -> Result<bool, CacheError> {
-        let sql = format!("SELECT 1 FROM {} WHERE path = ?1", tier.table());
-        let mut stmt = self.conn().prepare_cached(&sql)?;
+        let mut stmt = self.conn().prepare_cached(tier.exists_sql())?;
         let mut rows = stmt.query(rusqlite::params![path])?;
         Ok(rows.next()?.is_some())
     }

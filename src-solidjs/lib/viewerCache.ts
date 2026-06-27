@@ -7,10 +7,12 @@
 // protocol handler. Preloaded Image elements are swapped directly into the DOM
 // for instant display, avoiding any re-fetch or re-decode.
 //
-// Memory pressure integration:
-//   - Normal:    cache up to 20 images, preload 3 ahead/behind
-//   - Warning:   cache up to 10 images, preload 1 ahead/behind
-//   - Emergency: cache only current image, no preloading
+// Memory pressure integration (cache is bounded by BOTH an image count and an
+// estimated decoded-byte budget, so a few huge full-res images can't blow past
+// the memory ceiling that a count-only limit would allow):
+//   - Normal:    cache up to 10 images / 512MB, preload 2 ahead/behind
+//   - Warning:   cache up to 5 images / 192MB,  preload 1 ahead/behind
+//   - Emergency: cache only current image / 64MB floor, no preloading
 
 import { mediaUrl } from "./ipc";
 import { isVideoPath } from "./mediaExts";
@@ -23,21 +25,40 @@ import {
 interface CacheEntry {
   img: HTMLImageElement;
   lastAccess: number;
+  /** Estimated decoded size in bytes (naturalWidth × naturalHeight × 4). */
+  bytes: number;
 }
+
+const MB = 1024 * 1024;
 
 const PRESSURE_CONFIGS: Record<
   PressureLevel,
-  { maxCache: number; preloadRange: number; maxConcurrentLoads: number }
+  {
+    maxCache: number;
+    maxBytes: number;
+    preloadRange: number;
+    maxConcurrentLoads: number;
+  }
 > = {
-  normal: { maxCache: 10, preloadRange: 2, maxConcurrentLoads: 3 },
-  warning: { maxCache: 5, preloadRange: 1, maxConcurrentLoads: 2 },
-  emergency: { maxCache: 1, preloadRange: 0, maxConcurrentLoads: 1 },
+  normal: { maxCache: 10, maxBytes: 512 * MB, preloadRange: 2, maxConcurrentLoads: 3 },
+  warning: { maxCache: 5, maxBytes: 192 * MB, preloadRange: 1, maxConcurrentLoads: 2 },
+  emergency: { maxCache: 1, maxBytes: 64 * MB, preloadRange: 0, maxConcurrentLoads: 1 },
 };
+
+/** Estimate the decoded RGBA footprint of an image element. */
+function estimateBytes(img: HTMLImageElement): number {
+  const w = img.naturalWidth || 0;
+  const h = img.naturalHeight || 0;
+  // 4 bytes/px decoded; fall back to a small non-zero floor if dimensions
+  // aren't known yet so an entry never counts as weightless.
+  return w > 0 && h > 0 ? w * h * 4 : 64 * 1024;
+}
 
 export class ViewerImageCache {
   private cache = new Map<string, CacheEntry>();
   private pending = new Set<string>();
   private accessCounter = 0;
+  private totalBytes = 0;
   private pressureLevel: PressureLevel = "normal";
   private monitor: MemoryPressureMonitor;
   private readyCallback: ((path: string) => void) | null = null;
@@ -85,10 +106,13 @@ export class ViewerImageCache {
   /** Insert an externally-loaded Image element into the cache. */
   insert(path: string, img: HTMLImageElement) {
     if (this.cache.has(path)) return;
+    const bytes = estimateBytes(img);
     this.cache.set(path, {
       img,
       lastAccess: ++this.accessCounter,
+      bytes,
     });
+    this.totalBytes += bytes;
     this.trimToCapacity();
   }
 
@@ -137,10 +161,13 @@ export class ViewerImageCache {
 
     img.onload = () => {
       this.pending.delete(path);
+      const bytes = estimateBytes(img);
       this.cache.set(path, {
         img,
         lastAccess: ++this.accessCounter,
+        bytes,
       });
+      this.totalBytes += bytes;
       this.trimToCapacity();
       this.readyCallback?.(path);
     };
@@ -153,13 +180,20 @@ export class ViewerImageCache {
   }
 
   private trimToCapacity() {
-    const { maxCache } = this.config;
-    while (this.cache.size > maxCache) {
-      this.evictLRU();
+    const { maxCache, maxBytes } = this.config;
+    // Evict on either bound, but never drop below one entry — the current
+    // image must survive even if it alone exceeds the byte budget (e.g. a
+    // single 100MP photo).
+    while (
+      this.cache.size > 1 &&
+      (this.cache.size > maxCache || this.totalBytes > maxBytes)
+    ) {
+      if (!this.evictLRU()) break;
     }
   }
 
-  private evictLRU() {
+  /** Evict the least-recently-used entry. Returns false if nothing was evicted. */
+  private evictLRU(): boolean {
     let oldestPath: string | null = null;
     let oldestAccess = Infinity;
 
@@ -173,8 +207,11 @@ export class ViewerImageCache {
     if (oldestPath) {
       const entry = this.cache.get(oldestPath)!;
       entry.img.src = "";  // Release the image data
+      this.totalBytes -= entry.bytes;
       this.cache.delete(oldestPath);
+      return true;
     }
+    return false;
   }
 
   destroy() {
@@ -185,5 +222,6 @@ export class ViewerImageCache {
       entry.img.src = "";
     }
     this.cache.clear();
+    this.totalBytes = 0;
   }
 }

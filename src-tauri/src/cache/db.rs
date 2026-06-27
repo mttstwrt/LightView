@@ -512,6 +512,9 @@ impl CacheDb {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch("PRAGMA cache_size=-64000;")?; // 64MB cache
+        // Keep temp B-trees (ORDER BY, IN-list materialization) in RAM rather
+        // than spilling to a disk temp file.
+        conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
 
         // Ensure gallery_meta exists before anything else — migrations
         // need it to read/write the schema version.

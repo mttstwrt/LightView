@@ -33,9 +33,9 @@ pub fn read_cached_thumbnail(state: &AppState, tier: ThumbTier, path: &str) -> T
         }
     };
 
-    let sql = format!("SELECT thumbnail, format FROM {} WHERE path = ?1", tier.table());
+    let sql = tier.select_blob_sql();
     let result = pool.with_conn(|conn| {
-        conn.prepare_cached(&sql).and_then(|mut stmt| {
+        conn.prepare_cached(sql).and_then(|mut stmt| {
             stmt.query_row(rusqlite::params![path], |row| {
                 Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
             })

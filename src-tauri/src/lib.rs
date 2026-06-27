@@ -98,6 +98,8 @@ impl ThumbProtocolPool {
                     // 8MB page cache per connection — modest, since N of them
                     // exist and the OS page cache backs the WAL underneath.
                     let _ = conn.execute_batch("PRAGMA cache_size=-8000;");
+                    // Sorts / IN-list temp tables stay in RAM, not a temp file.
+                    let _ = conn.execute_batch("PRAGMA temp_store=MEMORY;");
                     conns.push(std::sync::Mutex::new(conn));
                 }
                 Err(e) => {
