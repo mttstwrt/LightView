@@ -1,7 +1,7 @@
 import { createSignal, createEffect, Show, For, onCleanup, onMount } from "solid-js";
 import { Portal, Dynamic } from "solid-js/web";
 import { settings, setSettings } from "../../stores/settingsStore";
-import { displayPaths, setSettingsOpen } from "../../stores/galleryStore";
+import { displayPaths, setSettingsOpen, viewMode, setViewMode } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
 import {
@@ -561,6 +561,30 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
               "dupes-scroll": !isMobile(),
             }}
           >
+            {/* ── View (mobile only — relocated from the top bar, which is too
+                cramped on phones to fit it alongside the search field) ── */}
+            <Show when={isMobile()}>
+              <Section label="View" order={0}>
+                <div class="flex items-center gap-1 p-0.5 rounded bg-neutral-800/60">
+                  <For each={[
+                    { mode: "grid" as const, label: "Grid" },
+                    { mode: "justified" as const, label: "Justified" },
+                    { mode: "map" as const, label: "Map" },
+                  ]}>
+                    {(v) => (
+                      <button
+                        onClick={() => { setViewMode(v.mode); setOpen(false); }}
+                        class="flex-1 px-2 py-1.5 text-sm rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
+                        classList={{ "bg-neutral-700 text-white": viewMode() === v.mode }}
+                      >
+                        {v.label}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Section>
+            </Show>
+
             {/* ── Display ── */}
             <Section label="Display" order={4}>
               {/* Thumbnail size — mobile uses a column-count picker so the

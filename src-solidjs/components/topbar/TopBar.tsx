@@ -121,24 +121,29 @@ export function TopBar(props: TopBarProps) {
       >
         <FilterBar onInputRef={(el) => { filterInputRef = el; }} />
         <SortMenu />
-        <div class="shrink-0 flex items-center gap-0.5 p-0.5 rounded bg-neutral-800/60">
-          <For each={[
-            { mode: "grid" as const, label: "Grid", title: "Uniform square grid" },
-            { mode: "justified" as const, label: "Justified", title: "Aspect-preserving rows" },
-            { mode: "map" as const, label: "Map", title: "Geographic map" },
-          ]}>
-            {(v) => (
-              <button
-                onClick={() => setViewMode(v.mode)}
-                class="px-2 py-0.5 text-xs rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
-                classList={{ "bg-neutral-700 text-white": viewMode() === v.mode }}
-                title={v.title}
-              >
-                {v.label}
-              </button>
-            )}
-          </For>
-        </div>
+        {/* View-mode selector. On mobile this lives at the top of the settings
+            menu instead — the top bar is too cramped, and squeezing it in here
+            made the search bar barely tappable. */}
+        <Show when={!isMobile()}>
+          <div class="shrink-0 flex items-center gap-0.5 p-0.5 rounded bg-neutral-800/60">
+            <For each={[
+              { mode: "grid" as const, label: "Grid", title: "Uniform square grid" },
+              { mode: "justified" as const, label: "Justified", title: "Aspect-preserving rows" },
+              { mode: "map" as const, label: "Map", title: "Geographic map" },
+            ]}>
+              {(v) => (
+                <button
+                  onClick={() => setViewMode(v.mode)}
+                  class="px-2 py-0.5 text-xs rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
+                  classList={{ "bg-neutral-700 text-white": viewMode() === v.mode }}
+                  title={v.title}
+                >
+                  {v.label}
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
         <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
       </div>
     </>

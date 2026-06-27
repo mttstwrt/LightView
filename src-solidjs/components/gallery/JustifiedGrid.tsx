@@ -1,13 +1,13 @@
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, type UnlistenFn } from "../../lib/runtime";
+import { safeListen as listen, isMobile, type UnlistenFn } from "../../lib/runtime";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, thumbUrl, mediaUrl, type ThumbTier } from "../../lib/ipc";
 import type { MediaMeta } from "../../stores/galleryStore";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
-import { computeJustifiedLayout, rowIndexAtOffset } from "../../lib/justifiedLayout";
+import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
 interface JustifiedGridProps {
@@ -81,8 +81,32 @@ const ROW_HEIGHT_MAX = 600;
 type DetailLevel = "base" | "mid" | "high";
 
 export function JustifiedGrid(props: JustifiedGridProps) {
-  const targetRowHeight = () => settings().display.thumbnail_size;
   const gap = () => settings().display.grid_gap;
+
+  // Measured width of the justified container; drives the mobile row-height
+  // derivation below. Declared up here (before targetRowHeight) so the
+  // detail-level effect, which reads targetRowHeight() during setup, doesn't
+  // hit the temporal dead zone.
+  const [containerWidth, setContainerWidth] = createSignal(0);
+
+  // Target row height (px). On desktop this is the raw thumbnail_size (the
+  // continuous zoom). On mobile, thumbnail_size is instead a *column-width*
+  // target chosen by the settings "Columns" picker; using it raw as a row
+  // height made the justified view ignore the selected column count and snap to
+  // a stale default (~3 columns) until a width was re-picked. So on mobile we
+  // derive the row height exactly the way the grid sizes its cells: turn the
+  // column-width target into a whole column count against the measured width,
+  // then use that cell width as the row height. Grid and justified then share
+  // one effective size and the picker drives both.
+  const targetRowHeight = () => {
+    const ts = settings().display.thumbnail_size;
+    if (!isMobile()) return ts;
+    const g = gap();
+    const cw = Math.max(0, containerWidth() - 2 * g);
+    if (cw <= 0) return ts;
+    const cols = Math.max(1, Math.floor((cw + g) / (ts + g)));
+    return (cw - (cols - 1) * g) / cols;
+  };
 
   // Current detail level from the (DPR-aware, hysteretic) zoom. "base" when
   // high-detail is disabled or zoomed out; "mid"/"high" step up as you zoom in.
@@ -114,6 +138,18 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     return i >= 0 ? p.slice(i + 1).toLowerCase() : "";
   };
 
+  // Longest edge (physical px) a cell is expected to display at. Mirrors the
+  // layout's per-row portrait boost (`portraitRowBoost`) so portrait cells —
+  // which render taller than `targetRowHeight` — drive a matching resize/source
+  // resolution instead of a soft, under-sized one. `aspect` is the cell's own
+  // aspect, a per-image stand-in for its row's average (exact for the
+  // portrait-only rows where the boost actually bites).
+  const displayedLongEdge = (aspect: number): number => {
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const h = targetRowHeight() * portraitRowBoost(aspect);
+    return h * Math.max(1, aspect) * dpr;
+  };
+
   // Whether `path` should be served via the media server's cell-fit resize
   // (`?fit=`) at the current level, rather than the pre-generated "jm"/"jh"
   // tier. Eligible: a native-format still image that isn't so large the on-
@@ -138,18 +174,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // tolerance of the displayed size; otherwise use the (precached, off-thread)
     // tier. Unknown dimensions fall back to the byte ceiling.
     if (meta.width != null && meta.height != null) {
-      const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-      const aspect = props.aspects.get(path) ?? 1;
-      // Cells are row-height tall; landscape cells are wider, so the displayed
-      // longest edge is rowHeight × max(1, aspect).
-      const physicalLongEdge = targetRowHeight() * Math.max(1, aspect) * dpr;
+      const physicalLongEdge = displayedLongEdge(props.aspects.get(path) ?? 1);
       const srcLongEdge = Math.max(meta.width, meta.height);
       if (srcLongEdge > physicalLongEdge * ORIGINAL_SRC_TOLERANCE) return false;
     }
     return true;
   };
 
-  const [containerWidth, setContainerWidth] = createSignal(0);
   const [startRow, setStartRow] = createSignal(0);
   const [endRow, setEndRow] = createSignal(0);
   const [generation, setGeneration] = createSignal(0);
@@ -275,9 +306,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // the `?fit=` URL stays cache-stable across small layout changes. This is the
   // resize target the media server fits the source to.
   const fitEdgeFor = (path: string): number => {
-    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-    const aspect = props.aspects.get(path) ?? 1;
-    const physicalLongEdge = targetRowHeight() * Math.max(1, aspect) * dpr;
+    const physicalLongEdge = displayedLongEdge(props.aspects.get(path) ?? 1);
     return Math.ceil(physicalLongEdge / FIT_BUCKET) * FIT_BUCKET;
   };
 

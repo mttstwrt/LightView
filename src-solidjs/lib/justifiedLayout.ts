@@ -50,6 +50,22 @@ export interface JustifiedLayoutOptions {
   minAspect?: number;
   maxAspect?: number;
   /**
+   * Boost row height for portrait-skewed rows so vertical images aren't dwarfed
+   * by landscapes. At a shared row height a portrait has far less area than a
+   * landscape (area = aspect × height²); to compensate, the per-row target
+   * height is multiplied by `sqrt(boostRefAspect / avgRowAspect)`, clamped to
+   * `[1, orientationBoost]`. The clamp floor of 1 means landscapes are never
+   * shrunk — only portrait/square rows grow taller (fewer, larger images).
+   * `orientationBoost = 1` disables the boost entirely.
+   */
+  orientationBoost?: number;
+  /**
+   * Average row aspect at/above which a row gets its natural (unboosted)
+   * target. Set near the typical landscape aspect so landscape rows stay put
+   * and only portrait-leaning rows are boosted.
+   */
+  boostRefAspect?: number;
+  /**
    * Indices at which a new group begins — the row is force-broken before each,
    * so group boundaries stay clean. Empty / omitted = no forced breaks.
    */
@@ -57,6 +73,29 @@ export interface JustifiedLayoutOptions {
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** Default cap on the portrait row-height boost (see `orientationBoost`). */
+export const DEFAULT_ORIENTATION_BOOST = 1.6;
+/** Default aspect at/above which a row is unboosted (see `boostRefAspect`). */
+export const DEFAULT_BOOST_REF_ASPECT = 1.5;
+
+/**
+ * Multiplier applied to a row's target height given its average aspect, so
+ * portrait-leaning rows grow taller (vertical images get more area). Returns
+ * `sqrt(boostRefAspect / avgAspect)` clamped to `[1, orientationBoost]`: 1 for
+ * landscape rows (`avgAspect >= boostRefAspect`), up to `orientationBoost` for
+ * strongly portrait rows. Exported so callers that need to predict a cell's
+ * displayed pixel size (e.g. choosing a resize resolution) stay in sync with
+ * the layout — passing a single image's aspect approximates its row's boost.
+ */
+export function portraitRowBoost(
+  avgAspect: number,
+  orientationBoost = DEFAULT_ORIENTATION_BOOST,
+  boostRefAspect = DEFAULT_BOOST_REF_ASPECT,
+): number {
+  if (orientationBoost <= 1 || avgAspect <= 0 || avgAspect >= boostRefAspect) return 1;
+  return Math.min(orientationBoost, Math.sqrt(boostRefAspect / avgAspect));
+}
 
 /**
  * Compute a justified layout. Runs in O(n) over the items.
@@ -71,8 +110,17 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
     maxRowHeight = targetRowHeight * 2,
     minAspect = 0.25,
     maxAspect = 4,
+    orientationBoost = DEFAULT_ORIENTATION_BOOST,
+    boostRefAspect = DEFAULT_BOOST_REF_ASPECT,
     groupStarts,
   } = opts;
+
+  // Per-row target height, scaled up when the row skews portrait (see
+  // `portraitRowBoost`). This is the only lever that gives portraits more space
+  // — within a row all heights are equal, so taller rows are the only way to
+  // enlarge vertical images.
+  const targetFor = (avgAspect: number): number =>
+    targetRowHeight * portraitRowBoost(avgAspect, orientationBoost, boostRefAspect);
 
   const rows: LayoutRow[] = [];
   const rowTops: number[] = [];
@@ -95,7 +143,10 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
     if (n <= 0) return;
     const totalGap = gap * (n - 1);
     const avail = containerWidth - totalGap;
-    let h = justify ? avail / sumAspect : targetRowHeight;
+    // Trailing/group-final rows aren't justified to full width, but still honor
+    // the portrait boost so a leftover portrait row matches the boosted rows
+    // above it rather than snapping back to the base target.
+    let h = justify ? avail / sumAspect : targetFor(sumAspect / n);
     h = clamp(h, minRowHeight, maxRowHeight);
 
     const cells: LayoutCell[] = [];
@@ -127,9 +178,11 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
     const totalGap = gap * (n - 1);
     const justifiedH = (containerWidth - totalGap) / sumAspect;
 
-    // Once justifying to full width would shrink the row to/under the target,
-    // the row is "full" — commit it at that justified height.
-    if (justifiedH <= targetRowHeight) {
+    // Once justifying to full width would shrink the row to/under its target,
+    // the row is "full" — commit it at that justified height. A portrait-leaning
+    // row has a taller target (see `targetFor`), so it commits earlier: fewer,
+    // bigger images instead of many narrow slivers.
+    if (justifiedH <= targetFor(sumAspect / n)) {
       flush(i + 1, true);
     }
   }
