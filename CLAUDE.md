@@ -49,14 +49,14 @@ cd src-tauri && cargo bench --bench cache_db
 | Module | Purpose |
 |---|---|
 | `commands/` | Tauri command handlers (thin wrappers delegating to domain modules) |
-| `provider/` | `FileProvider` trait + `ProviderRegistry` — abstraction over local/SMB/SFTP/S3 file access |
+| `provider/` | `FileProvider` trait + `ProviderRegistry` — file-access abstraction. Only `local` (`LocalProvider`) is implemented today; the trait exists to allow remote backends (SMB/SFTP/S3) later. |
 | `companion/` | Sidecar `.lightview` JSON companion files for per-image metadata (schema, reader, writer, migration) |
 | `cache/` | SQLite-backed cache: `db` (core), `thumbnails`, `index`, `counts`, `duplicates` |
 | `pipeline/` | Thumbnail generation: CPU `thumbnailer`, optional GPU pipeline (`gpu_pipeline` via wgpu) |
 | `filter/` | Query language for filtering media: `ast` → `parser` → `evaluator` |
 | `sort/` | Sorting + grouping: `sorter`, `grouper`, `timeline` |
 | `autocomplete/` | In-memory tag autocomplete engine |
-| `plugin/` | External plugin system: `manifest` (JSON), `runner`, `daemon` (long-running process plugins) |
+| `plugin/` | External plugin system: `manifest` (JSON) + `runner`. Spawns a plugin subprocess and exchanges NDJSON over stdin/stdout. Currently implements a single verb — image → tags — so in practice it's an auto-tagger runner, not a general extension host. See `docs/pluginExtensibility.md`. |
 | `hardware/` | Hardware detection (storage type, CPU, RAM, GPU) — drives adaptive performance tuning |
 | `util/` | Helpers: `paths` (data dir), `hash`, `fs_watch` |
 
@@ -77,7 +77,7 @@ cd src-tauri && cargo bench --bench cache_db
 - **Shared state**: Rust `AppState` (in `lib.rs`) holds all cross-command state behind `Arc<RwLock<>>` / `Arc<Mutex<>>`. `rusqlite::Connection` uses `Mutex` (not `RwLock`) because it's `Send` but not `Sync`.
 - **Thumbnail pipeline**: Hardware-adaptive — detects NVMe/SSD, discrete GPU, CPU cores. Uses a bounded `rayon::ThreadPool` (`thumb_pool`). Optional GPU path via `wgpu` (feature `gpu`) for fused crop+resize.
 - **Dependencies in dev builds**: `[profile.dev.package."*"] opt-level = 2` — image codecs, SIMD resize, and SQLite are unusably slow at opt-level 0.
-- **Plugin system**: Plugins are directories with a `manifest.json`. Execution is CLI-based (spawned process or long-running daemon). Example: `plugins/wd-tagger/` (ML image tagger).
+- **Plugin system**: Plugins are directories with a `manifest.json`. Execution is CLI-based: the host spawns the plugin as a subprocess and streams NDJSON image paths in / tag results out (`plugin/runner.rs`). The host only implements the `tag` verb today, so every plugin is effectively an auto-tagger keyed by `tag_prefix`. Example: `plugins/wd-tagger/` (ML image tagger). Roadmap for true extensibility: `docs/pluginExtensibility.md`.
 
 ### Cargo features
 
