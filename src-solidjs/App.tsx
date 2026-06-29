@@ -271,10 +271,11 @@ export function App() {
   });
   onCleanup(() => { unlisten.then((fn) => fn()); });
 
-  // Listen for external filesystem changes (files added/removed outside the app)
-  const unlistenFs = listen<{ added: string[]; removed: string[] }>("gallery:fs-changed", async (event) => {
-    const { added, removed } = event.payload;
-
+  // Apply a batch of external filesystem changes (files added/removed outside
+  // the app). Shared by the desktop Tauri event and the web SSE relay below —
+  // an empty batch (added/removed both empty) means "refetch everything", which
+  // the SSE side sends when its subscriber lagged.
+  const handleFsChange = async (added: string[], removed: string[]) => {
     if (removed.length > 0) {
       const removedSet = new Set(removed);
       setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
@@ -286,20 +287,45 @@ export function App() {
       });
     }
 
-    if (added.length > 0) {
+    if (added.length > 0 || removed.length === 0) {
       // Re-fetch sorted items to get correct insertion order
       try {
         const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
         setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
+        setTotalCount(sorted.items.length);
+        return;
       } catch (e) {
         console.error("Failed to refresh after file addition:", e);
       }
     }
 
     setTotalCount((c) => c + added.length - removed.length);
+  };
+
+  // Desktop: external filesystem changes arrive as a Tauri event. (On the web
+  // client `listen` is a no-op; the EventSource below covers that case.)
+  const unlistenFs = listen<{ added: string[]; removed: string[] }>("gallery:fs-changed", (event) => {
+    handleFsChange(event.payload.added, event.payload.removed);
   });
   onCleanup(() => { unlistenFs.then((fn) => fn()); });
+
+  // Web client: subscribe to the host's Server-Sent Events stream so the grid
+  // reflects uploads (from any device) and files added directly on the host,
+  // without a manual reload. EventSource reconnects on its own; it sends the
+  // same-origin `lv_device` cookie so only paired devices connect.
+  if (isWeb()) {
+    const source = new EventSource("/api/events");
+    source.addEventListener("fs-changed", (event) => {
+      try {
+        const { added = [], removed = [] } = JSON.parse((event as MessageEvent).data || "{}");
+        handleFsChange(added, removed);
+      } catch (e) {
+        console.error("Failed to handle fs-changed SSE event:", e);
+      }
+    });
+    onCleanup(() => source.close());
+  }
 
   // Hot-reload settings when settings.toml is hand-edited outside the app.
   // Backend emits this only for genuine external edits, not the app's own saves.

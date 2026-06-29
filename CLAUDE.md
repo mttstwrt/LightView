@@ -31,6 +31,41 @@ cd src-tauri && cargo bench --bench thumbnailer
 cd src-tauri && cargo bench --bench cache_db
 ```
 
+### Headless test server (verify the web client without the GUI)
+
+`lightview-headless` boots the same backend + axum HTTP server as the desktop
+app but **without WebKitGTK**, so the LAN web client (and routes like
+`/api/events`, `/api/upload`, `/api/invoke`) can be exercised with `curl` — no
+display required. The desktop app starts the fs-watcher from its `open_gallery`
+command; the headless binary calls `open_gallery_impl` and starts the watcher
+itself, so both paths watch for disk changes.
+
+```bash
+# Build the binary (debug is fine for testing) and the SPA it serves from dist/
+cd src-tauri && cargo build --bin lightview-headless
+npm run build      # produces dist/ at the repo root; resolve_web_root() finds it
+
+# Make a throwaway gallery
+G=$(mktemp -d); for c in red green blue; do magick -size 64x64 xc:$c "$G/$c.jpg"; done
+
+# Serve it (0.0.0.0, per-device cookie auth, SPA from dist/)
+./target/debug/lightview-headless serve "$G" --port 8799 &
+
+# Pair a device: mint a PIN, redeem it for the lv_device cookie
+PIN=$(./target/debug/lightview-headless pair "$G" | sed -n 's/Pairing PIN: //p')
+COOKIE=$(curl -s -D- -o/dev/null -X POST localhost:8799/pair/redeem \
+  -H 'Content-Type: application/json' -d "{\"code\":\"$PIN\",\"device_name\":\"test\"}" \
+  | sed -nE 's/.*(lv_device=[^;]+).*/\1/p')
+
+# Now hit auth-gated routes. Example: watch the SSE change stream, then add a file
+curl -sN --cookie "$COOKIE" localhost:8799/api/events &   # streams `event: fs-changed`
+cp "$G/red.jpg" "$G/new.jpg"                               # watcher → broadcast → SSE
+```
+
+Notes: the watcher only catches changes made *after* startup (a restart
+re-indexes). `/api/events`, `/api/upload`, and `/api/invoke` all require the
+`lv_device` cookie; unauthenticated requests get `401`. Default port is `8787`.
+
 ## Architecture
 
 ### Two-process Tauri model

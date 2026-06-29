@@ -99,6 +99,7 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
         .route("/gif-atlas/{tier}/{*path}", get(routes::gif_atlas))
         .route("/thumbhash/{*path}", get(routes::thumbhash))
         .route("/api/invoke", post(api::invoke))
+        .route("/api/events", get(routes::events))
         // The body limit applies only to the upload route; the other data
         // routes keep axum's small default.
         .route(

@@ -466,6 +466,53 @@ pub async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// `GET /api/events` — Server-Sent Events stream of gallery changes.
+///
+/// A browser has no Tauri IPC, so this is how the web client learns that files
+/// were added or removed (by another device's upload, or directly on the host).
+/// It subscribes to the app-wide `fs_change_tx` broadcast that the fs-watcher
+/// publishes to, and relays each batch as an `fs-changed` event whose data is
+/// the `{ added, removed }` JSON. The client refetches the grid on receipt.
+///
+/// Sits behind the auth layer like the other data routes; EventSource sends the
+/// `lv_device` cookie automatically (same-origin), so only paired devices can
+/// subscribe. A lagging subscriber gets an empty payload, which the client
+/// treats as "refetch everything".
+pub async fn events(
+    State(state): State<ServerState>,
+) -> axum::response::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio::sync::broadcast::error::RecvError;
+
+    let rx = state.app.fs_change_tx.subscribe();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(change) => {
+                    // json_data only fails if the value isn't serializable;
+                    // FsChangeEvent always is, so fall back to a refetch ping.
+                    let event = Event::default()
+                        .event("fs-changed")
+                        .json_data(&change)
+                        .unwrap_or_else(|_| Event::default().event("fs-changed").data("{}"));
+                    return Some((Ok(event), rx));
+                }
+                // Receiver fell behind and dropped messages: tell the client to
+                // refetch everything rather than trying to reconstruct the gap.
+                Err(RecvError::Lagged(_)) => {
+                    let event = Event::default().event("fs-changed").data("{}");
+                    return Some((Ok(event), rx));
+                }
+                // Sender dropped (app shutting down): end the stream.
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 // ─────────────────────────────────────────────────────────────
 // Uploads
 // ─────────────────────────────────────────────────────────────

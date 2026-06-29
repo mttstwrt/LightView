@@ -194,6 +194,13 @@ pub struct AppState {
     /// Cancellation flag for the filesystem watcher background task.
     pub fs_watch_cancel: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Broadcasts filesystem change batches to remote web clients. The desktop
+    /// webview gets these via Tauri's `gallery:fs-changed` event, but a browser
+    /// has no Tauri IPC, so the HTTP server's `/api/events` SSE route subscribes
+    /// here and relays each batch. The fs-watcher publishes; late subscribers
+    /// only see changes from their subscription onward, which is what we want.
+    pub fs_change_tx: tokio::sync::broadcast::Sender<commands::gallery::FsChangeEvent>,
+
     /// The TOML content the app itself last wrote to `settings.toml`. The fs
     /// watcher compares against this so it only emits `settings:changed` for
     /// genuine external (hand) edits, not the app's own saves.
@@ -269,6 +276,9 @@ impl AppState {
             thumb_gen_coalescer: Arc::new(ThumbGenCoalescer::new()),
             fs_watcher: Arc::new(std::sync::Mutex::new(None)),
             fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Capacity bounds memory if no clients are connected; a slow client
+            // that lags just gets a Lagged signal and triggers a full refresh.
+            fs_change_tx: tokio::sync::broadcast::channel(64).0,
             last_written_settings: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "gpu")]
             gpu_pipeline,

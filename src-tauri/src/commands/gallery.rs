@@ -330,10 +330,13 @@ pub struct FsChangeEvent {
 }
 
 /// Start the filesystem watcher background task.
-/// Polls for notify events, debounces them, updates the DB, and emits
-/// `gallery:fs-changed` to the frontend.
-fn start_fs_watcher(
-    app_handle: tauri::AppHandle,
+/// Polls for notify events, debounces them, updates the DB, and notifies
+/// clients: the desktop webview via Tauri events (when `app_handle` is `Some`)
+/// and remote web clients via the `fs_change_tx` broadcast (always). The
+/// headless server has no Tauri runtime, so it passes `None` and relies solely
+/// on the broadcast.
+pub fn start_fs_watcher(
+    app_handle: Option<tauri::AppHandle>,
     state: &AppState,
     gallery_path: &str,
 ) {
@@ -366,6 +369,7 @@ fn start_fs_watcher(
     let fs_watcher = Arc::clone(&state.fs_watcher);
     let cache_db = Arc::clone(&state.cache_db);
     let last_written_settings = Arc::clone(&state.last_written_settings);
+    let fs_change_tx = state.fs_change_tx.clone();
 
     tauri::async_runtime::spawn(async move {
         use notify::EventKind;
@@ -427,7 +431,9 @@ fn start_fs_watcher(
                                         // this same edit don't re-emit.
                                         *last_written_settings.lock().unwrap() =
                                             Some(toml_str);
-                                        let _ = app_handle.emit("settings:changed", json);
+                                        if let Some(h) = &app_handle {
+                                            let _ = h.emit("settings:changed", json);
+                                        }
                                     }
                                 }
                             }
@@ -549,14 +555,14 @@ fn start_fs_watcher(
                 }
             }
 
-            // Emit event to frontend
-            let _ = app_handle.emit(
-                "gallery:fs-changed",
-                FsChangeEvent {
-                    added,
-                    removed,
-                },
-            );
+            // Notify the desktop webview (Tauri event) and any connected remote
+            // web clients (SSE relay subscribes to `fs_change_tx`). `send`
+            // errors only when there are no subscribers — expected and ignored.
+            let change = FsChangeEvent { added, removed };
+            if let Some(h) = &app_handle {
+                let _ = h.emit("gallery:fs-changed", change.clone());
+            }
+            let _ = fs_change_tx.send(change);
         }
 
         log::info!("Filesystem watcher task exited");
@@ -730,8 +736,9 @@ pub async fn open_gallery(
     })
     .await?;
 
-    // Start watching for external file changes (desktop only).
-    start_fs_watcher(app_handle, &state, &path);
+    // Start watching for external file changes. The desktop passes its
+    // AppHandle so changes also surface as Tauri events for this webview.
+    start_fs_watcher(Some(app_handle), &state, &path);
 
     Ok(result)
 }
