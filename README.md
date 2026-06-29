@@ -78,6 +78,152 @@ render settings (see below); a restart is required for it to take effect.
 
 ---
 
+## Headless server
+
+LightView ships a second binary, **`lightview-headless`**, that boots the same Rust
+backend (gallery, cache, thumbnail pipeline, and the axum HTTP server) **without the
+Tauri desktop window**. It's meant for leaving a gallery served on a NAS, home server,
+or always-on machine so you can browse and upload from a phone or laptop on the same
+network — no desktop session required.
+
+It shares everything with the desktop app: the same `.lightview/cache.db`, the same
+companion files, and the same device pairings. A device you paired through the desktop
+app stays paired against the headless server, as long as it connects to the same
+`host:port` origin (browsers scope the pairing cookie to the origin).
+
+### Building it
+
+```bash
+# Build the web UI it serves
+npm run build               # produces dist/
+
+# Build the headless binary (release recommended — codecs/SQLite are slow in debug)
+cd src-tauri
+cargo build --release --bin lightview-headless
+# → src-tauri/target/release/lightview-headless
+```
+
+The server serves the built SPA from a `dist/` directory, which it looks for in the
+current working directory, its parent, and next to the executable. Run it from the repo
+root (or copy `dist/` next to the binary) so it can find the UI.
+
+### Running it
+
+```bash
+# Serve a gallery over the LAN (default port 8787, binds 0.0.0.0)
+lightview-headless serve /path/to/gallery
+
+# Pick a port
+lightview-headless serve /path/to/gallery --port 9000
+
+# Mint a one-time 6-digit pairing PIN for a device, then exit
+lightview-headless pair /path/to/gallery
+```
+
+| Command | Purpose |
+|---|---|
+| `serve <gallery-path> [--port <n>]` | Open the gallery and serve it on `0.0.0.0:<port>` (default `8787`) with per-device cookie auth |
+| `pair <gallery-path>` | Create a single-use PIN (stored in the gallery's `cache.db`) and print it; redeem it at `http://<host>:<port>/pair` on the device |
+| `-h` / `--help` | Usage |
+
+The port is fixed (not OS-assigned) on purpose: the pairing cookie is scoped to
+`host:port`, so a stable origin means devices don't have to re-pair after a restart.
+
+Logging uses `env_logger` — set `RUST_LOG` to control verbosity:
+
+```bash
+RUST_LOG=info lightview-headless serve /path/to/gallery
+```
+
+**First-device flow:** start `serve`, then in a second terminal run `pair` to print a
+PIN, and on the phone open `http://<server-ip>:8787/pair` and enter it. Subsequent
+visits from that device are authenticated by cookie.
+
+### Running it as a startup service
+
+#### Linux (systemd user service)
+
+Create `~/.config/systemd/user/lightview-headless.service`:
+
+```ini
+[Unit]
+Description=LightView headless gallery server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Run from a directory that contains dist/ (or place dist/ next to the binary)
+WorkingDirectory=/opt/lightview
+ExecStart=/opt/lightview/lightview-headless serve /srv/photos --port 8787
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable and start it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now lightview-headless.service
+
+# Keep it running after you log out (no active session required)
+loginctl enable-linger $USER
+
+# Follow logs
+journalctl --user -u lightview-headless -f
+```
+
+For a system-wide service (independent of any user login), put the unit in
+`/etc/systemd/system/`, add a `User=`/`Group=` to run it as an unprivileged account, and
+manage it with `sudo systemctl` instead of `--user`.
+
+#### macOS (launchd)
+
+Create `~/Library/LaunchAgents/com.lightview.headless.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.lightview.headless</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/lightview/lightview-headless</string>
+    <string>serve</string>
+    <string>/Users/Shared/Photos</string>
+    <string>--port</string>
+    <string>8787</string>
+  </array>
+  <key>WorkingDirectory</key><string>/opt/lightview</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>RUST_LOG</key><string>info</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+Load it with `launchctl load ~/Library/LaunchAgents/com.lightview.headless.plist`.
+
+#### Windows
+
+Run at startup with Task Scheduler — create a task triggered "At log on" (or "At
+startup" for a service-like task) whose action runs
+`lightview-headless.exe serve C:\Photos --port 8787`, with "Start in" set to the folder
+containing `dist/`. For a true background service, wrap it with a tool like
+[NSSM](https://nssm.cc/).
+
+> **Reminder:** the headless server binds `0.0.0.0`, so anything that can reach the port
+> can attempt to pair. Keep it on a trusted LAN, set a gallery password, and/or front it
+> with a reverse proxy + TLS if you expose it more widely.
+
+---
+
 ## How it works under the hood
 
 ### Two-process model
