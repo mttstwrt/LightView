@@ -100,6 +100,10 @@ impl ThumbProtocolPool {
                     let _ = conn.execute_batch("PRAGMA cache_size=-8000;");
                     // Sorts / IN-list temp tables stay in RAM, not a temp file.
                     let _ = conn.execute_batch("PRAGMA temp_store=MEMORY;");
+                    // Memory-map the DB (256MB) so this read-only blob-serving
+                    // connection reads thumbnails from a mapped page instead of
+                    // read() syscalls + buffer copies. mmap is per-connection.
+                    let _ = conn.execute_batch("PRAGMA mmap_size=268435456;");
                     conns.push(std::sync::Mutex::new(conn));
                 }
                 Err(e) => {
@@ -187,6 +191,11 @@ pub struct AppState {
     /// from the `lightview://thumb/...` protocol handler.
     pub thumb_gen_coalescer: Arc<ThumbGenCoalescer>,
 
+    /// Bounded cache of decoded ThumbHash placeholder PNGs, keyed by path.
+    /// Avoids re-decoding + re-encoding the same tiny PNG on every scroll.
+    /// Cleared whenever the active gallery's protocol pool is swapped.
+    pub thumbhash_png_cache: Arc<thumb_serve::ThumbhashPngCache>,
+
     /// Filesystem watcher for detecting external file additions/removals.
     /// Uses std::sync::Mutex because FsWatcher uses std mpsc channels.
     pub fs_watcher: Arc<std::sync::Mutex<Option<FsWatcher>>>,
@@ -273,6 +282,7 @@ impl AppState {
             recent_galleries: Arc::new(Mutex::new(recent_galleries)),
             plugin_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thumb_protocol_db: Arc::new(std::sync::RwLock::new(None)),
+            thumbhash_png_cache: Arc::new(thumb_serve::ThumbhashPngCache::default()),
             thumb_gen_coalescer: Arc::new(ThumbGenCoalescer::new()),
             fs_watcher: Arc::new(std::sync::Mutex::new(None)),
             fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),

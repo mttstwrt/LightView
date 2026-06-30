@@ -515,6 +515,9 @@ impl CacheDb {
         // Keep temp B-trees (ORDER BY, IN-list materialization) in RAM rather
         // than spilling to a disk temp file.
         conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
+        // Memory-map the DB (256MB) so hot thumbnail-blob reads come straight
+        // from a mapped page instead of read() syscalls + buffer copies.
+        conn.execute_batch("PRAGMA mmap_size=268435456;")?;
 
         // Ensure gallery_meta exists before anything else — migrations
         // need it to read/write the schema version.

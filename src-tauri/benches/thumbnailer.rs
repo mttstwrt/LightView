@@ -96,11 +96,11 @@ fn bench_decode_image(c: &mut Criterion) {
     let (_dir_png, path_png) = create_test_png(4000, 3000);
 
     group.bench_function("jpeg/4000x3000", |b| {
-        b.iter(|| thumbnailer::decode_image(black_box(&path_jpg)).expect("decode"))
+        b.iter(|| thumbnailer::decode_image(black_box(&path_jpg), 512).expect("decode"))
     });
 
     group.bench_function("png/4000x3000", |b| {
-        b.iter(|| thumbnailer::decode_image(black_box(&path_png)).expect("decode"))
+        b.iter(|| thumbnailer::decode_image(black_box(&path_png), 512).expect("decode"))
     });
 
     group.finish();

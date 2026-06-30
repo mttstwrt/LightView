@@ -10,6 +10,44 @@ use crate::cache::coalescer::Role;
 use crate::cache::thumbnails::ThumbTier;
 use crate::commands;
 use crate::AppState;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Maximum number of decoded ThumbHash PNGs to keep cached. Each entry is tiny
+/// (a ~32px PNG, a few hundred bytes), so even at capacity this is well under a
+/// few MB. On overflow the whole map is cleared — a coarse bound that avoids
+/// any LRU bookkeeping on the hot read path.
+const THUMBHASH_PNG_CACHE_CAP: usize = 4096;
+
+/// Bounded cache of decoded ThumbHash → PNG bytes. Placeholders are re-requested
+/// repeatedly while fling-scrolling the grid; decoding the hash and PNG-encoding
+/// it on every request is pure waste since the output is deterministic per path.
+/// Keyed by absolute path (galleries use absolute paths, so cross-gallery key
+/// collisions don't occur); [`AppState`] clears it when the gallery's protocol
+/// pool is swapped so it can't grow across sessions.
+#[derive(Default)]
+pub struct ThumbhashPngCache {
+    inner: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+}
+
+impl ThumbhashPngCache {
+    fn get(&self, path: &str) -> Option<Arc<Vec<u8>>> {
+        self.inner.lock().unwrap().get(path).cloned()
+    }
+
+    fn insert(&self, path: String, png: Arc<Vec<u8>>) {
+        let mut map = self.inner.lock().unwrap();
+        if map.len() >= THUMBHASH_PNG_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(path, png);
+    }
+
+    /// Drop all cached PNGs. Called when the active gallery changes.
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
+    }
+}
 
 /// Result of a thumbnail lookup/generation.
 pub enum ThumbOutcome {
@@ -116,6 +154,10 @@ pub enum ThumbhashOutcome {
 
 /// Read the ~25-byte ThumbHash blob for a path and decode it into a tiny PNG.
 pub fn render_thumbhash_png(state: &AppState, path: &str) -> ThumbhashOutcome {
+    if let Some(png) = state.thumbhash_png_cache.get(path) {
+        return ThumbhashOutcome::Png(png.as_ref().clone());
+    }
+
     let pool = {
         let guard = state.thumb_protocol_db.read().unwrap();
         match guard.as_ref() {
@@ -149,7 +191,11 @@ pub fn render_thumbhash_png(state: &AppState, path: &str) -> ThumbhashOutcome {
         return ThumbhashOutcome::Error;
     }
 
-    ThumbhashOutcome::Png(png.into_inner())
+    let bytes = png.into_inner();
+    state
+        .thumbhash_png_cache
+        .insert(path.to_string(), Arc::new(bytes.clone()));
+    ThumbhashOutcome::Png(bytes)
 }
 
 /// MIME type for a stored thumbnail format string.

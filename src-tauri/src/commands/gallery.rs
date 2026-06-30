@@ -637,6 +637,8 @@ pub async fn open_gallery_impl(
             Some(pool) => {
                 let mut proto_db = state.thumb_protocol_db.write().unwrap();
                 *proto_db = Some(Arc::new(pool));
+                // New gallery → previous ThumbHash PNGs are no longer relevant.
+                state.thumbhash_png_cache.clear();
             }
             None => {
                 log::warn!("Failed to open read-only DB pool for protocol handler");
@@ -765,6 +767,7 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
     {
         let mut proto_db = state.thumb_protocol_db.write().unwrap();
         *proto_db = None;
+        state.thumbhash_png_cache.clear();
     }
 
     // Checkpoint and close cache DB

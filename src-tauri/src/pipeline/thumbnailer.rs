@@ -202,13 +202,11 @@ fn generate_jpeg_thumbnail_inner(path: &Path, filter: ResizeFilter, format: Thum
 
     let final_data = match format {
         ThumbFormat::Jpeg => {
-            let cropped = crop_rgb(&rgb_buf, dw, cx, cy, side, side);
-            resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
+            resize_rgb_crop(dw, dh, &rgb_buf, cx, cy, side, side, thumb_w, thumb_h, filter)?
         }
         ThumbFormat::Webp => {
             let rgba_src = rgb_to_rgba(&rgb_buf);
-            let cropped = crop_rgba(&rgba_src, dw, cx, cy, side, side);
-            resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
+            resize_rgba_crop(dw, dh, &rgba_src, cx, cy, side, side, thumb_w, thumb_h, filter)?
         }
     };
 
@@ -240,15 +238,11 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
     let final_data = match format {
         ThumbFormat::Jpeg => {
             let rgb = img.to_rgb8();
-            let src_buf = rgb.as_raw();
-            let cropped = crop_rgb(src_buf, w, cx, cy, side, side);
-            resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
+            resize_rgb_crop(w, h, rgb.as_raw(), cx, cy, side, side, thumb_w, thumb_h, filter)?
         }
         ThumbFormat::Webp => {
             let rgba = img.to_rgba8();
-            let src_buf = rgba.as_raw();
-            let cropped = crop_rgba(src_buf, w, cx, cy, side, side);
-            resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
+            resize_rgba_crop(w, h, rgba.as_raw(), cx, cy, side, side, thumb_w, thumb_h, filter)?
         }
     };
 
@@ -281,12 +275,10 @@ fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForma
     let final_data = match format {
         ThumbFormat::Jpeg => {
             let rgb = rgba_to_rgb(&rgba_buf);
-            let cropped = crop_rgb(&rgb, dw, cx, cy, side, side);
-            resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
+            resize_rgb_crop(dw, dh, &rgb, cx, cy, side, side, thumb_w, thumb_h, filter)?
         }
         ThumbFormat::Webp => {
-            let cropped = crop_rgba(&rgba_buf, dw, cx, cy, side, side);
-            resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
+            resize_rgba_crop(dw, dh, &rgba_buf, cx, cy, side, side, thumb_w, thumb_h, filter)?
         }
     };
 
@@ -302,22 +294,6 @@ fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForma
         src_height: src_h,
         format,
     })
-}
-
-/// Resize RGB (U8x3) pixels to target dimensions.
-fn resize_rgb(sw: u32, sh: u32, src: &[u8], tw: u32, th: u32, filter: ResizeFilter) -> Result<Vec<u8>, ThumbError> {
-    if sw == tw && sh == th {
-        return Ok(src.to_vec());
-    }
-    let src_image = ImageRef::new(sw, sh, src, fir::PixelType::U8x3)
-        .map_err(|e| ThumbError::Decode(format!("Source image error: {e}")))?;
-    let mut dst_image = Image::new(tw, th, fir::PixelType::U8x3);
-    let options = fir::ResizeOptions::new().resize_alg(filter.to_fir_alg());
-    let mut resizer = fir::Resizer::new();
-    resizer
-        .resize(&src_image, &mut dst_image, &options)
-        .map_err(|e| ThumbError::Encode(format!("Resize failed: {e}")))?;
-    Ok(dst_image.into_vec())
 }
 
 /// Resize RGBA (U8x4) pixels to target dimensions.
@@ -336,26 +312,46 @@ fn resize_rgba(sw: u32, sh: u32, src: &[u8], tw: u32, th: u32, filter: ResizeFil
     Ok(dst_image.into_vec())
 }
 
-/// Crop an RGB (U8x3) buffer to a sub-region.
-fn crop_rgb(src: &[u8], src_w: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity((w * h * 3) as usize);
-    for row in y..y + h {
-        let start = ((row * src_w + x) * 3) as usize;
-        let end = start + (w * 3) as usize;
-        out.extend_from_slice(&src[start..end]);
-    }
-    out
+/// Resize the `(cx, cy, cw, ch)` sub-region of an RGB (U8x3) buffer to target
+/// dimensions, cropping *inside* fast_image_resize. This fuses crop+resize so
+/// the square-crop intermediate buffer (a full-region alloc + row-by-row
+/// memcpy) is never materialized — the hot path on every generated thumbnail.
+fn resize_rgb_crop(
+    sw: u32, sh: u32, src: &[u8],
+    cx: u32, cy: u32, cw: u32, ch: u32,
+    tw: u32, th: u32, filter: ResizeFilter,
+) -> Result<Vec<u8>, ThumbError> {
+    let src_image = ImageRef::new(sw, sh, src, fir::PixelType::U8x3)
+        .map_err(|e| ThumbError::Decode(format!("Source image error: {e}")))?;
+    let mut dst_image = Image::new(tw, th, fir::PixelType::U8x3);
+    let options = fir::ResizeOptions::new()
+        .resize_alg(filter.to_fir_alg())
+        .crop(cx as f64, cy as f64, cw as f64, ch as f64);
+    let mut resizer = fir::Resizer::new();
+    resizer
+        .resize(&src_image, &mut dst_image, &options)
+        .map_err(|e| ThumbError::Encode(format!("Resize failed: {e}")))?;
+    Ok(dst_image.into_vec())
 }
 
-/// Crop an RGBA (U8x4) buffer to a sub-region.
-fn crop_rgba(src: &[u8], src_w: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity((w * h * 4) as usize);
-    for row in y..y + h {
-        let start = ((row * src_w + x) * 4) as usize;
-        let end = start + (w * 4) as usize;
-        out.extend_from_slice(&src[start..end]);
-    }
-    out
+/// Resize the `(cx, cy, cw, ch)` sub-region of an RGBA (U8x4) buffer to target
+/// dimensions, cropping inside fast_image_resize (see [`resize_rgb_crop`]).
+fn resize_rgba_crop(
+    sw: u32, sh: u32, src: &[u8],
+    cx: u32, cy: u32, cw: u32, ch: u32,
+    tw: u32, th: u32, filter: ResizeFilter,
+) -> Result<Vec<u8>, ThumbError> {
+    let src_image = ImageRef::new(sw, sh, src, fir::PixelType::U8x4)
+        .map_err(|e| ThumbError::Decode(format!("Source image error: {e}")))?;
+    let mut dst_image = Image::new(tw, th, fir::PixelType::U8x4);
+    let options = fir::ResizeOptions::new()
+        .resize_alg(filter.to_fir_alg())
+        .crop(cx as f64, cy as f64, cw as f64, ch as f64);
+    let mut resizer = fir::Resizer::new();
+    resizer
+        .resize(&src_image, &mut dst_image, &options)
+        .map_err(|e| ThumbError::Encode(format!("Resize failed: {e}")))?;
+    Ok(dst_image.into_vec())
 }
 
 /// Convert RGB pixel buffer to RGBA (alpha = 255).
@@ -918,12 +914,10 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
             let final_data = match format {
                 ThumbFormat::Jpeg => {
                     let rgb = rgba_to_rgb(&rgba);
-                    let cropped = crop_rgb(&rgb, w, cx, cy, side, side);
-                    resize_rgb(side, side, &cropped, thumb_w, thumb_h, filter)?
+                    resize_rgb_crop(w, h, &rgb, cx, cy, side, side, thumb_w, thumb_h, filter)?
                 }
                 ThumbFormat::Webp => {
-                    let cropped = crop_rgba(&rgba, w, cx, cy, side, side);
-                    resize_rgba(side, side, &cropped, thumb_w, thumb_h, filter)?
+                    resize_rgba_crop(w, h, &rgba, cx, cy, side, side, thumb_w, thumb_h, filter)?
                 }
             };
 
