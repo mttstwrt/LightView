@@ -1196,6 +1196,32 @@ pub async fn generate_and_store_tier(
             thumb.width, thumb.height, &thumb.data, &fmt_str,
         )
         .map_err(|e| e.to_string())?;
+
+        // The web client's justified grid only ever requests these non-standard
+        // tiers, so without this the source dimensions never reach media_meta
+        // and the InfoPanel shows no dimensions for newly-added images until a
+        // restart re-indexes. Idempotent: guarded by `width IS NULL`.
+        let _ = db.conn().execute(
+            "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
+            rusqlite::params![thumb.src_width, thumb.src_height, path],
+        );
+
+        // Videos need ffprobe for duration/exact dimensions. Only probe when
+        // still missing so the (potentially 3) justified tiers don't each spawn
+        // ffprobe for the same file.
+        if thumb.media_type == "video" {
+            let needs_probe = db
+                .conn()
+                .query_row(
+                    "SELECT duration IS NULL FROM media_meta WHERE path = ?1",
+                    rusqlite::params![path],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if needs_probe {
+                populate_video_metadata(db.conn(), path);
+            }
+        }
     }
 
     Ok((bytes, fmt_str))
