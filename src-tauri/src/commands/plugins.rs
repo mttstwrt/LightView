@@ -97,7 +97,13 @@ async fn apply_result(
         Err(e) => return (vec![], false, Some(e)),
     };
 
-    runner::apply_plugin_output(&mut companion, manifest, &result.tags, result.meta.as_ref());
+    runner::apply_plugin_output(
+        &mut companion,
+        &manifest.tag_prefix,
+        &manifest.version,
+        &result.tags,
+        result.meta.as_ref(),
+    );
 
     if let Err(e) = writer::write_companion(media, &mut companion) {
         return (vec![], false, Some(e.to_string()));
@@ -470,4 +476,112 @@ fn rewrite_manifest_python(manifest_path: &Path, source_dir: &Path) -> Result<()
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Remote tag application (worker-tagging backend)
+// ---------------------------------------------------------------------------
+
+/// One plugin-namespace tag write, as pushed by a remote tagging worker (a
+/// paired machine that fetched the image over HTTP, ran an ML tagger locally,
+/// and reports the results). Same write path as a locally run plugin, so
+/// `NOT has::plugin.<prefix>` filters see the file as tagged afterwards.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginTagWrite {
+    pub path: String,
+    pub tag_prefix: String,
+    pub version: String,
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub meta: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApplyPluginTagsResult {
+    pub succeeded: Vec<String>,
+    pub failed: Vec<crate::commands::files::FileOpError>,
+}
+
+/// Write plugin-namespace tags for a batch of files: companion sidecar +
+/// `tag_index`, exactly like a local plugin run. Paths are confined to the
+/// open gallery (canonicalized, so `..`/symlink escapes are rejected) because
+/// this is reachable by remote paired devices.
+pub async fn apply_plugin_tags_impl(
+    state: &AppState,
+    entries: Vec<PluginTagWrite>,
+) -> Result<ApplyPluginTagsResult, String> {
+    let root = state
+        .canonical_gallery_root
+        .read()
+        .await
+        .clone()
+        .ok_or("No gallery open")?;
+
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+
+    for entry in entries {
+        let result = apply_one_tag_write(state, &root, &entry).await;
+        match result {
+            Ok(()) => succeeded.push(entry.path),
+            Err(error) => failed.push(crate::commands::files::FileOpError {
+                path: entry.path,
+                error,
+            }),
+        }
+    }
+
+    if !succeeded.is_empty() {
+        let db = state.cache_db.lock().await;
+        if let Some(db) = db.as_ref() {
+            let _ = db.rebuild_tag_counts();
+            if let Ok(counts) = db.query_all_tag_counts() {
+                state.autocomplete.refresh(counts).await;
+            }
+        }
+    }
+
+    Ok(ApplyPluginTagsResult { succeeded, failed })
+}
+
+async fn apply_one_tag_write(
+    state: &AppState,
+    gallery_root: &Path,
+    entry: &PluginTagWrite,
+) -> Result<(), String> {
+    if entry.tag_prefix.trim().is_empty() {
+        return Err("tag_prefix must not be empty".to_string());
+    }
+    let candidate = tokio::fs::canonicalize(&entry.path)
+        .await
+        .map_err(|_| "File not found".to_string())?;
+    if !candidate.starts_with(gallery_root) {
+        return Err("File is outside the current gallery".to_string());
+    }
+
+    let media = Path::new(&entry.path);
+    let mut companion = get_or_create_companion(media)?;
+    runner::apply_plugin_output(
+        &mut companion,
+        &entry.tag_prefix,
+        &entry.version,
+        &entry.tags,
+        entry.meta.as_ref(),
+    );
+    writer::write_companion(media, &mut companion).map_err(|e| e.to_string())?;
+
+    let db = state.cache_db.lock().await;
+    if let Some(db) = db.as_ref() {
+        let _ = db.reindex_tags_for_file(&entry.path, &companion);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn apply_plugin_tags(
+    state: tauri::State<'_, AppState>,
+    entries: Vec<PluginTagWrite>,
+) -> Result<ApplyPluginTagsResult, String> {
+    apply_plugin_tags_impl(&state, entries).await
 }

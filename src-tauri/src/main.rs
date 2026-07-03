@@ -355,6 +355,7 @@ fn main() {
             commands::plugins::run_plugin_batch,
             commands::plugins::cancel_plugin_batch,
             commands::plugins::install_plugin,
+            commands::plugins::apply_plugin_tags,
 
             // Viewer commands (GPU-accelerated transforms)
             commands::viewer::get_transformed_media,

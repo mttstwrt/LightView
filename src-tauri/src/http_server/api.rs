@@ -81,7 +81,7 @@ fn ok<T: Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
 }
 
 async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, DispatchError> {
-    use crate::commands::{autocomplete, duplicates, filter, gallery, geo, media, settings, sort, tags, trash};
+    use crate::commands::{autocomplete, duplicates, filter, gallery, geo, media, plugins, settings, sort, tags, trash};
 
     match command {
         "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
@@ -274,6 +274,19 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(tags::set_rating_batch_impl(app, a.paths, a.rating).await)
+        }
+
+        // --- Remote tag application (worker tagging) ------------------------
+        // A paired machine that ran an ML tagger locally pushes results here.
+        // Metadata-write tier — same trust as add_user_tag_batch. Paths are
+        // confined to the gallery inside the impl.
+        "apply_plugin_tags" => {
+            #[derive(Deserialize)]
+            struct A {
+                entries: Vec<plugins::PluginTagWrite>,
+            }
+            let a: A = parse(args)?;
+            ok(plugins::apply_plugin_tags_impl(app, a.entries).await)
         }
 
         // --- Duplicate detection --------------------------------------------

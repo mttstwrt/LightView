@@ -412,6 +412,22 @@ export const cancelPluginBatch = () => invoke<void>("cancel_plugin_batch");
 export const installPlugin = (path: string) =>
   invoke<PluginInfo>("install_plugin", { path });
 
+/** One plugin-namespace tag write, as pushed by a remote tagging worker (a
+ * paired machine runs the tagger locally and reports results over HTTP).
+ * Same write path as a local plugin run, so `NOT has::plugin.<prefix>`
+ * filters see the file as tagged afterwards. Not used by this UI yet —
+ * documents the contract for the future `lightview-worker`. */
+export interface PluginTagWrite {
+  path: string;
+  tagPrefix: string;
+  version: string;
+  tags: string[];
+  meta?: unknown;
+}
+
+export const applyPluginTags = (entries: PluginTagWrite[]) =>
+  invoke<FileOpResult>("apply_plugin_tags", { entries });
+
 // ---------------------------------------------------------------------------
 // File Operations (Copy / Move / Trash)
 // ---------------------------------------------------------------------------

@@ -193,29 +193,62 @@ pub async fn run_plugin_stream(
 }
 
 /// Apply a plugin result to a companion file under the plugin's tag namespace.
+/// Takes the prefix/version directly (not the manifest) so remote workers —
+/// which have no local manifest — can write through the same path.
 pub fn apply_plugin_output(
     companion: &mut CompanionFile,
-    manifest: &PluginManifest,
+    tag_prefix: &str,
+    version: &str,
     tags: &[String],
     meta: Option<&serde_json::Value>,
 ) {
     let entry = companion
         .tags
         .plugins
-        .entry(manifest.tag_prefix.clone())
+        .entry(tag_prefix.to_string())
         .or_insert_with(|| PluginTagEntry {
-            version: manifest.version.clone(),
+            version: version.to_string(),
             tags: Vec::new(),
             extra: std::collections::HashMap::new(),
         });
 
-    entry.version = manifest.version.clone();
+    entry.version = version.to_string();
     entry.tags = tags.iter().map(|t| t.replace(' ', "_")).collect();
 
     if let Some(meta) = meta {
         companion
             .meta
             .plugins
-            .insert(manifest.tag_prefix.clone(), meta.clone());
+            .insert(tag_prefix.to_string(), meta.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::companion::schema::MediaType;
+
+    #[test]
+    fn apply_plugin_output_writes_prefix_namespace() {
+        let mut companion = CompanionFile::new("img.jpg", MediaType::Image);
+        apply_plugin_output(
+            &mut companion,
+            "wd-tagger",
+            "1.2.0",
+            &["blue sky".to_string(), "beach".to_string()],
+            Some(&serde_json::json!({ "score": 0.9 })),
+        );
+
+        let entry = companion.tags.plugins.get("wd-tagger").unwrap();
+        assert_eq!(entry.version, "1.2.0");
+        // Spaces are normalized to underscores.
+        assert_eq!(entry.tags, vec!["blue_sky", "beach"]);
+        assert!(companion.meta.plugins.contains_key("wd-tagger"));
+
+        // A later run replaces the tag list rather than appending.
+        apply_plugin_output(&mut companion, "wd-tagger", "1.3.0", &["beach".to_string()], None);
+        let entry = companion.tags.plugins.get("wd-tagger").unwrap();
+        assert_eq!(entry.version, "1.3.0");
+        assert_eq!(entry.tags, vec!["beach"]);
     }
 }
