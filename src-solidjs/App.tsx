@@ -498,6 +498,7 @@ export function App() {
                 openViewer(index);
               }}
               onItemSelect={(path) => toggleSelection(path)}
+              onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
               onBackgroundClick={clearSelection}
               selectedPaths={selectedPaths()}
               onItemContextMenu={(e, path, index) => {

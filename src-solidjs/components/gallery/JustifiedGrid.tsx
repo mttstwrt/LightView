@@ -21,6 +21,7 @@ interface JustifiedGridProps {
   groupStarts?: number[];
   onItemClick: (index: number) => void;
   onItemSelect: (path: string) => void;
+  onDragSelect?: (paths: string[]) => void;
   onBackgroundClick?: () => void;
   selectedPaths: Set<string>;
   onItemContextMenu?: (e: MouseEvent, path: string, index: number) => void;
@@ -190,6 +191,82 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
 
   let containerRef: HTMLDivElement | undefined;
+
+  // -----------------------------------------------------------------------
+  // Drag-to-select state (mirrors GalleryGrid)
+  // -----------------------------------------------------------------------
+  const [isDragging, setIsDragging] = createSignal(false);
+  const [dragStartIndex, setDragStartIndex] = createSignal(-1);
+  const [dragCurrentIndex, setDragCurrentIndex] = createSignal(-1);
+  // Snapshot of the selection when the drag began (for additive Ctrl+drag).
+  let dragBaseSelection = new Set<string>();
+  // Suppress the click that fires after a multi-item drag completes.
+  let suppressClick = false;
+
+  const dragSelectedPaths = () => {
+    const si = dragStartIndex();
+    const ci = dragCurrentIndex();
+    if (si < 0 || ci < 0) return new Set<string>();
+    const lo = Math.min(si, ci);
+    const hi = Math.max(si, ci);
+    const paths = new Set<string>();
+    for (let i = lo; i <= hi; i++) {
+      if (props.paths[i]) paths.add(props.paths[i]);
+    }
+    return paths;
+  };
+
+  const handleDragStart = (index: number, e: MouseEvent) => {
+    // Only left button, only drag-select with Ctrl/Cmd held.
+    if (e.button !== 0) return;
+    if (!(e.ctrlKey || e.metaKey)) return;
+    e.preventDefault(); // prevent text selection during drag
+    dragBaseSelection = new Set(props.selectedPaths);
+    setIsDragging(true);
+    setDragStartIndex(index);
+    setDragCurrentIndex(index);
+  };
+
+  const handleDragEnter = (index: number) => {
+    if (!isDragging()) return;
+    setDragCurrentIndex(index);
+  };
+
+  // Effective selection shown during a drag = base selection + the swept range.
+  const effectiveSelected = () => {
+    if (!isDragging()) return props.selectedPaths;
+    const merged = new Set(dragBaseSelection);
+    for (const p of dragSelectedPaths()) merged.add(p);
+    return merged;
+  };
+
+  onMount(() => {
+    const onMouseUp = () => {
+      if (!isDragging()) return;
+      const dragged = dragSelectedPaths();
+      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex();
+      setIsDragging(false);
+
+      if (!wasMultiDrag) {
+        // No real drag — let onClick handle the single-item case.
+        setDragStartIndex(-1);
+        setDragCurrentIndex(-1);
+        return;
+      }
+
+      // Swallow the click that fires right after mouseup.
+      suppressClick = true;
+
+      const merged = new Set(dragBaseSelection);
+      for (const p of dragged) merged.add(p);
+      props.onDragSelect?.([...merged]);
+
+      setDragStartIndex(-1);
+      setDragCurrentIndex(-1);
+    };
+    window.addEventListener("mouseup", onMouseUp);
+    onCleanup(() => window.removeEventListener("mouseup", onMouseUp));
+  });
 
   // -----------------------------------------------------------------------
   // Layout
@@ -730,6 +807,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // -----------------------------------------------------------------------
 
   const handleItemClick = (item: { path: string; index: number }, e: MouseEvent) => {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
     if (e.ctrlKey || e.metaKey) {
       props.onItemSelect(item.path);
     } else if (props.selectedPaths.size > 0) {
@@ -747,7 +828,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   };
 
   return (
-    <div ref={containerRef} class="w-full" onClick={handleBackgroundClick}>
+    <div ref={containerRef} class="w-full" style={{ "user-select": isDragging() ? "none" : undefined }} onClick={handleBackgroundClick}>
       <Show when={!props.loading && props.paths.length === 0}>
         <div class="flex items-center justify-center h-screen text-neutral-500 text-sm">
           No media files found
@@ -790,8 +871,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                       tier={thumbTier()}
                       freeSize={true}
                       durationSec={durationByPath().get(path) ?? null}
-                      selected={props.selectedPaths.has(path)}
+                      selected={effectiveSelected().has(path)}
                       onClick={(e: MouseEvent) => handleItemClick({ path, index: index() }, e)}
+                      onMouseDown={(e: MouseEvent) => handleDragStart(index(), e)}
+                      onMouseEnter={() => handleDragEnter(index())}
                       onContextMenu={(e) => props.onItemContextMenu?.(e, path, index())}
                       onError={handleThumbError}
                     />
