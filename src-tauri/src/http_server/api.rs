@@ -6,10 +6,10 @@
 //! `dispatch` match are reachable — anything not listed is rejected with 403
 //! even if a client forges the name.
 //!
-//! The allowlist is mostly read-only, plus a small set of per-item metadata
-//! writes (tag add/remove, rating) so a paired device can edit from the
-//! viewer. Destructive and host-level operations — file ops (copy/move/
-//! delete), plugins, and batch mutations — remain off the list. Remote write
+//! The allowlist is mostly read-only, plus a small set of metadata writes
+//! (tag add/remove and rating, per-item and batch) so a paired device can edit
+//! from the viewer and multi-select. Destructive and host-level operations —
+//! file ops (copy/move/delete) and plugins — remain off the list. Remote write
 //! access is gated by the auth layer (device pairing + optional password);
 //! this allowlist is the second boundary that bounds *what* a paired device
 //! can do.
@@ -228,6 +228,36 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(tags::set_rating_impl(app, a.path, a.rating).await)
+        }
+
+        "add_user_tag_batch" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+                tag: String,
+            }
+            let a: A = parse(args)?;
+            ok(tags::add_user_tag_batch_impl(app, a.paths, a.tag).await)
+        }
+
+        "remove_user_tag_batch" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+                tag: String,
+            }
+            let a: A = parse(args)?;
+            ok(tags::remove_user_tag_batch_impl(app, a.paths, a.tag).await)
+        }
+
+        "set_rating_batch" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+                rating: u8,
+            }
+            let a: A = parse(args)?;
+            ok(tags::set_rating_batch_impl(app, a.paths, a.rating).await)
         }
 
         _ => Err(DispatchError::NotAllowed),

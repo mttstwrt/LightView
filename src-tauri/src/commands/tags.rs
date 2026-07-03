@@ -146,6 +146,14 @@ pub async fn add_user_tag_batch(
     paths: Vec<String>,
     tag: String,
 ) -> Result<u64, String> {
+    add_user_tag_batch_impl(&state, paths, tag).await
+}
+
+pub async fn add_user_tag_batch_impl(
+    state: &AppState,
+    paths: Vec<String>,
+    tag: String,
+) -> Result<u64, String> {
     let mut count = 0u64;
     for path in &paths {
         let tag_clone = tag.clone();
@@ -185,6 +193,14 @@ pub async fn remove_user_tag_batch(
     paths: Vec<String>,
     tag: String,
 ) -> Result<u64, String> {
+    remove_user_tag_batch_impl(&state, paths, tag).await
+}
+
+pub async fn remove_user_tag_batch_impl(
+    state: &AppState,
+    paths: Vec<String>,
+    tag: String,
+) -> Result<u64, String> {
     let mut count = 0u64;
     for path in &paths {
         let tag_clone = tag.clone();
@@ -219,6 +235,14 @@ pub async fn remove_user_tag_batch(
 #[tauri::command]
 pub async fn set_rating_batch(
     state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    rating: u8,
+) -> Result<u64, String> {
+    set_rating_batch_impl(&state, paths, rating).await
+}
+
+pub async fn set_rating_batch_impl(
+    state: &AppState,
     paths: Vec<String>,
     rating: u8,
 ) -> Result<u64, String> {

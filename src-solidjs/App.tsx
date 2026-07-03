@@ -513,7 +513,7 @@ export function App() {
             indicators={scrollIndicators()}
             getThumbLabel={thumbLabel}
           />
-          <Show when={selectedPaths().size > 0 && !isWeb()}>
+          <Show when={selectedPaths().size > 0}>
             <SelectionBar
               selectedPaths={selectedPaths()}
               onClear={clearSelection}
