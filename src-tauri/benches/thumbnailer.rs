@@ -106,6 +106,25 @@ fn bench_decode_image(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_pixel_convert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pixel_convert");
+
+    // ~1MP buffers — representative of a DCT-scaled decode fed into the
+    // justified/HEIC/WebP conversion path.
+    let px = 1024 * 1024;
+    let rgb: Vec<u8> = (0..px * 3).map(|i| (i % 256) as u8).collect();
+    let rgba: Vec<u8> = (0..px * 4).map(|i| (i % 256) as u8).collect();
+
+    group.bench_function("rgb_to_rgba/1MP", |b| {
+        b.iter(|| thumbnailer::rgb_to_rgba(black_box(&rgb)))
+    });
+    group.bench_function("rgba_to_rgb/1MP", |b| {
+        b.iter(|| thumbnailer::rgba_to_rgb(black_box(&rgba)))
+    });
+
+    group.finish();
+}
+
 fn bench_resize_filters(c: &mut Criterion) {
     let mut group = c.benchmark_group("resize_filter_comparison");
 
@@ -138,6 +157,7 @@ criterion_group!(
     bench_jpeg_thumbnail,
     bench_png_thumbnail,
     bench_decode_image,
+    bench_pixel_convert,
     bench_resize_filters,
 );
 criterion_main!(benches);
