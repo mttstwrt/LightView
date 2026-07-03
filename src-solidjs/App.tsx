@@ -19,6 +19,7 @@ import { WindowResizeGrips } from "./components/WindowResizeGrips";
 import { ContextMenu, type ContextMenuState } from "./components/shared/ContextMenu";
 import { SelectionBar } from "./components/gallery/SelectionBar";
 import { pluginActivity, type PluginActivity } from "./stores/pluginStore";
+import { loadCapabilities } from "./stores/capabilitiesStore";
 import { cancelPluginBatch } from "./lib/ipc";
 import { thumbGenActivity } from "./stores/thumbnailProgressStore";
 import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
@@ -317,6 +318,7 @@ export function App() {
   // without a manual reload. EventSource reconnects on its own; it sends the
   // same-origin `lv_device` cookie so only paired devices connect.
   if (isWeb()) {
+    loadCapabilities();
     const source = new EventSource("/api/events");
     source.addEventListener("fs-changed", (event) => {
       try {
@@ -488,7 +490,6 @@ export function App() {
               onBackgroundClick={clearSelection}
               selectedPaths={selectedPaths()}
               onItemContextMenu={(e, path, index) => {
-                if (isWeb()) return; // context menu is all write actions
                 setContextMenu({ x: e.clientX, y: e.clientY, path, index });
               }}
               loading={loading()}
@@ -510,7 +511,6 @@ export function App() {
               onBackgroundClick={clearSelection}
               selectedPaths={selectedPaths()}
               onItemContextMenu={(e, path, index) => {
-                if (isWeb()) return; // context menu is all write actions
                 setContextMenu({ x: e.clientX, y: e.clientY, path, index });
               }}
               loading={loading()}
@@ -577,7 +577,6 @@ export function App() {
             onNext={() => nextImage(displayPaths().length)}
             onPrev={prevImage}
             onContextMenu={(e, path, index) => {
-              if (isWeb()) return; // context menu is all write actions
               setContextMenu({ x: e.clientX, y: e.clientY, path, index });
             }}
           />

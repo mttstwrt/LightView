@@ -426,6 +426,62 @@ pub async fn remote_delete_allowed(state: &AppState) -> bool {
     }
 }
 
+/// What a remote (web) client is allowed to do, so it can hide unavailable
+/// actions up front instead of hitting 403s. `api.rs` enforces the same flags
+/// server-side; the desktop client short-circuits to all-true without calling
+/// this.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerCapabilities {
+    /// Tag/rating writes — always available to paired devices.
+    pub metadata_write: bool,
+    /// App-managed trash commands (per-gallery `remote.allow_delete` flag).
+    pub delete: bool,
+    /// Host filesystem/process ops (copy/move to folders, clipboard, open
+    /// with) — never available remotely.
+    pub local_fs: bool,
+    /// Running plugins on the host — never available remotely.
+    pub plugins: bool,
+}
+
+pub async fn get_server_capabilities_impl(
+    state: &AppState,
+) -> Result<ServerCapabilities, String> {
+    Ok(ServerCapabilities {
+        metadata_write: true,
+        delete: remote_delete_allowed(state).await,
+        local_fs: false,
+        plugins: false,
+    })
+}
+
+#[tauri::command]
+pub async fn get_server_capabilities(
+    state: tauri::State<'_, AppState>,
+) -> Result<ServerCapabilities, String> {
+    get_server_capabilities_impl(&state).await
+}
+
+/// Set the per-gallery remote-delete flag (host-only, via the desktop UI).
+#[tauri::command]
+pub async fn set_remote_delete_config(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    db.set_gallery_meta(REMOTE_ALLOW_DELETE_KEY, if enabled { "1" } else { "0" })
+        .map_err(|e| e.to_string())
+}
+
+/// Read the per-gallery remote-delete flag (desktop settings UI).
+#[tauri::command]
+pub async fn get_remote_delete_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(remote_delete_allowed(&state).await)
+}
+
 /// Set the per-gallery upload config (host-only, via the desktop UI).
 #[tauri::command]
 pub async fn set_upload_config(

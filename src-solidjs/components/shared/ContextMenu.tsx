@@ -1,9 +1,10 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
-import { safeListen as listen } from "../../lib/runtime";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard } from "../../lib/ipc";
+import { safeListen as listen, isWeb } from "../../lib/runtime";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
 import type { MovedFile } from "../../lib/ipc";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
+import { capabilities } from "../../stores/capabilitiesStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
 import type { PluginInfo } from "../../lib/types";
@@ -52,7 +53,9 @@ export function ContextMenu(props: ContextMenuProps) {
     if (props.state) {
       setSubMenu(null);
       setTagInput("");
-      listPlugins().then(setPlugins).catch(() => setPlugins([]));
+      if (capabilities().plugins) {
+        listPlugins().then(setPlugins).catch(() => setPlugins([]));
+      }
       window.addEventListener("keydown", handleKeyDown);
       // Delay to avoid closing from the same right-click event
       setTimeout(() => window.addEventListener("click", handleClickOutside), 0);
@@ -177,8 +180,14 @@ export function ContextMenu(props: ContextMenuProps) {
 
   const handleRegenerateThumbnail = async () => {
     if (!props.state) return;
+    const path = props.state.path;
     try {
-      await regenerateThumbnail(props.state.path);
+      await regenerateThumbnail(path);
+      // Desktop grids cache-bust via the `thumb:regenerated` Tauri event; the
+      // web client has no event channel, so stand in with a DOM event.
+      if (isWeb()) {
+        window.dispatchEvent(new CustomEvent(THUMB_REGENERATED_EVENT, { detail: { path } }));
+      }
     } catch (err) {
       console.error("Failed to regenerate thumbnail:", err);
     }
@@ -300,46 +309,61 @@ export function ContextMenu(props: ContextMenuProps) {
               </div>
               <Divider />
             </Show>
+            {/* Each group below is gated by what this client may do — the web
+                client only sees actions the server's capability report (and
+                its allowlist) actually permits. */}
             <Show when={!isBatchContext() && !props.hideViewOption}>
               <MenuItem label="View" onClick={handleOpenViewer} />
             </Show>
-            <MenuItem
-              label={isBatchContext() ? `Tag ${props.selectedPaths!.size} Items...` : "Add Tag..."}
-              onClick={() => setSubMenu("tag")}
-            />
-            <MenuItem
-              label={isBatchContext() ? `Rate ${props.selectedPaths!.size} Items` : "Set Rating"}
-              onClick={() => setSubMenu("rating")}
-            />
+            <Show when={capabilities().metadataWrite}>
+              <MenuItem
+                label={isBatchContext() ? `Tag ${props.selectedPaths!.size} Items...` : "Add Tag..."}
+                onClick={() => setSubMenu("tag")}
+              />
+              <MenuItem
+                label={isBatchContext() ? `Rate ${props.selectedPaths!.size} Items` : "Set Rating"}
+                onClick={() => setSubMenu("rating")}
+              />
+            </Show>
             <Divider />
-            <Show when={!isBatchContext()}>
+            <Show when={capabilities().metadataWrite && !isBatchContext()}>
               <MenuItem label="Regenerate Thumbnail" onClick={handleRegenerateThumbnail} />
             </Show>
             <MenuItem label="Copy Path" onClick={handleCopyPath} />
-            <MenuItem
-              label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to Clipboard` : "Copy to Clipboard"}
-              onClick={handleCopyToClipboard}
-            />
-            <Divider />
-            <MenuItem
-              label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to...` : "Copy to..."}
-              onClick={handleCopyTo}
-            />
-            <MenuItem
-              label={isBatchContext() ? `Move ${props.selectedPaths!.size} to...` : "Move to..."}
-              onClick={handleMoveTo}
-            />
-            <MenuItem
-              label={isBatchContext() ? `Delete ${props.selectedPaths!.size} Items` : "Delete"}
-              onClick={handleTrash}
-              danger
-            />
-            <Divider />
-            <MenuItem
-              label={isBatchContext() ? `Run Plugin on ${props.selectedPaths!.size}...` : "Run Plugin..."}
-              onClick={() => setSubMenu("plugins")}
-            />
-            <Show when={settings().external_apps.length > 0}>
+            <Show when={capabilities().localFs}>
+              <MenuItem
+                label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to Clipboard` : "Copy to Clipboard"}
+                onClick={handleCopyToClipboard}
+              />
+            </Show>
+            <Show when={capabilities().localFs || capabilities().delete}>
+              <Divider />
+            </Show>
+            <Show when={capabilities().localFs}>
+              <MenuItem
+                label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to...` : "Copy to..."}
+                onClick={handleCopyTo}
+              />
+              <MenuItem
+                label={isBatchContext() ? `Move ${props.selectedPaths!.size} to...` : "Move to..."}
+                onClick={handleMoveTo}
+              />
+            </Show>
+            <Show when={capabilities().delete}>
+              <MenuItem
+                label={isBatchContext() ? `Delete ${props.selectedPaths!.size} Items` : "Delete"}
+                onClick={handleTrash}
+                danger
+              />
+            </Show>
+            <Show when={capabilities().plugins}>
+              <Divider />
+              <MenuItem
+                label={isBatchContext() ? `Run Plugin on ${props.selectedPaths!.size}...` : "Run Plugin..."}
+                onClick={() => setSubMenu("plugins")}
+              />
+            </Show>
+            <Show when={capabilities().localFs && settings().external_apps.length > 0}>
               <MenuItem label="Open With..." onClick={() => setSubMenu("openWith")} />
             </Show>
           </Show>

@@ -4,7 +4,7 @@ import { safeListen as listen, hasTouch, type UnlistenFn } from "../../lib/runti
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
-import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
+import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, THUMB_REGENERATED_EVENT, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { ThumbnailCell } from "./ThumbnailCell";
@@ -298,17 +298,27 @@ export function GalleryGrid(props: GalleryGridProps) {
   // Listen for one-shot regeneration. Unlike thumb:streamed there is no
   // in-flight batch to gate on — just bump the URL version so WebKit's
   // image cache fetches the fresh bytes from the protocol handler.
+  const handleRegenerated = (path: string) => {
+    bumpVersion(path);
+    if (assignedSet.has(path)) {
+      setThumbMap(path, thumbSrcFor(path, tier()));
+    }
+  };
   let unlistenRegenerated: UnlistenFn | undefined;
   onMount(() => {
     listen<ThumbnailResult>("thumb:regenerated", (event) => {
-      const r = event.payload;
-      bumpVersion(r.path);
-      if (assignedSet.has(r.path)) {
-        setThumbMap(r.path, thumbSrcFor(r.path, tier()));
-      }
+      handleRegenerated(event.payload.path);
     }).then((fn) => {
       unlistenRegenerated = fn;
     });
+    // Web stand-in for the Tauri event (dispatched by ContextMenu after the
+    // regenerate invoke resolves; `listen` above is a no-op off-desktop).
+    const domRegen = (e: Event) => {
+      const path = (e as CustomEvent<{ path: string }>).detail?.path;
+      if (path) handleRegenerated(path);
+    };
+    window.addEventListener(THUMB_REGENERATED_EVENT, domRegen);
+    onCleanup(() => window.removeEventListener(THUMB_REGENERATED_EVENT, domRegen));
   });
   onCleanup(() => unlistenRegenerated?.());
 

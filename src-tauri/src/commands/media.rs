@@ -573,15 +573,12 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
 /// Regenerate a single thumbnail, bypassing all caches. Clears every tier
 /// (micro/standard/large/preview) so stale rows don't survive when the
 /// gallery is rendered at a different cell size, then regenerates the
-/// standard tier eagerly. Emits `thumb:regenerated` so the frontend can
-/// cache-bust its `<img>` URL — without that, WebKit's image cache keeps
-/// serving the old bytes until the app restarts.
-#[tauri::command]
-pub async fn regenerate_thumbnail(
-    app_handle: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+/// standard tier eagerly. Returns the fresh thumbnail info so the caller can
+/// cache-bust its `<img>` URL.
+pub async fn regenerate_thumbnail_impl(
+    state: &AppState,
     path: String,
-) -> Result<(), String> {
+) -> Result<ThumbnailResult, String> {
     let format = ThumbFormat::Jpeg;
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let thumb_size = STANDARD_THUMB_SIZE;
@@ -590,7 +587,15 @@ pub async fn regenerate_thumbnail(
     {
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
-            for table in ["thumbnails", "thumbnails_micro", "thumbnails_large", "thumbnails_preview"] {
+            for table in [
+                "thumbnails",
+                "thumbnails_micro",
+                "thumbnails_large",
+                "thumbnails_preview",
+                "thumbnails_justified",
+                "thumbnails_justified_mid",
+                "thumbnails_justified_high",
+            ] {
                 let _ = db.conn().execute(
                     &format!("DELETE FROM {} WHERE path = ?1", table),
                     rusqlite::params![path],
@@ -620,17 +625,31 @@ pub async fn regenerate_thumbnail(
                     );
                 }
             }
-            let _ = app_handle.emit("thumb:regenerated", ThumbnailResult {
+            Ok(ThumbnailResult {
                 path: thumb.path,
                 width: thumb.width,
                 height: thumb.height,
                 media_type: thumb.media_type,
                 format: fmt_str.to_string(),
-            });
-            Ok(())
+            })
         }
         Err(e) => Err(format!("Thumbnail generation failed: {}", e)),
     }
+}
+
+/// Desktop wrapper: also emits `thumb:regenerated` so the webview cache-busts
+/// its `<img>` URL — without that, WebKit's image cache keeps serving the old
+/// bytes until the app restarts. (The web client cache-busts from the returned
+/// value instead; it has no Tauri events.)
+#[tauri::command]
+pub async fn regenerate_thumbnail(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let thumb = regenerate_thumbnail_impl(&state, path).await?;
+    let _ = app_handle.emit("thumb:regenerated", thumb);
+    Ok(())
 }
 
 /// Get metadata for a media file from the media_meta cache table.

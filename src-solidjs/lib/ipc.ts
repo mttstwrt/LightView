@@ -447,6 +447,29 @@ export const copyFilesToClipboard = (paths: string[]) =>
   invoke<void>("copy_files_to_clipboard", { paths });
 
 // ---------------------------------------------------------------------------
+// Server capabilities (what a remote client may do; see capabilitiesStore)
+// ---------------------------------------------------------------------------
+
+export interface ServerCapabilities {
+  metadataWrite: boolean;
+  delete: boolean;
+  localFs: boolean;
+  plugins: boolean;
+}
+
+export const getServerCapabilities = () =>
+  invoke<ServerCapabilities>("get_server_capabilities");
+
+/** Desktop-only host toggle for the web client's delete capability. */
+export const getRemoteDeleteConfig = () => invoke<boolean>("get_remote_delete_config");
+export const setRemoteDeleteConfig = (enabled: boolean) =>
+  invoke<void>("set_remote_delete_config", { enabled });
+
+/** DOM event dispatched on web after `regenerate_thumbnail` resolves, standing
+ * in for the desktop-only `thumb:regenerated` Tauri event so grids cache-bust. */
+export const THUMB_REGENERATED_EVENT = "lv:thumb-regenerated";
+
+// ---------------------------------------------------------------------------
 // App-managed trash (delete moves into <gallery>/.lightview/trash/)
 // ---------------------------------------------------------------------------
 

@@ -23,6 +23,8 @@ import {
   setRemoteInactivity,
   getUploadConfig,
   setUploadConfig,
+  getRemoteDeleteConfig,
+  setRemoteDeleteConfig,
   getRenderConfig,
   setRenderConfig,
   type RenderConfig,
@@ -33,6 +35,7 @@ import {
 } from "../../lib/ipc";
 import QRCode from "qrcode";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
+import { capabilities } from "../../stores/capabilitiesStore";
 import { safeListen as listen } from "../../lib/runtime";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { isWeb, isMobile } from "../../lib/runtime";
@@ -184,6 +187,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     getRemoteAccessInfo().then(setRemote).catch(() => {});
     refreshAuthState();
     refreshUploadCfg();
+    refreshRemoteDelete();
   });
 
   // While the panel is open and remote access is on, poll status so the
@@ -325,6 +329,24 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     } catch (e) {
       console.error("Set upload config failed:", e);
       refreshUploadCfg(); // revert to server truth
+    }
+  };
+
+  // ── Remote delete (per-gallery) ──
+  const [remoteDelete, setRemoteDelete] = createSignal<boolean | null>(null);
+
+  const refreshRemoteDelete = () => {
+    if (isWeb()) return;
+    getRemoteDeleteConfig().then(setRemoteDelete).catch(() => {});
+  };
+
+  const saveRemoteDelete = async (enabled: boolean) => {
+    setRemoteDelete(enabled); // optimistic
+    try {
+      await setRemoteDeleteConfig(enabled);
+    } catch (e) {
+      console.error("Set remote delete config failed:", e);
+      refreshRemoteDelete(); // revert to server truth
     }
   };
 
@@ -994,6 +1016,25 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                                 />
                               </button>
                             </div>
+                            {/* ── Remote delete ── */}
+                            <Show when={remoteDelete() !== null}>
+                              <div class="flex items-center justify-between mt-1">
+                                <span class="text-[11px] text-neutral-400">Allow deletes from devices</span>
+                                <button
+                                  onClick={() => saveRemoteDelete(!remoteDelete())}
+                                  class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                                    remoteDelete() ? "bg-teal-600" : "bg-neutral-700"
+                                  }`}
+                                  title="Let paired devices move photos to the gallery trash (restorable; auto-purged after the retention period)"
+                                >
+                                  <span
+                                    class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
+                                      remoteDelete() ? "left-[18px]" : "left-0.5"
+                                    }`}
+                                  />
+                                </button>
+                              </div>
+                            </Show>
                             <Show when={cfg().enabled}>
                               <div class="flex items-center gap-2 mt-0.5">
                                 <span class="text-[10px] text-neutral-500">Organize into</span>
@@ -1203,8 +1244,8 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             </Section>
             </Show>
 
-            {/* ── Trash ── */}
-            <Show when={props.onOpenTrash}>
+            {/* ── Trash (on web only when the host allows remote delete) ── */}
+            <Show when={props.onOpenTrash && capabilities().delete}>
             <Section label="Trash" order={1}>
               <button
                 onClick={() => {

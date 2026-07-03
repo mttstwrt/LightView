@@ -94,6 +94,10 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
         // button and album field. Writing the config remains desktop-only.
         "get_upload_config" => ok(settings::get_upload_config_impl(app).await),
 
+        // Read-only: what this client may do, so the UI hides unavailable
+        // actions instead of surfacing 403s. Enforcement stays in this match.
+        "get_server_capabilities" => ok(settings::get_server_capabilities_impl(app).await),
+
         "get_sorted_items" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -146,6 +150,17 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(media::get_media_meta_impl(app, a.path).await)
+        }
+
+        // Server-side compute; returns the fresh thumbnail info so the web
+        // client can cache-bust its <img> URL (no Tauri event channel here).
+        "regenerate_thumbnail" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+            }
+            let a: A = parse(args)?;
+            ok(media::regenerate_thumbnail_impl(app, a.path).await)
         }
 
         "get_thumbhashes" => {

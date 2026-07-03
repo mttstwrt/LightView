@@ -3,7 +3,7 @@ import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, isMobile, type UnlistenFn } from "../../lib/runtime";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
-import { ensureTierThumbnails, thumbUrl, mediaUrl, type ThumbTier } from "../../lib/ipc";
+import { ensureTierThumbnails, thumbUrl, mediaUrl, THUMB_REGENERATED_EVENT, type ThumbTier } from "../../lib/ipc";
 import type { MediaMeta } from "../../stores/galleryStore";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
@@ -438,13 +438,23 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   };
 
   // Regeneration / one-shot invalidation listener.
+  const handleRegenerated = (p: string) => {
+    bumpVersion(p);
+    if (assignedSet.has(p)) setThumbMap(p, thumbSrcFor(p));
+  };
   let unlistenRegenerated: UnlistenFn | undefined;
   onMount(() => {
     listen<{ path: string }>("thumb:regenerated", (event) => {
-      const p = event.payload.path;
-      bumpVersion(p);
-      if (assignedSet.has(p)) setThumbMap(p, thumbSrcFor(p));
+      handleRegenerated(event.payload.path);
     }).then((fn) => { unlistenRegenerated = fn; });
+    // Web stand-in for the Tauri event (dispatched by ContextMenu after the
+    // regenerate invoke resolves; `listen` above is a no-op off-desktop).
+    const domRegen = (e: Event) => {
+      const p = (e as CustomEvent<{ path: string }>).detail?.path;
+      if (p) handleRegenerated(p);
+    };
+    window.addEventListener(THUMB_REGENERATED_EVENT, domRegen);
+    onCleanup(() => window.removeEventListener(THUMB_REGENERATED_EVENT, domRegen));
   });
   onCleanup(() => unlistenRegenerated?.());
 
