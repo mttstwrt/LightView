@@ -9,6 +9,7 @@ import { isMobile, isTauri } from "../../lib/runtime";
 interface TopBarProps {
   onOpenFolder: () => void;
   onOpenDuplicates?: () => void;
+  onOpenTrash?: () => void;
 }
 
 // Pixels the user must scroll past 0 before we'll consider hiding the bar.
@@ -154,7 +155,7 @@ export function TopBar(props: TopBarProps) {
             </For>
           </div>
         </Show>
-        <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
+        <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onOpenTrash={props.onOpenTrash} onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
       </div>
     </>
   );

@@ -571,4 +571,27 @@ impl CacheDb {
             None => Ok(None),
         }
     }
+
+    /// Drop every row keyed by a media path: metadata, tags, and every
+    /// thumbnail LOD tier. Used when a file leaves the gallery (trash, move
+    /// out, fs-watch removal) so no tier is left orphaned.
+    pub fn remove_media_rows(&self, path: &str) {
+        const TABLES: [&str; 9] = [
+            "media_meta",
+            "tag_index",
+            "thumbnails",
+            "thumbnails_micro",
+            "thumbnails_large",
+            "thumbnails_preview",
+            "thumbnails_justified",
+            "thumbnails_justified_mid",
+            "thumbnails_justified_high",
+        ];
+        for table in TABLES {
+            let _ = self.conn.execute(
+                &format!("DELETE FROM {table} WHERE path = ?1"),
+                rusqlite::params![path],
+            );
+        }
+    }
 }

@@ -9,4 +9,5 @@ pub mod plugins;
 pub mod settings;
 pub mod viewer;
 pub mod files;
+pub mod trash;
 pub mod duplicates;

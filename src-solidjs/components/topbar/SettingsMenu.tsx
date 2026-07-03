@@ -58,7 +58,7 @@ const GAP_PRESETS = [
   { label: "Wide", value: 8 },
 ] as const;
 
-export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onRequestShow?: () => void }) {
+export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onOpenTrash?: () => void; onRequestShow?: () => void }) {
   const [open, setOpen] = createSignal(false);
 
   // Mirror open state into the store so App can hide the grid behind the
@@ -1199,6 +1199,21 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
               >
                 Find Duplicates...
+              </button>
+            </Section>
+            </Show>
+
+            {/* ── Trash ── */}
+            <Show when={props.onOpenTrash}>
+            <Section label="Trash" order={1}>
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  props.onOpenTrash?.();
+                }}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+              >
+                View Trash...
               </button>
             </Section>
             </Show>

@@ -8,11 +8,12 @@
 //!
 //! The allowlist is mostly read-only, plus a small set of metadata writes
 //! (tag add/remove and rating, per-item and batch) so a paired device can edit
-//! from the viewer and multi-select. Destructive and host-level operations —
-//! file ops (copy/move/delete) and plugins — remain off the list. Remote write
-//! access is gated by the auth layer (device pairing + optional password);
-//! this allowlist is the second boundary that bounds *what* a paired device
-//! can do.
+//! from the viewer and multi-select, and the app-managed trash commands —
+//! reversible deletes, additionally gated by the per-gallery
+//! `remote.allow_delete` flag. Host-level operations — file ops (copy/move)
+//! and plugins — remain off the list. Remote write access is gated by the
+//! auth layer (device pairing + optional password); this allowlist is the
+//! second boundary that bounds *what* a paired device can do.
 //!
 //! Arg structs use `rename_all = "camelCase"` so the JSON the frontend already
 //! builds for Tauri's `invoke()` (which camelCases snake_case params) works
@@ -80,7 +81,7 @@ fn ok<T: Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
 }
 
 async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, DispatchError> {
-    use crate::commands::{autocomplete, filter, gallery, geo, media, settings, sort, tags};
+    use crate::commands::{autocomplete, filter, gallery, geo, media, settings, sort, tags, trash};
 
     match command {
         "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
@@ -258,6 +259,47 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(tags::set_rating_batch_impl(app, a.paths, a.rating).await)
+        }
+
+        // --- App-managed trash (gated by the per-gallery delete flag) ------
+        // Trash is reversible (restore + retention-based purge), but hosts can
+        // still revoke remote delete entirely; the check here is the security
+        // boundary, the client-side capability gating is just UX.
+        "trash_files" | "list_trash" | "restore_trash" | "purge_trash"
+            if !settings::remote_delete_allowed(app).await =>
+        {
+            Err(DispatchError::NotAllowed)
+        }
+
+        "trash_files" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+            }
+            let a: A = parse(args)?;
+            ok(trash::trash_files_impl(app, a.paths).await)
+        }
+
+        "list_trash" => ok(trash::list_trash_impl(app).await),
+
+        "restore_trash" => {
+            #[derive(Deserialize)]
+            struct A {
+                ids: Vec<String>,
+            }
+            let a: A = parse(args)?;
+            ok(trash::restore_trash_impl(app, a.ids).await)
+        }
+
+        "purge_trash" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                ids: Option<Vec<String>>,
+                older_than_days: Option<u32>,
+            }
+            let a: A = parse(args)?;
+            ok(trash::purge_trash_impl(app, a.ids, a.older_than_days).await)
         }
 
         _ => Err(DispatchError::NotAllowed),

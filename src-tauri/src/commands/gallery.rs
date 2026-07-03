@@ -329,6 +329,41 @@ pub struct FsChangeEvent {
     pub removed: Vec<String>,
 }
 
+/// Insert a bare `media_meta` row for a file that just appeared on disk
+/// (fs-watch add, trash restore). `date_taken` falls back to the file mtime —
+/// the EXIF/GPS backfill on the next gallery open refines it. Returns `false`
+/// when the path has no recognized media extension or can't be stat'd (e.g.
+/// it vanished again).
+pub fn insert_media_meta_row(conn: &rusqlite::Connection, path_str: &str) -> bool {
+    let p = std::path::Path::new(path_str);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let media_type = match MediaType::from_extension(ext) {
+        Some(mt) => mt.as_str().to_string(),
+        None => return false,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let (mtime, size) = match std::fs::metadata(p) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(now);
+            (mtime, meta.len() as i64)
+        }
+        Err(_) => return false,
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, date_added) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![path_str, mtime, size, media_type, now],
+    )
+    .is_ok()
+}
+
 /// Start the filesystem watcher background task.
 /// Polls for notify events, debounces them, updates the DB, and notifies
 /// clients: the desktop webview via Tauri events (when `app_handle` is `Some`)
@@ -498,58 +533,14 @@ pub fn start_fs_watcher(
                 let conn = db.conn();
 
                 // Insert new files
-                if !added.is_empty() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-
-                    for path_str in &added {
-                        let p = std::path::Path::new(path_str);
-                        let ext = p
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        let media_type = match MediaType::from_extension(ext) {
-                            Some(mt) => mt.as_str().to_string(),
-                            None => continue,
-                        };
-                        // Read file metadata for mtime and size
-                        let (mtime, size) = match std::fs::metadata(p) {
-                            Ok(meta) => {
-                                let mtime = meta
-                                    .modified()
-                                    .ok()
-                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(now);
-                                (mtime, meta.len() as i64)
-                            }
-                            Err(_) => continue, // File may have been removed already
-                        };
-
-                        let _ = conn.execute(
-                            "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, date_added) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            rusqlite::params![path_str, mtime, size, media_type, now],
-                        );
-                    }
+                for path_str in &added {
+                    insert_media_meta_row(conn, path_str);
                 }
 
                 // Remove deleted files
                 if !removed.is_empty() {
                     for path_str in &removed {
-                        let _ = conn.execute(
-                            "DELETE FROM media_meta WHERE path = ?1",
-                            rusqlite::params![path_str],
-                        );
-                        let _ = conn.execute(
-                            "DELETE FROM thumbnails WHERE path = ?1",
-                            rusqlite::params![path_str],
-                        );
-                        let _ = conn.execute(
-                            "DELETE FROM tag_index WHERE path = ?1",
-                            rusqlite::params![path_str],
-                        );
+                        db.remove_media_rows(path_str);
                     }
                     let _ = db.rebuild_tag_counts();
                 }
@@ -680,12 +671,20 @@ pub async fn open_gallery_impl(
         let autocomplete = Arc::clone(&state.autocomplete);
         let gallery = path.clone();
         tauri::async_runtime::spawn(async move {
+            let mut trash_retention_days = crate::commands::trash::DEFAULT_TRASH_RETENTION_DAYS;
             let counts = {
                 let db_guard = cache_db.lock().await;
                 let db = match db_guard.as_ref() {
                     Some(db) => db,
                     None => return,
                 };
+
+                trash_retention_days = db
+                    .get_gallery_meta(crate::commands::trash::TRASH_RETENTION_KEY)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(trash_retention_days);
 
                 // Best-effort EXIF GPS backfill — only touches rows where
                 // gps_lat IS NULL, so later opens skip already-extracted files.
@@ -710,6 +709,9 @@ pub async fn open_gallery_impl(
                     autocomplete.refresh(counts).await;
                 }
             }
+
+            // Drop expired trash entries (filesystem-only, no DB lock needed).
+            crate::commands::trash::auto_purge(&gallery, trash_retention_days);
 
             // Tell the caller indexing finished (desktop refreshes the view).
             on_tags_indexed();

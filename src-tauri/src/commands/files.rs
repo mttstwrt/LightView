@@ -149,11 +149,14 @@ pub async fn move_files(
     // Update the cache DB for the moved files.
     if !succeeded.is_empty() {
         // All thumbnail LOD tiers are keyed by path.
-        const THUMB_TABLES: [&str; 4] = [
+        const THUMB_TABLES: [&str; 7] = [
             "thumbnails",
             "thumbnails_micro",
             "thumbnails_large",
             "thumbnails_preview",
+            "thumbnails_justified",
+            "thumbnails_justified_mid",
+            "thumbnails_justified_high",
         ];
 
         let db = state.cache_db.lock().await;
@@ -176,14 +179,7 @@ pub async fn move_files(
                         );
                     }
                 } else {
-                    let _ = conn.execute("DELETE FROM media_meta WHERE path = ?1", rusqlite::params![old_path]);
-                    let _ = conn.execute("DELETE FROM tag_index WHERE path = ?1", rusqlite::params![old_path]);
-                    for table in THUMB_TABLES {
-                        let _ = conn.execute(
-                            &format!("DELETE FROM {table} WHERE path = ?1"),
-                            rusqlite::params![old_path],
-                        );
-                    }
+                    db.remove_media_rows(old_path);
                 }
             }
             let _ = db.rebuild_tag_counts();
@@ -206,64 +202,6 @@ pub async fn move_files(
         removed,
         failed,
     })
-}
-
-/// Send media files (and their companion files) to the system trash/recycle bin.
-/// Removes trashed files from the cache DB so they disappear from the gallery.
-#[tauri::command]
-pub async fn trash_files(
-    state: tauri::State<'_, AppState>,
-    paths: Vec<String>,
-) -> Result<FileOpResult, String> {
-    let mut succeeded = Vec::new();
-    let mut failed = Vec::new();
-
-    for src_path in &paths {
-        let src = Path::new(src_path);
-
-        match trash::delete(src) {
-            Ok(_) => {
-                // Also trash companion file if it exists
-                trash_companion(src);
-                succeeded.push(src_path.clone());
-            }
-            Err(e) => {
-                failed.push(FileOpError {
-                    path: src_path.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
-    }
-
-    // Remove trashed files from the cache DB
-    if !succeeded.is_empty() {
-        let db = state.cache_db.lock().await;
-        if let Some(db) = db.as_ref() {
-            let conn = db.conn();
-            for path in &succeeded {
-                let _ = conn.execute("DELETE FROM media_meta WHERE path = ?1", rusqlite::params![path]);
-                let _ = conn.execute("DELETE FROM thumbnails WHERE path = ?1", rusqlite::params![path]);
-                let _ = conn.execute("DELETE FROM tag_index WHERE path = ?1", rusqlite::params![path]);
-            }
-            let _ = db.rebuild_tag_counts();
-        }
-    }
-
-    Ok(FileOpResult { succeeded, failed })
-}
-
-/// Send the companion file for a media file to trash if it exists.
-fn trash_companion(media_src: &Path) {
-    let companion_name = format!(
-        "{}{}",
-        media_src.file_name().unwrap_or_default().to_string_lossy(),
-        COMPANION_EXTENSION
-    );
-    let companion_src = media_src.with_file_name(&companion_name);
-    if companion_src.exists() {
-        let _ = trash::delete(&companion_src);
-    }
 }
 
 /// Copy the companion file for a media file if it exists (alongside variant).

@@ -361,8 +361,13 @@ fn main() {
             // File operations (copy/move)
             commands::files::copy_files,
             commands::files::move_files,
-            commands::files::trash_files,
             commands::files::copy_files_to_clipboard,
+
+            // App-managed trash
+            commands::trash::trash_files,
+            commands::trash::list_trash,
+            commands::trash::restore_trash,
+            commands::trash::purge_trash,
 
             // Duplicate detection
             commands::duplicates::find_duplicates,

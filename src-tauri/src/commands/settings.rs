@@ -401,6 +401,31 @@ pub async fn get_upload_config(
     get_upload_config_impl(&state).await
 }
 
+// ---------------------------------------------------------------------------
+// Remote delete permission (per-gallery)
+// ---------------------------------------------------------------------------
+
+/// `gallery_meta` key gating destructive commands (trash/restore/purge) over
+/// the `/api/invoke` bridge. Defaults to allowed — trash is reversible and
+/// pairing already gates access — but a host can switch it off per gallery.
+pub const REMOTE_ALLOW_DELETE_KEY: &str = "remote.allow_delete";
+
+/// Whether paired web devices may use the trash commands. This is the
+/// server-side enforcement point (`api.rs` checks it per dispatch); the
+/// capability the web client sees merely mirrors it.
+pub async fn remote_delete_allowed(state: &AppState) -> bool {
+    let db = state.cache_db.lock().await;
+    match db.as_ref() {
+        Some(db) => db
+            .get_gallery_meta(REMOTE_ALLOW_DELETE_KEY)
+            .ok()
+            .flatten()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true),
+        None => false,
+    }
+}
+
 /// Set the per-gallery upload config (host-only, via the desktop UI).
 #[tauri::command]
 pub async fn set_upload_config(

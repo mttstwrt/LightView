@@ -447,6 +447,31 @@ export const copyFilesToClipboard = (paths: string[]) =>
   invoke<void>("copy_files_to_clipboard", { paths });
 
 // ---------------------------------------------------------------------------
+// App-managed trash (delete moves into <gallery>/.lightview/trash/)
+// ---------------------------------------------------------------------------
+
+export interface TrashEntry {
+  id: string;
+  /** Gallery-relative path the entry restores to. */
+  original_path: string;
+  file_name: string;
+  /** Unix seconds. */
+  deleted_at: number;
+  size: number;
+}
+
+export const listTrash = () => invoke<TrashEntry[]>("list_trash");
+
+/** Restored paths come back in `succeeded`; the grid refreshes via the
+ * fs-changed broadcast, so callers only need this for error reporting. */
+export const restoreTrash = (ids: string[]) =>
+  invoke<FileOpResult>("restore_trash", { ids });
+
+/** No args = empty the whole trash. */
+export const purgeTrash = (ids?: string[], olderThanDays?: number) =>
+  invoke<number>("purge_trash", { ids: ids ?? null, olderThanDays: olderThanDays ?? null });
+
+// ---------------------------------------------------------------------------
 // Duplicate Detection
 // ---------------------------------------------------------------------------
 

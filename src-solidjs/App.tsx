@@ -24,6 +24,7 @@ import { thumbGenActivity } from "./stores/thumbnailProgressStore";
 import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
 import { DebugOverlay } from "./components/debug/DebugOverlay";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
+import { TrashPanel } from "./components/TrashPanel";
 import { UploadButton } from "./components/upload/UploadButton";
 import type { SortedItem, SortField } from "./lib/types";
 
@@ -167,6 +168,7 @@ function getThumbLabelForItems(items: SortedItem[], field: SortField, fraction: 
 export function App() {
   const [debugOpen, setDebugOpen] = createSignal(false);
   const [duplicatesOpen, setDuplicatesOpen] = createSignal(false);
+  const [trashOpen, setTrashOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
 
@@ -472,7 +474,7 @@ export function App() {
           </>
         }
       >
-        <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} />
+        <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} onOpenTrash={() => setTrashOpen(true)} />
         <Show when={(viewMode() === "grid" || viewMode() === "justified") && !contentHidden()}>
           <Show when={viewMode() === "grid"}>
             <GalleryGrid
@@ -582,6 +584,9 @@ export function App() {
         </Show>
         <Show when={duplicatesOpen()}>
           <DuplicatesPanel onClose={() => setDuplicatesOpen(false)} />
+        </Show>
+        <Show when={trashOpen()}>
+          <TrashPanel onClose={() => setTrashOpen(false)} />
         </Show>
         <Show when={isWeb()}>
           <UploadButton onUploaded={refreshAfterUpload} />
