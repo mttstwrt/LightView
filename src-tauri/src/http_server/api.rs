@@ -81,7 +81,7 @@ fn ok<T: Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
 }
 
 async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, DispatchError> {
-    use crate::commands::{autocomplete, filter, gallery, geo, media, settings, sort, tags, trash};
+    use crate::commands::{autocomplete, duplicates, filter, gallery, geo, media, settings, sort, tags, trash};
 
     match command {
         "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
@@ -274,6 +274,28 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(tags::set_rating_batch_impl(app, a.paths, a.rating).await)
+        }
+
+        // --- Duplicate detection --------------------------------------------
+        // find = read + server-side hash compute; mark = metadata write, same
+        // trust tier as tag edits. Resolving a group deletes via trash_files,
+        // which carries its own gate below.
+        "find_duplicates" => {
+            #[derive(Deserialize)]
+            struct A {
+                threshold: Option<u32>,
+            }
+            let a: A = parse(args)?;
+            ok(duplicates::find_duplicates_impl(app, a.threshold).await)
+        }
+
+        "mark_not_duplicates" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+            }
+            let a: A = parse(args)?;
+            ok(duplicates::mark_not_duplicates_impl(app, a.paths).await)
         }
 
         // --- App-managed trash (gated by the per-gallery delete flag) ------

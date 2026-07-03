@@ -1229,8 +1229,8 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             </Section>
             </Show>
 
-            {/* ── Deduplication (desktop only) ── */}
-            <Show when={!isWeb()}>
+            {/* ── Deduplication ── */}
+            <Show when={props.onOpenDuplicates}>
             <Section label="Deduplication" order={1}>
               <button
                 onClick={() => {

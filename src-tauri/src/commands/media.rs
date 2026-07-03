@@ -123,6 +123,7 @@ pub async fn get_thumbnails_batch(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<Vec<ThumbnailResult>, String> {
+    state.touch_thumb_activity();
     let format = ThumbFormat::Jpeg;
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let thumb_w = STANDARD_THUMB_SIZE;
@@ -946,6 +947,7 @@ pub async fn ensure_tier_thumbnails(
     paths: Vec<String>,
     tier: String,
 ) -> Result<usize, String> {
+    state.touch_thumb_activity();
     let tier = ThumbTier::from_segment(&tier).ok_or_else(|| format!("unknown tier: {}", tier))?;
     if matches!(tier, ThumbTier::Standard) {
         return Err("ensure_tier_thumbnails does not handle the standard tier; use get_thumbnails_batch".into());

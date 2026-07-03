@@ -670,6 +670,7 @@ pub async fn open_gallery_impl(
         let cache_db = Arc::clone(&state.cache_db);
         let autocomplete = Arc::clone(&state.autocomplete);
         let gallery = path.clone();
+        let state_for_idle = state.clone();
         tauri::async_runtime::spawn(async move {
             let mut trash_retention_days = crate::commands::trash::DEFAULT_TRASH_RETENTION_DAYS;
             let counts = {
@@ -713,6 +714,10 @@ pub async fn open_gallery_impl(
             // Drop expired trash entries (filesystem-only, no DB lock needed).
             crate::commands::trash::auto_purge(&gallery, trash_retention_days);
 
+            // Backfill missing thumbnails/phashes whenever the gallery goes
+            // quiet. Started after indexing so the two don't fight over the DB.
+            crate::pipeline::idle::start_idle_worker(&state_for_idle);
+
             // Tell the caller indexing finished (desktop refreshes the view).
             on_tags_indexed();
         });
@@ -752,6 +757,11 @@ pub async fn open_gallery(
 pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Stop filesystem watcher first
     stop_fs_watcher(&state);
+
+    // Retire the idle backfill worker (it exits at its next generation check).
+    state
+        .idle_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let gallery_path = {
         let current = state.current_gallery.read().await;

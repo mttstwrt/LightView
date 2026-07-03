@@ -2,6 +2,7 @@ import { createSignal, Show, For, onCleanup } from "solid-js";
 import { findDuplicates, markNotDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
 import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
 import { setTotalCount } from "../stores/galleryStore";
+import { capabilities } from "../stores/capabilitiesStore";
 import { InfoPanel } from "./viewer/InfoPanel";
 
 const THRESHOLD_PRESETS = [
@@ -428,18 +429,22 @@ function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void; onClic
           </span>
         </Show>
 
-        {/* Trash button — muted for the "best" copy since it's the recommended keep */}
-        <button
-          onClick={(e) => { e.stopPropagation(); props.onTrash(); }}
-          class={`mt-1 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors ${
-            props.item.is_best
-              ? "bg-neutral-800/40 text-neutral-500 hover:bg-red-900/30 hover:text-red-400"
-              : "bg-red-900/30 text-red-400 hover:bg-red-800/40 hover:text-red-300"
-          }`}
-          title={props.item.is_best ? "Trash (marked as best — usually the one to keep)" : "Trash"}
-        >
-          Trash
-        </button>
+        {/* Trash button — muted for the "best" copy since it's the recommended
+            keep. Hidden when this client lacks the delete capability (web with
+            remote delete switched off) — resolving is then mark-only. */}
+        <Show when={capabilities().delete}>
+          <button
+            onClick={(e) => { e.stopPropagation(); props.onTrash(); }}
+            class={`mt-1 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors ${
+              props.item.is_best
+                ? "bg-neutral-800/40 text-neutral-500 hover:bg-red-900/30 hover:text-red-400"
+                : "bg-red-900/30 text-red-400 hover:bg-red-800/40 hover:text-red-300"
+            }`}
+            title={props.item.is_best ? "Trash (marked as best — usually the one to keep)" : "Trash"}
+          >
+            Trash
+          </button>
+        </Show>
       </div>
     </div>
   );

@@ -87,6 +87,50 @@ pub struct DuplicateGroup {
 }
 
 impl CacheDb {
+    /// Compute and store the perceptual hash for up to `limit` thumbnails that
+    /// don't have one yet. Returns the number of hashes computed — callers loop
+    /// until it comes back short of `limit`, releasing the DB lock between
+    /// batches so a long backfill doesn't starve other requests. Thumbnails
+    /// whose format can't be hashed get a sentinel `0` so they aren't
+    /// re-selected forever (a real all-zero dHash means a flat image, which
+    /// groups harmlessly with other flat images).
+    pub fn compute_phashes_batch(&self, limit: usize) -> Result<usize, rusqlite::Error> {
+        let mut read_stmt = self.conn().prepare_cached(
+            "SELECT path, thumbnail, format, width, height FROM thumbnails WHERE phash IS NULL LIMIT ?1",
+        )?;
+
+        let rows: Vec<(String, Vec<u8>, String, u32, u32)> = read_stmt
+            .query_map([limit], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let fetched = rows.len();
+        let tx = self.conn().unchecked_transaction()?;
+        {
+            let mut update_stmt =
+                tx.prepare_cached("UPDATE thumbnails SET phash = ?1 WHERE path = ?2")?;
+
+            for (path, data, format, width, height) in &rows {
+                let hash = match format.as_str() {
+                    "rgba" => Some(dhash_rgba(data, *width, *height)),
+                    "jpeg" => dhash_jpeg(data),
+                    _ => None,
+                };
+                update_stmt.execute(rusqlite::params![hash.unwrap_or(0) as i64, path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(fetched)
+    }
+
     /// Compute and store the perceptual hash for all thumbnails that don't have one yet.
     /// Returns the number of hashes computed.
     pub fn compute_phashes(&self) -> Result<usize, rusqlite::Error> {

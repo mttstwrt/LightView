@@ -210,6 +210,8 @@ fn main() {
                         // or painting. AppState is a cheap Arc-bundle clone.
                         let state_owned: AppState =
                             (*ctx.app_handle().state::<AppState>()).clone();
+                        // The desktop user is browsing — hold the idle worker off.
+                        state_owned.touch_thumb_activity();
                         // TEMP perf instrumentation.
                         let log_path = path.clone();
                         tauri::async_runtime::spawn(async move {

@@ -203,6 +203,18 @@ pub struct AppState {
     /// Cancellation flag for the filesystem watcher background task.
     pub fs_watch_cancel: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Generation counter for the idle backfill worker (thumbnails + phashes).
+    /// Each gallery open bumps it; a running worker exits when the count moves
+    /// past the one it was started with.
+    pub idle_generation: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Unix millis of the last user-driven thumbnail request (desktop protocol
+    /// handler or frontend batch commands). The idle worker stays quiet until
+    /// this has been stale for a while, so it never competes with an active
+    /// desktop user; connected web clients are detected via `fs_change_tx`
+    /// subscriber count instead.
+    pub last_thumb_activity: Arc<std::sync::atomic::AtomicU64>,
+
     /// Broadcasts filesystem change batches to remote web clients. The desktop
     /// webview gets these via Tauri's `gallery:fs-changed` event, but a browser
     /// has no Tauri IPC, so the HTTP server's `/api/events` SSE route subscribes
@@ -232,6 +244,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Record user-driven thumbnail activity so the idle backfill worker backs
+    /// off while someone is actively browsing (see `last_thumb_activity`).
+    pub fn touch_thumb_activity(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_thumb_activity
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn new() -> Self {
         let hardware = HardwareProfile::detect();
         let num_threads = hardware.thumbnail_threads();
@@ -286,6 +309,8 @@ impl AppState {
             thumb_gen_coalescer: Arc::new(ThumbGenCoalescer::new()),
             fs_watcher: Arc::new(std::sync::Mutex::new(None)),
             fs_watch_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_thumb_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Capacity bounds memory if no clients are connected; a slow client
             // that lags just gets a Lagged signal and triggers a full refresh.
             fs_change_tx: tokio::sync::broadcast::channel(64).0,
