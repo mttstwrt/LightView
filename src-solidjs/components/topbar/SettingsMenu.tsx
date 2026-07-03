@@ -540,7 +540,16 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
           }
         >
           <div class="px-4 py-3 border-b border-neutral-800/60 flex items-center justify-between shrink-0">
-            <span class="text-sm font-medium text-neutral-200">Settings</span>
+            <div class="flex items-baseline gap-2">
+              <span class="text-sm font-medium text-neutral-200">Settings</span>
+              {/* Image count for the current filter. On desktop this sits in the
+                  top bar; on mobile the bar is too cramped, so it lives here. */}
+              <Show when={isMobile()}>
+                <span class="text-xs text-neutral-500 tabular-nums">
+                  {displayPaths().length.toLocaleString()} images
+                </span>
+              </Show>
+            </div>
             <Show when={isMobile()}>
               <button
                 onClick={() => setOpen(false)}

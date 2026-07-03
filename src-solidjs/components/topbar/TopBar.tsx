@@ -3,7 +3,7 @@ import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
 import { TitleBar } from "./TitleBar";
-import { viewMode, setViewMode } from "../../stores/galleryStore";
+import { viewMode, setViewMode, displayPaths } from "../../stores/galleryStore";
 import { isMobile, isTauri } from "../../lib/runtime";
 
 interface TopBarProps {
@@ -121,6 +121,16 @@ export function TopBar(props: TopBarProps) {
       >
         <FilterBar onInputRef={(el) => { filterInputRef = el; }} />
         <SortMenu />
+        {/* Image count for the current filter. Hidden on mobile (relocated to
+            the settings panel) — the top bar is too cramped for it there. */}
+        <Show when={!isMobile()}>
+          <div
+            class="shrink-0 text-xs text-neutral-400 tabular-nums whitespace-nowrap px-1"
+            title="Images in the current filter"
+          >
+            {displayPaths().length.toLocaleString()}
+          </div>
+        </Show>
         {/* View-mode selector. On mobile this lives at the top of the settings
             menu instead — the top bar is too cramped, and squeezing it in here
             made the search bar barely tappable. */}
