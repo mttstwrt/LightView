@@ -5,7 +5,7 @@ import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups } from "./stores/galleryStore";
-import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel } from "./stores/viewerStore";
+import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
 import { setFilterQuery } from "./stores/filterStore";
@@ -409,6 +409,12 @@ export function App() {
       } else if (e.key === "i" || e.key === "I") {
         if (typingInInput) return;
         toggleInfoPanel();
+      } else if (e.key === "Tab" && infoPanelOpen() && !typingInInput) {
+        // First Tab while the info panel is open jumps focus into the new-tag
+        // input. Once focus is in the input (typingInInput), Tab falls through
+        // to default traversal.
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("lightview:focus-tag-input"));
       } else if (e.key >= "0" && e.key <= "5" && !e.ctrlKey && !e.metaKey && !e.altKey) {
         if (typingInInput) return;
         e.preventDefault();

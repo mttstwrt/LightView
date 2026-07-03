@@ -166,6 +166,21 @@ export function InfoPanel(props: { path: string; filename: string }) {
   window.addEventListener("lightview:rating-changed", onRatingChanged);
   onCleanup(() => window.removeEventListener("lightview:rating-changed", onRatingChanged));
 
+  let tagInputRef: HTMLInputElement | undefined;
+  const onFocusTagInput = () => {
+    // Make sure the user section is expanded so the input is actually mounted,
+    // then focus it on the next frame once SolidJS has rendered it.
+    setExpandedNamespaces((prev) => {
+      if (prev.has("user")) return prev;
+      const next = new Set(prev);
+      next.add("user");
+      return next;
+    });
+    requestAnimationFrame(() => tagInputRef?.focus());
+  };
+  window.addEventListener("lightview:focus-tag-input", onFocusTagInput);
+  onCleanup(() => window.removeEventListener("lightview:focus-tag-input", onFocusTagInput));
+
   let panelRef: HTMLDivElement | undefined;
 
   // --- Bottom-sheet drag-to-dismiss (touch) ------------------------------
@@ -389,6 +404,7 @@ export function InfoPanel(props: { path: string; filename: string }) {
                     <Show when={namespace === "user"}>
                       <form onSubmit={handleAddTag} class="flex gap-1 mt-2">
                         <input
+                          ref={tagInputRef}
                           type="text"
                           value={newTag()}
                           onInput={(e) => setNewTag(e.currentTarget.value)}
