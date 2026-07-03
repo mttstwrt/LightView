@@ -84,6 +84,30 @@ type DetailLevel = "base" | "mid" | "high";
 export function JustifiedGrid(props: JustifiedGridProps) {
   const gap = () => settings().display.grid_gap;
 
+  // Aspect ratios recovered from loaded thumbnails, for paths whose indexed
+  // dimensions aren't known yet (a just-added file is inserted with NULL
+  // width/height and its dimensions are only written when its thumbnail is
+  // generated — after the frontend has already fetched the sorted items). The
+  // j/jm/jh tiers are all aspect-preserving, so a loaded cell's natural pixel
+  // size gives the exact source aspect. Without this such cells lay out 1:1 and
+  // the aspect-correct thumbnail is object-cover cropped to a square — looking
+  // like a grid thumbnail until a restart re-reads the now-populated dimensions.
+  const [measuredAspects, setMeasuredAspects] = createSignal<Map<string, number>>(new Map());
+  // A path's aspect: indexed dimensions win; fall back to a measured value, then
+  // 1:1. Reads measuredAspects() so consumers recompute when a cell is measured.
+  const aspectOf = (path: string): number =>
+    props.aspects.get(path) ?? measuredAspects().get(path) ?? 1;
+  const recordMeasuredAspect = (path: string, w: number, h: number) => {
+    if (w <= 0 || h <= 0) return;
+    // The indexed value takes precedence and never needs a measured override.
+    if (props.aspects.has(path)) return;
+    const cur = measuredAspects();
+    if (cur.has(path)) return;
+    const next = new Map(cur);
+    next.set(path, w / h);
+    setMeasuredAspects(next);
+  };
+
   // Measured width of the justified container; drives the mobile row-height
   // derivation below. Declared up here (before targetRowHeight) so the
   // detail-level effect, which reads targetRowHeight() during setup, doesn't
@@ -175,7 +199,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // tolerance of the displayed size; otherwise use the (precached, off-thread)
     // tier. Unknown dimensions fall back to the byte ceiling.
     if (meta.width != null && meta.height != null) {
-      const physicalLongEdge = displayedLongEdge(props.aspects.get(path) ?? 1);
+      const physicalLongEdge = displayedLongEdge(aspectOf(path));
       const srcLongEdge = Math.max(meta.width, meta.height);
       if (srcLongEdge > physicalLongEdge * ORIGINAL_SRC_TOLERANCE) return false;
     }
@@ -274,8 +298,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
   // Aspect ratios aligned to props.paths (fallback 1:1 for un-indexed items).
   const aspectArray = createMemo(() => {
-    const map = props.aspects;
-    return props.paths.map((p) => map.get(p) ?? 1);
+    const measured = measuredAspects();
+    return props.paths.map((p) => props.aspects.get(p) ?? measured.get(p) ?? 1);
   });
 
   // The wrapper reserves a `gap`-wide margin on each side, so the row content
@@ -383,7 +407,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // the `?fit=` URL stays cache-stable across small layout changes. This is the
   // resize target the media server fits the source to.
   const fitEdgeFor = (path: string): number => {
-    const physicalLongEdge = displayedLongEdge(props.aspects.get(path) ?? 1);
+    const physicalLongEdge = displayedLongEdge(aspectOf(path));
     return Math.ceil(physicalLongEdge / FIT_BUCKET) * FIT_BUCKET;
   };
 
@@ -791,6 +815,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     failedSet.clear();
     urlVersions.clear();
     jhPrecached.clear();
+    setMeasuredAspects(new Map());
     bgCursor = 0;
     thumbGenTotal = 0;
     thumbGenDone = 0;
@@ -877,6 +902,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                       onMouseEnter={() => handleDragEnter(index())}
                       onContextMenu={(e) => props.onItemContextMenu?.(e, path, index())}
                       onError={handleThumbError}
+                      onImageLoad={(w, h) => recordMeasuredAspect(path, w, h)}
                     />
                   </div>
                 </Show>

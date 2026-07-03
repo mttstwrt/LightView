@@ -22,6 +22,10 @@ interface ThumbnailCellProps {
   onContextMenu?: (e: MouseEvent) => void;
   /** Called when the protocol handler returns 404 (thumbnail not cached). */
   onError?: (path: string) => void;
+  /** Called when the thumbnail <img> finishes loading, with its natural pixel
+   *  dimensions. The justified view uses this to recover a cell's aspect ratio
+   *  when the indexed dimensions aren't known yet (e.g. a just-added file). */
+  onImageLoad?: (naturalWidth: number, naturalHeight: number) => void;
   /**
    * Free-size mode: fill the parent (which sizes the cell explicitly) instead of
    * forcing a square aspect ratio. Used by the justified gallery view.
@@ -292,11 +296,15 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         }}
         decoding="async"
         draggable={false}
-        onLoad={() => {
+        onLoad={(e) => {
           if (props.thumbSrc) markUrlLoaded(props.thumbSrc);
           if (loadStart > 0) {
             recordImageLoad(performance.now() - loadStart);
             loadStart = 0;
+          }
+          const img = e.currentTarget;
+          if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+            props.onImageLoad?.(img.naturalWidth, img.naturalHeight);
           }
           setLoaded(true);
         }}
