@@ -899,6 +899,10 @@ export function MediaViewer(props: MediaViewerProps) {
                 class="max-w-[100vw] max-h-[100vh] outline-none pointer-events-auto"
                 controls
                 autoplay
+                // Keep playback inside our viewer instead of iOS's native
+                // fullscreen player, which autoplay otherwise triggers.
+                playsinline
+                attr:webkit-playsinline="true"
                 preload="auto"
                 onLoadedData={() => setLoaded(true)}
                 onEnded={(e) => {

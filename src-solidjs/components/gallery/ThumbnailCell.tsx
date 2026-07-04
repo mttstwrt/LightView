@@ -335,6 +335,10 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           class="absolute inset-0 w-full h-full object-cover"
           muted
           autoplay
+          // iOS forces autoplaying <video> into fullscreen unless it's told to
+          // play inline; this keeps grid previews in-cell like animated GIFs.
+          playsinline
+          attr:webkit-playsinline="true"
           preload="auto"
           // Resume where this clip last left off, so scrolling it out of view
           // and back doesn't restart it from the beginning.
