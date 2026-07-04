@@ -7,6 +7,7 @@ import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, THUMB_REGENERATED_EVENT, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
+import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { ThumbnailCell } from "./ThumbnailCell";
 
 interface GalleryGridProps {
@@ -118,110 +119,11 @@ export function GalleryGrid(props: GalleryGridProps) {
   const [pinchActive, setPinchActive] = createSignal(false);
   const [pinchScale, setPinchScale] = createSignal(1);
 
-  // -----------------------------------------------------------------------
-  // Drag-to-select state
-  // -----------------------------------------------------------------------
-  const [isDragging, setIsDragging] = createSignal(false);
-  const [dragStartIndex, setDragStartIndex] = createSignal(-1);
-  const [dragCurrentIndex, setDragCurrentIndex] = createSignal(-1);
-  // Snapshot of selection when drag started (for additive Ctrl+drag)
-  let dragBaseSelection = new Set<string>();
-  // Suppress the next click after a multi-item drag completes
-  let suppressClick = false;
-
-  const dragSelectedPaths = () => {
-    const si = dragStartIndex();
-    const ci = dragCurrentIndex();
-    if (si < 0 || ci < 0) return new Set<string>();
-    const lo = Math.min(si, ci);
-    const hi = Math.max(si, ci);
-    const paths = new Set<string>();
-    for (let i = lo; i <= hi; i++) {
-      if (props.paths[i]) paths.add(props.paths[i]);
-    }
-    return paths;
-  };
-
-  const handleDragStart = (index: number, e: MouseEvent) => {
-    // Only left mouse button, only drag-select with Ctrl/Cmd
-    if (e.button !== 0) return;
-    if (!(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault(); // Prevent text selection during drag
-    dragBaseSelection = new Set(props.selectedPaths);
-    setIsDragging(true);
-    setDragStartIndex(index);
-    setDragCurrentIndex(index);
-  };
-
-  const handleDragEnter = (index: number) => {
-    if (!isDragging()) return;
-    setDragCurrentIndex(index);
-  };
-
-  const handleItemClick = (item: { path: string; index: number }, e: MouseEvent) => {
-    if (suppressClick) {
-      suppressClick = false;
-      return;
-    }
-    if (e.ctrlKey || e.metaKey) {
-      props.onItemSelect(item.path);
-    } else if (props.selectedPaths.size > 0) {
-      // Clear selection first — don't open viewer until selection is gone
-      props.onBackgroundClick?.();
-    } else {
-      props.onItemClick(item.index);
-    }
-  };
-
-  const handleBackgroundClick = (e: MouseEvent) => {
-    // Only fire when clicking the background, not on a thumbnail
-    const target = e.target as HTMLElement;
-    if (!target.closest(".thumb-cell") && !e.ctrlKey && !e.metaKey) {
-      props.onBackgroundClick?.();
-    }
-  };
-
-  // Global mouseup to end drag
-  onMount(() => {
-    const onMouseUp = () => {
-      if (!isDragging()) return;
-      const dragged = dragSelectedPaths();
-      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex();
-      setIsDragging(false);
-
-      if (!wasMultiDrag) {
-        // Single click (no real drag) — let onClick handle it
-        setDragStartIndex(-1);
-        setDragCurrentIndex(-1);
-        return;
-      }
-
-      // Suppress the click event that fires after mouseup
-      suppressClick = true;
-
-      // Merge base selection with drag selection
-      const merged = new Set(dragBaseSelection);
-      for (const p of dragged) merged.add(p);
-
-      if (props.onDragSelect) {
-        props.onDragSelect([...merged]);
-      }
-      setDragStartIndex(-1);
-      setDragCurrentIndex(-1);
-    };
-
-    window.addEventListener("mouseup", onMouseUp);
-    onCleanup(() => window.removeEventListener("mouseup", onMouseUp));
-  });
-
-  // Compute effective selection (base + drag range) for display during drag
-  const effectiveSelected = () => {
-    if (!isDragging()) return props.selectedPaths;
-    const dragged = dragSelectedPaths();
-    const merged = new Set(dragBaseSelection);
-    for (const p of dragged) merged.add(p);
-    return merged;
-  };
+  // Shared pointer controls: Ctrl/Cmd-drag range select + click handling, and
+  // edge-scroll while dragging. Identical behavior in JustifiedGrid.
+  const { isDragging, effectiveSelected, handleDragStart, handleDragEnter, handleItemClick, handleBackgroundClick } =
+    createDragSelect(props);
+  createEdgeScroll(isDragging);
 
   // -----------------------------------------------------------------------
   // Thumbnail streaming state

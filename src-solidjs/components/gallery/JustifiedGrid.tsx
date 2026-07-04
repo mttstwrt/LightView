@@ -8,6 +8,7 @@ import type { MediaMeta } from "../../stores/galleryStore";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
+import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
 interface JustifiedGridProps {
@@ -216,81 +217,11 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
   let containerRef: HTMLDivElement | undefined;
 
-  // -----------------------------------------------------------------------
-  // Drag-to-select state (mirrors GalleryGrid)
-  // -----------------------------------------------------------------------
-  const [isDragging, setIsDragging] = createSignal(false);
-  const [dragStartIndex, setDragStartIndex] = createSignal(-1);
-  const [dragCurrentIndex, setDragCurrentIndex] = createSignal(-1);
-  // Snapshot of the selection when the drag began (for additive Ctrl+drag).
-  let dragBaseSelection = new Set<string>();
-  // Suppress the click that fires after a multi-item drag completes.
-  let suppressClick = false;
-
-  const dragSelectedPaths = () => {
-    const si = dragStartIndex();
-    const ci = dragCurrentIndex();
-    if (si < 0 || ci < 0) return new Set<string>();
-    const lo = Math.min(si, ci);
-    const hi = Math.max(si, ci);
-    const paths = new Set<string>();
-    for (let i = lo; i <= hi; i++) {
-      if (props.paths[i]) paths.add(props.paths[i]);
-    }
-    return paths;
-  };
-
-  const handleDragStart = (index: number, e: MouseEvent) => {
-    // Only left button, only drag-select with Ctrl/Cmd held.
-    if (e.button !== 0) return;
-    if (!(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault(); // prevent text selection during drag
-    dragBaseSelection = new Set(props.selectedPaths);
-    setIsDragging(true);
-    setDragStartIndex(index);
-    setDragCurrentIndex(index);
-  };
-
-  const handleDragEnter = (index: number) => {
-    if (!isDragging()) return;
-    setDragCurrentIndex(index);
-  };
-
-  // Effective selection shown during a drag = base selection + the swept range.
-  const effectiveSelected = () => {
-    if (!isDragging()) return props.selectedPaths;
-    const merged = new Set(dragBaseSelection);
-    for (const p of dragSelectedPaths()) merged.add(p);
-    return merged;
-  };
-
-  onMount(() => {
-    const onMouseUp = () => {
-      if (!isDragging()) return;
-      const dragged = dragSelectedPaths();
-      const wasMultiDrag = dragStartIndex() !== dragCurrentIndex();
-      setIsDragging(false);
-
-      if (!wasMultiDrag) {
-        // No real drag — let onClick handle the single-item case.
-        setDragStartIndex(-1);
-        setDragCurrentIndex(-1);
-        return;
-      }
-
-      // Swallow the click that fires right after mouseup.
-      suppressClick = true;
-
-      const merged = new Set(dragBaseSelection);
-      for (const p of dragged) merged.add(p);
-      props.onDragSelect?.([...merged]);
-
-      setDragStartIndex(-1);
-      setDragCurrentIndex(-1);
-    };
-    window.addEventListener("mouseup", onMouseUp);
-    onCleanup(() => window.removeEventListener("mouseup", onMouseUp));
-  });
+  // Shared pointer controls: Ctrl/Cmd-drag range select + click handling, and
+  // edge-scroll while dragging. Identical behavior in GalleryGrid.
+  const { isDragging, effectiveSelected, handleDragStart, handleDragEnter, handleItemClick, handleBackgroundClick } =
+    createDragSelect(props);
+  createEdgeScroll(isDragging);
 
   // -----------------------------------------------------------------------
   // Layout
@@ -630,48 +561,6 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     };
     window.addEventListener("wheel", onWheel, { passive: false });
 
-    // -----------------------------------------------------------------------
-    // Edge-scroll while drag-selecting: mouse near top/bottom auto-scrolls so
-    // the selection can extend past the viewport without needing the wheel.
-    // -----------------------------------------------------------------------
-    const EDGE_ZONE_PX = 80;
-    const EDGE_MAX_SPEED = 1400; // px/sec at the very edge
-    let edgeMouseY = 0;
-    let edgeRafId = 0;
-    let edgeLastTime = 0;
-
-    const edgeScrollFrame = (now: number) => {
-      if (!isDragging()) { edgeRafId = 0; return; }
-      const dt = Math.min((now - edgeLastTime) / 1000, 0.05);
-      edgeLastTime = now;
-      const vh = window.innerHeight;
-      let speed = 0;
-      if (edgeMouseY < EDGE_ZONE_PX) {
-        speed = -EDGE_MAX_SPEED * Math.pow(1 - edgeMouseY / EDGE_ZONE_PX, 2);
-      } else if (edgeMouseY > vh - EDGE_ZONE_PX) {
-        speed = EDGE_MAX_SPEED * Math.pow((edgeMouseY - (vh - EDGE_ZONE_PX)) / EDGE_ZONE_PX, 2);
-      }
-      if (speed !== 0) {
-        const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-        window.scrollTo(0, Math.max(0, Math.min(maxScroll, window.scrollY + speed * dt)));
-      }
-      edgeRafId = requestAnimationFrame(edgeScrollFrame);
-    };
-
-    const onEdgeMouseMove = (e: MouseEvent) => { edgeMouseY = e.clientY; };
-    window.addEventListener("mousemove", onEdgeMouseMove, { passive: true });
-
-    createEffect(() => {
-      if (isDragging()) {
-        if (!edgeRafId) {
-          edgeLastTime = performance.now();
-          edgeRafId = requestAnimationFrame(edgeScrollFrame);
-        }
-      } else {
-        if (edgeRafId) { cancelAnimationFrame(edgeRafId); edgeRafId = 0; }
-      }
-    });
-
     recalcRange();
 
     // -------------------------------------------------------------------
@@ -849,12 +738,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("scrollend", onScrollEnd);
       window.removeEventListener("wheel", onWheel);
-      window.removeEventListener("mousemove", onEdgeMouseMove);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
-      if (edgeRafId) cancelAnimationFrame(edgeRafId);
       if (settleTimer) clearTimeout(settleTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
@@ -881,31 +768,6 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   }));
 
   createEffect(on(totalHeight, (h) => { props.onContentHeight?.(h); }));
-
-  // -----------------------------------------------------------------------
-  // Click handling
-  // -----------------------------------------------------------------------
-
-  const handleItemClick = (item: { path: string; index: number }, e: MouseEvent) => {
-    if (suppressClick) {
-      suppressClick = false;
-      return;
-    }
-    if (e.ctrlKey || e.metaKey) {
-      props.onItemSelect(item.path);
-    } else if (props.selectedPaths.size > 0) {
-      props.onBackgroundClick?.();
-    } else {
-      props.onItemClick(item.index);
-    }
-  };
-
-  const handleBackgroundClick = (e: MouseEvent) => {
-    const target = e.target as HTMLElement;
-    if (!target.closest(".thumb-cell") && !e.ctrlKey && !e.metaKey) {
-      props.onBackgroundClick?.();
-    }
-  };
 
   return (
     <div ref={containerRef} class="w-full" style={{ "user-select": isDragging() ? "none" : undefined }} onClick={handleBackgroundClick}>
