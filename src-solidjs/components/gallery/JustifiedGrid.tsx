@@ -605,7 +605,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
     const onWheel = (e: WheelEvent) => {
       // Ctrl+wheel zooms (changes the target row height) instead of scrolling.
-      if (e.ctrlKey || e.metaKey) {
+      // During a Ctrl+drag selection, fall through to scroll (mirrors GalleryGrid).
+      if ((e.ctrlKey || e.metaKey) && !isDragging()) {
         e.preventDefault();
         const cur = settings().display.thumbnail_size;
         const step = Math.max(8, Math.round(cur * 0.12));
@@ -628,6 +629,48 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       if (!wheelRafId) wheelRafId = requestAnimationFrame(drainWheel);
     };
     window.addEventListener("wheel", onWheel, { passive: false });
+
+    // -----------------------------------------------------------------------
+    // Edge-scroll while drag-selecting: mouse near top/bottom auto-scrolls so
+    // the selection can extend past the viewport without needing the wheel.
+    // -----------------------------------------------------------------------
+    const EDGE_ZONE_PX = 80;
+    const EDGE_MAX_SPEED = 1400; // px/sec at the very edge
+    let edgeMouseY = 0;
+    let edgeRafId = 0;
+    let edgeLastTime = 0;
+
+    const edgeScrollFrame = (now: number) => {
+      if (!isDragging()) { edgeRafId = 0; return; }
+      const dt = Math.min((now - edgeLastTime) / 1000, 0.05);
+      edgeLastTime = now;
+      const vh = window.innerHeight;
+      let speed = 0;
+      if (edgeMouseY < EDGE_ZONE_PX) {
+        speed = -EDGE_MAX_SPEED * Math.pow(1 - edgeMouseY / EDGE_ZONE_PX, 2);
+      } else if (edgeMouseY > vh - EDGE_ZONE_PX) {
+        speed = EDGE_MAX_SPEED * Math.pow((edgeMouseY - (vh - EDGE_ZONE_PX)) / EDGE_ZONE_PX, 2);
+      }
+      if (speed !== 0) {
+        const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+        window.scrollTo(0, Math.max(0, Math.min(maxScroll, window.scrollY + speed * dt)));
+      }
+      edgeRafId = requestAnimationFrame(edgeScrollFrame);
+    };
+
+    const onEdgeMouseMove = (e: MouseEvent) => { edgeMouseY = e.clientY; };
+    window.addEventListener("mousemove", onEdgeMouseMove, { passive: true });
+
+    createEffect(() => {
+      if (isDragging()) {
+        if (!edgeRafId) {
+          edgeLastTime = performance.now();
+          edgeRafId = requestAnimationFrame(edgeScrollFrame);
+        }
+      } else {
+        if (edgeRafId) { cancelAnimationFrame(edgeRafId); edgeRafId = 0; }
+      }
+    });
 
     recalcRange();
 
@@ -806,10 +849,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("scrollend", onScrollEnd);
       window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("mousemove", onEdgeMouseMove);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
+      if (edgeRafId) cancelAnimationFrame(edgeRafId);
       if (settleTimer) clearTimeout(settleTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
