@@ -2,7 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- maximum-scale=1 + user-scalable=no disables browser zoom entirely: no
+         pinch-to-zoom and, crucially on iOS, no auto-zoom when focusing an input
+         (Safari zooms on focus unless it's already pinned at scale 1). All
+         zooming in LightView is handled by the grid/viewer, never the browser. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+    />
     <title>LightView</title>
   </head>
   <body>

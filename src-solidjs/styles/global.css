@@ -20,6 +20,19 @@ html, body, #root {
   box-sizing: border-box;
 }
 
+/* iOS Safari auto-zooms when a focused form control has a font-size below 16px
+   — and it does this even when the viewport is pinned at maximum-scale=1. The
+   only reliable defeat is a 16px minimum on the control itself. Scope it to
+   touch devices so the desktop web client keeps its intended input sizing
+   (WebKitGTK/Tauri never does this focus-zoom, so desktop is unaffected). */
+@media (hover: none) and (pointer: coarse) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
 /* Map view marker styling. Leaflet injects these via divIcon HTML so the
    classes need to be globally available rather than scoped/Tailwind-only. */
 @keyframes lv-marker-fade-in {
