@@ -536,6 +536,43 @@ export interface FindDuplicatesResult {
 export const findDuplicates = (threshold?: number) =>
   invoke<FindDuplicatesResult>("find_duplicates", { threshold });
 
+export interface MergeGps {
+  lat: number;
+  lon: number;
+  alt: number | null;
+}
+
+export interface MergeCandidate {
+  path: string;
+  width: number | null;
+  height: number | null;
+  file_size: number;
+  mtime: number | null;
+  user_tags: string[];
+  rating: number | null;
+  color_label: string | null;
+  notes: string | null;
+  companion_location: MergeGps | null;
+  exif_location: MergeGps | null;
+}
+
+export interface MergePlan {
+  keeper: string;
+  discard: string[];
+  user_tags: string[];
+  rating: number | null;
+  color_label: string | null;
+  notes: string | null;
+  location: MergeGps | null;
+  set_mtime: number | null;
+}
+
+export const getMergeCandidates = (paths: string[]) =>
+  invoke<MergeCandidate[]>("get_merge_candidates", { paths });
+
+export const mergeDuplicates = (plan: MergePlan) =>
+  invoke<void>("merge_duplicates", { plan });
+
 export const markNotDuplicates = (paths: string[]) =>
   invoke<number>("mark_not_duplicates", { paths });
 

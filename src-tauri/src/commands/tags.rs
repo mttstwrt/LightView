@@ -6,7 +6,7 @@ use crate::companion::schema::{CompanionFile, CoreMeta, MediaType};
 use crate::AppState;
 
 /// Read a companion file, apply a mutation, and write it back atomically.
-fn modify_companion(
+pub(crate) fn modify_companion(
     path: &str,
     mutate: impl FnOnce(&mut CompanionFile),
 ) -> Result<CompanionFile, String> {

@@ -311,6 +311,30 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(duplicates::mark_not_duplicates_impl(app, a.paths).await)
         }
 
+        "get_merge_candidates" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+            }
+            let a: A = parse(args)?;
+            ok(duplicates::get_merge_candidates_impl(app, a.paths).await)
+        }
+
+        // Merge trashes the discarded copies, so it sits behind the same delete
+        // gate as trash_files below.
+        "merge_duplicates" if !settings::remote_delete_allowed(app).await => {
+            Err(DispatchError::NotAllowed)
+        }
+
+        "merge_duplicates" => {
+            #[derive(Deserialize)]
+            struct A {
+                plan: duplicates::MergePlan,
+            }
+            let a: A = parse(args)?;
+            ok(duplicates::merge_duplicates_impl(app, a.plan).await)
+        }
+
         // --- App-managed trash (gated by the per-gallery delete flag) ------
         // Trash is reversible (restore + retention-based purge), but hosts can
         // still revoke remote delete entirely; the check here is the security

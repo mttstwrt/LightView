@@ -4,6 +4,7 @@ import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
 import { setTotalCount } from "../stores/galleryStore";
 import { capabilities } from "../stores/capabilitiesStore";
 import { InfoPanel } from "./viewer/InfoPanel";
+import { MergeDialog } from "./MergeDialog";
 
 const THRESHOLD_PRESETS = [
   { label: "Exact", value: 0, desc: "Identical perceptual hash" },
@@ -35,6 +36,9 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
   const [scanned, setScanned] = createSignal(false);
   const [threshold, setThreshold] = createSignal(8);
   const [hashesComputed, setHashesComputed] = createSignal(0);
+
+  // Merge dialog: which group index is being merged (null = closed)
+  const [mergeGroup, setMergeGroup] = createSignal<number | null>(null);
 
   // Preview state: which group and which item index within it
   const [previewGroup, setPreviewGroup] = createSignal<number | null>(null);
@@ -155,6 +159,28 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
     }
   };
 
+  // After a merge: the keeper survives, the discarded copies are gone. Remove
+  // discarded paths from the group (dissolving it if fewer than 2 remain) and
+  // from the gallery display.
+  const handleMerged = (groupIdx: number, discarded: string[]) => {
+    const removedSet = new Set(discarded);
+    setGroups((prev) => {
+      const updated = [...prev];
+      const group = updated[groupIdx];
+      if (!group) return prev;
+      const newItems = group.items.filter((it) => !removedSet.has(it.path));
+      if (newItems.length < 2) {
+        updated.splice(groupIdx, 1);
+      } else {
+        updated[groupIdx] = { ...group, items: newItems };
+      }
+      return updated;
+    });
+    setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+    setTotalCount((c) => Math.max(0, c - discarded.length));
+    setMergeGroup(null);
+  };
+
   return (
     <div
       ref={(el) => {
@@ -249,13 +275,24 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
                     <span class="text-[11px] uppercase tracking-wider text-neutral-500 font-medium">
                       Group {groupIdx() + 1} — {group.items.length} images
                     </span>
-                    <button
-                      onClick={() => handleNotDuplicates(groupIdx())}
-                      class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
-                      title="Mark these images as not duplicates — they won't be grouped together in future scans"
-                    >
-                      Not duplicates
-                    </button>
+                    <div class="flex items-center gap-1.5">
+                      <Show when={capabilities().delete}>
+                        <button
+                          onClick={() => setMergeGroup(groupIdx())}
+                          class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-teal-800/50 text-teal-300 hover:bg-teal-700/60 hover:text-teal-200"
+                          title="Merge — keep one file, fold selected metadata from the others into it, then trash the rest"
+                        >
+                          Merge
+                        </button>
+                      </Show>
+                      <button
+                        onClick={() => handleNotDuplicates(groupIdx())}
+                        class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
+                        title="Mark these images as not duplicates — they won't be grouped together in future scans"
+                      >
+                        Not duplicates
+                      </button>
+                    </div>
                   </div>
                   <div class="flex gap-2 flex-wrap">
                     <For each={group.items}>
@@ -274,6 +311,18 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
           </div>
         </Show>
       </div>
+
+      {/* Merge dialog */}
+      <Show when={mergeGroup() !== null && groups()[mergeGroup()!]}>
+        {(group) => (
+          <MergeDialog
+            paths={group().items.map((it) => it.path)}
+            bestPath={group().items.find((it) => it.is_best)?.path ?? null}
+            onCancel={() => setMergeGroup(null)}
+            onMerged={(_keeper, discarded) => handleMerged(mergeGroup()!, discarded)}
+          />
+        )}
+      </Show>
 
       {/* Full-res preview overlay */}
       <Show when={previewItem()}>
