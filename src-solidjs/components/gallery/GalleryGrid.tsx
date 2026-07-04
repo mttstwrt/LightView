@@ -1,6 +1,6 @@
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, hasTouch, type UnlistenFn } from "../../lib/runtime";
+import { safeListen as listen, hasTouch, isTauri, type UnlistenFn } from "../../lib/runtime";
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
@@ -8,7 +8,9 @@ import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl,
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
-import { ThumbnailCell } from "./ThumbnailCell";
+import { createScrollDynamics, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
+import { createThumbSwapper } from "../../lib/thumbSwap";
+import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
 interface GalleryGridProps {
   paths: string[];
@@ -22,9 +24,15 @@ interface GalleryGridProps {
   onContentHeight?: (height: number) => void;
 }
 
-// Asymmetric buffer: more rows ahead of scroll direction, fewer behind.
-const BUFFER_AHEAD = 5;
-const BUFFER_BEHIND = 2;
+// Two-zone asymmetric render buffer, more rows ahead of scroll direction than
+// behind. The outer window renders cells at the cheap "s" tier — small enough
+// to keep a deep look-ahead loaded — and the inner window carries the target
+// tier; cells upgrade as rows cross into it (off-screen, so invisibly during
+// normal scrolling).
+const BUFFER_AHEAD = 12;
+const BUFFER_BEHIND = 4;
+const FULL_AHEAD = 5;
+const FULL_BEHIND = 2;
 
 // How many paths to send per IPC batch call.
 const BATCH_SIZE = 128;
@@ -42,15 +50,6 @@ const BG_BATCH_SIZE = 64;
 // Rows beyond the visible+buffer range before thumbnails are evicted from memory.
 const EVICT_ROWS = 15;
 
-// Above this scroll speed (px/sec) we stop assigning new <img> srcs so the
-// webview's main thread can keep up with scrolling instead of choking on a
-// wall of image decodes. Srcs are assigned once scrolling settles.
-const FAST_SCROLL_VELOCITY = 2500;
-// Idle gap (ms) after the last fast-scroll frame before we consider scrolling
-// settled and resume assigning srcs (in case `scrollend` doesn't fire).
-const SCROLL_SETTLE_MS = 120;
-
-
 // Ctrl+wheel thumbnail resize bounds (px). Each tick retargets the column
 // count by ±1 so one scroll notch always produces a visible change.
 const THUMB_SIZE_MIN = 80;
@@ -58,6 +57,9 @@ const THUMB_SIZE_MAX = 600;
 
 // LOD tier native pixel sizes (longest edge of the square crop).
 const TIER_PX = { s: 128, m: 512, l: 1024 } as const;
+// Tier ordering for upgrade decisions — during a fling a cell may hold a
+// lower ("cheap") tier than pickTier() wants, upgraded once scrolling settles.
+const TIER_RANK: Partial<Record<ThumbTier, number>> = { s: 0, m: 1, l: 2 };
 // How much upscale a tier may cover before bumping to the next one up. Slight
 // upscaling of a downsampled thumbnail is visually minor, but decoding a 2×-
 // larger tier than the cell can show is the dominant per-cell cost on
@@ -93,17 +95,17 @@ export function GalleryGrid(props: GalleryGridProps) {
   // Measured container width (updated by ResizeObserver).
   const [containerWidth, setContainerWidth] = createSignal(0);
 
-  // Visible row range — only updated when it actually changes.
+  // Rendered row range (the outer, cheap-tier window) — only updated when it
+  // actually changes.
   const [startRow, setStartRow] = createSignal(0);
   const [endRow, setEndRow] = createSignal(0);
+  // Inner full-resolution window (viewport + FULL_* buffers) within the
+  // rendered range; rows inside it get / upgrade to the target tier.
+  const [fullStartRow, setFullStartRow] = createSignal(0);
+  const [fullEndRow, setFullEndRow] = createSignal(0);
 
   // Generation counter — incremented on large jumps or path changes.
   const [generation, setGeneration] = createSignal(0);
-
-  // True while scrolling fast enough that we defer assigning new <img> srcs
-  // (see FAST_SCROLL_VELOCITY). Flips back to false when scrolling settles,
-  // which re-runs the assignment effect for whatever is now visible.
-  const [fastScroll, setFastScroll] = createSignal(false);
 
   // Store for protocol URLs (lightview://thumb/...).
   const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
@@ -129,8 +131,10 @@ export function GalleryGrid(props: GalleryGridProps) {
   // Thumbnail streaming state
   // -----------------------------------------------------------------------
 
-  /** Paths that currently have a protocol URL in thumbMap. */
-  const assignedSet = new Set<string>();
+  /** Paths that currently have a protocol URL in thumbMap → the tier that URL
+   *  serves. During a fling new cells get the cheap "s" rung; the assignment
+   *  effect upgrades any entry below the target tier once scrolling settles. */
+  const assignedRung = new Map<string, ThumbTier>();
   /** Paths where the protocol handler returned 404 — need IPC generation. */
   const needsGeneration = new Set<string>();
   /** Paths currently in-flight for IPC generation. */
@@ -182,6 +186,20 @@ export function GalleryGrid(props: GalleryGridProps) {
     }
   };
 
+  // Off-DOM decode-then-swap for tier upgrades on cells already showing an
+  // image, so the cheap rung stays on screen (no skeleton flash) until the
+  // target tier is ready. Cancelled per-path on eviction, wholesale on resets.
+  const swapper = createThumbSwapper({
+    generation,
+    isCurrent: (path, gen) => generation() === gen && assignedRung.has(path),
+    apply: (path, url) => {
+      markUrlLoaded(url); // bytes already decoded — suppress the fade-in
+      setThumbMap(path, url);
+    },
+    onMiss: handleThumbError,
+  });
+  onCleanup(() => swapper.cancelAll());
+
   // Listen for streamed thumbnail results — update URLs as each arrives
   // rather than waiting for the full batch to complete.
   let unlistenStreamed: UnlistenFn | undefined;
@@ -190,6 +208,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const r = event.payload;
       if (!inFlightSet.has(r.path)) return;
       bumpVersion(r.path);
+      if (assignedRung.has(r.path)) assignedRung.set(r.path, tier());
       setThumbMap(r.path, thumbSrcFor(r.path, tier()));
     }).then((fn) => {
       unlistenStreamed = fn;
@@ -202,7 +221,8 @@ export function GalleryGrid(props: GalleryGridProps) {
   // image cache fetches the fresh bytes from the protocol handler.
   const handleRegenerated = (path: string) => {
     bumpVersion(path);
-    if (assignedSet.has(path)) {
+    if (assignedRung.has(path)) {
+      assignedRung.set(path, tier());
       setThumbMap(path, thumbSrcFor(path, tier()));
     }
   };
@@ -258,6 +278,36 @@ export function GalleryGrid(props: GalleryGridProps) {
     return rows * cellSize() + (rows - 1) * gap();
   };
 
+  // Scroll velocity/direction tracking + the WebKitGTK decode gate (never
+  // engages on the web client). Owns the window scroll listener; each frame
+  // runs jump detection and the range recalc.
+  const dynamics = createScrollDynamics({
+    rowHeight,
+    cellsPerRow: cols,
+    cellCostPx: () => {
+      const px = TIER_PX[tier() as keyof typeof TIER_PX] ?? TIER_PX.m;
+      return px * px;
+    },
+    onFrame: ({ dy }) => {
+      // Jump detection: a huge delta means the user warped (scrollbar drag,
+      // scroll-to-index) — drop all queued/in-flight work for the old spot.
+      if (dy > window.innerHeight * JUMP_FACTOR) {
+        setGeneration((g) => g + 1);
+        assignedRung.clear();
+        swapper.cancelAll();
+        needsGeneration.clear();
+        coalescedPaths.clear();
+        inFlightSet.clear();
+        failedSet.clear();
+        bgCursor = 0;
+        thumbGenTotal = 0;
+        thumbGenDone = 0;
+      }
+      recalcRange?.();
+    },
+  });
+  onCleanup(() => dynamics.dispose());
+
   // -----------------------------------------------------------------------
   // Visible items — derived from startRow/endRow signals (stable references)
   // -----------------------------------------------------------------------
@@ -291,18 +341,43 @@ export function GalleryGrid(props: GalleryGridProps) {
   // Uncached ones 404 → onerror → queued for IPC generation.
   // -----------------------------------------------------------------------
 
-  createEffect(on([visibleItems, fastScroll], ([items, fast]) => {
-    // While flinging, leave new cells on their skeleton/placeholder so the main
-    // thread isn't buried under image decodes mid-scroll. When scrolling
-    // settles (fast → false) this effect re-runs and assigns whatever's now on
-    // screen. Already-assigned cells keep their src, so visible content stays.
-    if (fast) return;
-    const t = tier();
+  createEffect(on(
+    [visibleItems, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow],
+    ([items, gated, settled, fullStart, fullEnd]) => {
+    // While the WebKitGTK decode gate is up, leave new cells on their skeleton
+    // so the main thread isn't buried under image decodes mid-scroll. When it
+    // releases this effect re-runs and assigns whatever's now on screen.
+    // Already-assigned cells keep their src, so visible content stays.
+    if (gated && !CHEAP_RUNG_DURING_GATE) return;
+    const target = tier();
+    // Resolution ladder: a cell gets the tiny "s" tier when it's outside the
+    // inner full-res window (deep look-ahead stays cheap) or while a fling is
+    // in progress (content flying past isn't worth full decodes), and is
+    // upgraded to the target tier when it sits in the inner window with
+    // scrolling settled — usually off-screen, so the swap isn't seen. On the
+    // desktop webview the hard gate covers flings, so the fling rung only
+    // applies there behind the experiment flag.
+    const cheap = isTauri() ? gated : !settled;
+    const canDegrade = (TIER_RANK[target] ?? 0) > 0;
+    const c = cols();
+    const fullStartIdx = fullStart * c;
+    const fullEndIdx = fullEnd * c;
     const updates: [string, string][] = [];
+    const upgrades: string[] = [];
     for (const item of items as ReturnType<typeof visibleItems>) {
-      if (!assignedSet.has(item.path)) {
-        assignedSet.add(item.path);
-        updates.push([item.path, thumbSrcFor(item.path, t)]);
+      const inFull = item.index >= fullStartIdx && item.index < fullEndIdx;
+      const cur = assignedRung.get(item.path);
+      if (cur === undefined) {
+        const rung: ThumbTier = canDegrade && (cheap || !inFull) ? "s" : target;
+        assignedRung.set(item.path, rung);
+        updates.push([item.path, thumbSrcFor(item.path, rung)]);
+      } else if (
+        inFull &&
+        !cheap &&
+        (TIER_RANK[cur] ?? 0) < (TIER_RANK[target] ?? 0)
+      ) {
+        assignedRung.set(item.path, target);
+        upgrades.push(item.path);
       }
     }
     if (updates.length > 0) {
@@ -311,6 +386,11 @@ export function GalleryGrid(props: GalleryGridProps) {
           setThumbMap(path, url);
         }
       });
+    }
+    // Upgrades decode off-DOM and swap in on success, so the cheap rung stays
+    // visible with no skeleton flash.
+    for (const path of upgrades) {
+      swapper.swap(path, thumbSrcFor(path, target));
     }
   }));
 
@@ -330,13 +410,6 @@ export function GalleryGrid(props: GalleryGridProps) {
     });
     if (containerRef) ro.observe(containerRef);
 
-    // Scroll state (raw, not reactive — avoids triggering effects on every pixel)
-    let currentScrollY = window.scrollY;
-    let currentVelocity = 0;
-    let lastScrollY = window.scrollY;
-    let lastTimestamp = performance.now();
-    let scrollDirection: 1 | -1 = 1; // 1 = down, -1 = up
-
     /** Recompute the visible row range from current scroll position and update signals if changed. */
     recalcRange = () => {
       const sy = window.scrollY;
@@ -349,77 +422,47 @@ export function GalleryGrid(props: GalleryGridProps) {
       const relativeTop = Math.max(0, sy - offset);
       const relativeBottom = relativeTop + vh;
 
-      let bufferTop = scrollDirection === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
-      let bufferBottom = scrollDirection === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+      let bufferTop = dynamics.direction() === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
+      let bufferBottom = dynamics.direction() === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+      let fullTop = dynamics.direction() === 1 ? FULL_BEHIND : FULL_AHEAD;
+      let fullBottom = dynamics.direction() === 1 ? FULL_AHEAD : FULL_BEHIND;
 
       // While pinching, the slice is visually scaled by `pinchScale` about the
       // focal point. Scaling down (zoom out) makes the viewport show ~1/scale
-      // more rows, so render that many extra rows on both sides to avoid blanks.
+      // more rows, so render that many extra rows on both sides to avoid blanks
+      // — all at full resolution, since they're about to be on screen.
       if (untrack(pinchActive)) {
         const s = Math.max(0.2, untrack(pinchScale));
         const extra = Math.min(60, Math.ceil((vh / rh) * (1 / s)) + 2);
         bufferTop = extra;
         bufferBottom = extra;
+        fullTop = extra;
+        fullBottom = extra;
       }
 
-      const newStart = Math.max(0, Math.floor(relativeTop / rh) - bufferTop);
-      const newEnd = Math.min(totalRows(), Math.ceil(relativeBottom / rh) + bufferBottom);
+      const firstRow = Math.floor(relativeTop / rh);
+      const lastRow = Math.ceil(relativeBottom / rh);
+      const newStart = Math.max(0, firstRow - bufferTop);
+      const newEnd = Math.min(totalRows(), lastRow + bufferBottom);
+      const newFullStart = Math.max(0, firstRow - fullTop);
+      const newFullEnd = Math.min(totalRows(), lastRow + fullBottom);
 
       // Only update signals when the range actually changes — this is the key
       // optimization that prevents reactive recomputation on every scroll pixel.
-      if (newStart !== untrack(startRow) || newEnd !== untrack(endRow)) {
+      if (
+        newStart !== untrack(startRow) ||
+        newEnd !== untrack(endRow) ||
+        newFullStart !== untrack(fullStartRow) ||
+        newFullEnd !== untrack(fullEndRow)
+      ) {
         batch(() => {
           setStartRow(newStart);
           setEndRow(newEnd);
+          setFullStartRow(newFullStart);
+          setFullEndRow(newFullEnd);
         });
       }
     };
-
-    let rafId = 0;
-    let settleTimer: ReturnType<typeof setTimeout> | undefined;
-    const markSettled = () => {
-      if (untrack(fastScroll)) setFastScroll(false);
-    };
-    const onScroll = () => {
-      if (rafId) return;
-      rafId = requestAnimationFrame((now) => {
-        const y = window.scrollY;
-        const dt = (now - lastTimestamp) / 1000;
-        const dy = Math.abs(y - lastScrollY);
-
-        currentVelocity = dt > 0 ? dy / dt : 0;
-        currentScrollY = y;
-        scrollDirection = y >= lastScrollY ? 1 : -1;
-
-        // Defer src assignment while flinging; resume shortly after it settles.
-        if (currentVelocity > FAST_SCROLL_VELOCITY) {
-          if (!untrack(fastScroll)) setFastScroll(true);
-          if (settleTimer) clearTimeout(settleTimer);
-          settleTimer = setTimeout(markSettled, SCROLL_SETTLE_MS);
-        }
-
-        // Jump detection
-        if (dy > window.innerHeight * JUMP_FACTOR) {
-          setGeneration((g) => g + 1);
-          assignedSet.clear();
-          needsGeneration.clear();
-          coalescedPaths.clear();
-          inFlightSet.clear();
-          failedSet.clear();
-          bgCursor = 0;
-          thumbGenTotal = 0;
-          thumbGenDone = 0;
-        }
-
-        lastScrollY = y;
-        lastTimestamp = now;
-
-        recalcRange?.();
-        rafId = 0;
-      });
-    };
-
-    window.addEventListener("scroll", onScroll, { passive: true });
 
     // WebKitGTK doesn't propagate wheel events to window scroll natively, so we
     // intercept them and drive the scroll ourselves with momentum smoothing.
@@ -670,7 +713,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const keepEnd = Math.min(props.paths.length, (er + EVICT_ROWS) * c);
 
       const toEvict: string[] = [];
-      for (const p of assignedSet) {
+      for (const p of assignedRung.keys()) {
         const idx = pathToIndex.get(p);
         if (idx !== undefined && (idx < keepStart || idx >= keepEnd)) {
           toEvict.push(p);
@@ -681,7 +724,8 @@ export function GalleryGrid(props: GalleryGridProps) {
         batch(() => {
           for (const p of toEvict) {
             setThumbMap(p, undefined as any);
-            assignedSet.delete(p);
+            assignedRung.delete(p);
+            swapper.cancel(p);
           }
         });
       }
@@ -689,10 +733,7 @@ export function GalleryGrid(props: GalleryGridProps) {
 
     const scheduleFetch = () => {
       if (inFlightFetch) return;
-
-      const now = performance.now();
-      if (now - lastTimestamp > 150) currentVelocity = 0;
-      if (currentVelocity > VELOCITY_FAST) return;
+      if (dynamics.velocity() > VELOCITY_FAST) return;
 
       // Drain coalesced paths into needsGeneration (they're already there,
       // but clear the coalesced set so new items can accumulate during next fetch).
@@ -750,6 +791,7 @@ export function GalleryGrid(props: GalleryGridProps) {
                 batch(() => {
                   for (const p of toGenerate) {
                     bumpVersion(p);
+                    if (assignedRung.has(p)) assignedRung.set(p, activeTier);
                     setThumbMap(p, thumbSrcFor(p, activeTier));
                   }
                 });
@@ -762,6 +804,7 @@ export function GalleryGrid(props: GalleryGridProps) {
                 batch(() => {
                   for (const r of results) {
                     bumpVersion(r.path);
+                    if (assignedRung.has(r.path)) assignedRung.set(r.path, activeTier);
                     setThumbMap(r.path, thumbSrcFor(r.path, activeTier));
                   }
                 });
@@ -795,13 +838,13 @@ export function GalleryGrid(props: GalleryGridProps) {
       }
 
       // Phase 2: Background prefetch (silent, no progress tracking)
-      if (currentVelocity < VELOCITY_SLOW && bgCursor < props.paths.length) {
+      if (dynamics.velocity() < VELOCITY_SLOW && bgCursor < props.paths.length) {
         const bgNeeded: string[] = [];
         const total = props.paths.length;
         while (bgNeeded.length < BG_BATCH_SIZE && bgCursor < total) {
           const p = props.paths[bgCursor];
           bgCursor++;
-          if (p && !assignedSet.has(p) && !failedSet.has(p)) {
+          if (p && !assignedRung.has(p) && !failedSet.has(p)) {
             bgNeeded.push(p);
           }
         }
@@ -822,7 +865,7 @@ export function GalleryGrid(props: GalleryGridProps) {
     // scrollend fires when scrolling stops — replaces manual debounce.
     // Also covers native scrollbar drags and programmatic scrollTo().
     const onScrollEnd = () => {
-      markSettled();
+      dynamics.markSettled();
       scheduleFetch();
     };
     window.addEventListener("scrollend", onScrollEnd);
@@ -844,7 +887,8 @@ export function GalleryGrid(props: GalleryGridProps) {
     // differ from the one the webview may have cached.
     const onInvalidate = () => {
       setThumbMap(reconcile({}));
-      assignedSet.clear();
+      assignedRung.clear();
+      swapper.cancelAll();
       needsGeneration.clear();
       inFlightSet.clear();
       failedSet.clear();
@@ -878,14 +922,11 @@ export function GalleryGrid(props: GalleryGridProps) {
 
     onCleanup(() => {
       ro.disconnect();
-      window.removeEventListener("scroll", onScroll);
       window.removeEventListener("scrollend", onScrollEnd);
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
-      if (rafId) cancelAnimationFrame(rafId);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
-      if (settleTimer) clearTimeout(settleTimer);
       clearInterval(bgIntervalId);
       fetchAbort = true;
     });
@@ -897,7 +938,8 @@ export function GalleryGrid(props: GalleryGridProps) {
       () => props.paths,
       (paths) => {
         setThumbMap(reconcile({}));
-        assignedSet.clear();
+        assignedRung.clear();
+        swapper.cancelAll();
         needsGeneration.clear();
         inFlightSet.clear();
         failedSet.clear();
@@ -943,7 +985,8 @@ export function GalleryGrid(props: GalleryGridProps) {
     on(
       tier,
       () => {
-        assignedSet.clear();
+        assignedRung.clear();
+        swapper.cancelAll();
         needsGeneration.clear();
         inFlightSet.clear();
         failedSet.clear();
@@ -953,7 +996,7 @@ export function GalleryGrid(props: GalleryGridProps) {
         const items = visibleItems();
         batch(() => {
           for (const item of items) {
-            assignedSet.add(item.path);
+            assignedRung.set(item.path, newTier);
             setThumbMap(item.path, thumbSrcFor(item.path, newTier));
           }
         });

@@ -228,15 +228,34 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
   // 0 means "don't time this load" (no URL, or already-seen URL).
   let loadStart = 0;
 
+  // Previous same-cell image, held in an underlay <img> while the current src
+  // fetches/decodes. Swapping a live <img>'s src drops the old bitmap before
+  // the new one attaches — a background-colored flash on mobile engines even
+  // when the new URL was pre-decoded off-DOM — so during a tier upgrade or
+  // zoom swap the outgoing image stays visible underneath until onLoad.
+  const [prevSrc, setPrevSrc] = createSignal<string | null>(null);
+
   // Clear error/loaded state when a new URL is provided (e.g. after generation + cache-bust).
-  createEffect(on(() => props.thumbSrc, (url) => {
-    setErrored(false);
-    const seen = url ? loadedUrls.has(url) : false;
-    setLoaded(seen);
-    // Only timestamp when the perf monitor is active, so this is zero-cost
-    // (no performance.now() per load) when the debug overlay is closed.
-    loadStart = url && !seen && perfActive() ? performance.now() : 0;
-  }));
+  createEffect(on(
+    () => [props.path, props.thumbSrc] as const,
+    ([path, url], prev) => {
+      setErrored(false);
+      // Only hold the outgoing image for a same-cell URL change that had
+      // actually loaded; a recycled cell (path changed) must not linger the
+      // previous item's image.
+      const [prevPath, prevUrl] = prev ?? [undefined, null];
+      if (url && prevUrl && url !== prevUrl && path === prevPath && loadedUrls.has(prevUrl)) {
+        setPrevSrc(prevUrl);
+      } else {
+        setPrevSrc(null);
+      }
+      const seen = url ? loadedUrls.has(url) : false;
+      setLoaded(seen);
+      // Only timestamp when the perf monitor is active, so this is zero-cost
+      // (no performance.now() per load) when the debug overlay is closed.
+      loadStart = url && !seen && perfActive() ? performance.now() : 0;
+    },
+  ));
 
   // Whether we have a valid URL to attempt loading.
   const hasUrl = () => !!props.thumbSrc && !errored();
@@ -250,12 +269,16 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       style={{
         background: "#1a1a1a",
         contain: "layout style paint",
-        // Let the engine skip rendering/decoding cells that are in the
-        // virtual-scroll buffer but off-screen until they scroll into view.
-        // Cell size is set externally (grid track / explicit), so the
+        // Let WebKitGTK skip rendering/decoding cells that are in the
+        // virtual-scroll buffer but off-screen — a main-thread win there.
+        // Real browsers (the web client) defer image load/decode inside
+        // skipped subtrees until the cell intersects the viewport, which
+        // makes every image pop in at the viewport edge regardless of scroll
+        // speed — defeating the buffer's pre-loading — so desktop-webview
+        // only. Cell size is set externally (grid track / explicit), so the
         // intrinsic-size fallback is only a pre-first-paint placeholder.
-        "content-visibility": "auto",
-        "contain-intrinsic-size": "auto 250px",
+        "content-visibility": isTauri() ? "auto" : undefined,
+        "contain-intrinsic-size": isTauri() ? "auto 250px" : undefined,
         outline: props.selected ? "2px solid #3b82f6" : "none",
         "outline-offset": "-2px",
       }}
@@ -283,6 +306,20 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         style={{ display: hasUrl() ? "none" : undefined }}
       />
 
+      {/* Underlay: the previous image held during a same-cell src swap so
+          tier upgrades never flash the cell background. z-index -1 keeps it
+          beneath the in-flow main <img> (the cell's paint containment makes
+          it a stacking context, so -1 still paints above its background). */}
+      <img
+        src={prevSrc() ?? undefined}
+        alt=""
+        aria-hidden="true"
+        class="absolute inset-0 w-full h-full object-cover"
+        style={{ display: prevSrc() ? undefined : "none", "z-index": -1 }}
+        decoding="async"
+        draggable={false}
+      />
+
       {/* Img: always present, hidden when no URL. src cleared to cancel
           any in-flight decode when recycled without a URL. */}
       <img
@@ -303,14 +340,23 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
             loadStart = 0;
           }
           const img = e.currentTarget;
+          // decoding="async" lets the browser postpone decode until first
+          // paint — for a cell sitting in the virtual-scroll buffer that's
+          // the moment it scrolls in, i.e. a visible pop at the viewport
+          // edge. Decode eagerly so buffered cells are paint-ready when
+          // revealed. Not on WebKitGTK: it decodes on the main thread, and
+          // deferring buffer-cell decodes is exactly what keeps it smooth.
+          if (!isTauri()) void img.decode?.().catch(() => {});
           if (img.naturalWidth > 0 && img.naturalHeight > 0) {
             props.onImageLoad?.(img.naturalWidth, img.naturalHeight);
           }
           setLoaded(true);
+          setPrevSrc(null); // new image attached — release the underlay
         }}
         onError={() => {
           // Don't treat media URL errors as thumbnail errors
           if (isGif() && hovered()) return;
+          setPrevSrc(null); // don't leave a stale image under the skeleton
           setErrored(true);
           props.onError?.(props.path);
         }}
