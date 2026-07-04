@@ -6,7 +6,7 @@ import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
-import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, applyExternalSettings } from "./stores/settingsStore";
+import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, setRating, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
 import { setFilterQuery } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
@@ -238,6 +238,9 @@ export function App() {
     };
     window.addEventListener(NOT_PAIRED_EVENT, onNotPaired);
     onCleanup(() => window.removeEventListener(NOT_PAIRED_EVENT, onNotPaired));
+
+    // Restore this browser's per-client display settings (GIF-in-grid, etc.).
+    loadWebSettings();
 
     try {
       const info = await getGalleryInfo();

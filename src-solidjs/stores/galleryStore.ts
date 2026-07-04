@@ -5,6 +5,7 @@ import type {
   SortedItem,
   TimelineEntry,
 } from "../lib/types";
+import { loadPref, savePref } from "../lib/clientPrefs";
 
 // ---------------------------------------------------------------------------
 // Gallery state
@@ -82,7 +83,21 @@ const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
 // View mode: grid (uniform squares), justified (aspect-preserving rows), or
 // map (geographic browsing).
 export type ViewMode = "grid" | "justified" | "map";
-const [viewMode, setViewMode] = createSignal<ViewMode>("grid");
+
+// Persist the chosen layout per client so the last-used view is restored on the
+// next open (localStorage — per browser/device, matching per-client settings).
+const VIEW_MODE_PREF = "viewMode";
+const savedViewMode = loadPref<ViewMode>(VIEW_MODE_PREF);
+const [viewMode, setViewModeRaw] = createSignal<ViewMode>(
+  savedViewMode === "grid" || savedViewMode === "justified" || savedViewMode === "map"
+    ? savedViewMode
+    : "grid",
+);
+const setViewMode = ((value) => {
+  const next = setViewModeRaw(value as any);
+  savePref(VIEW_MODE_PREF, next);
+  return next;
+}) as typeof setViewModeRaw;
 
 // Whether the settings panel is open. On mobile the panel is a full-screen
 // page, so App uses this to stop rendering the grid behind it.

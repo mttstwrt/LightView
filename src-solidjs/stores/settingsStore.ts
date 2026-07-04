@@ -1,6 +1,10 @@
 import { createSignal } from "solid-js";
 import type { AppSettings, SortField, SortOrder, GroupBy } from "../lib/types";
 import { saveGallerySettings, loadGallerySettings } from "../lib/ipc";
+import { isWeb } from "../lib/runtime";
+import { loadPref, savePref } from "../lib/clientPrefs";
+
+const SETTINGS_PREF = "settings";
 
 const DEFAULT_SETTINGS: AppSettings = {
   display: {
@@ -54,9 +58,13 @@ let galleryOpen = false;
 export function setSettings(update: Partial<AppSettings> | ((prev: AppSettings) => AppSettings)) {
   setSettingsRaw((prev) => {
     const next = typeof update === "function" ? update(prev) : { ...prev, ...update };
-    // Persist to the open gallery's settings.toml. With no gallery open there's
+    // The web client has no local gallery settings.toml (every browser talks to
+    // the same host), so it persists per-client in localStorage. Desktop
+    // persists to the open gallery's settings.toml; with no gallery open there's
     // nothing to persist for (the selector screen uses no settings).
-    if (galleryOpen) {
+    if (isWeb()) {
+      savePref(SETTINGS_PREF, next);
+    } else if (galleryOpen) {
       saveGallerySettings(JSON.stringify(next)).catch(() => {});
     }
     return next;
@@ -90,6 +98,17 @@ export async function loadSettingsFromGallery() {
       await saveGallerySettings(JSON.stringify(DEFAULT_SETTINGS)).catch(() => {});
     }
   } catch {}
+}
+
+/** Load the web client's per-client settings from localStorage. The web client
+ *  has no gallery settings.toml, so this restores each browser's own display
+ *  preferences (e.g. GIF-in-grid playback) on open. No-op values simply fall
+ *  back to the hard defaults. */
+export function loadWebSettings() {
+  const stored = loadPref<Partial<AppSettings>>(SETTINGS_PREF);
+  if (stored) {
+    setSettingsRaw(() => ({ ...DEFAULT_SETTINGS, ...stored }));
+  }
 }
 
 /** Called when gallery is closed to stop backend persistence. */
