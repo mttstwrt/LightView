@@ -6,7 +6,7 @@
 //! placeholders. The functions here return plain outcomes so each caller can
 //! build its own response (`tauri::http::Response` vs `axum::response`).
 
-use crate::cache::coalescer::Role;
+use crate::cache::coalescer::Acquired;
 use crate::cache::thumbnails::ThumbTier;
 use crate::commands;
 use crate::AppState;
@@ -107,41 +107,51 @@ pub async fn read_cached_thumbnail_async(
 
 /// Full lookup-then-generate. On a cache miss, generates on the thumb pool with
 /// coalescing so concurrent requests for the same key decode only once.
+///
+/// A loop rather than a single pass: a generator whose request future was
+/// cancelled (browser aborted the fetch mid-scroll) wakes its waiters without
+/// having produced anything — the woken waiter re-checks the cache, finds the
+/// slot free, and becomes the new generator. Attempts are bounded so a
+/// persistently failing source degrades to Miss instead of looping.
 pub async fn get_or_generate(state: &AppState, tier: ThumbTier, path: String) -> ThumbOutcome {
-    match read_cached_thumbnail_async(state, tier, path.clone()).await {
-        ThumbOutcome::Miss => {}
-        other => return other,
-    }
+    const MAX_ATTEMPTS: usize = 3;
+    for _ in 0..MAX_ATTEMPTS {
+        match read_cached_thumbnail_async(state, tier, path.clone()).await {
+            ThumbOutcome::Miss => {}
+            other => return other,
+        }
 
-    let key = (path.clone(), tier);
-    let (role, notify) = state.thumb_gen_coalescer.acquire(key.clone());
+        match state.thumb_gen_coalescer.acquire((path.clone(), tier)) {
+            Acquired::Generator(_guard) => {
+                // `_guard` releases the slot and wakes waiters when dropped —
+                // on success, on error, and on cancellation at any await point.
+                return match commands::media::generate_and_store_tier(state, &path, tier).await {
+                    Ok((data, format)) => ThumbOutcome::Hit { data, format },
+                    Err(e) => {
+                        log::warn!("generate-on-miss failed for {} (tier {:?}): {}", path, tier, e);
+                        ThumbOutcome::Miss
+                    }
+                };
+            }
+            Acquired::Waiter(notify) => {
+                let listener = notify.notified();
+                tokio::pin!(listener);
+                // Enrol in the wake queue before re-checking the cache to avoid
+                // missing a notify that races with the generator's release.
+                listener.as_mut().enable();
 
-    match role {
-        Role::Generator => {
-            let result = commands::media::generate_and_store_tier(state, &path, tier).await;
-            state.thumb_gen_coalescer.release(&key);
-            match result {
-                Ok((data, format)) => ThumbOutcome::Hit { data, format },
-                Err(e) => {
-                    log::warn!("generate-on-miss failed for {} (tier {:?}): {}", path, tier, e);
-                    ThumbOutcome::Miss
+                if let ThumbOutcome::Hit { data, format } =
+                    read_cached_thumbnail_async(state, tier, path.clone()).await
+                {
+                    return ThumbOutcome::Hit { data, format };
                 }
+                listener.await;
+                // Loop around: a completed generation hits the cache re-read;
+                // a cancelled one misses and this caller contends for the slot.
             }
-        }
-        Role::Waiter => {
-            let listener = notify.notified();
-            tokio::pin!(listener);
-            // Enrol in the wake queue before re-checking the cache to avoid
-            // missing a notify that races with the generator's release.
-            listener.as_mut().enable();
-
-            if let ThumbOutcome::Hit { data, format } = read_cached_thumbnail(state, tier, &path) {
-                return ThumbOutcome::Hit { data, format };
-            }
-            listener.await;
-            read_cached_thumbnail(state, tier, &path)
         }
     }
+    read_cached_thumbnail_async(state, tier, path).await
 }
 
 /// Result of decoding a ThumbHash placeholder.

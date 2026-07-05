@@ -7,6 +7,15 @@
 // callers for the same key become Waiters and resume once the Generator
 // signals completion. The actual result is persisted to SQLite, so waiters
 // only need a wake-up to re-read the cache.
+//
+// The generator's slot is held by an RAII guard: releasing (and waking
+// waiters) happens on Drop, so it also happens when the generating future is
+// *cancelled* — an HTTP request future is dropped whenever the browser aborts
+// the fetch, which the grids' virtual scrolling does constantly. The previous
+// explicit-release design leaked the key on cancellation, permanently hanging
+// every later request for that thumbnail (and, once a few piled up, the
+// browser's whole per-origin connection budget — the "server stops
+// responding" symptom).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,11 +25,28 @@ use crate::cache::thumbnails::ThumbTier;
 
 pub type ThumbKey = (String, ThumbTier);
 
-pub enum Role {
-    /// You got the slot — run the generator, then call `release`.
-    Generator,
-    /// Another caller is generating — await `notified()` then re-read cache.
-    Waiter,
+/// Outcome of [`ThumbGenCoalescer::acquire`].
+pub enum Acquired {
+    /// You got the slot — run the generator while holding the guard. The slot
+    /// is released and all waiters are woken when the guard drops, on every
+    /// exit path (success, error, or cancellation mid-await).
+    Generator(GenerationGuard),
+    /// Another caller is generating — await `notified()` (enrol via
+    /// `Notified::enable` before re-checking the cache to avoid missing a
+    /// release that races with `acquire`), then re-read the cache.
+    Waiter(Arc<Notify>),
+}
+
+/// RAII slot for a generating caller; see [`Acquired::Generator`].
+pub struct GenerationGuard {
+    coalescer: Arc<ThumbGenCoalescer>,
+    key: ThumbKey,
+}
+
+impl Drop for GenerationGuard {
+    fn drop(&mut self) {
+        self.coalescer.release(&self.key);
+    }
 }
 
 #[derive(Default)]
@@ -33,25 +59,23 @@ impl ThumbGenCoalescer {
         Self::default()
     }
 
-    /// Claim a slot for `key`. If the key is free the caller becomes the
-    /// Generator and is expected to run generation then call `release`.
-    /// Otherwise the caller becomes a Waiter and should await the returned
-    /// `Notify` (enrol via `Notified::enable` before awaiting to avoid
-    /// missing a release that races with this call).
-    pub fn acquire(&self, key: ThumbKey) -> (Role, Arc<Notify>) {
+    /// Claim the generation slot for `key`, or enrol as a waiter on whoever
+    /// holds it.
+    pub fn acquire(self: &Arc<Self>, key: ThumbKey) -> Acquired {
         let mut map = self.inner.lock().unwrap();
         if let Some(notify) = map.get(&key) {
-            (Role::Waiter, notify.clone())
+            Acquired::Waiter(notify.clone())
         } else {
-            let notify = Arc::new(Notify::new());
-            map.insert(key, notify.clone());
-            (Role::Generator, notify)
+            map.insert(key.clone(), Arc::new(Notify::new()));
+            Acquired::Generator(GenerationGuard {
+                coalescer: self.clone(),
+                key,
+            })
         }
     }
 
-    /// Called by the Generator after generation (success or failure).
-    /// Removes the key and wakes all waiters.
-    pub fn release(&self, key: &ThumbKey) {
+    /// Remove the key and wake all waiters. Called from the guard's Drop.
+    fn release(&self, key: &ThumbKey) {
         let mut map = self.inner.lock().unwrap();
         if let Some(notify) = map.remove(key) {
             notify.notify_waiters();

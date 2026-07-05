@@ -6,6 +6,9 @@ import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
 import {
   rebuildThumbnails,
+  getSortedItems,
+  precacheThumbnails,
+  ensureTierThumbnails,
   listPlugins,
   installPlugin,
   runPluginBatch,
@@ -35,6 +38,7 @@ import {
 } from "../../lib/ipc";
 import QRCode from "qrcode";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
+import { thumbGenStarted, thumbGenProgress, thumbGenFinished, thumbGenFailed } from "../../stores/thumbnailProgressStore";
 import { capabilities } from "../../stores/capabilitiesStore";
 import { safeListen as listen } from "../../lib/runtime";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -392,6 +396,48 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
       console.error("Rebuild failed:", e);
     }
     setRebuilding(false);
+  };
+
+  // ── Generate missing thumbnails (all tiers the grids use at normal zoom) ──
+  // Sequential bounded batches over the whole gallery: pass 1 the standard
+  // grid tier (micro derives with it), pass 2 the justified base tier.
+  // Already-cached paths are filtered backend-side, so re-runs are cheap.
+  // Running this up front trades one supervised generation session for the
+  // burst-generation heat that otherwise happens while scrolling cold
+  // regions. Progress drives the same overlay as scroll-driven generation.
+  const [precachingAll, setPrecachingAll] = createSignal(false);
+  let precacheAllCancel = false;
+  const PRECACHE_ALL_BATCH = 48;
+  const handlePrecacheAll = async () => {
+    if (precachingAll()) {
+      precacheAllCancel = true;
+      return;
+    }
+    setPrecachingAll(true);
+    precacheAllCancel = false;
+    try {
+      // Unfiltered listing — the active view filter must not hide paths from
+      // a whole-gallery maintenance pass.
+      const all = await getSortedItems("name", "asc", { type: "none" });
+      const paths = all.items.map((it) => it.path);
+      const totalSteps = paths.length * 2;
+      let done = 0;
+      thumbGenStarted(totalSteps);
+      for (const pass of ["standard", "justified"] as const) {
+        for (let i = 0; i < paths.length && !precacheAllCancel; i += PRECACHE_ALL_BATCH) {
+          const batch = paths.slice(i, i + PRECACHE_ALL_BATCH);
+          if (pass === "standard") await precacheThumbnails(batch);
+          else await ensureTierThumbnails(batch, "j");
+          done += batch.length;
+          thumbGenProgress(done, totalSteps);
+        }
+      }
+      thumbGenFinished(done);
+    } catch (e) {
+      console.error("Generate-missing-thumbnails failed:", e);
+      thumbGenFailed(String(e));
+    }
+    setPrecachingAll(false);
   };
 
   // ── Plugins ──
@@ -1130,9 +1176,22 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
               </Section>
             </Show>
 
-            {/* ── Thumbnails (desktop only — write op) ── */}
-            <Show when={!isWeb()}>
-              <Section label="Thumbnails" order={6}>
+            {/* ── Thumbnails ── */}
+            <Section label="Thumbnails" order={6}>
+              <button
+                onClick={handlePrecacheAll}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+              >
+                {precachingAll() ? "Cancel Generation" : "Generate Missing Thumbnails"}
+              </button>
+              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
+                Pre-generates every thumbnail size the gallery views use, so
+                they don't burst-generate (CPU spikes) while scrolling new
+                areas. Safe to cancel and re-run — already-generated
+                thumbnails are skipped.
+              </p>
+              {/* Rebuild + rendering are desktop-only (destructive / local) */}
+              <Show when={!isWeb()}>
                 <button
                   onClick={handleRebuild}
                   disabled={rebuilding()}
@@ -1155,8 +1214,8 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                     Restart LightView to apply the new rendering mode.
                   </p>
                 </Show>
-              </Section>
-            </Show>
+              </Show>
+            </Section>
 
             {/* ── Storage (desktop only) ── */}
             <Show when={!isWeb()}>

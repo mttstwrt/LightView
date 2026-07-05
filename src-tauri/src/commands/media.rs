@@ -728,13 +728,26 @@ pub async fn precache_thumbnails(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<PrecacheResult, String> {
+    precache_thumbnails_impl(&state, paths).await
+}
+
+/// Backing implementation shared by the Tauri command and the web client's
+/// `/api/invoke` bridge.
+pub async fn precache_thumbnails_impl(
+    state: &AppState,
+    paths: Vec<String>,
+) -> Result<PrecacheResult, String> {
     let format = ThumbFormat::Jpeg;
     let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
     let thumb_w = STANDARD_THUMB_SIZE;
     let thumb_h = STANDARD_THUMB_SIZE;
 
-    // Filter to only paths that are uncached or have a format mismatch
+    // Filter to only paths that are uncached or have a format mismatch. Also
+    // collect cached paths whose micro row is missing (galleries thumbnailed
+    // before the micro tier existed) so precache leaves the DB in the same
+    // shape as batch generation: standard + thumbhash + micro all present.
     let requested_fmt = format.as_cache_str();
+    let mut micro_missing: Vec<String> = Vec::new();
     let uncached: Vec<String> = {
         let db = state.cache_db.lock().await;
         let db = db.as_ref().ok_or("No gallery open")?;
@@ -743,11 +756,19 @@ pub async fn precache_thumbnails(
             .map_err(|e| e.to_string())?;
         paths
             .into_iter()
-            .filter(|p| info.get(p).map(|(_, _, fmt, _)| fmt != requested_fmt).unwrap_or(true))
+            .filter(|p| match info.get(p) {
+                Some((_, _, fmt, has_micro)) if fmt == requested_fmt => {
+                    if !has_micro {
+                        micro_missing.push(p.clone());
+                    }
+                    false
+                }
+                _ => true,
+            })
             .collect()
     };
 
-    if uncached.is_empty() {
+    if uncached.is_empty() && micro_missing.is_empty() {
         return Ok(PrecacheResult {
             generated: 0,
             failed: Vec::new(),
@@ -818,6 +839,15 @@ pub async fn precache_thumbnails(
                 }
             }
         }
+    }
+
+    // Backfill micro + thumbhash for both the freshly generated rows and any
+    // previously cached paths that were missing them, so a precache pass over
+    // the gallery leaves the cheap "s" tier fully warm.
+    let mut micro_needed = micro_missing;
+    micro_needed.extend(to_cache.iter().map(|item| item.0.clone()));
+    if !micro_needed.is_empty() {
+        derive_micro_for_cached(state, &micro_needed).await;
     }
 
     Ok(PrecacheResult { generated, failed })
@@ -944,6 +974,16 @@ pub async fn get_thumbhashes_impl(
 #[tauri::command]
 pub async fn ensure_tier_thumbnails(
     state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    tier: String,
+) -> Result<usize, String> {
+    ensure_tier_thumbnails_impl(&state, paths, tier).await
+}
+
+/// Backing implementation shared by the Tauri command and the web client's
+/// `/api/invoke` bridge.
+pub async fn ensure_tier_thumbnails_impl(
+    state: &AppState,
     paths: Vec<String>,
     tier: String,
 ) -> Result<usize, String> {
@@ -1124,6 +1164,18 @@ pub async fn generate_and_store_tier(
     path: &str,
     tier: ThumbTier,
 ) -> Result<(Vec<u8>, String), String> {
+    // Micro fast path: derive from the cached Standard-tier bytes when they
+    // exist — decoding a 512px thumbnail instead of the multi-megapixel
+    // original. The grids' cheap-rung look-ahead floods this tier on galleries
+    // thumbnailed before the micro tier existed; paying a full source decode
+    // per 128px thumb pegged the CPU during sustained scrolling. Falls back to
+    // full generation when the Standard tier isn't cached yet.
+    if matches!(tier, ThumbTier::Micro) {
+        if let Some(hit) = derive_micro_from_standard(state, path).await? {
+            return Ok(hit);
+        }
+    }
+
     let target = tier.target_size();
     let filter = thumbnailer::filter_for_size(target);
     let tier_format = match tier {
@@ -1174,6 +1226,39 @@ pub async fn generate_and_store_tier(
         None
     };
 
+    // Videos need ffprobe for duration/exact dimensions. Probe BEFORE taking
+    // the DB lock: ffprobe is a subprocess taking up to hundreds of ms, and
+    // running it under the lock kept every other DB user queued for the
+    // duration during sustained scroll-driven generation. Only probe when
+    // duration is still missing so the (potentially 3) justified tiers don't
+    // each spawn ffprobe for the same file.
+    let video_meta: Option<(u32, u32, Option<f64>)> = if thumb.media_type == "video" {
+        let needs_probe = {
+            let db = state.cache_db.lock().await;
+            let db = db.as_ref().ok_or("No gallery open")?;
+            db.conn()
+                .query_row(
+                    "SELECT duration IS NULL FROM media_meta WHERE path = ?1",
+                    rusqlite::params![path],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+        };
+        if needs_probe {
+            let p = path.to_string();
+            tokio::task::spawn_blocking(move || {
+                thumbnailer::probe_video_metadata(Path::new(&p)).ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut db = state.cache_db.lock().await;
     let db = db.as_mut().ok_or("No gallery open")?;
 
@@ -1208,8 +1293,11 @@ pub async fn generate_and_store_tier(
 
         tx.commit().map_err(|e| e.to_string())?;
 
-        if thumb.media_type == "video" {
-            populate_video_metadata(db.conn(), path);
+        if let Some((w, h, duration)) = video_meta {
+            let _ = db.conn().execute(
+                "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
+                rusqlite::params![w, h, duration, path],
+            );
         }
     } else {
         crate::cache::thumbnails::write_tier_row(
@@ -1227,23 +1315,72 @@ pub async fn generate_and_store_tier(
             rusqlite::params![thumb.src_width, thumb.src_height, path],
         );
 
-        // Videos need ffprobe for duration/exact dimensions. Only probe when
-        // still missing so the (potentially 3) justified tiers don't each spawn
-        // ffprobe for the same file.
-        if thumb.media_type == "video" {
-            let needs_probe = db
-                .conn()
-                .query_row(
-                    "SELECT duration IS NULL FROM media_meta WHERE path = ?1",
-                    rusqlite::params![path],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap_or(false);
-            if needs_probe {
-                populate_video_metadata(db.conn(), path);
-            }
+        if let Some((w, h, duration)) = video_meta {
+            let _ = db.conn().execute(
+                "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
+                rusqlite::params![w, h, duration, path],
+            );
         }
     }
 
     Ok((bytes, fmt_str))
+}
+
+/// Derive the Micro (128px) tier for `path` from its cached Standard-tier
+/// bytes, persisting the micro row (and backfilling the ThumbHash) like
+/// `derive_micro_for_cached`. Returns `Ok(None)` when the Standard tier isn't
+/// cached, in which case the caller should fall back to full generation.
+async fn derive_micro_from_standard(
+    state: &AppState,
+    path: &str,
+) -> Result<Option<(Vec<u8>, String)>, String> {
+    let row = {
+        let db = state.cache_db.lock().await;
+        let db = db.as_ref().ok_or("No gallery open")?;
+        db.get_thumbnail(path).ok().flatten()
+    };
+    let Some(row) = row else { return Ok(None) };
+    let (width, height, media_type, data) = (row.width, row.height, row.media_type, row.thumbnail);
+
+    // Decode + downsample on the CPU pool — cheap (512px source), but still
+    // not for the async threads.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.thumb_pool.spawn(move || {
+        let _ = tx.send(derive_extras_from_bytes(&data, width, height));
+    });
+    let extras = rx
+        .await
+        .map_err(|_| "micro derivation task dropped".to_string())?;
+    let Some(micro) = extras.micro_bytes else {
+        // Undecodable standard bytes — let the caller regenerate from source.
+        return Ok(None);
+    };
+
+    {
+        let mut db = state.cache_db.lock().await;
+        let db = db.as_mut().ok_or("No gallery open")?;
+        let txn = db.transaction().map_err(|e| e.to_string())?;
+        if let Some(hash) = &extras.thumbhash {
+            let _ = txn.execute(
+                "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2 AND thumbhash IS NULL",
+                rusqlite::params![hash, path],
+            );
+        }
+        let _ = txn.execute(
+            "INSERT OR IGNORE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                path,
+                media_type,
+                0u64,
+                extras.micro_size,
+                extras.micro_size,
+                micro,
+                "jpeg"
+            ],
+        );
+        txn.commit().map_err(|e| e.to_string())?;
+    }
+
+    Ok(Some((micro, "jpeg".to_string())))
 }

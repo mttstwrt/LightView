@@ -8,7 +8,46 @@
 > upgrading as rows cross the inner boundary; and (b) an underlay `<img>` in
 > ThumbnailCell that holds the outgoing image during same-cell src swaps,
 > because mobile engines drop the old bitmap for a frame+ even when the new
-> URL is pre-decoded (the "flicker on upgrade" symptom). Phases 3–5 pending.
+> URL is pre-decoded (the "flicker on upgrade" symptom).
+>
+> Phase 3 implemented: drain-time priority ordering lives in
+> `lib/loadPriority.ts` (full-res window → rendered buffer by distance →
+> drop out-of-window leftovers) and is used by both grids' generation
+> queues; upgrade-decode cancellation landed with `lib/thumbSwap.ts` in
+> Phase 2. The common drain skeleton was left per-grid (streamed events /
+> tier branches differ too much to unify cleanly). Phases 4–5 pending.
+>
+> Server-side findings from device testing (2026-07-04): the request
+> pressure these phases add surfaced two backend bugs. (1) The thumbnail
+> generation coalescer leaked its key when a generating request future was
+> cancelled (browser aborts a fetch → axum drops the handler mid-await →
+> `release` never ran), permanently hanging every later request for that
+> thumbnail and eventually the browser's whole connection budget — the
+> "server stops responding until restart" symptom. Fixed with an RAII
+> guard (`cache/coalescer.rs`) plus a retry loop in
+> `thumb_serve::get_or_generate` so a woken waiter takes over a cancelled
+> generation. (2) A micro ("s") tier miss on the HTTP route ran full
+> generation — decoding the multi-megapixel *original* per 128px thumb —
+> even when the 512px standard tier was cached; the cheap-rung look-ahead
+> flood made this peg the CPU. `generate_and_store_tier` now derives micro
+> from cached standard bytes (~10–20× cheaper). Also moved ffprobe out
+> from under the cache-DB lock on that path. Known follow-ups: the batch
+> paths still call `populate_video_metadata` under the lock (bounded per
+> batch), and the `?fit=` resize route has no coalescer.
+>
+> Follow-up work (2026-07-04): Settings → Thumbnails gained "Generate
+> Missing Thumbnails" — a sequential batched pass over the whole gallery
+> (standard+micro, then justified base) so cold regions don't
+> burst-generate during scrolling; it drives the existing progress
+> overlay. Investigating why that overlay "never shows" surfaced that it
+> is fed only by frontend-observed 404s, which generate-on-miss routes
+> almost never produce — scroll-driven generation is invisible to it by
+> design, not broken. The same investigation found `precache_thumbnails`
+> and `ensure_tier_thumbnails` missing from the web `/api/invoke`
+> allowlist, so the web grids' look-ahead warming had been silently
+> failing (masked by generate-on-miss); both are now bridged via `_impl`
+> splits, and `precache_thumbnails` now backfills missing micro/thumbhash
+> rows so a precache pass leaves the DB fully shaped.
 
 ## Problem
 

@@ -163,6 +163,29 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(media::regenerate_thumbnail_impl(app, a.path).await)
         }
 
+        // Generation-only writes to the thumbnail cache — the same work the
+        // /thumb route already does per-request on a miss, just batched.
+        // Needed by the web grids' look-ahead warming and the settings
+        // "Generate Missing Thumbnails" maintenance pass.
+        "precache_thumbnails" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+            }
+            let a: A = parse(args)?;
+            ok(media::precache_thumbnails_impl(app, a.paths).await)
+        }
+
+        "ensure_tier_thumbnails" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+                tier: String,
+            }
+            let a: A = parse(args)?;
+            ok(media::ensure_tier_thumbnails_impl(app, a.paths, a.tier).await)
+        }
+
         "get_thumbhashes" => {
             #[derive(Deserialize)]
             struct A {
