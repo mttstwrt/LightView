@@ -1,5 +1,6 @@
 import { createSignal, untrack, type Accessor } from "solid-js";
 import { isTauri } from "./runtime";
+import { ewmaImageLoadMs } from "./perfMonitor";
 
 // ---------------------------------------------------------------------------
 // Shared scroll dynamics for the virtualized grid views.
@@ -52,6 +53,26 @@ const FLING_PROJECTION_S = 0.35;
 // thread, which is the reason the hard gate exists at all.
 export const CHEAP_RUNG_DURING_GATE = false;
 
+/**
+ * True when the browser reports a constrained network: Save-Data enabled or a
+ * 2g-class effective connection. Progressive — Safari and WebKitGTK lack
+ * `navigator.connection`, so this is false there and nothing changes. While
+ * constrained, the grids hold cells at the cheap rung (skip tier upgrades)
+ * and `bufferAheadRows` stops deepening the prefetch window, both of which
+ * would spend the user's data budget on speculation.
+ */
+export function constrainedNetwork(): boolean {
+  const conn = (navigator as {
+    connection?: { saveData?: boolean; effectiveType?: string };
+  }).connection;
+  if (!conn) return false;
+  return (
+    conn.saveData === true ||
+    conn.effectiveType === "2g" ||
+    conn.effectiveType === "slow-2g"
+  );
+}
+
 export interface ScrollFrame {
   /** Current window.scrollY. */
   y: number;
@@ -86,6 +107,15 @@ export interface ScrollDynamics {
    * landing-zone thumbnail warming during flings.
    */
   projectedLandingY: () => number;
+  /**
+   * Rows to render ahead of the scroll direction: `base` plus however many
+   * rows the current velocity covers in one measured image-load round-trip
+   * (velocity × ewmaImageLoadMs), clamped to `max` so DOM growth stays
+   * bounded. A slow network or big tiers ⇒ deeper prefetch; instant
+   * localhost or idle ⇒ exactly `base` (today's static behavior). Also
+   * `base` on a constrained network, where speculation isn't worth the data.
+   */
+  bufferAheadRows: (base: number, max: number) => number;
   /** Release the gate / mark settled now (scrollend, wheel animation done). */
   markSettled: () => void;
   dispose: () => void;
@@ -122,6 +152,14 @@ export function createScrollDynamics(opts: {
     );
     const projected = window.scrollY + dir * velocity() * FLING_PROJECTION_S;
     return Math.max(0, Math.min(maxScroll, projected));
+  };
+
+  const bufferAheadRows = (base: number, max: number) => {
+    if (constrainedNetwork()) return base;
+    const rh = opts.rowHeight();
+    if (rh <= 0) return base;
+    const extra = Math.ceil((velocity() * ewmaImageLoadMs()) / 1000 / rh);
+    return Math.max(base, Math.min(max, base + extra));
   };
 
   const markSettled = () => {
@@ -168,6 +206,7 @@ export function createScrollDynamics(opts: {
     velocity,
     direction: () => dir,
     projectedLandingY,
+    bufferAheadRows,
     decodeGate,
     settled,
     markSettled,

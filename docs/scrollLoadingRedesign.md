@@ -24,7 +24,22 @@
 > plus low-priority browser-cache fetches of the cheap-rung URLs on the web
 > client, deduped per fling via a `landingWarmed` set. JustifiedGrid gained
 > the `VELOCITY_FAST` fling branch it previously lacked (its generation
-> drain used to run at any velocity). Phase 5 pending.
+> drain used to run at any velocity).
+>
+> Phase 5 implemented (2026-07-04): always-on load-latency EWMA in
+> `perfMonitor.ts` (`ewmaImageLoadMs()`, fed by now-unconditional
+> `ThumbnailCell` timestamps; the overlay sums stay gated); a
+> `bufferAheadRows(base, max)` helper on `scrollDynamics` implementing the
+> velocity×latency formula, consumed by both grids' `recalcRange`; and
+> `constrainedNetwork()` (Save-Data / 2g via `navigator.connection`), which
+> holds web-client cells at the cheap rung and pins the buffer at `base`.
+> One amendment vs. the plan below: the formula was written before Phase 2's
+> two-zone buffer, so its BASE (5/4) and MAX (12) referred to the old single
+> window — as built, the *outer* cheap-rung window adapts with BASE = 12
+> (today's `BUFFER_AHEAD`) and `BUFFER_AHEAD_MAX = 20`; eviction margins are
+> relative to the rendered range, so no `EVICT_ROWS` change was needed. The
+> Tauri gate auto-tune stretch was skipped per its own "only if the static
+> default proves wrong" condition.
 >
 > Server-side findings from device testing (2026-07-04): the request
 > pressure these phases add surfaced two backend bugs. (1) The thumbnail

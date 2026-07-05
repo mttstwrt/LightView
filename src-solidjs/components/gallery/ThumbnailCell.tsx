@@ -4,7 +4,7 @@ import { mediaUrl, gifAtlasUrl, type ThumbTier } from "../../lib/ipc";
 import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
 import { isTauri } from "../../lib/runtime";
-import { recordImageLoad, isActive as perfActive } from "../../lib/perfMonitor";
+import { recordImageLoad } from "../../lib/perfMonitor";
 import { GifCanvas } from "../GifCanvas";
 
 interface ThumbnailCellProps {
@@ -251,9 +251,10 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       }
       const seen = url ? loadedUrls.has(url) : false;
       setLoaded(seen);
-      // Only timestamp when the perf monitor is active, so this is zero-cost
-      // (no performance.now() per load) when the debug overlay is closed.
-      loadStart = url && !seen && perfActive() ? performance.now() : 0;
+      // Timestamp every fresh load (seen URLs still skipped): the sample feeds
+      // the always-on load-latency EWMA that sizes the grids' look-ahead
+      // buffer, not just the debug overlay.
+      loadStart = url && !seen ? performance.now() : 0;
     },
   ));
 

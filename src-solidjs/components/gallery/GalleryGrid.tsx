@@ -8,7 +8,7 @@ import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl,
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
-import { createScrollDynamics, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
+import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
 import { createThumbSwapper } from "../../lib/thumbSwap";
 import { pickByPriority } from "../../lib/loadPriority";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
@@ -34,6 +34,11 @@ const BUFFER_AHEAD = 12;
 const BUFFER_BEHIND = 4;
 const FULL_AHEAD = 5;
 const FULL_BEHIND = 2;
+// Ceiling for the velocity×latency-adaptive ahead buffer: BUFFER_AHEAD grows
+// by the rows a scroll covers in one measured image-load round-trip
+// (dynamics.bufferAheadRows), capped here to bound DOM growth. Eviction
+// margins are relative to the rendered range, so they track the growth.
+const BUFFER_AHEAD_MAX = 20;
 
 // How many paths to send per IPC batch call.
 const BATCH_SIZE = 128;
@@ -361,8 +366,10 @@ export function GalleryGrid(props: GalleryGridProps) {
     // upgraded to the target tier when it sits in the inner window with
     // scrolling settled — usually off-screen, so the swap isn't seen. On the
     // desktop webview the hard gate covers flings, so the fling rung only
-    // applies there behind the experiment flag.
-    const cheap = isTauri() ? gated : !settled;
+    // applies there behind the experiment flag. On a constrained network
+    // (Save-Data / 2g) cells are held at the cheap rung outright — a blurry
+    // grid beats spending the user's data budget on tier upgrades.
+    const cheap = isTauri() ? gated : !settled || constrainedNetwork();
     const canDegrade = (TIER_RANK[target] ?? 0) > 0;
     const c = cols();
     const fullStartIdx = fullStart * c;
@@ -427,8 +434,9 @@ export function GalleryGrid(props: GalleryGridProps) {
       const relativeTop = Math.max(0, sy - offset);
       const relativeBottom = relativeTop + vh;
 
-      let bufferTop = dynamics.direction() === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
-      let bufferBottom = dynamics.direction() === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+      const ahead = dynamics.bufferAheadRows(BUFFER_AHEAD, BUFFER_AHEAD_MAX);
+      let bufferTop = dynamics.direction() === 1 ? BUFFER_BEHIND : ahead;
+      let bufferBottom = dynamics.direction() === 1 ? ahead : BUFFER_BEHIND;
       let fullTop = dynamics.direction() === 1 ? FULL_BEHIND : FULL_AHEAD;
       let fullBottom = dynamics.direction() === 1 ? FULL_AHEAD : FULL_BEHIND;
 

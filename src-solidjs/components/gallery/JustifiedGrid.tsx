@@ -9,7 +9,7 @@ import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../store
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
-import { createScrollDynamics, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
+import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
 import { createThumbSwapper } from "../../lib/thumbSwap";
 import { pickByPriority } from "../../lib/loadPriority";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
@@ -42,6 +42,11 @@ const BUFFER_AHEAD = 12;
 const BUFFER_BEHIND = 4;
 const FULL_AHEAD = 4;
 const FULL_BEHIND = 2;
+// Ceiling for the velocity×latency-adaptive ahead buffer: BUFFER_AHEAD grows
+// by the rows a scroll covers in one measured image-load round-trip
+// (dynamics.bufferAheadRows), capped here to bound DOM growth. Eviction
+// margins are relative to the rendered range, so they track the growth.
+const BUFFER_AHEAD_MAX = 20;
 // Rows beyond the visible+buffer range before thumbnails are evicted.
 const EVICT_ROWS = 12;
 // Rows ahead of the viewport (in scroll direction) to warm the high (jh) tier
@@ -482,8 +487,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // (jm/jh/fit-original) once it sits in the inner window with scrolling
     // settled — usually off-screen. At base detail "j" *is* the target, so
     // there's nothing to degrade. On the desktop webview the hard gate covers
-    // flings (cheap rung behind the experiment flag).
-    const cheapScroll = isTauri() ? gated : !settled;
+    // flings (cheap rung behind the experiment flag). On a constrained
+    // network (Save-Data / 2g) cells are held at the cheap rung outright —
+    // "j" everywhere beats spending the data budget on jm/jh/fit upgrades.
+    const cheapScroll = isTauri() ? gated : !settled || constrainedNetwork();
     const degradable = detailLevel() !== "base";
     for (const cell of cells as ReturnType<typeof visibleCells>) {
       const inFull = cell.row >= fullStart && cell.row < fullEnd;
@@ -528,8 +535,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       // rowIndexAtOffset returns the row whose top is <= offset; include it.
       lastRow = Math.min(lay.rows.length, lastRow + 1);
 
-      const bufTop = dynamics.direction() === 1 ? BUFFER_BEHIND : BUFFER_AHEAD;
-      const bufBottom = dynamics.direction() === 1 ? BUFFER_AHEAD : BUFFER_BEHIND;
+      const ahead = dynamics.bufferAheadRows(BUFFER_AHEAD, BUFFER_AHEAD_MAX);
+      const bufTop = dynamics.direction() === 1 ? BUFFER_BEHIND : ahead;
+      const bufBottom = dynamics.direction() === 1 ? ahead : BUFFER_BEHIND;
       const fullTop = dynamics.direction() === 1 ? FULL_BEHIND : FULL_AHEAD;
       const fullBottom = dynamics.direction() === 1 ? FULL_AHEAD : FULL_BEHIND;
       const newStart = Math.max(0, firstRow - bufTop);

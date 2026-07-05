@@ -5,7 +5,9 @@
 // All metric collection is gated behind `active`. When the debug overlay
 // mounts it calls `startMonitoring()`, which flips the flag and begins
 // rAF/interval loops. `stopMonitoring()` tears everything down so there
-// is exactly zero overhead during normal use.
+// is exactly zero overhead during normal use — with one exception: the
+// image-load-latency EWMA is always on (a multiply-add per load), because
+// the grids' adaptive prefetch depth consumes it outside the overlay.
 
 const HISTORY_LEN = 120; // ~2 minutes at 1 sample/sec
 
@@ -116,7 +118,25 @@ export function recordCacheMiss() {
 let imageLoadSum = 0;
 let imageLoadCount = 0;
 
+// Always-on EWMA of image load latency, independent of the overlay's `_active`
+// gate: the grids size their look-ahead buffer by velocity × this latency
+// (docs/scrollLoadingRedesign.md Phase 5), which must work during normal use.
+// One multiply-add per fresh load; α=0.2 ≈ the last ~10 loads dominate, so a
+// network change re-converges within a screenful of cells.
+const IMAGE_LOAD_EWMA_ALPHA = 0.2;
+let imageLoadEwma = 0;
+
+/** Smoothed per-image load latency (ms); 0 until the first load is measured. */
+export function ewmaImageLoadMs(): number {
+  return imageLoadEwma;
+}
+
 export function recordImageLoad(durationMs: number) {
+  // Seed with the first sample so the estimate doesn't crawl up from 0.
+  imageLoadEwma =
+    imageLoadEwma === 0
+      ? durationMs
+      : imageLoadEwma + IMAGE_LOAD_EWMA_ALPHA * (durationMs - imageLoadEwma);
   if (!_active) return;
   imageLoadSum += durationMs;
   imageLoadCount++;
