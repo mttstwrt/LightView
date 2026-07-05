@@ -144,6 +144,9 @@ export function GalleryGrid(props: GalleryGridProps) {
   const failedSet = new Set<string>();
   /** Coalesced paths: accumulated during in-flight fetch, merged into next batch. */
   const coalescedPaths = new Set<string>();
+  /** Paths already sent to the backend by landing-zone warming during a
+   *  fling, so successive drains of the same fling don't re-issue them. */
+  const landingWarmed = new Set<string>();
   /** Cache-bust version per path — incremented after IPC generation. */
   const urlVersions = new Map<string, number>();
   /** Cache-bust epoch for full invalidations (rebuilds). Thumbnail responses
@@ -300,6 +303,7 @@ export function GalleryGrid(props: GalleryGridProps) {
         coalescedPaths.clear();
         inFlightSet.clear();
         failedSet.clear();
+        landingWarmed.clear();
         bgCursor = 0;
         thumbGenTotal = 0;
         thumbGenDone = 0;
@@ -732,9 +736,62 @@ export function GalleryGrid(props: GalleryGridProps) {
       }
     };
 
+    // A fling has a predictable destination — warm thumbnails around the
+    // projected landing scroll position (± one viewport) so they're cached by
+    // the time the scroll arrives. Backend warm via precacheThumbnails; on
+    // the web client additionally prime the browser's HTTP cache with the
+    // cheap-rung URLs (responses are cacheable for 1h). Reuses the
+    // single-flight inFlightFetch slot — one batch per drain, recomputed from
+    // the live projection each time, so a redirected fling self-corrects and
+    // wasted warms stay bounded.
+    const warmLandingZone = () => {
+      const rh = rowHeight();
+      const c = cols();
+      if (rh <= 0 || c <= 0) return;
+      const offset = containerRef?.offsetTop ?? 0;
+      const vh = window.innerHeight;
+      const landingTop = dynamics.projectedLandingY() - offset;
+      const firstRow = Math.max(0, Math.floor((landingTop - vh) / rh));
+      const lastRow = Math.min(totalRows(), Math.ceil((landingTop + 2 * vh) / rh));
+      const startIdx = firstRow * c;
+      const endIdx = Math.min(props.paths.length, lastRow * c);
+
+      const want: string[] = [];
+      for (let i = startIdx; i < endIdx && want.length < BG_BATCH_SIZE; i++) {
+        const p = props.paths[i];
+        if (!p || assignedRung.has(p) || inFlightSet.has(p) || failedSet.has(p) || landingWarmed.has(p)) continue;
+        landingWarmed.add(p);
+        want.push(p);
+      }
+      if (want.length === 0) return;
+
+      inFlightFetch = (async () => {
+        try {
+          await precacheThumbnails(want);
+          // Browser cache warm — low-priority so it can't compete with the
+          // visible cells' loads. `priority` is a progressive enhancement
+          // (ignored where unsupported; absent from TS 5.4's RequestInit).
+          if (!isTauri()) {
+            for (const p of want) {
+              fetch(thumbSrcFor(p, "s"), { priority: "low" } as RequestInit).catch(() => {});
+            }
+          }
+        } catch (e) {
+          console.error("Landing-zone precache failed:", e);
+        }
+        inFlightFetch = null;
+      })();
+    };
+
     const scheduleFetch = () => {
       if (inFlightFetch) return;
-      if (dynamics.velocity() > VELOCITY_FAST) return;
+      // During a fling, near-viewport generation is wasted work — those cells
+      // fly past unseen. Warm the projected landing zone instead; queued
+      // 404-generation drains on settle (with stale entries dropped).
+      if (dynamics.velocity() > VELOCITY_FAST) {
+        warmLandingZone();
+        return;
+      }
 
       // Drain coalesced paths into needsGeneration (they're already there,
       // but clear the coalesced set so new items can accumulate during next fetch).
@@ -895,6 +952,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       needsGeneration.clear();
       inFlightSet.clear();
       failedSet.clear();
+      landingWarmed.clear();
       urlVersions.clear();
       versionEpoch++;
       bgCursor = 0;
@@ -946,6 +1004,7 @@ export function GalleryGrid(props: GalleryGridProps) {
         needsGeneration.clear();
         inFlightSet.clear();
         failedSet.clear();
+        landingWarmed.clear();
         urlVersions.clear();
         bgCursor = 0;
         thumbGenTotal = 0;
@@ -993,6 +1052,7 @@ export function GalleryGrid(props: GalleryGridProps) {
         needsGeneration.clear();
         inFlightSet.clear();
         failedSet.clear();
+        landingWarmed.clear();
         urlVersions.clear();
         bgCursor = 0;
         const newTier = tier();

@@ -38,6 +38,13 @@ const FLING_VIEWPORTS_PER_SEC = 1.5;
 // Quiet gap (ms) below the fling threshold before the scroll counts as
 // settled — debounces the cheap-rung → target-tier upgrade pass.
 const SETTLE_DEBOUNCE_MS = 150;
+// How far ahead (seconds) a fling's momentum is projected when estimating
+// where it will land. iOS-style deceleration coasts roughly velocity × 0.5s
+// past the current position; projecting a bit short of that keeps the warm
+// window overlapping the real landing spot even when the user drags the
+// fling shorter. Recomputed every drain, so an interrupted or redirected
+// fling self-corrects.
+const FLING_PROJECTION_S = 0.35;
 
 // Cheap-rung experiment on WebKitGTK: when true, gated frames assign the tiny
 // "s" tier instead of nothing (128px decodes are ~16× cheaper than 512px).
@@ -72,6 +79,13 @@ export interface ScrollDynamics {
    * Drives cheap-rung assignment and the upgrade pass on all platforms.
    */
   settled: Accessor<boolean>;
+  /**
+   * Estimated scroll position (px) where the current fling will land:
+   * scrollY + signed velocity × FLING_PROJECTION_S, clamped to the document's
+   * scroll range. Equals the current scrollY when not scrolling. Drives
+   * landing-zone thumbnail warming during flings.
+   */
+  projectedLandingY: () => number;
   /** Release the gate / mark settled now (scrollend, wheel animation done). */
   markSettled: () => void;
   dispose: () => void;
@@ -100,6 +114,15 @@ export function createScrollDynamics(opts: {
 
   const velocity = () =>
     performance.now() - lastTs > VELOCITY_STALE_MS ? 0 : vel;
+
+  const projectedLandingY = () => {
+    const maxScroll = Math.max(
+      0,
+      document.documentElement.scrollHeight - window.innerHeight,
+    );
+    const projected = window.scrollY + dir * velocity() * FLING_PROJECTION_S;
+    return Math.max(0, Math.min(maxScroll, projected));
+  };
 
   const markSettled = () => {
     if (untrack(decodeGate)) setDecodeGate(false);
@@ -144,6 +167,7 @@ export function createScrollDynamics(opts: {
   return {
     velocity,
     direction: () => dir,
+    projectedLandingY,
     decodeGate,
     settled,
     markSettled,

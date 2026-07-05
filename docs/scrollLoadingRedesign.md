@@ -15,7 +15,16 @@
 > drop out-of-window leftovers) and is used by both grids' generation
 > queues; upgrade-decode cancellation landed with `lib/thumbSwap.ts` in
 > Phase 2. The common drain skeleton was left per-grid (streamed events /
-> tier branches differ too much to unify cleanly). Phases 4–5 pending.
+> tier branches differ too much to unify cleanly).
+>
+> Phase 4 implemented (2026-07-04): `projectedLandingY()` in
+> `scrollDynamics.ts`; both grids' `scheduleFetch` now warm the landing
+> window (± one viewport) during flings instead of just early-returning —
+> `precacheThumbnails` (grid) / `ensureTierThumbnails(_, "j")` (justified)
+> plus low-priority browser-cache fetches of the cheap-rung URLs on the web
+> client, deduped per fling via a `landingWarmed` set. JustifiedGrid gained
+> the `VELOCITY_FAST` fling branch it previously lacked (its generation
+> drain used to run at any velocity). Phase 5 pending.
 >
 > Server-side findings from device testing (2026-07-04): the request
 > pressure these phases add surfaced two backend bugs. (1) The thumbnail

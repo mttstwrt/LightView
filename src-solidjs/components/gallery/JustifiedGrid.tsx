@@ -49,6 +49,10 @@ const EVICT_ROWS = 12;
 const JH_PRECACHE_ROWS = 6;
 // How many paths to generate per IPC batch.
 const BATCH_SIZE = 96;
+// Scroll velocity (px/s) above which the fetch loop treats the scroll as a
+// fling: near-viewport generation is skipped (cells fly past unseen) and the
+// projected landing zone is warmed instead. Matches GalleryGrid.
+const VELOCITY_FAST = 3000;
 // Detail levels by zoom. "base" serves the 512px "j" tier. When zoomed in, the
 // view serves the *original file* for cheap native-format images (sharp, no
 // extra storage) and a 2560px "jh" thumbnail for large/non-native ones. The
@@ -307,6 +311,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Paths already requested for high-tier (jh) look-ahead precache, so we don't
   // re-issue IPC for them while zoomed in.
   const jhPrecached = new Set<string>();
+  // Paths already sent to the backend by landing-zone warming during a fling,
+  // so successive drains of the same fling don't re-issue them.
+  const landingWarmed = new Set<string>();
   let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
 
@@ -351,6 +358,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     inFlightSet.clear();
     failedSet.clear();
     jhPrecached.clear();
+    landingWarmed.clear();
     bgCursor = 0;
     thumbGenTotal = 0;
     thumbGenDone = 0;
@@ -634,10 +642,71 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       }
     };
 
+    // A fling has a predictable destination — warm the base "j" tier around
+    // the projected landing scroll position (± one viewport) so cells are
+    // cached by the time the scroll arrives ("j" is both the cheap fling rung
+    // and the base target, so it's the right thing to warm at every detail
+    // level). Backend warm via ensureTierThumbnails; on the web client
+    // additionally prime the browser's HTTP cache with the same URLs
+    // (responses are cacheable for 1h). Reuses the single-flight
+    // inFlightFetch slot — one batch per drain, recomputed from the live
+    // projection each time, so a redirected fling self-corrects and wasted
+    // warms stay bounded.
+    const warmLandingZone = () => {
+      const lay = layout();
+      if (lay.rows.length === 0) return;
+      const offset = containerRef?.offsetTop ?? 0;
+      const vh = window.innerHeight;
+      const landingTop = Math.max(0, dynamics.projectedLandingY() - offset);
+      const firstRow = rowIndexAtOffset(lay.rowTops, Math.max(0, landingTop - vh));
+      const lastRow = Math.min(
+        lay.rows.length,
+        rowIndexAtOffset(lay.rowTops, landingTop + 2 * vh) + 1,
+      );
+
+      const want: string[] = [];
+      for (let r = firstRow; r < lastRow && want.length < BATCH_SIZE; r++) {
+        const row = lay.rows[r];
+        if (!row) continue;
+        for (const cell of row.cells) {
+          const p = props.paths[cell.index];
+          if (!p || assignedRung.has(p) || inFlightSet.has(p) || failedSet.has(p) || landingWarmed.has(p)) continue;
+          landingWarmed.add(p);
+          want.push(p);
+        }
+      }
+      if (want.length === 0) return;
+
+      inFlightFetch = (async () => {
+        try {
+          await ensureTierThumbnails(want, "j");
+          // Browser cache warm — low-priority so it can't compete with the
+          // visible cells' loads. `priority` is a progressive enhancement
+          // (ignored where unsupported; absent from TS 5.4's RequestInit).
+          if (!isTauri()) {
+            for (const p of want) {
+              fetch(versionedThumbUrl(p, "j"), { priority: "low" } as RequestInit).catch(() => {});
+            }
+          }
+        } catch (e) {
+          console.error("Landing-zone warm failed:", e);
+        }
+        inFlightFetch = null;
+      })();
+    };
+
     const scheduleFetch = () => {
       if (inFlightFetch) return;
 
       evictFaraway();
+
+      // During a fling, near-viewport generation is wasted work — those cells
+      // fly past unseen. Warm the projected landing zone instead; queued
+      // 404-generation drains on settle (with stale entries dropped).
+      if (dynamics.velocity() > VELOCITY_FAST) {
+        warmLandingZone();
+        return;
+      }
 
       const gen = generation();
 
@@ -827,6 +896,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     failedSet.clear();
     urlVersions.clear();
     jhPrecached.clear();
+    landingWarmed.clear();
     setMeasuredAspects(new Map());
     bgCursor = 0;
     thumbGenTotal = 0;
