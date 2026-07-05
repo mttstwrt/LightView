@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::hardware::{HardwareProfile, MemoryStatus};
 use crate::http_server::devices::{self, DeviceRow, PairingKind, DEFAULT_INACTIVITY_SECS};
+use crate::http_server::tls::detect_lan_ip;
 use crate::http_server::uploads::{self, UploadConfig, UploadScheme};
 use crate::http_server::{self, HttpConfig, RemoteAccess};
 use crate::pipeline::thumbnailer::STANDARD_THUMB_SIZE;
@@ -114,12 +115,6 @@ pub struct PairingCode {
 /// Best-effort detection of the LAN IP used for the default route. Opens a UDP
 /// socket "connected" to a public address (no packets are sent) and reads back
 /// the local address the OS would route through.
-fn detect_lan_ip() -> Option<std::net::IpAddr> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    sock.local_addr().ok().map(|a| a.ip())
-}
-
 /// If a host firewall is active, return a short hint with the command to allow
 /// `port`. Linux-only; other platforms return None (the user manages their own).
 #[cfg(target_os = "linux")]
@@ -171,9 +166,10 @@ fn resolve_web_root() -> Option<PathBuf> {
 fn build_info(remote: &RemoteAccess) -> RemoteAccessInfo {
     let addr_port = remote.addr.port();
     let lan_ip = detect_lan_ip().map(|ip| ip.to_string());
+    // The remote server always terminates TLS (see HttpConfig::remote).
     let base_url = lan_ip
         .as_ref()
-        .map(|ip| format!("http://{ip}:{addr_port}"));
+        .map(|ip| format!("https://{ip}:{addr_port}"));
     RemoteAccessInfo {
         port: addr_port,
         lan_ip,
@@ -310,7 +306,7 @@ pub async fn generate_pairing_code(
     let base_url = {
         let guard = state.remote_server.lock().await;
         guard.as_ref().and_then(|r| {
-            detect_lan_ip().map(|ip| format!("http://{ip}:{}", r.addr.port()))
+            detect_lan_ip().map(|ip| format!("https://{ip}:{}", r.addr.port()))
         })
     };
 

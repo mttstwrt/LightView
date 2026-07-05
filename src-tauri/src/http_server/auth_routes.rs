@@ -53,9 +53,13 @@ pub async fn redeem(
 
     match result {
         Ok(redeemed) => {
+            // `Secure` when serving HTTPS so the cookie is never sent over a
+            // plaintext connection to the same host/port.
             let cookie_header = format!(
-                "{}={}; Path=/; Max-Age=31536000; SameSite=Strict; HttpOnly",
-                DEVICE_COOKIE, redeemed.cookie_value
+                "{}={}; Path=/; Max-Age=31536000; SameSite=Strict; HttpOnly{}",
+                DEVICE_COOKIE,
+                redeemed.cookie_value,
+                if state.config.tls { "; Secure" } else { "" }
             );
             let body = Json(RedeemResponse {
                 device_id: redeemed.device.id.clone(),

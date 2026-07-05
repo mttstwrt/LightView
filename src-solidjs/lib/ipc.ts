@@ -589,7 +589,7 @@ export const getMemoryStatus = () =>
 export interface RemoteAccessInfo {
   port: number;
   lan_ip: string | null;
-  /** Base URL of the running server (no path) — e.g. `http://192.168.0.5:8723`. */
+  /** Base URL of the running server (no path) — e.g. `https://192.168.0.5:8723`. */
   base_url: string | null;
   clients_seen: number;
   firewall_hint: string | null;

@@ -17,6 +17,7 @@ use super::auth_routes;
 use super::config::HttpConfig;
 use super::middleware as mw;
 use super::routes;
+use super::tls;
 use crate::AppState;
 
 #[derive(Clone)]
@@ -65,8 +66,13 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     let listener = socket.listen(1024)?;
     let addr = listener.local_addr()?;
 
-    log::info!("HTTP media server listening on http://{}", addr);
+    log::info!(
+        "HTTP media server listening on {}://{}",
+        if config.tls { "https" } else { "http" },
+        addr
+    );
 
+    let use_tls = config.tls;
     let remote_hits = Arc::new(AtomicU64::new(0));
     let state = ServerState {
         config: Arc::new(config),
@@ -153,11 +159,28 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     // Serve with peer-address info so the tracking middleware can tell remote
     // clients from loopback ones.
     let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
-    let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, make_service).await {
-            log::error!("HTTP media server exited with error: {}", e);
-        }
-    });
+    let handle = if use_tls {
+        // Browsers only grant secure-context APIs over HTTPS, so the remote
+        // server terminates TLS with a persisted self-signed cert (tls.rs).
+        let material = tls::load_or_generate().map_err(std::io::Error::other)?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem(material.cert_pem, material.key_pem)
+                .await?;
+        let std_listener = listener.into_std()?;
+        tokio::spawn(async move {
+            if let Err(e) =
+                axum_server::from_tcp_rustls(std_listener, rustls_config).serve(make_service).await
+            {
+                log::error!("HTTPS media server exited with error: {}", e);
+            }
+        })
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, make_service).await {
+                log::error!("HTTP media server exited with error: {}", e);
+            }
+        })
+    };
 
     Ok(RunningServer {
         addr,

@@ -1,8 +1,9 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { safeListen as listen, isWeb } from "../../lib/runtime";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
 import type { MovedFile } from "../../lib/ipc";
+import { isVideoPath } from "../../lib/mediaExts";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
 import { capabilities } from "../../stores/capabilitiesStore";
 import { settings } from "../../stores/settingsStore";
@@ -205,6 +206,32 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
   };
 
+  const handleCopyImage = () => {
+    if (!props.state) return;
+    const path = props.state.path;
+    props.onClose();
+    // The clipboard only accepts image/png, and Safari requires the
+    // ClipboardItem to be built synchronously in the user gesture — so hand
+    // it a promise that fetches and re-encodes.
+    const png = fetch(mediaUrl(path)).then(async (res) => {
+      if (!res.ok) throw new Error(`media fetch failed: ${res.status}`);
+      const blob = await res.blob();
+      if (blob.type === "image/png") return blob;
+      const bitmap = await createImageBitmap(blob);
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      return new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("PNG encode failed"))), "image/png"),
+      );
+    });
+    navigator.clipboard
+      .write([new ClipboardItem({ "image/png": png })])
+      .catch((err) => console.error("Failed to copy image to clipboard:", err));
+  };
+
   const handleCopyToClipboard = async () => {
     if (!props.state) return;
     const paths = isBatchContext() ? batchPaths() : [props.state.path];
@@ -330,6 +357,11 @@ export function ContextMenu(props: ContextMenuProps) {
               <MenuItem label="Regenerate Thumbnail" onClick={handleRegenerateThumbnail} />
             </Show>
             <MenuItem label="Copy Path" onClick={handleCopyPath} />
+            {/* Web client: copy the image bitmap via the browser clipboard.
+                Desktop copies actual files below instead. */}
+            <Show when={isWeb() && !isBatchContext() && !isVideoPath(props.state!.path)}>
+              <MenuItem label="Copy Image" onClick={handleCopyImage} />
+            </Show>
             <Show when={capabilities().localFs}>
               <MenuItem
                 label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to Clipboard` : "Copy to Clipboard"}

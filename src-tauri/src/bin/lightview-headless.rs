@@ -115,7 +115,10 @@ async fn serve(path: PathBuf, port: u16) -> ExitCode {
         }
     };
 
-    log::info!("LightView headless serving on http://0.0.0.0:{}", server.addr.port());
+    log::info!(
+        "LightView headless serving on https://0.0.0.0:{} (self-signed cert)",
+        server.addr.port()
+    );
     log::info!("Pair a device with:  lightview-headless pair {path_str}");
 
     // Park on the server task — it only resolves if axum::serve returns/errors.
@@ -142,7 +145,7 @@ fn pair(path: &Path) -> ExitCode {
             println!("Pairing PIN: {pin}");
             println!(
                 "Single-use, expires in {} minutes. Redeem it at \
-                 http://<host>:<port>/pair on the device.",
+                 https://<host>:<port>/pair on the device.",
                 devices::PAIRING_TTL_SECS / 60
             );
             ExitCode::SUCCESS

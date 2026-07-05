@@ -9,6 +9,12 @@ pub struct HttpConfig {
     /// Directory of the built SPA to serve at `/`. `None` disables static
     /// serving (the desktop webview loads the app from Tauri, not over HTTP).
     pub web_root: Option<PathBuf>,
+    /// Serve HTTPS with the persisted self-signed certificate (see `tls.rs`).
+    /// Required for non-loopback binds: browsers only grant secure-context
+    /// APIs (async clipboard, etc.) over HTTPS. Loopback serving stays plain
+    /// HTTP — the desktop webview won't accept a self-signed cert, and
+    /// 127.0.0.1 is already a secure context.
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +38,7 @@ impl HttpConfig {
             port: 0,
             auth: AuthMode::None,
             web_root: None,
+            tls: false,
         }
     }
 
@@ -43,6 +50,7 @@ impl HttpConfig {
             port,
             auth: AuthMode::DeviceCookie,
             web_root,
+            tls: true,
         }
     }
 }
