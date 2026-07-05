@@ -10,6 +10,7 @@ import { recordCacheMiss } from "../../lib/perfMonitor";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
 import { createThumbSwapper } from "../../lib/thumbSwap";
+import { pickByPriority } from "../../lib/loadPriority";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
 interface GalleryGridProps {
@@ -746,33 +747,35 @@ export function GalleryGrid(props: GalleryGridProps) {
 
       const gen = generation();
 
-      // Phase 1: Generate thumbnails that 404'd.
-      // Prioritize near-viewport, drop far-away items to prevent redundant work.
+      // Phase 1: Generate thumbnails that 404'd. Priorities are computed at
+      // drain time from the current windows (full-res first, then rendered
+      // buffer by distance); leftovers outside the rendered window are
+      // dropped — they were queued during a scroll that has since moved past
+      // them, and re-queue via 404 if the user scrolls back.
       if (needsGeneration.size > 0) {
-        const nearViewport: string[] = [];
-        const farAway: string[] = [];
-        const sr = startRow();
-        const er = endRow();
         const c = cols();
-        const nearStart = Math.max(0, (sr - EVICT_ROWS)) * c;
-        const nearEnd = Math.min(props.paths.length, (er + EVICT_ROWS) * c);
-
-        for (const p of needsGeneration) {
-          const idx = pathToIndex.get(p);
-          if (idx !== undefined && idx >= nearStart && idx < nearEnd) {
-            if (nearViewport.length < BATCH_SIZE) nearViewport.push(p);
-          } else {
-            // Drop out-of-range items from needsGeneration — they were
-            // queued during a scroll that has since moved past them.
-            // They'll re-queue if the user scrolls back.
-            if (farAway.length < BATCH_SIZE) farAway.push(p);
+        const { picked: toGenerate, stale } = pickByPriority(
+          needsGeneration,
+          (p) => pathToIndex.get(p),
+          {
+            viewStart: fullStartRow() * c,
+            viewEnd: fullEndRow() * c,
+            renderStart: startRow() * c,
+            renderEnd: endRow() * c,
+          },
+          BATCH_SIZE,
+        );
+        if (stale.length > 0) {
+          for (const p of stale) needsGeneration.delete(p);
+          thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - stale.length);
+          // Dropping may have emptied the queue — close out the progress UI
+          // (stale items were counted when queued, so it is showing).
+          if (needsGeneration.size === 0 && inFlightSet.size === 0) {
+            thumbGenFinished(thumbGenDone);
+            thumbGenTotal = 0;
+            thumbGenDone = 0;
           }
         }
-
-        // Near-viewport first, then fill remaining slots with off-screen paths
-        const toGenerate = nearViewport.slice(0, BATCH_SIZE);
-        const remaining = BATCH_SIZE - toGenerate.length;
-        if (remaining > 0) toGenerate.push(...farAway.slice(0, remaining));
 
         if (toGenerate.length > 0) {
           for (const p of toGenerate) {

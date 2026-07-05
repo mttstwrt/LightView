@@ -11,6 +11,7 @@ import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../.
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
 import { createThumbSwapper } from "../../lib/thumbSwap";
+import { pickByPriority } from "../../lib/loadPriority";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
 interface JustifiedGridProps {
@@ -641,10 +642,37 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       const gen = generation();
 
       if (needsGeneration.size > 0) {
-        const toGenerate: string[] = [];
-        for (const p of needsGeneration) {
-          toGenerate.push(p);
-          if (toGenerate.length >= BATCH_SIZE) break;
+        // Drain-time prioritization (mirrors GalleryGrid): full-res window
+        // first, then the rendered buffer by distance; leftovers outside the
+        // rendered window are dropped and re-queue via 404 if scrolled back.
+        // Row ranges map to item-index ranges through the layout (cell
+        // indices are contiguous across justified rows).
+        const lay = layout();
+        const idxAt = (row: number) => lay.rows[row]?.cells[0]?.index ?? props.paths.length;
+        const idxAfter = (rowExcl: number) => {
+          const last = lay.rows[rowExcl - 1];
+          return last ? last.cells[last.cells.length - 1].index + 1 : 0;
+        };
+        const { picked: toGenerate, stale } = pickByPriority(
+          needsGeneration,
+          (p) => pathToIndex.get(p),
+          {
+            viewStart: idxAt(fullStartRow()),
+            viewEnd: idxAfter(fullEndRow()),
+            renderStart: idxAt(startRow()),
+            renderEnd: idxAfter(endRow()),
+          },
+          BATCH_SIZE,
+        );
+        if (stale.length > 0) {
+          for (const p of stale) needsGeneration.delete(p);
+          thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - stale.length);
+          // Dropping may have emptied the queue — close out the progress UI.
+          if (needsGeneration.size === 0 && inFlightSet.size === 0) {
+            thumbGenFinished(thumbGenDone);
+            thumbGenTotal = 0;
+            thumbGenDone = 0;
+          }
         }
         if (toGenerate.length > 0) {
           for (const p of toGenerate) {
