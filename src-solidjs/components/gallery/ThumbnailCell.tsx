@@ -341,18 +341,34 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
             loadStart = 0;
           }
           const img = e.currentTarget;
-          // decoding="async" lets the browser postpone decode until first
-          // paint — for a cell sitting in the virtual-scroll buffer that's
-          // the moment it scrolls in, i.e. a visible pop at the viewport
-          // edge. Decode eagerly so buffered cells are paint-ready when
-          // revealed. Not on WebKitGTK: it decodes on the main thread, and
-          // deferring buffer-cell decodes is exactly what keeps it smooth.
-          if (!isTauri()) void img.decode?.().catch(() => {});
           if (img.naturalWidth > 0 && img.naturalHeight > 0) {
             props.onImageLoad?.(img.naturalWidth, img.naturalHeight);
           }
-          setLoaded(true);
-          setPrevSrc(null); // new image attached — release the underlay
+          // onLoad means fetched, not decoded — with decoding="async" the
+          // element paints nothing until the decode lands, so releasing the
+          // underlay here blanks the cell for the decode window. Invisible on
+          // desktop, but on mobile a whole row of tier upgrades decodes at
+          // once and cells blank for a beat. Reveal only after decode()
+          // (which also makes buffered cells paint-ready when they scroll
+          // in). Not on WebKitGTK: it decodes on the main thread at paint
+          // time (no blank to hide), and deferring buffer-cell decodes is
+          // exactly what keeps it smooth.
+          const reveal = () => {
+            setLoaded(true);
+            setPrevSrc(null); // new image attached — release the underlay
+          };
+          if (isTauri() || !img.decode) {
+            reveal();
+            return;
+          }
+          const src = img.src;
+          img.decode().then(
+            () => reveal(),
+            // Rejected: src changed mid-decode (a newer load will reveal) or
+            // the image is undecodable — reveal anyway rather than wedging
+            // the cell at opacity 0 / stale underlay.
+            () => { if (img.src === src) reveal(); },
+          );
         }}
         onError={() => {
           // Don't treat media URL errors as thumbnail errors

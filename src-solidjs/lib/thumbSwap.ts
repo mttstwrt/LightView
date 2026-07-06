@@ -14,6 +14,8 @@
 // Image fetching/decoding in the background with nothing to guard it.
 // ---------------------------------------------------------------------------
 
+import { isTauri } from "./runtime";
+
 export interface ThumbSwapper {
   /** Decode `url` off-DOM, then apply it to `path`'s cell on success. */
   swap: (path: string, url: string) => void;
@@ -50,9 +52,24 @@ export function createThumbSwapper(opts: {
     const img = new Image();
     inFlight.set(path, img);
     img.onload = () => {
-      inFlight.delete(path);
-      if (!opts.isCurrent(path, gen)) return;
-      opts.apply(path, url);
+      const commit = () => {
+        // A cancel() or a newer swap() may have run while decode() was
+        // pending — committing then would clobber the newer URL.
+        if (inFlight.get(path) !== img) return;
+        inFlight.delete(path);
+        if (!opts.isCurrent(path, gen)) return;
+        opts.apply(path, url);
+      };
+      // onload means fetched, not decoded — decode off-DOM so the cell's
+      // <img> finds the bitmap in the document's decoded-image cache and
+      // paints on its first frame instead of blanking for its own decode.
+      // Skipped on WebKitGTK, where decode() is a main-thread hit and paint
+      // blocks on decode anyway (no flash to prevent).
+      if (!isTauri() && img.decode) {
+        img.decode().then(commit, commit);
+      } else {
+        commit();
+      }
     };
     img.onerror = () => {
       inFlight.delete(path);
