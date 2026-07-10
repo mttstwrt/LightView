@@ -218,6 +218,51 @@ startup" for a service-like task) whose action runs
 containing `dist/`. For a true background service, wrap it with a tool like
 [NSSM](https://nssm.cc/).
 
+#### Docker / Podman
+
+The repo ships a `Dockerfile` and `docker-compose.yml` that build and run the headless
+server in a container — no Rust or Node toolchain needed on the host. The image builds
+the SPA and the `lightview-headless` binary, then runs `serve` on `0.0.0.0:8787`. The
+GPU thumbnail path is dropped (useless in a container); everything else is identical to
+a native headless server.
+
+Point the `photos` bind mount in `docker-compose.yml` at your media folder, then:
+
+```bash
+# Build the image and start the server (add --build to rebuild after code changes)
+docker compose up -d --build
+
+# Pair a device — prints a one-time PIN
+docker compose exec lightview /opt/lightview/lightview-headless pair /gallery
+# then open https://<host>:8787/pair on the device and enter the PIN
+
+# Follow logs / stop
+docker compose logs -f
+docker compose down
+```
+
+Podman works as a drop-in replacement — swap `docker compose` for `podman compose`
+(Podman 4+; it reads the same `docker-compose.yml`). One gotcha when testing from the
+host machine itself under rootless Podman: published ports bind IPv4, so reach the
+server at `https://127.0.0.1:8787`, not `https://localhost:8787` (which may resolve to
+IPv6 `::1` and fail to connect). Phones/other devices connecting over the LAN IP are
+unaffected.
+
+The base image is Arch Linux — `libheif-rs` requires libheif ≥ 1.21, newer than
+Debian/Ubuntu stable ship, and Arch tracks the current release.
+
+Two things are persisted:
+
+- **Your gallery** (the bind mount, `./photos` → `/gallery`) — mounted read-write
+  because uploads land here and the gallery's `.lightview/cache.db` (thumbnails, tags,
+  and device pairings) lives inside it.
+- **The `data/` volume** (`lightview-data` → `/opt/lightview/data`) — the persisted
+  self-signed TLS cert and any server-side plugins. Keeping it means devices stay paired
+  across image rebuilds, since the cert (and thus the origin's identity) is stable.
+
+To change the port, edit **both** the `ports:` mapping and the `--port` in the service's
+`command:` so the bound port and the advertised origin stay in sync.
+
 > **Reminder:** the headless server binds `0.0.0.0`, so anything that can reach the port
 > can attempt to pair. Keep it on a trusted LAN, set a gallery password, and/or front it
 > with a reverse proxy + TLS if you expose it more widely.

@@ -1,0 +1,37 @@
+# LightView headless gallery server.
+#
+#   1. Point the gallery bind mount below at your photo/video folder.
+#   2. docker compose up -d --build
+#   3. Pair a device (mints a one-time PIN):
+#        docker compose exec lightview \
+#          /opt/lightview/lightview-headless pair /gallery
+#      then open https://<host>:8787/pair on the device and enter the PIN.
+#
+# The server is HTTPS with a self-signed cert, so the browser will warn once —
+# that's expected (a secure context is required for clipboard/upload APIs).
+
+services:
+  lightview:
+    build: .
+    image: lightview-headless
+    container_name: lightview
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      # Your media folder. Read-write: uploads land here and the gallery's
+      # .lightview/cache.db (thumbnails, tags, device pairings) lives inside it.
+      - ./photos:/gallery
+      # Persists the self-signed TLS cert + any server-side plugins across
+      # rebuilds (data/ is resolved next to the binary at /opt/lightview).
+      - lightview-data:/opt/lightview/data
+    environment:
+      - RUST_LOG=info
+    # To change the port, update BOTH the mapping above and this command's port.
+    command: ["serve", "/gallery", "--port", "8787"]
+    # The SSE change-stream holds connections open; without this, `down` waits
+    # the full 10s SIGTERM timeout before killing the container.
+    stop_grace_period: 3s
+
+volumes:
+  lightview-data:

@@ -1,0 +1,7 @@
+# Rebuilt inside the image — never copy host artifacts in.
+.git
+node_modules
+dist
+src-tauri/target
+target
+**/*.log
