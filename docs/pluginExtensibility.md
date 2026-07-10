@@ -20,6 +20,13 @@ How it works:
   protocol over stdin/stdout:
   - Request line: `{"action": "tag", "path": "/abs/path/img.jpg"}`
   - Result line: `{"path": "...", "tags": [...], "meta": {...}}` or `{"path": "...", "error": "..."}`
+  - **Plugins MUST emit results incrementally** — consume requests as they arrive
+    and emit each result as soon as it's ready, never buffer stdin to EOF before
+    tagging. Remote hosts (`lightview-worker`) keep only a bounded number of
+    downloaded files on disk and download more only as results come back, so an
+    EOF-buffering plugin deadlocks any job larger than that bound. For pool/batch
+    sizing decisions that used to need the full request list, the host advertises
+    the expected request count in the `LIGHTVIEW_JOB_TOTAL` env var.
 - `apply_plugin_output` writes the returned tags into the companion file under
   `tags.plugins[tag_prefix]`, and any `meta` object under `meta.plugins[tag_prefix]`.
 

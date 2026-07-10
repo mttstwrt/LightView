@@ -1,10 +1,11 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { safeListen as listen, isWeb } from "../../lib/runtime";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
+import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, enqueueTaggingJob, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
 import type { MovedFile } from "../../lib/ipc";
 import { isVideoPath } from "../../lib/mediaExts";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
+import { workerPlugins, taggingActions, refreshTaggingStatus, trackQueuedJob } from "../../stores/taggingStore";
 import { capabilities } from "../../stores/capabilitiesStore";
 import { settings } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
@@ -56,12 +57,20 @@ export function ContextMenu(props: ContextMenuProps) {
       setTagInput("");
       if (capabilities().plugins) {
         listPlugins().then(setPlugins).catch(() => setPlugins([]));
+      } else if (isWeb()) {
+        // No host plugins on web — but a connected lightview-worker may offer
+        // some. Refresh so the submenu (and its gate) reflect live workers.
+        refreshTaggingStatus();
       }
       window.addEventListener("keydown", handleKeyDown);
       // Delay to avoid closing from the same right-click event
       setTimeout(() => window.addEventListener("click", handleClickOutside), 0);
     }
   });
+
+  /** Plugins runnable from this menu: the host's own (desktop) or those
+   * offered by connected tagging workers (web). */
+  const menuPlugins = () => (capabilities().plugins ? plugins() : workerPlugins());
 
   onCleanup(() => {
     window.removeEventListener("keydown", handleKeyDown);
@@ -121,12 +130,28 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
   };
 
-  const handleRunPlugin = async (pluginName: string) => {
+  const handleRunPlugin = async (pluginName: string, workerId?: string) => {
     if (!props.state || pluginBusy()) return;
-    const plugin = plugins().find((p) => p.name === pluginName);
+    const plugin = menuPlugins().find((p) => p.name === pluginName);
     const displayName = plugin?.display_name ?? pluginName;
     const isBatch = isBatchContext();
     const paths = isBatch ? batchPaths() : [props.state.path];
+
+    // Web: the host can't run plugins — enqueue a job for a connected worker.
+    // Progress arrives via the tagging SSE events → taggingStore → toast.
+    if (!capabilities().plugins) {
+      props.onClose();
+      try {
+        const job = await enqueueTaggingJob(pluginName, { paths }, workerId);
+        trackQueuedJob(job);
+      } catch (err) {
+        console.error("Failed to enqueue tagging job:", err);
+        pluginStarted(pluginName, displayName, paths.length);
+        pluginFailed(String(err));
+      }
+      return;
+    }
+
     setPluginBusy(true);
     props.onClose();
     try {
@@ -388,7 +413,7 @@ export function ContextMenu(props: ContextMenuProps) {
                 danger
               />
             </Show>
-            <Show when={capabilities().plugins}>
+            <Show when={capabilities().plugins || menuPlugins().length > 0}>
               <Divider />
               <MenuItem
                 label={isBatchContext() ? `Run Plugin on ${props.selectedPaths!.size}...` : "Run Plugin..."}
@@ -441,18 +466,37 @@ export function ContextMenu(props: ContextMenuProps) {
 
           {/* Plugins sub-menu */}
           <Show when={subMenu() === "plugins"}>
-            <div class="px-3 py-2 text-neutral-500">Run Plugin</div>
-            <Show when={plugins().length > 0} fallback={
+            <div class="px-3 py-2 text-neutral-500">
+              {capabilities().plugins ? "Run Plugin" : "Tag via Worker"}
+            </div>
+            <Show when={menuPlugins().length > 0} fallback={
               <div class="px-3 py-1.5 text-neutral-600 text-xs">No plugins installed</div>
             }>
-              <For each={plugins()}>
-                {(plugin) => (
-                  <MenuItem
-                    label={pluginBusy() ? `${plugin.display_name} (running...)` : plugin.display_name}
-                    onClick={() => handleRunPlugin(plugin.name)}
-                  />
-                )}
-              </For>
+              <Show
+                when={!capabilities().plugins}
+                fallback={
+                  <For each={menuPlugins()}>
+                    {(plugin) => (
+                      <MenuItem
+                        label={pluginBusy() ? `${plugin.display_name} (running...)` : plugin.display_name}
+                        onClick={() => handleRunPlugin(plugin.name)}
+                      />
+                    )}
+                  </For>
+                }
+              >
+                {/* Web: one entry per (plugin, worker) — a plugin offered by
+                    several workers (e.g. server + remote) gets pinned entries
+                    so the user picks where it runs. */}
+                <For each={taggingActions()}>
+                  {(action) => (
+                    <MenuItem
+                      label={action.where ? `${action.plugin.display_name} ${action.where}` : action.plugin.display_name}
+                      onClick={() => handleRunPlugin(action.plugin.name, action.workerId)}
+                    />
+                  )}
+                </For>
+              </Show>
             </Show>
             <Divider />
             <MenuItem label="Back" onClick={() => setSubMenu(null)} />

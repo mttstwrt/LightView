@@ -6,8 +6,9 @@ Streaming protocol (newline-delimited JSON):
   Stdin:  {"action": "tag", "path": "/abs/path/img.jpg"}\n  ...
   Stdout: {"path": "...", "tags": [...], "meta": {...}}\n   ...
 
-The plugin reads stdin to EOF and writes one result per request. The host
-handles all companion-file I/O, batching, and index updates.
+The plugin emits one result per request as each line arrives (never buffer
+until EOF — remote hosts gate further input on results). The host handles
+all companion-file I/O, batching, and index updates.
 """
 
 import json

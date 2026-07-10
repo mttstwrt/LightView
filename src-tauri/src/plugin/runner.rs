@@ -10,6 +10,14 @@
 //!   Result line:   {"path": "/abs/path/img.jpg", "tags": [...], "meta": {...}}
 //!                  {"path": "...", "error": "..."}
 //!
+//! Plugins MUST emit results incrementally as they process requests — never
+//! buffer stdin to EOF before producing output. Remote hosts
+//! (`lightview-worker`) bound how many input files exist on disk and only
+//! download more as results arrive, so a plugin that waits for EOF deadlocks.
+//! The host sets `LIGHTVIEW_JOB_TOTAL` (expected request count) in the
+//! plugin's environment so pool/instance sizing doesn't need to see the whole
+//! request list up front.
+//!
 //! Cancellation: the host kills the child process. Plugins should be tolerant
 //! of mid-batch SIGTERM.
 
@@ -53,15 +61,31 @@ pub enum RunError {
     Io(#[from] std::io::Error),
 }
 
+/// Resolve a plugin by its manifest `name`. The directory usually matches the
+/// name (fast path), but it doesn't have to — e.g. `example-auto-tagger/`
+/// declares `name: "example-image-tagger"` — so fall back to scanning every
+/// subdirectory's manifest, the same match `scan_plugins` announces by.
 pub fn find_plugin(plugin_dir: &Path, name: &str) -> Result<(PluginManifest, PathBuf), RunError> {
     let dir = plugin_dir.join(name);
     let manifest_path = dir.join("manifest.json");
-    if !manifest_path.exists() {
-        return Err(RunError::NotFound(name.to_string()));
+    if manifest_path.exists() {
+        let manifest =
+            PluginManifest::load(&manifest_path).map_err(|e| RunError::Exec(e.to_string()))?;
+        if manifest.name == name {
+            return Ok((manifest, dir));
+        }
     }
-    let manifest =
-        PluginManifest::load(&manifest_path).map_err(|e| RunError::Exec(e.to_string()))?;
-    Ok((manifest, dir))
+    if let Ok(entries) = std::fs::read_dir(plugin_dir) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if let Ok(manifest) = PluginManifest::load(&dir.join("manifest.json")) {
+                if manifest.name == name {
+                    return Ok((manifest, dir));
+                }
+            }
+        }
+    }
+    Err(RunError::NotFound(name.to_string()))
 }
 
 /// A running plugin subprocess streaming results back to the host.
@@ -98,6 +122,32 @@ pub async fn run_plugin_stream(
     plugin_dir: &Path,
     requests: Vec<PluginRequest>,
 ) -> Result<RunningPlugin, RunError> {
+    // Capacity matches the request count, so try_send never fails and the
+    // whole list is buffered up front — same behavior as before the channel
+    // variant existed.
+    let total = requests.len();
+    let (tx, rx) = mpsc::channel(total.max(1));
+    for req in requests {
+        let _ = tx.try_send(req);
+    }
+    drop(tx); // closes the stream → stdin EOF after the last request
+    run_plugin_stream_channel(manifest, plugin_dir, rx, Some(total)).await
+}
+
+/// Like [`run_plugin_stream`], but requests arrive over a channel so the
+/// caller can feed them incrementally. Closing the sender ends the stream
+/// (stdin EOF). Used by `lightview-worker`, which downloads images while the
+/// plugin is already tagging earlier ones — one subprocess (one model load)
+/// for an arbitrarily long job, with only a bounded number of files on disk.
+///
+/// `total_hint` is exported to the plugin as `LIGHTVIEW_JOB_TOTAL` so it can
+/// size instance pools without reading its whole request stream first.
+pub async fn run_plugin_stream_channel(
+    manifest: &PluginManifest,
+    plugin_dir: &Path,
+    mut requests: mpsc::Receiver<PluginRequest>,
+    total_hint: Option<usize>,
+) -> Result<RunningPlugin, RunError> {
     let (command, args) = match &manifest.execution {
         ExecutionConfig::Cli { command, args } => (command, args),
         ExecutionConfig::Wasm { .. } => return Err(RunError::WasmNotSupported),
@@ -117,6 +167,9 @@ pub async fn run_plugin_stream(
         .stderr(Stdio::piped())
         .current_dir(plugin_dir)
         .kill_on_drop(true);
+    if let Some(total) = total_hint {
+        cmd.env("LIGHTVIEW_JOB_TOTAL", total.to_string());
+    }
 
     let mut child = cmd
         .spawn()
@@ -138,7 +191,7 @@ pub async fn run_plugin_stream(
     // Writer task: serialize each request as NDJSON, write, then drop stdin to send EOF.
     tokio::spawn(async move {
         let mut stdin = stdin;
-        for req in requests {
+        while let Some(req) = requests.recv().await {
             let mut line = match serde_json::to_string(&req) {
                 Ok(s) => s,
                 Err(e) => {

@@ -478,6 +478,11 @@ pub async fn healthz() -> impl IntoResponse {
 /// `lv_device` cookie automatically (same-origin), so only paired devices can
 /// subscribe. A lagging subscriber gets an empty payload, which the client
 /// treats as "refetch everything".
+///
+/// Also relays the remote-tagging broadcast (`tagging-job` / `tagging-workers`
+/// events) so web clients can watch worker tagging progress live. That channel
+/// is merged in rather than widening `fs_change_tx`, whose subscriber count
+/// doubles as the idle-backfill "web clients connected" signal.
 pub async fn events(
     State(state): State<ServerState>,
 ) -> axum::response::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
@@ -486,7 +491,7 @@ pub async fn events(
     use tokio::sync::broadcast::error::RecvError;
 
     let rx = state.app.fs_change_tx.subscribe();
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    let fs_stream = futures::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
                 Ok(change) => {
@@ -510,6 +515,35 @@ pub async fn events(
         }
     });
 
+    let tag_rx = state.app.tagging_event_tx.subscribe();
+    let tagging_stream = futures::stream::unfold(tag_rx, |mut rx| async move {
+        loop {
+            use crate::tagging::TaggingSseEvent;
+            match rx.recv().await {
+                Ok(ev) => {
+                    let event = match &ev {
+                        TaggingSseEvent::Job(job) => {
+                            Event::default().event("tagging-job").json_data(job)
+                        }
+                        TaggingSseEvent::Workers(workers) => {
+                            Event::default().event("tagging-workers").json_data(workers)
+                        }
+                    };
+                    match event {
+                        Ok(e) => return Some((Ok(e), rx)),
+                        Err(_) => continue,
+                    }
+                }
+                // Every tagging event is a full snapshot and the client
+                // re-syncs via get_tagging_status, so dropped messages are
+                // safe to skip.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    let stream = futures::stream::select(fs_stream, tagging_stream);
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

@@ -312,6 +312,113 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(plugins::apply_plugin_tags_impl(app, a.entries).await)
         }
 
+        // --- Remote tagging job queue (worker + web client) -----------------
+        // Coordination only — the server never runs a plugin for a remote
+        // device. Web clients enqueue/cancel/observe; a paired lightview-worker
+        // announces, claims, and reports progress, pushing the actual tag
+        // writes through apply_plugin_tags above. Same metadata-write tier.
+        // See docs/workerTagging.md.
+        "worker_announce" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                worker_id: String,
+                worker_name: String,
+                plugins: Vec<plugins::PluginInfo>,
+            }
+            let a: A = parse(args)?;
+            // The in-process executor's id is reserved — a remote device must
+            // not be able to impersonate "the server" in the registry.
+            if a.worker_id == crate::tagging::local::LOCAL_WORKER_ID {
+                return Err(DispatchError::Command(format!(
+                    "worker id '{}' is reserved",
+                    a.worker_id
+                )));
+            }
+            ok(crate::tagging::announce_worker(app, a.worker_id, a.worker_name, a.plugins, false)
+                .await)
+        }
+
+        "claim_tagging_job" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                worker_id: String,
+                plugin_names: Vec<String>,
+            }
+            let a: A = parse(args)?;
+            ok(crate::tagging::claim_job(app, a.worker_id, a.plugin_names).await)
+        }
+
+        "update_tagging_job" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                job_id: String,
+                worker_id: String,
+                completed: usize,
+                failed: usize,
+            }
+            let a: A = parse(args)?;
+            ok(crate::tagging::update_job(app, a.job_id, a.worker_id, a.completed, a.failed).await)
+        }
+
+        "complete_tagging_job" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                job_id: String,
+                worker_id: String,
+                succeeded: usize,
+                failed: usize,
+            }
+            let a: A = parse(args)?;
+            ok(crate::tagging::complete_job(app, a.job_id, a.worker_id, a.succeeded, a.failed)
+                .await)
+        }
+
+        "fail_tagging_job" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                job_id: String,
+                worker_id: String,
+                error: String,
+            }
+            let a: A = parse(args)?;
+            ok(crate::tagging::fail_job(app, a.job_id, a.worker_id, a.error).await)
+        }
+
+        "enqueue_tagging_job" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                plugin_name: String,
+                paths: Option<Vec<String>>,
+                filter: Option<String>,
+                // Pin the job to one worker (e.g. the server's in-process
+                // executor) when several offer the same plugin.
+                worker_id: Option<String>,
+            }
+            let a: A = parse(args)?;
+            ok(
+                crate::tagging::enqueue_job(app, a.plugin_name, a.paths, a.filter, a.worker_id)
+                    .await,
+            )
+        }
+
+        "cancel_tagging_job" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                job_id: String,
+            }
+            let a: A = parse(args)?;
+            ok(crate::tagging::cancel_job(app, a.job_id).await)
+        }
+
+        "get_tagging_status" => ok(crate::tagging::get_status(app).await),
+
         // --- Duplicate detection --------------------------------------------
         // find = read + server-side hash compute; mark = metadata write, same
         // trust tier as tag edits. Resolving a group deletes via trash_files,

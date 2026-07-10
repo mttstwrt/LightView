@@ -98,6 +98,10 @@ async fn serve(path: PathBuf, port: u16) -> ExitCode {
     // to. The desktop app starts this from its `open_gallery` command instead.
     lightview_lib::commands::gallery::start_fs_watcher(None, &state, &path_str);
 
+    // Serve tagging jobs with the server's own plugins (if any are installed
+    // under data/plugins) alongside any remote lightview-worker.
+    lightview_lib::tagging::local::ensure_started(&state);
+
     let web_root = resolve_web_root();
     if web_root.is_none() {
         log::warn!(

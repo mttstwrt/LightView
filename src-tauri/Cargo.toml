@@ -59,6 +59,9 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }
 argon2 = "0.5"
 rand = "0.8"
+# HTTP client for the lightview-worker binary only (feature `worker`); rustls
+# 0.23 above keeps the TLS stack version-aligned for cert pinning.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-clipboard = "0.9"
@@ -73,6 +76,17 @@ opt-level = 2
 default = ["custom-protocol", "gpu"]
 custom-protocol = ["tauri/custom-protocol"]
 gpu = ["dep:wgpu", "dep:pollster"]
+# Remote tagging worker (docs/workerTagging.md). Feature-gated so the desktop
+# and headless builds never pull in an HTTP client.
+worker = ["dep:reqwest"]
+
+# The tagging worker: runs plugins on a capable machine against a remote
+# headless server. Explicit [[bin]] because required-features can't be set on
+# auto-discovered binaries; lightview-headless stays auto-discovered.
+[[bin]]
+name = "lightview-worker"
+path = "src/bin/lightview-worker/main.rs"
+required-features = ["worker"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

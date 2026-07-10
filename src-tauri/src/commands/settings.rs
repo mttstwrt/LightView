@@ -211,6 +211,10 @@ pub async fn enable_remote_access(
 
     log::info!("Remote access enabled on port {}", server.addr.port());
 
+    // Web clients can now enqueue tagging jobs — offer this host's own
+    // plugins as the "run on the server" option.
+    crate::tagging::local::ensure_started(state.inner());
+
     let remote = RemoteAccess {
         addr: server.addr,
         handle: server.handle,

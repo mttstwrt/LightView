@@ -326,6 +326,14 @@ installed, listed, run on a single file, or run as a cancellable batch.
 > per-gallery enablement, and a sandboxed view surface) lives in
 > [`docs/pluginExtensibility.md`](docs/pluginExtensibility.md).
 
+**Remote tagging (headless servers):** a server too weak for ML taggers never runs
+plugins itself. Instead, run `lightview-worker` on a capable machine: it pairs with the
+server like any device, and the web UI's *Run Plugin* / *Tag All Untagged* actions
+enqueue jobs that the worker claims — pulling image bytes over HTTPS, running the
+plugin locally, and pushing tags back. Progress streams live to every connected web
+client. The server never executes code on a remote device's behalf. See
+[`docs/workerTagging.md`](docs/workerTagging.md).
+
 ### Remote web access
 
 You can expose the open gallery to other devices on your LAN. The same axum server

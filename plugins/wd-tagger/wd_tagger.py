@@ -13,8 +13,12 @@ Streaming protocol (newline-delimited JSON):
       {"path": "...", "tags": [...], "meta": {...}}
       {"path": "...", "tags": [], "error": "..."}
 
-The plugin reads stdin to EOF, batches images for parallel GPU inference,
-and runs videos one at a time (each video has its own per-frame loop).
+The plugin streams: requests are consumed as they arrive and results are
+emitted as soon as each batch finishes. Hosts like lightview-worker bound
+their download pipeline on results, so buffering stdin to EOF would deadlock.
+Images are batched for parallel GPU inference; videos run one at a time
+(each has its own per-frame loop). The host advertises the expected request
+count in LIGHTVIEW_JOB_TOTAL for instance-pool sizing.
 """
 
 import ctypes
@@ -472,17 +476,56 @@ def decide_instance_count(num_images):
     return n
 
 
-def run_image_workers(taggers, paths, batch_size):
-    """Distribute image paths across instances via a shared queue."""
-    if not paths:
-        return
+# Sentinel marking end-of-input on the work queue.
+_EOF = object()
 
-    work_q = queue.Queue()
-    for p in paths:
-        work_q.put(p)
+
+def spawn_stdin_reader():
+    """Feed validated request paths into a bounded queue from a reader thread.
+
+    Streaming (instead of reading stdin to EOF first) matters for remote
+    hosts: lightview-worker keeps only a bounded number of downloaded files
+    on disk and downloads more only as results are emitted, so a plugin that
+    waits for EOF before tagging deadlocks the job.
+    """
+    work_q = queue.Queue(maxsize=256)
+
+    def reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as e:
+                emit({"path": "", "tags": [], "error": f"Invalid JSON: {e}"})
+                continue
+            path = request.get("path", "")
+            action = request.get("action", "tag")
+            if action != "tag":
+                emit({"path": path, "tags": [], "error": f"Unknown action: {action}"})
+                continue
+            if not path or not os.path.isfile(path):
+                emit({"path": path, "tags": [], "error": f"File not found: {path}"})
+                continue
+            work_q.put(path)
+        work_q.put(_EOF)
+
+    threading.Thread(target=reader, daemon=True).start()
+    return work_q
+
+
+def run_workers(taggers, work_q, batch_size):
+    """Consume the path queue with one worker thread per tagger instance.
+
+    Batches fill opportunistically: when the queue runs dry the partial batch
+    is flushed immediately, because a remote host may be waiting on results
+    before it downloads (and queues) more images.
+    """
 
     def worker(tagger):
         buf = []
+
         def flush():
             if not buf:
                 return
@@ -492,12 +535,20 @@ def run_image_workers(taggers, paths, batch_size):
 
         while True:
             try:
-                path = work_q.get_nowait()
+                item = work_q.get(timeout=0.25)
             except queue.Empty:
-                break
-            buf.append(path)
-            if len(buf) >= batch_size:
                 flush()
+                continue
+            if item is _EOF:
+                work_q.put(_EOF)  # release sibling workers
+                break
+            if is_video(item):
+                flush()  # a video interrupts batching; keep the GPU batch clean
+                emit(tagger.predict_video(item))
+            else:
+                buf.append(item)
+                if len(buf) >= batch_size:
+                    flush()
         flush()
 
     threads = [threading.Thread(target=worker, args=(t,), daemon=True) for t in taggers]
@@ -508,6 +559,10 @@ def run_image_workers(taggers, paths, batch_size):
 
 
 def main():
+    # Start consuming stdin immediately — requests buffer in the queue
+    # while the model downloads/loads below.
+    work_q = spawn_stdin_reader()
+
     # Block on model download before any sizing decision. The VRAM heuristic
     # reads model.onnx's actual file size, so it must exist on disk first.
     # download_model() is idempotent — a no-op once files are cached.
@@ -518,32 +573,15 @@ def main():
         sys.stderr.flush()
     download_model()
 
-    # Read all requests up front so we can size the worker pool to the workload.
-    # Per-line cost is ~80B; even 100k images is ~8MB of memory.
-    requests = []
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            requests.append(json.loads(line))
-        except json.JSONDecodeError as e:
-            emit({"path": "", "tags": [], "error": f"Invalid JSON: {e}"})
+    # Size the pool without reading the whole stream: the host advertises the
+    # request count via LIGHTVIEW_JOB_TOTAL; with an older host, fall back to
+    # whatever has buffered so far.
+    try:
+        expected = int(os.environ.get("LIGHTVIEW_JOB_TOTAL", ""))
+    except ValueError:
+        expected = work_q.qsize()
 
-    image_paths = []
-    video_paths = []
-    for r in requests:
-        path = r.get("path", "")
-        action = r.get("action", "tag")
-        if action != "tag":
-            emit({"path": path, "tags": [], "error": f"Unknown action: {action}"})
-            continue
-        if not path or not os.path.isfile(path):
-            emit({"path": path, "tags": [], "error": f"File not found: {path}"})
-            continue
-        (video_paths if is_video(path) else image_paths).append(path)
-
-    n_instances = decide_instance_count(len(image_paths))
+    n_instances = decide_instance_count(expected)
 
     # Load instances sequentially to avoid thundering-herd VRAM allocation.
     taggers = []
@@ -562,11 +600,9 @@ def main():
 
     batch_size = max(1, int(os.environ.get("WDTAGGER_BATCH_SIZE", "8")))
 
-    # Images run on the worker pool; videos run sequentially on instance 0
-    # afterwards (each video is its own per-frame loop and doesn't batch).
-    run_image_workers(taggers, image_paths, batch_size)
-    for vp in video_paths:
-        emit(taggers[0].predict_video(vp))
+    # Images batch on the worker pool; a video flushes the batch and runs
+    # inline on whichever worker picked it up.
+    run_workers(taggers, work_q, batch_size)
 
 
 if __name__ == "__main__":

@@ -415,8 +415,8 @@ export const installPlugin = (path: string) =>
 /** One plugin-namespace tag write, as pushed by a remote tagging worker (a
  * paired machine runs the tagger locally and reports results over HTTP).
  * Same write path as a local plugin run, so `NOT has::plugin.<prefix>`
- * filters see the file as tagged afterwards. Not used by this UI yet —
- * documents the contract for the future `lightview-worker`. */
+ * filters see the file as tagged afterwards. Used by `lightview-worker`,
+ * not this UI — kept here to document the contract. */
 export interface PluginTagWrite {
   path: string;
   tagPrefix: string;
@@ -427,6 +427,64 @@ export interface PluginTagWrite {
 
 export const applyPluginTags = (entries: PluginTagWrite[]) =>
   invoke<FileOpResult>("apply_plugin_tags", { entries });
+
+// ---------------------------------------------------------------------------
+// Remote tagging jobs (web-triggered, executed by a paired lightview-worker;
+// see docs/workerTagging.md and stores/taggingStore.ts)
+// ---------------------------------------------------------------------------
+
+export type TaggingJobState = "queued" | "running" | "done" | "failed" | "cancelled";
+
+export interface TaggingJob {
+  id: string;
+  pluginName: string;
+  tagPrefix: string;
+  displayName: string;
+  target: { paths: string[] } | { filter: string };
+  /** When set, only this worker may claim the job (explicit "run on the
+   * server" / "run on worker X" choice). */
+  pinnedWorker: string | null;
+  state: TaggingJobState;
+  /** Fixed when the job is claimed; 0 for still-queued filter jobs. */
+  total: number;
+  completed: number;
+  failed: number;
+  claimedBy: string | null;
+  workerName: string | null;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface WorkerStatus {
+  workerId: string;
+  workerName: string;
+  plugins: PluginInfo[];
+  lastSeen: number;
+  /** True for the in-process executor on the server host itself. */
+  local: boolean;
+  busyJobId: string | null;
+}
+
+export interface TaggingStatus {
+  workers: WorkerStatus[];
+  jobs: TaggingJob[];
+}
+
+export const getTaggingStatus = () => invoke<TaggingStatus>("get_tagging_status");
+
+/** Enqueue a tagging job for a connected worker: either an explicit path list
+ * (selection) or a filter query resolved at claim time ("tag all untagged").
+ * `workerId` pins the job to one worker — used to choose between the server's
+ * own executor and a remote worker when both offer the plugin. */
+export const enqueueTaggingJob = (
+  pluginName: string,
+  target: { paths: string[] } | { filter: string },
+  workerId?: string,
+) => invoke<TaggingJob>("enqueue_tagging_job", { pluginName, ...target, workerId });
+
+export const cancelTaggingJob = (jobId: string) =>
+  invoke<void>("cancel_tagging_job", { jobId });
 
 // ---------------------------------------------------------------------------
 // File Operations (Copy / Move / Trash)

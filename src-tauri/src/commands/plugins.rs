@@ -13,14 +13,10 @@ use crate::plugin::manifest::PluginManifest;
 use crate::plugin::runner;
 use crate::AppState;
 
-#[derive(Debug, Serialize)]
-pub struct PluginInfo {
-    pub name: String,
-    pub display_name: String,
-    pub version: String,
-    pub description: String,
-    pub tag_prefix: String,
-}
+// Canonical definition lives in `plugin` so the worker binary can reuse it;
+// re-exported here because the command layer is where callers historically
+// found it.
+pub use crate::plugin::PluginInfo;
 
 #[derive(Debug, Serialize)]
 pub struct PluginRunResult {
@@ -31,35 +27,12 @@ pub struct PluginRunResult {
 }
 
 fn plugin_dir() -> std::path::PathBuf {
-    crate::util::paths::data_dir().join("plugins")
+    crate::plugin::default_dir()
 }
 
 #[tauri::command]
 pub async fn list_plugins(_state: tauri::State<'_, AppState>) -> Result<Vec<PluginInfo>, String> {
-    let dir = plugin_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut plugins = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let manifest_path = entry.path().join("manifest.json");
-            if manifest_path.exists() {
-                if let Ok(manifest) = PluginManifest::load(&manifest_path) {
-                    plugins.push(PluginInfo {
-                        name: manifest.name,
-                        display_name: manifest.display_name,
-                        version: manifest.version,
-                        description: manifest.description,
-                        tag_prefix: manifest.tag_prefix,
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(plugins)
+    Ok(crate::plugin::scan_plugins(&plugin_dir()))
 }
 
 fn get_or_create_companion(media_path: &Path) -> Result<CompanionFile, String> {

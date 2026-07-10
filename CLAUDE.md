@@ -72,6 +72,39 @@ Clipboard API and friends. The self-signed ECDSA cert persists at
 (`src-tauri/src/http_server/tls.rs`). The desktop's loopback media server
 stays plain HTTP (the webview won't accept a self-signed cert).
 
+### Remote tagging worker (test the job queue end-to-end, no ML needed)
+
+`lightview-worker` (feature-gated bin; see `docs/workerTagging.md`) runs tagger
+plugins on a capable machine against a headless server. The dependency-free
+`plugins/example-auto-tagger` exercises the whole loop:
+
+```bash
+cd src-tauri && cargo build --bin lightview-worker --features worker
+
+# Worker-local plugin install (data dir is exe-relative: target/debug/data/)
+mkdir -p target/debug/data/plugins && cp -r ../plugins/example-auto-tagger target/debug/data/plugins/
+
+# Pair the worker (TOFU-pins the server cert; PIN from lightview-headless pair).
+# NOTE: pairings live in the gallery's cache.db — a new test gallery needs a re-pair.
+./target/debug/lightview-worker pair --server https://localhost:8799 --pin "$PIN" --name test --yes
+./target/debug/lightview-worker run &
+
+# Enqueue from a paired "browser" device; watch `tagging-job` /
+# `tagging-workers` SSE events on /api/events, then confirm nothing is left:
+curl -sk --cookie "$COOKIE" -X POST https://localhost:8799/api/invoke -H 'Content-Type: application/json' \
+  -d '{"command":"enqueue_tagging_job","args":{"pluginName":"example-image-tagger","filter":"type:image AND NOT has::plugin.example"}}'
+curl -sk --cookie "$COOKIE" -X POST https://localhost:8799/api/invoke -H 'Content-Type: application/json' \
+  -d '{"command":"apply_filter","args":{"query":"NOT has::plugin.example"}}'   # → []
+```
+
+Notes: the *server itself* also runs jobs when plugins are installed in **its**
+`data_dir()/plugins` (same `target/debug/data/plugins/` when server and worker
+share an exe dir) — it registers as worker `local-server` / "Server (<host>)"
+with `local: true`, so no `lightview-worker` is needed for a server-local run.
+Pass `"workerId": "<id>"` to `enqueue_tagging_job` to pin a job to a specific
+worker when several offer the same plugin. Plugins must stream results (never
+buffer stdin to EOF) — see `docs/workerTagging.md`.
+
 ## Architecture
 
 ### Two-process Tauri model
@@ -98,6 +131,7 @@ stays plain HTTP (the webview won't accept a self-signed cert).
 | `sort/` | Sorting + grouping: `sorter`, `grouper`, `timeline` |
 | `autocomplete/` | In-memory tag autocomplete engine |
 | `plugin/` | External plugin system: `manifest` (JSON) + `runner`. Spawns a plugin subprocess and exchanges NDJSON over stdin/stdout. Currently implements a single verb — image → tags — so in practice it's an auto-tagger runner, not a general extension host. See `docs/pluginExtensibility.md`. |
+| `tagging/` | Remote-tagging job queue + worker registry (in-memory). Web clients enqueue jobs over `/api/invoke` (optionally pinned to one worker); a paired `lightview-worker` (bin, feature `worker`) claims them, runs the plugin on its own machine, and pushes tags back via `apply_plugin_tags`. `tagging/local.rs` is the in-process executor: the server registers itself as worker `local-server` and runs its own installed plugins directly (opt-in by installing plugins server-side). Job/worker changes stream to web clients as `tagging-job`/`tagging-workers` SSE events. See `docs/workerTagging.md`. |
 | `hardware/` | Hardware detection (storage type, CPU, RAM, GPU) — drives adaptive performance tuning |
 | `util/` | Helpers: `paths` (data dir), `hash`, `fs_watch` |
 
@@ -105,7 +139,7 @@ stays plain HTTP (the webview won't accept a self-signed cert).
 
 | Path | Purpose |
 |---|---|
-| `stores/` | SolidJS signals for global state: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `thumbnailProgressStore` |
+| `stores/` | SolidJS signals for global state: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore` (remote-tagging workers/jobs, web), `thumbnailProgressStore` |
 | `lib/ipc.ts` | All Tauri `invoke()` calls — the single IPC boundary |
 | `lib/types.ts` | Shared TypeScript types |
 | `components/gallery/` | Grid views: `GalleryGrid`, `ThumbnailCell`, `SelectionBar` |

@@ -19,8 +19,9 @@ import { WindowResizeGrips } from "./components/WindowResizeGrips";
 import { ContextMenu, type ContextMenuState } from "./components/shared/ContextMenu";
 import { SelectionBar } from "./components/gallery/SelectionBar";
 import { pluginActivity, type PluginActivity } from "./stores/pluginStore";
+import { applyJobEvent, applyWorkersEvent, refreshTaggingStatus, activeTaggingJobId } from "./stores/taggingStore";
 import { loadCapabilities } from "./stores/capabilitiesStore";
-import { cancelPluginBatch } from "./lib/ipc";
+import { cancelPluginBatch, cancelTaggingJob } from "./lib/ipc";
 import { thumbGenActivity } from "./stores/thumbnailProgressStore";
 import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
 import { DebugOverlay } from "./components/debug/DebugOverlay";
@@ -331,6 +332,25 @@ export function App() {
         console.error("Failed to handle fs-changed SSE event:", e);
       }
     });
+    // Remote-tagging: live job progress + worker registry changes, driving
+    // the taggingStore (and through it the PluginToast). Snapshots are
+    // self-contained, so a missed event just means a slightly stale view
+    // until the next one or a menu-open refresh.
+    source.addEventListener("tagging-job", (event) => {
+      try {
+        applyJobEvent(JSON.parse((event as MessageEvent).data));
+      } catch (e) {
+        console.error("Failed to handle tagging-job SSE event:", e);
+      }
+    });
+    source.addEventListener("tagging-workers", (event) => {
+      try {
+        applyWorkersEvent(JSON.parse((event as MessageEvent).data));
+      } catch (e) {
+        console.error("Failed to handle tagging-workers SSE event:", e);
+      }
+    });
+    refreshTaggingStatus();
     onCleanup(() => source.close());
   }
 
@@ -668,7 +688,16 @@ function PluginToast() {
         </div>
         <Show when={activity().status === "running"}>
           <button
-            onClick={() => cancelPluginBatch()}
+            onClick={() => {
+              // The toast serves both local plugin batches (desktop) and
+              // remote worker jobs (web) — cancel whichever is driving it.
+              const jobId = activeTaggingJobId();
+              if (jobId) {
+                cancelTaggingJob(jobId).catch((e) => console.error("Cancel failed:", e));
+              } else {
+                cancelPluginBatch();
+              }
+            }}
             class="shrink-0 px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-700 text-neutral-400 hover:bg-neutral-600 hover:text-neutral-200"
             title="Cancel"
           >

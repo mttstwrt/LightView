@@ -38,6 +38,8 @@ import {
 } from "../../lib/ipc";
 import QRCode from "qrcode";
 import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
+import { taggingWorkers, taggingJobs, taggingActions, refreshTaggingStatus, trackQueuedJob } from "../../stores/taggingStore";
+import { enqueueTaggingJob, cancelTaggingJob, type TaggingJob } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished, thumbGenFailed } from "../../stores/thumbnailProgressStore";
 import { capabilities } from "../../stores/capabilitiesStore";
 import { safeListen as listen } from "../../lib/runtime";
@@ -72,6 +74,12 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
   // full-screen mobile settings page. Cleared on unmount.
   createEffect(() => setSettingsOpen(open()));
   onCleanup(() => setSettingsOpen(false));
+
+  // Web: re-sync worker/job state whenever the menu opens, so the Remote
+  // Tagging section is current even if an SSE event was missed.
+  createEffect(() => {
+    if (open() && isWeb()) refreshTaggingStatus();
+  });
 
   const toggle = () => setOpen((v) => !v);
 
@@ -489,6 +497,40 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
       console.error("Install failed:", e);
       setPluginStatus("Install failed");
       setTimeout(() => setPluginStatus(""), 3000);
+    }
+  };
+
+  /** Web: enqueue a "tag everything this plugin hasn't seen" job for a
+   * connected worker (pinned to `workerId` when the user picked one). The
+   * filter resolves at claim time, so it's idempotent — re-running after new
+   * uploads only tags the new files. */
+  const handleTagAllUntagged = async (pluginName: string, tagPrefix: string, workerId?: string) => {
+    try {
+      const job = await enqueueTaggingJob(
+        pluginName,
+        { filter: `type:image AND NOT has::plugin.${tagPrefix}` },
+        workerId,
+      );
+      trackQueuedJob(job);
+    } catch (e) {
+      console.error("Failed to enqueue tagging job:", e);
+      // The desktop plugin-status line isn't rendered on web; surface the
+      // error through the toast instead.
+      pluginStarted(pluginName, pluginName, 0);
+      pluginFailed(String(e));
+    }
+  };
+
+  /** Newest-first slice of the server's job list for the status readout. */
+  const recentTaggingJobs = () => taggingJobs().slice(-5).reverse();
+
+  const jobStateColor = (job: TaggingJob) => {
+    switch (job.state) {
+      case "running": return "text-teal-400";
+      case "queued": return "text-neutral-400";
+      case "done": return "text-green-400";
+      case "failed": return "text-red-400";
+      case "cancelled": return "text-yellow-400";
     }
   };
 
@@ -1285,6 +1327,85 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                   Add Folder...
                 </button>
               </div>
+            </Section>
+            </Show>
+
+            {/* ── Remote Tagging (web only): jobs executed by a paired
+                   lightview-worker on a capable machine ── */}
+            <Show when={isWeb()}>
+            <Section label="Remote Tagging" order={3}>
+              <Show
+                when={taggingWorkers().length > 0}
+                fallback={
+                  <span class="text-xs text-neutral-600">
+                    No tagging worker connected — run <code class="text-neutral-500">lightview-worker</code> on
+                    a machine with your plugins installed, or install plugins on the server itself.
+                  </span>
+                }
+              >
+                <div class="flex flex-col gap-1">
+                  <For each={taggingWorkers()}>
+                    {(worker) => (
+                      <span class="text-[11px] text-neutral-500">
+                        ● {worker.workerName}
+                        <Show when={worker.local}>
+                          <span class="ml-1 px-1 py-px rounded bg-neutral-800 text-[9px] text-neutral-400 align-middle">server</span>
+                        </Show>
+                        {worker.busyJobId ? " (tagging...)" : " (idle)"}
+                      </span>
+                    )}
+                  </For>
+                </div>
+                <div class="flex flex-col gap-2">
+                  {/* One row per (plugin, place-to-run-it): plugins offered by
+                      several workers get a pinned row each ("on <worker>"). */}
+                  <For each={taggingActions()}>
+                    {(action) => (
+                      <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-neutral-800/50">
+                        <div class="flex flex-col min-w-0">
+                          <span class="text-xs text-neutral-300 truncate">
+                            {action.plugin.display_name}
+                            <Show when={action.where}>
+                              <span class="text-neutral-500"> {action.where}</span>
+                            </Show>
+                          </span>
+                          <span class="text-[10px] text-neutral-500 truncate">{action.plugin.description}</span>
+                        </div>
+                        <button
+                          onClick={() => handleTagAllUntagged(action.plugin.name, action.plugin.tag_prefix, action.workerId)}
+                          class="shrink-0 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors bg-neutral-700 text-neutral-300 hover:bg-neutral-600 hover:text-neutral-100"
+                        >
+                          Tag All Untagged
+                        </button>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+              <Show when={recentTaggingJobs().length > 0}>
+                <div class="flex flex-col gap-1">
+                  <For each={recentTaggingJobs()}>
+                    {(job) => (
+                      <div class="flex items-center gap-2 px-2 py-1 rounded bg-neutral-800/30">
+                        <span class={`text-[10px] ${jobStateColor(job)}`}>{job.state}</span>
+                        <span class="text-[11px] text-neutral-400 truncate flex-1">
+                          {job.displayName}
+                          {job.total > 0 ? ` — ${job.completed + job.failed}/${job.total}` : ""}
+                          {job.failed > 0 ? ` (${job.failed} failed)` : ""}
+                        </span>
+                        <Show when={job.state === "queued" || job.state === "running"}>
+                          <button
+                            onClick={() => cancelTaggingJob(job.id).catch(() => {})}
+                            class="shrink-0 px-1.5 py-0.5 text-[10px] rounded cursor-pointer bg-neutral-700 text-neutral-400 hover:bg-neutral-600 hover:text-neutral-200"
+                          >
+                            Cancel
+                          </button>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
             </Section>
             </Show>
 

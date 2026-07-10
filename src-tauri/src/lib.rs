@@ -10,6 +10,7 @@ pub mod hardware;
 pub mod commands;
 pub mod util;
 pub mod http_server;
+pub mod tagging;
 pub mod thumb_serve;
 pub mod gif_serve;
 pub mod file_clipboard;
@@ -241,6 +242,21 @@ pub struct AppState {
     /// loopback media server above so enabling remote access never adds auth
     /// to the desktop webview's own requests.
     pub remote_server: Arc<Mutex<Option<http_server::RemoteAccess>>>,
+
+    /// Remote-tagging job queue + worker registry: web clients enqueue jobs,
+    /// a paired `lightview-worker` claims them and pushes tags back. In-memory
+    /// on purpose — see `tagging` module docs.
+    pub tagging: Arc<Mutex<tagging::TaggingState>>,
+
+    /// Broadcasts tagging job/worker changes to web clients; the HTTP server's
+    /// `/api/events` SSE route merges this with `fs_change_tx`. Kept separate
+    /// because `fs_change_tx`'s subscriber count doubles as the "web clients
+    /// connected" signal for the idle backfill worker.
+    pub tagging_event_tx: tokio::sync::broadcast::Sender<tagging::TaggingSseEvent>,
+
+    /// One-shot guard for the in-process tagging executor (`tagging::local`),
+    /// which is started lazily by headless `serve` / `enable_remote_access`.
+    pub local_tagger_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -319,6 +335,9 @@ impl AppState {
             gpu_pipeline,
             media_server_url: Arc::new(std::sync::OnceLock::new()),
             remote_server: Arc::new(Mutex::new(None)),
+            tagging: Arc::new(Mutex::new(tagging::TaggingState::default())),
+            tagging_event_tx: tokio::sync::broadcast::channel(64).0,
+            local_tagger_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
