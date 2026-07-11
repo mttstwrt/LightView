@@ -1,7 +1,8 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
-import { safeListen as listen, isWeb } from "../../lib/runtime";
-import { addUserTag, removeUserTag, setRating as setRatingIpc, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, enqueueTaggingJob, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
+import { safeListen as listen, isWeb, hasTouch } from "../../lib/runtime";
+import { rateItem } from "../../stores/galleryStore";
+import { addUserTag, removeUserTag, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, enqueueTaggingJob, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
 import type { MovedFile } from "../../lib/ipc";
 import { isVideoPath } from "../../lib/mediaExts";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
@@ -35,6 +36,7 @@ export function ContextMenu(props: ContextMenuProps) {
   const [tagInput, setTagInput] = createSignal("");
   const [plugins, setPlugins] = createSignal<PluginInfo[]>([]);
   const [pluginBusy, setPluginBusy] = createSignal(false);
+  let menuRef: HTMLDivElement | undefined;
 
   // Close on click outside or Escape
   const handleKeyDown = (e: KeyboardEvent) => {
@@ -47,7 +49,14 @@ export function ContextMenu(props: ContextMenuProps) {
     }
   };
 
-  const handleClickOutside = () => {
+  // Capture-phase, and consumes the click: a click outside should only
+  // dismiss the menu, never also activate what's underneath (e.g. open the
+  // grid cell it landed on). Clicks inside the menu pass through to items.
+  const handleClickOutside = (e: MouseEvent) => {
+    if (!props.state) return;
+    if (menuRef && e.target instanceof Node && menuRef.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
     props.onClose();
   };
 
@@ -64,7 +73,12 @@ export function ContextMenu(props: ContextMenuProps) {
       }
       window.addEventListener("keydown", handleKeyDown);
       // Delay to avoid closing from the same right-click event
-      setTimeout(() => window.addEventListener("click", handleClickOutside), 0);
+      setTimeout(() => window.addEventListener("click", handleClickOutside, true), 0);
+    } else {
+      // Detach on close — a lingering capture listener would swallow every
+      // click in the app.
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("click", handleClickOutside, true);
     }
   });
 
@@ -74,7 +88,7 @@ export function ContextMenu(props: ContextMenuProps) {
 
   onCleanup(() => {
     window.removeEventListener("keydown", handleKeyDown);
-    window.removeEventListener("click", handleClickOutside);
+    window.removeEventListener("click", handleClickOutside, true);
   });
 
   /** True when the right-clicked item is part of a multi-selection. */
@@ -110,7 +124,8 @@ export function ContextMenu(props: ContextMenuProps) {
       if (isBatchContext()) {
         await setRatingBatch(batchPaths(), value);
       } else {
-        await setRatingIpc(props.state.path, value);
+        // rateItem keeps sortedItems + the info panel in sync, not just the DB.
+        await rateItem(props.state.path, value);
       }
       props.onClose();
     } catch (err) {
@@ -339,6 +354,7 @@ export function ContextMenu(props: ContextMenuProps) {
   return (
     <Show when={props.state}>
       <div
+        ref={menuRef}
         style={menuStyle()}
         class="min-w-[180px] rounded shadow-lg text-xs"
         classList={{ hidden: !props.state }}
@@ -525,7 +541,11 @@ export function ContextMenu(props: ContextMenuProps) {
 function MenuItem(props: { label: string; onClick: () => void; danger?: boolean }) {
   return (
     <button
-      class={`w-full text-left px-3 py-1.5 cursor-pointer transition-colors ${
+      // Touch: taller rows + larger text so items are comfortable finger
+      // targets (the desktop density stays tight for mouse pointers).
+      class={`w-full text-left px-3 cursor-pointer transition-colors ${
+        hasTouch() ? "py-2.5 text-sm" : "py-1.5"
+      } ${
         props.danger
           ? "text-red-400 hover:bg-red-900/30"
           : "text-neutral-300 hover:bg-neutral-700/50"

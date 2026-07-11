@@ -3,6 +3,8 @@ import { settings } from "../../stores/settingsStore";
 import { mediaUrl, gifAtlasUrl, type ThumbTier } from "../../lib/ipc";
 import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
+import { LONG_PRESS_MS, TAP_SLOP_PX, suppressNextClick } from "../../lib/touch";
+import { hapticTick } from "../../lib/haptics";
 import { isTauri } from "../../lib/runtime";
 import { recordImageLoad } from "../../lib/perfMonitor";
 import { GifCanvas } from "../GifCanvas";
@@ -263,6 +265,69 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
 
   const fadeEnabled = () => settings().display.scroll_blur;
 
+  // --- Touch long-press → context menu ------------------------------------
+  // iOS Safari never fires `contextmenu` for touch, so the menu needs a
+  // custom timer. While it counts down the cell "pops" out slightly; on fire
+  // it ticks the haptics and opens the same menu a right-click would.
+  // Android Chrome DOES fire a native `contextmenu` on long-press — the
+  // `touchActive` flag suppresses it so the timer is the single opener on
+  // every touch platform. Scrolling cancels via `pointercancel` (the browser
+  // takes the pointer), and movement past the tap slop cancels explicitly.
+  let pressTimer: number | null = null;
+  let pressX = 0;
+  let pressY = 0;
+  let touchActive = false;
+  let longPressFired = false;
+  const [popped, setPopped] = createSignal(false);
+
+  const cancelPressTimer = () => {
+    if (pressTimer !== null) {
+      clearTimeout(pressTimer);
+      pressTimer = null;
+    }
+  };
+  const releasePress = () => {
+    cancelPressTimer();
+    touchActive = false;
+    setPopped(false);
+  };
+
+  const onCellPointerDown = (e: PointerEvent) => {
+    // Any new pointer (including a mouse right-click) starts a fresh
+    // interaction — clear the stale long-press flag.
+    longPressFired = false;
+    if (e.pointerType !== "touch" || !props.onContextMenu) return;
+    touchActive = true;
+    pressX = e.clientX;
+    pressY = e.clientY;
+    cancelPressTimer();
+    pressTimer = window.setTimeout(() => {
+      pressTimer = null;
+      longPressFired = true;
+      hapticTick();
+      setPopped(true);
+      // App only reads clientX/clientY off the event — the original
+      // pointerdown (a MouseEvent subclass) carries the press point.
+      props.onContextMenu?.(e);
+    }, LONG_PRESS_MS);
+  };
+
+  const onCellPointerMove = (e: PointerEvent) => {
+    if (pressTimer === null) return;
+    if (Math.hypot(e.clientX - pressX, e.clientY - pressY) > TAP_SLOP_PX) {
+      cancelPressTimer();
+    }
+  };
+
+  const onCellPointerUp = () => {
+    // Swallow the compatibility click the lift synthesizes, so it can't
+    // open the viewer or instantly dismiss the just-opened menu.
+    if (longPressFired) suppressNextClick();
+    releasePress();
+  };
+
+  onCleanup(cancelPressTimer);
+
   return (
     <div
       ref={cellRef}
@@ -285,6 +350,12 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         "contain-intrinsic-size": isTauri() ? "auto 250px" : undefined,
         outline: props.selected ? "2px solid #3b82f6" : "none",
         "outline-offset": "-2px",
+        // Long-press pop: lifts the pressed cell slightly above its
+        // neighbours while the finger holds (the cell is position:relative,
+        // so z-index applies).
+        transform: popped() ? "scale(1.07)" : undefined,
+        transition: "transform 0.15s ease-out",
+        "z-index": popped() ? 5 : undefined,
       }}
       onClick={(e) => props.onClick(e)}
       onMouseDown={(e) => props.onMouseDown?.(e)}
@@ -294,9 +365,18 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       // leave a cell stuck "hovered" mid-pinch — so drive it from pointer
       // events gated on a real mouse instead.
       onPointerEnter={(e) => { if (e.pointerType === "mouse") setHovered(true); }}
-      onPointerLeave={() => setHovered(false)}
-      onPointerCancel={() => setHovered(false)}
+      onPointerDown={onCellPointerDown}
+      onPointerMove={onCellPointerMove}
+      onPointerUp={onCellPointerUp}
+      onPointerLeave={() => { setHovered(false); releasePress(); }}
+      onPointerCancel={() => { setHovered(false); releasePress(); }}
       onContextMenu={(e) => {
+        // Touch-generated native contextmenu (Android long-press) — the
+        // custom timer owns that path; suppress so the menu doesn't open twice.
+        if (touchActive || longPressFired) {
+          e.preventDefault();
+          return;
+        }
         if (props.onContextMenu) {
           e.preventDefault();
           props.onContextMenu(e);

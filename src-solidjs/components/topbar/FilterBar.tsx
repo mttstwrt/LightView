@@ -7,12 +7,12 @@ import {
   acSelectedIndex, setAcSelectedIndex,
   filterQuery, setFilterQuery,
   ratingFilter, setRatingFilter,
-  buildFilterQuery,
+  refreshFilteredItems,
   clearAllFilters,
 } from "../../stores/filterStore";
 import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
 import { sortField, sortOrder, subSortField, subSortOrder, groupBy } from "../../stores/settingsStore";
-import { autocompleteTags, applyFilter, clearFilter, getSortedItems } from "../../lib/ipc";
+import { autocompleteTags, clearFilter, getSortedItems } from "../../lib/ipc";
 
 interface FilterBarProps {
   onInputRef?: (el: HTMLInputElement) => void;
@@ -156,23 +156,7 @@ export function FilterBar(props: FilterBarProps) {
     }
   };
 
-  const applyCurrentFilter = async () => {
-    const query = buildFilterQuery();
-    try {
-      if (query) {
-        const filteredPaths = await applyFilter(query);
-        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filteredPaths, subSortField(), subSortOrder());
-        setSortedItems(sorted.items);
-        setDisplayPaths(sorted.items.map((item) => item.path));
-      } else {
-        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
-        setSortedItems(sorted.items);
-        setDisplayPaths(sorted.items.map((item) => item.path));
-      }
-    } catch (e) {
-      console.error("Filter error:", e);
-    }
-  };
+  const applyCurrentFilter = refreshFilteredItems;
 
   const handleClear = async () => {
     clearAllFilters();

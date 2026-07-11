@@ -4,9 +4,9 @@ import {
   getTags,
   addUserTag,
   removeUserTag,
-  setRating as setRatingIpc,
   getAllThumbnailTiers,
 } from "../../lib/ipc";
+import { rateItem } from "../../stores/galleryStore";
 import type { ThumbnailTierInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
 import { hasTouch } from "../../lib/runtime";
@@ -44,7 +44,14 @@ interface MetaInfo {
   duration_seconds: number | null;
 }
 
-export function InfoPanel(props: { path: string; filename: string }) {
+export function InfoPanel(props: {
+  path: string;
+  filename: string;
+  /** Called when a tag chip is tapped — filters the gallery to that tag.
+   *  Tags containing spaces can't be expressed in the query language, so
+   *  their chips stay inert. */
+  onTagFilter?: (namespace: string, tag: string) => void;
+}) {
   const [meta, setMeta] = createSignal<MetaInfo | null>(null);
   const [tags, setTags] = createSignal<{ namespace: string; tag: string }[]>([]);
   const [newTag, setNewTag] = createSignal("");
@@ -133,13 +140,17 @@ export function InfoPanel(props: { path: string; filename: string }) {
     if (!props.path) return;
     const newRating = value === rating() ? 0 : value;
     try {
-      await setRatingIpc(props.path, newRating);
-      setRating(newRating);
-      setLastRated(newRating > 0 ? Math.floor(Date.now() / 1000) : null);
+      // rateItem dispatches lightview:rating-changed; the listener below
+      // updates this panel's rating/lastRated signals.
+      await rateItem(props.path, newRating);
     } catch (err) {
       console.error("Failed to set rating:", err);
     }
   };
+
+  // The filter tokenizer splits on whitespace — a tag with spaces would parse
+  // as garbage, so only offer tap-to-filter for tags the language can express.
+  const tagFilterable = (tag: string) => !!props.onTagFilter && !/\s/.test(tag);
 
   const tagsByNamespace = () => {
     const groups = new Map<string, { namespace: string; tag: string }[]>();
@@ -361,16 +372,38 @@ export function InfoPanel(props: { path: string; filename: string }) {
                             <Show
                               when={namespace === "user"}
                               fallback={
-                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-400 bg-neutral-800/50">
-                                  {t.tag}
-                                </span>
+                                <Show
+                                  when={tagFilterable(t.tag)}
+                                  fallback={
+                                    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-400 bg-neutral-800/50">
+                                      {t.tag}
+                                    </span>
+                                  }
+                                >
+                                  <button
+                                    class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-400 bg-neutral-800/50 cursor-pointer hover:text-neutral-200 hover:bg-neutral-700/60 transition-colors"
+                                    onClick={() => props.onTagFilter!(namespace, t.tag)}
+                                    title={`Filter: ${namespace}::${t.tag}`}
+                                  >
+                                    {t.tag}
+                                  </button>
+                                </Show>
                               }
                             >
                               <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-neutral-300 bg-neutral-800">
-                                {t.tag}
+                                <Show when={tagFilterable(t.tag)} fallback={t.tag}>
+                                  <button
+                                    class="cursor-pointer hover:text-white transition-colors"
+                                    onClick={() => props.onTagFilter!(namespace, t.tag)}
+                                    title={`Filter: ${namespace}::${t.tag}`}
+                                  >
+                                    {t.tag}
+                                  </button>
+                                </Show>
                                 <button
                                   class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
                                   onClick={() => handleRemoveTag(t.tag)}
+                                  aria-label={`Remove tag ${t.tag}`}
                                 >
                                   &times;
                                 </button>

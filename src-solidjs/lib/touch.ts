@@ -43,3 +43,37 @@ export const SWIPE_DISMISS_PX = 110;
 
 /** Scale the photo eases toward at full dismiss travel (Apple-Photos shrink). */
 export const DISMISS_MIN_SCALE = 0.85;
+
+/** Hold duration (ms) before a stationary touch counts as a long-press.
+ *  Matches the typical native threshold so it feels like the platform's own
+ *  context-menu gesture. */
+export const LONG_PRESS_MS = 500;
+
+// --- Long-press helpers ---------------------------------------------------
+
+/**
+ * Swallow the compatibility `click` the browser synthesizes when the finger
+ * lifts after a long-press. iOS Safari fires it even after a multi-second
+ * hold, and it would land on whatever opened under the finger (a context
+ * menu's first item, the viewer backdrop, the grid cell). Call this from the
+ * `pointerup` that ends a fired long-press — the click follows within the
+ * same event sequence, so a short window is enough; if the platform never
+ * fires one (Android suppresses it), the listener times out harmlessly.
+ */
+export function suppressNextClick(windowMs = 150): void {
+  let timer: number | null = null;
+  const swallow = (e: MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    cleanup();
+  };
+  const cleanup = () => {
+    window.removeEventListener("click", swallow, true);
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  window.addEventListener("click", swallow, true);
+  timer = window.setTimeout(cleanup, windowMs);
+}

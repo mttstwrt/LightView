@@ -9,6 +9,9 @@ html, body, #root {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   user-select: none;
   -webkit-user-select: none;
+  /* iOS Safari: no system callout/preview on long-press — the app has its own
+     long-press → context menu gesture (grid cells and the viewer). Inherits. */
+  -webkit-touch-callout: none;
   scroll-behavior: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;

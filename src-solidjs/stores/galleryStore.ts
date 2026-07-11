@@ -6,6 +6,7 @@ import type {
   TimelineEntry,
 } from "../lib/types";
 import { loadPref, savePref } from "../lib/clientPrefs";
+import { setRating as setRatingIpc } from "../lib/ipc";
 
 // ---------------------------------------------------------------------------
 // Gallery state
@@ -120,6 +121,27 @@ export {
   viewMode, setViewMode,
   settingsOpen, setSettingsOpen,
 };
+
+// ---------------------------------------------------------------------------
+// Rating
+// ---------------------------------------------------------------------------
+
+/** Persist a rating and keep every consumer in sync: the backend (IPC), the
+ *  in-memory sorted items, and any listener on the
+ *  `lightview:rating-changed` event (info panel). All rating writes —
+ *  keyboard 0–5, info panel, context menu — go through here. */
+export async function rateItem(path: string, rating: number) {
+  await setRatingIpc(path, rating);
+  const lastRated = rating > 0 ? Math.floor(Date.now() / 1000) : null;
+  setSortedItems((items) =>
+    items.map((it) =>
+      it.path === path ? { ...it, rating: rating > 0 ? rating : null, last_rated: lastRated } : it,
+    ),
+  );
+  window.dispatchEvent(
+    new CustomEvent("lightview:rating-changed", { detail: { path, rating } }),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Selection helpers

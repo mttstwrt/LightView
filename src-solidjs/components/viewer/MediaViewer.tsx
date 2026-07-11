@@ -9,6 +9,7 @@ import {
   type Rect,
 } from "../../lib/viewerTransition";
 import { aspectByPath } from "../../stores/galleryStore";
+import { applyQueryAndRefresh } from "../../stores/filterStore";
 import { TitleBar } from "../topbar/TitleBar";
 import {
   pointerDistance,
@@ -20,8 +21,11 @@ import {
   SWIPE_VELOCITY,
   SWIPE_DISMISS_PX,
   DISMISS_MIN_SCALE,
+  LONG_PRESS_MS,
+  suppressNextClick,
   type Point,
 } from "../../lib/touch";
+import { hapticTick } from "../../lib/haptics";
 import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, thumbUrl, ensureTierThumbnails, gifAtlasUrl } from "../../lib/ipc";
@@ -114,6 +118,15 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   const isVideo = () => isVideoPath(currentPath());
+
+  // Tapping a tag chip in the info panel filters the gallery to that tag and
+  // drops back to the grid. Close instantly (no fly-back) — the cell likely
+  // won't exist under the new filter; the refresh completes in the background.
+  const handleTagFilter = (namespace: string, tag: string) => {
+    applyQueryAndRefresh(`${namespace}::${tag}`).catch(() => {});
+    setInfoPanelOpen(false);
+    props.onClose();
+  };
 
   // Desktop webview renders GIFs on a <canvas> from a backend frame atlas —
   // WebKitGTK's <img> GIF animation is broken (too fast + leaks). A real
@@ -463,6 +476,17 @@ export function MediaViewer(props: MediaViewerProps) {
   // Suppresses the compatibility click a tap synthesizes (so a backdrop tap
   // toggles chrome instead of also closing the viewer).
   let suppressBackdropClick = false;
+  // Long-press → context menu (iOS never fires `contextmenu` for touch, so a
+  // timer stands in). Cancelled by movement past the tap slop, a second
+  // finger, or lift; on fire the gesture is consumed (no tap follows).
+  let longPressTimer: number | null = null;
+  let longPressFired = false;
+  const cancelLongPress = () => {
+    if (longPressTimer !== null) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  };
 
   const ptList = (): Point[] => [...pointers.values()];
 
@@ -582,6 +606,7 @@ export function MediaViewer(props: MediaViewerProps) {
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (pointers.size === 2) {
+      cancelLongPress(); // a second finger means pinch, not press-and-hold
       // Videos don't zoom, so ignore two-finger pinches on them (otherwise the
       // pinch would apply a stuck zoom transform to the empty image container).
       if (isVideo()) { gestureMode = "none"; e.preventDefault(); return; }
@@ -608,6 +633,20 @@ export function MediaViewer(props: MediaViewerProps) {
       panStartTY = panY();
       gestureMode = zoom() > 1 ? "pan" : "pending";
       cancelSnap();
+
+      // Arm the long-press. On fire: haptic tick, open the context menu at
+      // the press point, and consume the gesture so no tap follows the lift.
+      longPressFired = false;
+      cancelLongPress();
+      if (props.onContextMenu) {
+        longPressTimer = window.setTimeout(() => {
+          longPressTimer = null;
+          longPressFired = true;
+          gestureMode = "none";
+          hapticTick();
+          props.onContextMenu!(e, currentPath(), props.currentIndex);
+        }, LONG_PRESS_MS);
+      }
     }
   };
 
@@ -637,6 +676,9 @@ export function MediaViewer(props: MediaViewerProps) {
     lastT = e.timeStamp;
     const dx = e.clientX - startX;
     const dy = e.clientY - startY;
+
+    // Wandering past the tap slop is a drag, not a press-and-hold.
+    if (longPressTimer !== null && Math.hypot(dx, dy) > TAP_SLOP_PX) cancelLongPress();
 
     if (gestureMode === "pan") {
       e.preventDefault();
@@ -765,6 +807,13 @@ export function MediaViewer(props: MediaViewerProps) {
   const onPointerUp = (e: PointerEvent) => {
     if (e.pointerType !== "touch" || !pointers.has(e.pointerId)) return;
     pointers.delete(e.pointerId);
+    cancelLongPress();
+    if (longPressFired) {
+      // The hold already opened the context menu; swallow the compatibility
+      // click the lift synthesizes (it would land on the menu or backdrop).
+      longPressFired = false;
+      suppressNextClick();
+    }
 
     if (gestureMode === "pinch") {
       if (zoom() <= 1) snapZoomReset();
@@ -785,6 +834,8 @@ export function MediaViewer(props: MediaViewerProps) {
   const onPointerCancel = (e: PointerEvent) => {
     if (e.pointerType !== "touch" || !pointers.has(e.pointerId)) return;
     pointers.delete(e.pointerId);
+    cancelLongPress();
+    longPressFired = false;
     if (gestureMode === "horizontal" || gestureMode === "vertical" || gestureMode === "info") {
       snapDragReset();
       if (gestureMode === "horizontal") endSwipeSoon();
@@ -796,6 +847,7 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   onCleanup(() => {
+    cancelLongPress();
     if (singleTapTimer !== null) clearTimeout(singleTapTimer);
     if (snapTimer !== null) clearTimeout(snapTimer);
     if (navTimer !== null) clearTimeout(navTimer);
@@ -823,6 +875,8 @@ export function MediaViewer(props: MediaViewerProps) {
         pointers.clear();
         gestureMode = "none";
         gestureMoved = false;
+        cancelLongPress();
+        longPressFired = false;
         if (swipeEndTimer !== null) { clearTimeout(swipeEndTimer); swipeEndTimer = null; }
         setSwiping(false);
 
@@ -956,6 +1010,14 @@ export function MediaViewer(props: MediaViewerProps) {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerCancel}
       onContextMenu={(e) => {
+        // A touch-generated contextmenu (Android fires one natively on
+        // long-press) is owned by the gesture machine's timer — suppress it
+        // so the menu doesn't open twice. `pointers` only ever holds touch
+        // pointers, so a mouse right-click passes through untouched.
+        if (pointers.size > 0 || longPressFired) {
+          e.preventDefault();
+          return;
+        }
         if (props.onContextMenu) {
           e.preventDefault();
           props.onContextMenu(e, currentPath(), props.currentIndex);
@@ -1181,7 +1243,7 @@ export function MediaViewer(props: MediaViewerProps) {
 
       {/* Info panel */}
       <Show when={infoPanelOpen()}>
-        <InfoPanel path={currentPath()} filename={filename()} />
+        <InfoPanel path={currentPath()} filename={filename()} onTagFilter={handleTagFilter} />
       </Show>
 
       {/* Shared-element transition clone — flies between the grid cell rect

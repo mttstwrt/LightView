@@ -1,5 +1,8 @@
 import { createSignal } from "solid-js";
 import type { TagSuggestion } from "../lib/types";
+import { applyFilter, getSortedItems } from "../lib/ipc";
+import { setDisplayPaths, setSortedItems } from "./galleryStore";
+import { sortField, sortOrder, subSortField, subSortOrder, groupBy } from "./settingsStore";
 
 // The raw filter query string (e.g. "user AND example OR rating>=3")
 const [filterQuery, setFilterQuery] = createSignal("");
@@ -37,6 +40,34 @@ export function buildFilterQuery(): string {
   }
 
   return parts.join(" AND ");
+}
+
+/// Apply the current filter state (query + rating) to the gallery: filter on
+/// the backend, re-sort, and swap the displayed items. With no active filter
+/// this just re-sorts the full gallery.
+export async function refreshFilteredItems() {
+  const query = buildFilterQuery();
+  try {
+    const filteredPaths = query ? await applyFilter(query) : undefined;
+    const sorted = await getSortedItems(
+      sortField(), sortOrder(), groupBy(), filteredPaths, subSortField(), subSortOrder(),
+    );
+    setSortedItems(sorted.items);
+    setDisplayPaths(sorted.items.map((item) => item.path));
+  } catch (e) {
+    console.error("Filter error:", e);
+  }
+}
+
+/// Replace the filter with `query` and apply it. Also mirrors the query into
+/// the filter bar's input so the active filter is visible and editable there.
+/// Used by tappable tag chips in the viewer's info panel.
+export async function applyQueryAndRefresh(query: string) {
+  setFilterQuery(query);
+  setAcQuery(query);
+  setAcOpen(false);
+  setAcSuggestions([]);
+  await refreshFilteredItems();
 }
 
 /// Clear all filter state.
