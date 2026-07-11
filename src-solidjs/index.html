@@ -5,10 +5,21 @@
     <!-- maximum-scale=1 + user-scalable=no disables browser zoom entirely: no
          pinch-to-zoom and, crucially on iOS, no auto-zoom when focusing an input
          (Safari zooms on focus unless it's already pinned at scale 1). All
-         zooming in LightView is handled by the grid/viewer, never the browser. -->
+         zooming in LightView is handled by the grid/viewer, never the browser.
+
+         viewport-fit=cover lets the layout viewport extend edge-to-edge under
+         the iOS notch / dynamic island instead of being letterboxed into the
+         safe area (which paints as a black bar). The grid then scrolls under
+         the island; floating chrome pads itself with env(safe-area-inset-*).
+
+         interactive-widget=resizes-content makes Android Chrome shrink the
+         layout viewport when the software keyboard opens, so bottom-anchored
+         chrome (the mobile filter sheet) lands above the keyboard instead of
+         behind it. iOS ignores this; there the sheet tracks visualViewport in
+         JS (TopBar) to stay visible. -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <title>LightView</title>
   </head>

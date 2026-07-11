@@ -5,16 +5,11 @@ import { displayPaths } from "./galleryStore";
 const [viewerOpen, setViewerOpen] = createSignal(false);
 const [viewerIndex, setViewerIndex] = createSignal(0);
 const [infoPanelOpen, setInfoPanelOpen] = createSignal(false);
-// Measured height (px) of the touch info sheet, reported by InfoPanel via a
-// ResizeObserver. The viewer reads this to shrink the photo into the space
-// above the sheet (Apple-Photos–style). 0 when no sheet is mounted.
-const [infoPanelHeight, setInfoPanelHeight] = createSignal(0);
 
 export {
   viewerOpen, setViewerOpen,
   viewerIndex, setViewerIndex,
   infoPanelOpen, setInfoPanelOpen,
-  infoPanelHeight, setInfoPanelHeight,
 };
 
 /** Record that the item at the given index was viewed. */

@@ -611,7 +611,10 @@ export function App() {
           <TrashPanel onClose={() => setTrashOpen(false)} />
         </Show>
         <Show when={isWeb()}>
-          <UploadButton onUploaded={refreshAfterUpload} />
+          {/* Hidden (not unmounted — that would refetch the upload config)
+              while the viewer is open: it floats bottom-right, on top of the
+              video player's mute button. */}
+          <UploadButton hidden={viewerOpen()} onUploaded={refreshAfterUpload} />
         </Show>
       </Show>
       <Show when={debugOpen()}>

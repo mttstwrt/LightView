@@ -10,7 +10,7 @@ import {
 import type { ThumbnailTierInfo } from "../../lib/ipc";
 import { ScrollBar } from "../shared/ScrollBar";
 import { hasTouch } from "../../lib/runtime";
-import { setInfoPanelOpen, setInfoPanelHeight } from "../../stores/viewerStore";
+import { setInfoPanelOpen } from "../../stores/viewerStore";
 import { SWIPE_DISMISS_PX, SWIPE_VELOCITY } from "../../lib/touch";
 
 // On touch devices the panel is an Apple-Photos–style opaque bottom sheet that
@@ -191,22 +191,8 @@ export function InfoPanel(props: { path: string; filename: string }) {
   const [dragY, setDragY] = createSignal(0);
   const [smooth, setSmooth] = createSignal(true);
 
-  // Report the sheet's height so the viewer can shrink the photo into the space
-  // above it (Apple-Photos style). Observed because the height depends on the
-  // variable content. Cleared on unmount so the photo re-centers full-screen.
-  let sheetRef: HTMLDivElement | undefined;
   onMount(() => {
     requestAnimationFrame(() => setEntered(true));
-    if (!sheetRef) return;
-    const ro = new ResizeObserver(() => {
-      if (sheetRef) setInfoPanelHeight(sheetRef.offsetHeight);
-    });
-    ro.observe(sheetRef);
-    setInfoPanelHeight(sheetRef.offsetHeight);
-    onCleanup(() => {
-      ro.disconnect();
-      setInfoPanelHeight(0);
-    });
   });
 
   let dragging = false;
@@ -251,35 +237,29 @@ export function InfoPanel(props: { path: string; filename: string }) {
     return dragY() > 0 ? `translateY(${dragY()}px)` : "translateY(0)";
   };
 
+  // One compact line instead of a label:value row per fact.
+  const metaLine = () => {
+    const m = meta();
+    if (!m) return "";
+    const parts = [m.media_type.toUpperCase(), formatBytes(m.file_size)];
+    if (m.width && m.height) parts.push(`${m.width} × ${m.height}`);
+    if (m.duration_seconds) parts.push(`${m.duration_seconds.toFixed(1)}s`);
+    return parts.join(" · ");
+  };
+
   const fields = () => (
     <div class="text-xs text-neutral-400 space-y-3">
-          <InfoRow label="File" value={props.filename} breakAll />
-          <InfoRow label="Path" value={props.path} breakAll />
-
-          <Show when={meta()}>
-            <div class="border-t border-neutral-800 pt-3 mt-3 space-y-3">
-              <InfoRow label="Type" value={meta()!.media_type.toUpperCase()} />
-              <InfoRow label="Size" value={formatBytes(meta()!.file_size)} />
-
-              <Show when={meta()!.width && meta()!.height}>
-                <InfoRow
-                  label="Dimensions"
-                  value={`${meta()!.width} × ${meta()!.height}`}
-                />
-              </Show>
-
+          {/* Header block: filename, muted path, condensed facts. */}
+          <div>
+            <div class="text-sm text-neutral-200 break-all">{props.filename}</div>
+            <div class="text-[11px] text-neutral-600 break-all mt-0.5">{props.path}</div>
+            <Show when={meta()}>
+              <div class="text-neutral-300 mt-1.5">{metaLine()}</div>
               <Show when={meta()!.date_taken}>
-                <InfoRow label="Date" value={formatDate(meta()!.date_taken!)} />
+                <div class="text-neutral-500 mt-0.5">{formatDate(meta()!.date_taken!)}</div>
               </Show>
-
-              <Show when={meta()!.duration_seconds}>
-                <InfoRow
-                  label="Duration"
-                  value={`${meta()!.duration_seconds!.toFixed(1)}s`}
-                />
-              </Show>
-            </div>
-          </Show>
+            </Show>
+          </div>
 
           {/* Thumbnails */}
           <Show when={thumbTiers().length > 0}>
@@ -321,29 +301,28 @@ export function InfoPanel(props: { path: string; filename: string }) {
             </div>
           </Show>
 
-          {/* Rating */}
-          <div class="border-t border-neutral-800 pt-3 mt-3">
-            <span class="text-neutral-500">Rating:</span>
-            <div class="flex items-center gap-2 mt-1">
-              <div class="flex gap-1">
-                <For each={[1, 2, 3, 4, 5]}>
-                  {(star) => (
-                    <button
-                      class="text-base transition-colors cursor-pointer"
-                      style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
-                      onClick={() => handleSetRating(star)}
-                    >
-                      &#9733;
-                    </button>
-                  )}
-                </For>
-              </div>
-              <Show when={rating() > 0}>
-                <span class="text-neutral-500 text-[11px]">
-                  {lastRated() ? formatDate(lastRated()!) : "unknown"}
-                </span>
-              </Show>
+          {/* Rating — single inline row */}
+          <div class="border-t border-neutral-800 pt-3 mt-3 flex items-center gap-3">
+            <span class="text-neutral-500">Rating</span>
+            <div class="flex gap-1">
+              <For each={[1, 2, 3, 4, 5]}>
+                {(star) => (
+                  <button
+                    class="text-base transition-colors cursor-pointer leading-none"
+                    style={{ color: star <= rating() ? "#f59e0b" : "#525252" }}
+                    onClick={() => handleSetRating(star)}
+                    aria-label={`Rate ${star} star${star > 1 ? "s" : ""}`}
+                  >
+                    &#9733;
+                  </button>
+                )}
+              </For>
             </div>
+            <Show when={rating() > 0}>
+              <span class="text-neutral-500 text-[11px]">
+                {lastRated() ? formatDate(lastRated()!) : "unknown"}
+              </span>
+            </Show>
           </div>
 
           {/* Tags — one collapsible section per namespace */}
@@ -428,46 +407,36 @@ export function InfoPanel(props: { path: string; filename: string }) {
   );
 
   // --- Touch: opaque bottom sheet ----------------------------------------
+  // The sheet overlays the photo — no dim layer, no photo re-fit. The photo
+  // stays full-screen behind it; a tap or swipe-down on the visible part of
+  // the photo dismisses the sheet (handled by the viewer's gestures).
   if (sheetMode) {
     return (
-      <>
-        {/* Dimming layer over the photo area; fades as the sheet is dragged.
-            pointer-events-none so the viewer keeps handling gestures above the
-            sheet (tap or swipe-down on the photo closes the panel). */}
+      <div
+        class="fixed left-0 right-0 bottom-0 z-[60] rounded-t-2xl flex flex-col max-h-[70vh] shadow-2xl"
+        style={{
+          // Opaque — Apple-Photos info sheet, not a translucent overlay.
+          background: "#1c1c1e",
+          transform: sheetTransform(),
+          transition: smooth() ? "transform 0.3s ease-out" : "none",
+          "padding-bottom": "env(safe-area-inset-bottom)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Drag handle / grab area — flick down here to dismiss. */}
         <div
-          class="fixed inset-0 z-[59] pointer-events-none"
-          style={{
-            background: `rgba(0,0,0,${0.4 * Math.max(0, 1 - dragY() / 300)})`,
-            transition: smooth() ? "background 0.25s ease-out" : "none",
-          }}
-        />
-        <div
-          ref={sheetRef}
-          class="fixed left-0 right-0 bottom-0 z-[60] rounded-t-2xl flex flex-col max-h-[85vh] shadow-2xl"
-          style={{
-            // Opaque — Apple-Photos info sheet, not a translucent overlay.
-            background: "#1c1c1e",
-            transform: sheetTransform(),
-            transition: smooth() ? "transform 0.3s ease-out" : "none",
-          }}
-          onClick={(e) => e.stopPropagation()}
+          class="shrink-0 pt-2.5 pb-2 cursor-grab touch-none"
+          onPointerDown={onHandleDown}
+          onPointerMove={onHandleMove}
+          onPointerUp={onHandleUp}
+          onPointerCancel={onHandleUp}
         >
-          {/* Drag handle / grab area — flick down here to dismiss. */}
-          <div
-            class="shrink-0 pt-2.5 pb-1 cursor-grab touch-none"
-            onPointerDown={onHandleDown}
-            onPointerMove={onHandleMove}
-            onPointerUp={onHandleUp}
-            onPointerCancel={onHandleUp}
-          >
-            <div class="mx-auto h-1 w-9 rounded-full bg-neutral-600" />
-            <h3 class="text-center text-sm font-medium text-neutral-300 mt-2">Info</h3>
-          </div>
-          <div class="px-4 pb-6 overflow-y-auto hide-scrollbar">
-            {fields()}
-          </div>
+          <div class="mx-auto h-1 w-9 rounded-full bg-neutral-600" />
         </div>
-      </>
+        <div class="px-4 pb-6 overflow-y-auto overscroll-contain hide-scrollbar">
+          {fields()}
+        </div>
+      </div>
     );
   }
 

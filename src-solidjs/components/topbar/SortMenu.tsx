@@ -21,7 +21,7 @@ function defaultOrder(field: SortField): SortOrder {
   return field === "name" || field === "media_type" ? "asc" : "desc";
 }
 
-export function SortMenu() {
+export function SortMenu(props: { dropUp?: boolean }) {
   const [open, setOpen] = createSignal(false);
 
   const toggle = () => setOpen((v) => !v);
@@ -117,7 +117,11 @@ export function SortMenu() {
         <div class="fixed inset-0 z-40" onClick={() => setOpen(false)} />
 
         <div
-          class="absolute top-full right-0 mt-2 min-w-[220px] rounded-lg overflow-hidden shadow-xl z-50"
+          class="absolute right-0 min-w-[220px] rounded-lg overflow-hidden shadow-xl z-50"
+          classList={{
+            "top-full mt-2": !props.dropUp,
+            "bottom-full mb-2": props.dropUp,
+          }}
           style={{
             background: "rgba(18, 18, 18, 0.96)",
             "backdrop-filter": "blur(16px)",

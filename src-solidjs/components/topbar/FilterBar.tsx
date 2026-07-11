@@ -16,6 +16,13 @@ import { autocompleteTags, applyFilter, clearFilter, getSortedItems } from "../.
 
 interface FilterBarProps {
   onInputRef?: (el: HTMLInputElement) => void;
+  /** Open the autocomplete list and rating popover upward instead of down —
+   *  used when the bar sits in a bottom sheet (otherwise they'd fall off the
+   *  bottom of the screen, behind the keyboard). */
+  dropUp?: boolean;
+  /** Called after Enter applies the filter. The mobile sheet passes this to
+   *  dismiss itself (and the keyboard with it) so the results are visible. */
+  onSubmit?: () => void;
 }
 
 export function FilterBar(props: FilterBarProps) {
@@ -143,6 +150,7 @@ export function FilterBar(props: FilterBarProps) {
       setFilterQuery(acQuery().trim());
       setAcOpen(false);
       applyCurrentFilter();
+      props.onSubmit?.();
     } else if (e.key === "Escape") {
       (e.target as HTMLInputElement).blur();
     }
@@ -191,12 +199,15 @@ export function FilterBar(props: FilterBarProps) {
   };
 
   // The five 1–5 star buttons, shared by the desktop inline row and the mobile
-  // popover. `closeAfter` dismisses the mobile popover once a star is tapped.
+  // popover. `closeAfter` dismisses the mobile popover once a star is tapped;
+  // that variant also gets real padding — a bare ~14px glyph is far below a
+  // usable touch target.
   const ratingStars = (closeAfter: boolean) => (
     <For each={[1, 2, 3, 4, 5]}>
       {(star) => (
         <button
-          class="cursor-pointer text-sm transition-colors leading-none"
+          class="cursor-pointer transition-colors leading-none"
+          classList={{ "text-base p-2": closeAfter, "text-sm": !closeAfter }}
           style={{
             color: ratingFilter() && star <= ratingFilter()!.value ? "#f59e0b" : "#525252",
           }}
@@ -255,7 +266,8 @@ export function FilterBar(props: FilterBarProps) {
             </button>
             <Show when={ratingMenuOpen()}>
               <div
-                class="absolute top-full left-0 mt-1 p-1.5 rounded shadow-lg z-50 flex items-center gap-0.5"
+                class="absolute left-0 p-1.5 rounded shadow-lg z-50 flex items-center gap-0.5"
+                classList={{ "top-full mt-1": !props.dropUp, "bottom-full mb-1": props.dropUp }}
                 style={{
                   background: "rgba(20, 20, 20, 0.97)",
                   "backdrop-filter": "blur(12px)",
@@ -265,7 +277,8 @@ export function FilterBar(props: FilterBarProps) {
                 {ratingStars(true)}
                 <Show when={ratingFilter()}>
                   <button
-                    class="text-neutral-400 hover:text-neutral-200 text-xs ml-1 cursor-pointer"
+                    class="text-neutral-400 hover:text-neutral-200 text-sm p-2 ml-1 cursor-pointer"
+                    aria-label="Clear rating filter"
                     onClick={() => { handleClearRatingFilter(); setRatingMenuOpen(false); }}
                   >
                     &times;
@@ -288,7 +301,12 @@ export function FilterBar(props: FilterBarProps) {
           onBlur={() => {
             setTimeout(() => setAcOpen(false), 200);
           }}
-          placeholder="Filter... (e.g. user AND example, date>=2024-01-01, width>=1920, size>=10mb)"
+          placeholder={
+            // The full syntax tour truncates uselessly in a phone-width input.
+            isMobile()
+              ? "Filter tags…"
+              : "Filter... (e.g. user AND example, date>=2024-01-01, width>=1920, size>=10mb)"
+          }
           class="flex-1 bg-transparent border-none outline-none text-sm text-neutral-200 placeholder-neutral-500 min-w-0"
         />
 
@@ -305,7 +323,8 @@ export function FilterBar(props: FilterBarProps) {
       {/* Autocomplete dropdown */}
       <Show when={acOpen()}>
         <div
-          class="absolute top-full left-0 right-0 mt-1 rounded overflow-hidden shadow-lg z-50 max-h-64 overflow-y-auto hide-scrollbar"
+          class="absolute left-0 right-0 rounded overflow-hidden shadow-lg z-50 max-h-64 overflow-y-auto hide-scrollbar"
+          classList={{ "top-full mt-1": !props.dropUp, "bottom-full mb-1": props.dropUp }}
           style={{
             background: "rgba(20, 20, 20, 0.95)",
             "backdrop-filter": "blur(12px)",

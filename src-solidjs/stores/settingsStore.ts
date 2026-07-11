@@ -21,6 +21,8 @@ const DEFAULT_SETTINGS: AppSettings = {
     scroll_blur: false,
     map_dark_mode: true,
     justified_high_detail: true,
+    mobile_filter_sheet: "top",
+    video_autoplay_viewer: true,
   },
   performance: {
     preload_count: 3,
@@ -39,6 +41,22 @@ const DEFAULT_SETTINGS: AppSettings = {
     { label: "GIMP", command: "gimp", args: ["{file}"] },
   ],
 };
+
+/** Merge stored settings over the defaults section-by-section. Settings saved
+ *  by an older build lack keys added since; a shallow top-level spread would
+ *  let a stored `display` object wipe out new display defaults entirely, so
+ *  every setting added later had to be read with an ad-hoc `?? fallback`.
+ *  Merging per section keeps new defaults present and the AppSettings type
+ *  honest (no key is ever undefined at runtime). */
+function mergeSettings(stored: Partial<AppSettings>): AppSettings {
+  return {
+    display: { ...DEFAULT_SETTINGS.display, ...stored.display },
+    performance: { ...DEFAULT_SETTINGS.performance, ...stored.performance },
+    storage: { ...DEFAULT_SETTINGS.storage, ...stored.storage },
+    default_filter: { ...DEFAULT_SETTINGS.default_filter, ...stored.default_filter },
+    external_apps: stored.external_apps ?? DEFAULT_SETTINGS.external_apps,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Exported reactive store
@@ -77,7 +95,7 @@ export function setSettings(update: Partial<AppSettings> | ((prev: AppSettings) 
 export function applyExternalSettings(json: string) {
   try {
     const stored = JSON.parse(json) as Partial<AppSettings>;
-    setSettingsRaw(() => ({ ...DEFAULT_SETTINGS, ...stored }));
+    setSettingsRaw(() => mergeSettings(stored));
   } catch {}
 }
 
@@ -90,7 +108,7 @@ export async function loadSettingsFromGallery() {
     const json = await loadGallerySettings();
     if (json) {
       const stored = JSON.parse(json) as Partial<AppSettings>;
-      setSettingsRaw(() => ({ ...DEFAULT_SETTINGS, ...stored }));
+      setSettingsRaw(() => mergeSettings(stored));
     } else {
       // First open of this gallery — start from hard defaults and seed the
       // gallery's settings.toml with them, so each gallery is self-contained.
@@ -107,7 +125,7 @@ export async function loadSettingsFromGallery() {
 export function loadWebSettings() {
   const stored = loadPref<Partial<AppSettings>>(SETTINGS_PREF);
   if (stored) {
-    setSettingsRaw(() => ({ ...DEFAULT_SETTINGS, ...stored }));
+    setSettingsRaw(() => mergeSettings(stored));
   }
 }
 

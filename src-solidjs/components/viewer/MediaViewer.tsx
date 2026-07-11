@@ -1,6 +1,14 @@
-import { Show, createSignal, createEffect, on, onCleanup, batch } from "solid-js";
+import { Show, createSignal, createEffect, on, onMount, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { isWeb, hasTouch, isTauri, isMobile } from "../../lib/runtime";
+import {
+  findCellImage,
+  prefersReducedMotion,
+  viewportContainRect,
+  rectKeyframe,
+  type Rect,
+} from "../../lib/viewerTransition";
+import { aspectByPath } from "../../stores/galleryStore";
 import { TitleBar } from "../topbar/TitleBar";
 import {
   pointerDistance,
@@ -14,7 +22,7 @@ import {
   DISMISS_MIN_SCALE,
   type Point,
 } from "../../lib/touch";
-import { infoPanelOpen, setInfoPanelOpen, infoPanelHeight } from "../../stores/viewerStore";
+import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, thumbUrl, ensureTierThumbnails, gifAtlasUrl } from "../../lib/ipc";
 import { isVideoPath, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
@@ -22,6 +30,7 @@ import { GifCanvas } from "../GifCanvas";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { setViewerCacheCountSource } from "../../lib/perfMonitor";
 import { InfoPanel } from "./InfoPanel";
+import { VideoPlayer } from "./VideoPlayer";
 
 interface MediaViewerProps {
   paths: string[];
@@ -120,22 +129,8 @@ export function MediaViewer(props: MediaViewerProps) {
   const neighbourSrc = (path: string) =>
     isVideoPath(path) ? thumbUrl(path, "p") : mediaUrl(path);
 
-  // When the info panel is open on touch, the photo shrinks + lifts to fill the
-  // space above the sheet. Returns the uniform scale + vertical shift, or null
-  // when no fit applies. Shared by the current image and the neighbour slides so
-  // swiping between photos with the panel open keeps them the same size.
-  const infoFit = (): { scale: number; ty: number } | null => {
-    if (!(infoPanelOpen() && hasTouch())) return null;
-    const h = window.innerHeight;
-    const ph = infoPanelHeight();
-    if (ph <= 0 || ph >= h) return null;
-    return { scale: (h - ph) / h, ty: -ph / 2 };
-  };
-  const neighbourTransform = (dir: number): string => {
-    const base = `translateX(${dir * 100}vw)`;
-    const f = infoFit();
-    return f ? `${base} translateY(${f.ty}px) scale(${f.scale})` : base;
-  };
+  // Neighbour slides sit one viewport-width to either side of the current one.
+  const neighbourTransform = (dir: number): string => `translateX(${dir * 100}vw)`;
 
   // WebKitGTK's <video> element only handles a narrow set of containers
   // reliably (H.264/AAC in MP4, VP8/9 in WebM). MKV/AVI/WMV/FLV will fail
@@ -144,12 +139,22 @@ export function MediaViewer(props: MediaViewerProps) {
   // and waiting for an error event.
   const isBrowserPlayableVideo = () => PLAYABLE_VIDEO_EXTS.has(ext());
 
-  // Lazy video mounting: don't attach <video src=...> until the user
-  // clicks play. With `preload="metadata"` the browser would still pull
-  // the moov atom + leading bytes immediately on navigation; for nearby
-  // videos (e.g. arrow-keying past one) that's pure waste.
+  // Lazy video mounting: don't attach <video src=...> until playback should
+  // start. With `preload="metadata"` the browser would still pull the moov
+  // atom + leading bytes immediately on navigation; for nearby videos (e.g.
+  // arrow-keying past one) that's pure waste. Playback starts from a manual
+  // play tap, or — with the autoplay setting on — automatically once the user
+  // has *settled* on the video (a short delay keeps skimming past cheap).
+  // Autoplay always starts muted (VideoPlayer shows a tap-to-unmute pill);
+  // manual play starts with sound.
   const [videoStarted, setVideoStarted] = createSignal(false);
   const [videoError, setVideoError] = createSignal(false);
+  const [videoAutoMuted, setVideoAutoMuted] = createSignal(false);
+  let autoplayTimer: number | null = null;
+  const clearAutoplayTimer = () => {
+    if (autoplayTimer !== null) { clearTimeout(autoplayTimer); autoplayTimer = null; }
+  };
+  onCleanup(clearAutoplayTimer);
 
   const openVideoExternal = () => {
     const path = currentPath();
@@ -224,13 +229,120 @@ export function MediaViewer(props: MediaViewerProps) {
     else clearTimeout(idleHandle);
   });
 
+  // --- Grid ↔ viewer shared-element transition ----------------------------
+  // On open, the tapped thumbnail's rect expands into the fitted media rect;
+  // on close, the media flies back down into its cell. A fixed-position clone
+  // (object-fit: cover, so square grid crops un-crop smoothly) does the
+  // flying; the real content is revealed / hidden underneath it. Any missing
+  // ingredient (reduced motion, cell not rendered, zoomed in) falls back to a
+  // plain fade.
+  let rootRef: HTMLDivElement | undefined;
+  let cloneRef: HTMLDivElement | undefined;
+  const [cloneState, setCloneState] = createSignal<{ src: string; from: Rect } | null>(null);
+  const [closing, setClosing] = createSignal(false);
+  let closingNow = false;
+
+  const mediaAspect = (): number | null => {
+    const a = aspectByPath().get(currentPath());
+    if (a) return a;
+    const img = imageContainerRef?.querySelector("img") as HTMLImageElement | null;
+    if (img && img.naturalWidth > 0) return img.naturalWidth / img.naturalHeight;
+    return null;
+  };
+
+  onMount(() => {
+    if (prefersReducedMotion()) return;
+    const cellImg = findCellImage(currentPath());
+    if (!cellImg) return;
+    const from = cellImg.getBoundingClientRect();
+    if (from.width < 4 || from.height < 4) return;
+    const src = cellImg.currentSrc || cellImg.src;
+    if (!src) return;
+    const aspect =
+      aspectByPath().get(currentPath()) ??
+      (cellImg.naturalWidth > 0 ? cellImg.naturalWidth / cellImg.naturalHeight : 1);
+    // Backdrop fades in from transparent underneath the flying clone.
+    setBackdropAlpha(0);
+    requestAnimationFrame(() => setBackdropAlpha(1));
+    setCloneState({ src, from });
+    if (!cloneRef) { setCloneState(null); return; }
+    const anim = cloneRef.animate(
+      [rectKeyframe(from), rectKeyframe(viewportContainRect(aspect))],
+      { duration: 260, easing: "cubic-bezier(0.2, 0, 0.2, 1)", fill: "forwards" },
+    );
+    anim.onfinish = () => setCloneState(null);
+    anim.oncancel = () => setCloneState(null);
+  });
+
+  /** Close with the fly-back-to-cell transition (or a fade fallback). All
+   *  in-viewer close paths route through here; App-level Escape still closes
+   *  instantly. */
+  const requestClose = () => {
+    if (closingNow) return;
+    if (prefersReducedMotion() || zoom() > 1) { props.onClose(); return; }
+    closingNow = true;
+    // Ask the grid to bring the (possibly navigated-to) item's cell into
+    // view, then give it two frames to scroll + render the virtual slice.
+    window.dispatchEvent(
+      new CustomEvent("lightview:scroll-to-index", { detail: props.currentIndex }),
+    );
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const path = currentPath();
+      const cellImg = findCellImage(path);
+      if (!cellImg) {
+        // Fade fallback: dim the backdrop, hide the content, close.
+        setClosing(true);
+        setChromeVisible(false);
+        setBackdropAlpha(0);
+        window.setTimeout(() => props.onClose(), 200);
+        return;
+      }
+      // Fly from wherever the media currently is on screen (including a
+      // mid-dismiss dragged/shrunken position) back into the cell.
+      const mediaEl =
+        (imageContainerRef?.querySelector("img") as HTMLElement | null) ??
+        (rootRef?.querySelector("video, canvas") as HTMLElement | null);
+      let from: Rect | null = null;
+      if (mediaEl) from = mediaEl.getBoundingClientRect();
+      else {
+        const a = mediaAspect();
+        if (a) from = viewportContainRect(a);
+      }
+      if (!from || from.width < 4) {
+        setClosing(true);
+        setChromeVisible(false);
+        setBackdropAlpha(0);
+        window.setTimeout(() => props.onClose(), 200);
+        return;
+      }
+      const src =
+        mediaEl instanceof HTMLImageElement && mediaEl.naturalWidth > 0
+          ? mediaEl.currentSrc || mediaEl.src
+          : thumbUrl(path, "p");
+      // One batch so the track hides in the same frame the clone appears.
+      batch(() => {
+        setClosing(true);
+        setChromeVisible(false);
+        setBackdropAlpha(0);
+        setCloneState({ src, from });
+      });
+      if (!cloneRef) { props.onClose(); return; }
+      const anim = cloneRef.animate(
+        [rectKeyframe(from), rectKeyframe(cellImg.getBoundingClientRect())],
+        { duration: 230, easing: "cubic-bezier(0.4, 0, 0.2, 1)", fill: "forwards" },
+      );
+      anim.onfinish = () => props.onClose();
+      anim.oncancel = () => props.onClose();
+    }));
+  };
+
   const handleBackdropClick = (e: MouseEvent) => {
     // A touch tap handles itself (toggles chrome); swallow the compatibility
     // click it synthesizes so we don't also close the viewer.
     if (suppressBackdropClick) { suppressBackdropClick = false; return; }
     if (didDrag) { didDrag = false; return; }
     if (e.target === e.currentTarget) {
-      props.onClose();
+      requestClose();
     }
   };
 
@@ -457,11 +569,13 @@ export function MediaViewer(props: MediaViewerProps) {
 
   const onPointerDown = (e: PointerEvent) => {
     if (e.pointerType !== "touch") return;
+    if (closingNow) return; // close transition in flight — ignore new gestures
     const t = e.target as HTMLElement;
-    // Touches that land on the native video controls (or buttons / inputs /
-    // links) are left to them; margin touches drive our gestures even on video
-    // so tap-to-toggle-chrome and swipe-to-dismiss keep working.
-    if (t.closest("button, video, input, a")) return;
+    // Touches on real controls (buttons / inputs / links / anything marked
+    // data-gesture-exempt, like the video scrubber) are left to them. The
+    // video surface itself is NOT excluded — with custom controls it behaves
+    // like a photo: tap toggles chrome, swipes navigate / dismiss / open info.
+    if (t.closest("button, input, a, [data-gesture-exempt]")) return;
     // If a swipe-navigation is still mid-flight, land it now so the new gesture
     // operates on the settled index rather than racing the pending commit.
     runNavCommit();
@@ -599,7 +713,7 @@ export function MediaViewer(props: MediaViewerProps) {
       }
       snapDragReset();
     } else if (dy > SWIPE_DISMISS_PX || vy > SWIPE_VELOCITY) {
-      props.onClose();
+      requestClose();
     } else {
       snapDragReset();
     }
@@ -713,11 +827,29 @@ export function MediaViewer(props: MediaViewerProps) {
         setSwiping(false);
 
         const path = props.paths[idx];
+        clearAutoplayTimer();
         setVideoStarted(false);
         setVideoError(false);
+        setVideoAutoMuted(false);
+        // A playing video may have idle-hidden the chrome; navigation must
+        // bring it back (desktop has no tap-to-toggle to recover it).
+        setChromeVisible(true);
         if (!path || isVideo()) {
           setLoaded(false);
           if (imageContainerRef) imageContainerRef.replaceChildren();
+          // Settle-then-autoplay: wait a beat so arrow-keying / swiping past
+          // videos never mounts <video> or pulls bytes.
+          if (
+            path &&
+            isBrowserPlayableVideo() &&
+            settings().display.video_autoplay_viewer
+          ) {
+            autoplayTimer = window.setTimeout(() => {
+              autoplayTimer = null;
+              setVideoAutoMuted(true);
+              setVideoStarted(true);
+            }, 300);
+          }
           return;
         }
 
@@ -767,34 +899,19 @@ export function MediaViewer(props: MediaViewerProps) {
   });
 
   // Current image transform. Composes persistent zoom/pan with the transient
-  // vertical-gesture offsets (dismiss follow + shrink) and, when the info panel
-  // is open on touch, a uniform shrink + lift so the photo fills the space
-  // above the sheet (Apple-Photos style) instead of sitting centred behind it.
+  // vertical-gesture offsets (dismiss follow + shrink). The info sheet simply
+  // overlays the photo — no re-fit, the photo stays where it is.
   createEffect(() => {
     if (!imageContainerRef) return;
-    let z = zoom() * dragScale();
+    const z = zoom() * dragScale();
     const px = panX();
-    let py = panY() + dragY();
-    const f = infoFit();
-    if (f && zoom() === 1) {
-      z *= f.scale;
-      py += f.ty;
-    }
+    const py = panY() + dragY();
     if (z === 1 && px === 0 && py === 0) {
       imageContainerRef.style.transform = "";
     } else {
       imageContainerRef.style.transform = `translate(${px}px, ${py}px) scale(${z})`;
     }
   });
-
-  // Ease the photo into / out of its info-panel position whenever the panel
-  // toggles (so opening or closing the sheet animates the shrink, not just the
-  // gesture-driven path). Deferred so it doesn't fire on initial mount.
-  createEffect(
-    on(infoPanelOpen, () => {
-      if (hasTouch()) animateContainer();
-    }, { defer: true }),
-  );
 
   // Pixel ratio: effective physical display width / natural width
   // Accounts for devicePixelRatio so 1:1 = one image pixel per physical screen pixel
@@ -818,6 +935,7 @@ export function MediaViewer(props: MediaViewerProps) {
   return (
     <div
       ref={(el) => {
+        rootRef = el;
         el.addEventListener("wheel", handleWheel, { passive: false });
         onCleanup(() => el.removeEventListener("wheel", handleWheel));
       }}
@@ -854,180 +972,154 @@ export function MediaViewer(props: MediaViewerProps) {
         </button>
       </Show>
 
-      {/* Media display — video */}
-      <Show when={isVideo()}>
-        {/* Click-through wrapper: only the video / play controls capture
-            pointer events, so a click or tap in the surrounding margin still
-            falls through to the backdrop's close handler. */}
-        <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <Show when={isBrowserPlayableVideo() && !videoError()} fallback={
-            <div class="text-neutral-400 text-sm text-center pointer-events-auto" onClick={(e) => e.stopPropagation()}>
-              <button
-                class="w-20 h-20 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer transition-colors mb-4"
-                onClick={() => openVideoExternal()}
-              >
-                <span class="text-white/80 text-3xl ml-1">&#9654;</span>
-              </button>
-              <div>{isWeb() ? "Open / download video" : "Open in external player"}</div>
-              <div class="text-neutral-600 mt-1">{filename()}</div>
-            </div>
-          }>
-            <Show when={videoStarted()} fallback={
-              <div
-                class="relative max-w-[100vw] max-h-[100vh] flex items-center justify-center pointer-events-auto"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <img
-                  src={thumbUrl(currentPath(), "p")}
-                  class="max-w-[100vw] max-h-[100vh] object-contain"
-                  draggable={false}
-                  onError={(e) => {
-                    (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
-                  }}
-                />
+      {/* Media display — filmstrip. A horizontally-sliding track holds the
+          previous / current / next items so a swipe glides between them
+          (neighbours are only mounted during a swipe; video neighbours show
+          their poster thumb). The current slide holds either the imperative
+          cache-swapped <img> plus zoom/pan, or the video player. The track is
+          click-through except the media itself, so a backdrop tap/click in
+          the surrounding margin still closes the viewer. */}
+      <div
+        ref={trackRef}
+        class="absolute inset-0 pointer-events-none"
+        // Hidden the instant the close clone takes over (the clone starts at
+        // the media's exact on-screen rect, so there's no visible seam). The
+        // clone-less fade fallback eases out instead.
+        style={{
+          opacity: closing() ? "0" : undefined,
+          transition: closing() && !cloneState() ? "opacity 0.18s ease-out" : undefined,
+        }}
+      >
+        {/* Previous neighbour slide */}
+        <Show when={swiping() && prevPath()}>
+          <div class="absolute inset-0 flex items-center justify-center" style={{ transform: neighbourTransform(-1) }}>
+            <img
+              src={neighbourSrc(prevPath()!)}
+              class="max-w-[100vw] max-h-[100vh] object-contain"
+              draggable={false}
+              onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }}
+            />
+          </div>
+        </Show>
+
+        {/* Current slide */}
+        <div class="absolute inset-0 flex items-center justify-center">
+          <Show
+            when={isVideo()}
+            fallback={
+              <>
+                {/* Preview tier underlay — shown while the full-resolution
+                    image is still decoding. Fails silently (404) until the
+                    tier is ready, then a natural re-render swaps it in. Sized
+                    to contain in the full viewport so it aligns with the full
+                    image. */}
+                <Show when={!loaded()}>
+                  <img
+                    src={thumbUrl(currentPath(), "p")}
+                    class="absolute inset-0 w-full h-full object-contain pointer-events-none"
+                    style={{ filter: "blur(2px)" }}
+                    draggable={false}
+                    onError={(e) => {
+                      (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
+                    }}
+                  />
+                </Show>
+
+                {/* Image container — preloaded Image elements are swapped in
+                    directly. pointer-events-auto so a click/tap on the photo
+                    doesn't fall through to the backdrop's click-to-close. */}
+                <div ref={imageContainerRef} class="flex items-center justify-center pointer-events-auto" />
+
+                {/* Canvas GIF playback (desktop) — replaces the imperative
+                    <img> for GIFs. Zoom/pan don't apply here (the transform
+                    targets the image container); acceptable for GIFs. */}
+                <Show when={useGifCanvas()}>
+                  <GifCanvas
+                    url={gifAtlasUrl(currentPath(), "p")}
+                    class="max-w-[100vw] max-h-[100vh] pointer-events-auto"
+                    style={{ "object-fit": "contain" }}
+                  />
+                </Show>
+
+                {/* Spinner — suppressed while the open-transition clone is
+                    flying so it doesn't flash behind it. */}
+                <Show when={!loaded() && !cloneState()}>
+                  <svg
+                    width="48"
+                    height="48"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="text-white/20 pointer-events-none"
+                  >
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                    <circle cx="8.5" cy="8.5" r="1.5" />
+                    <polyline points="21 15 16 10 5 21" />
+                  </svg>
+                </Show>
+              </>
+            }
+          >
+            <Show when={isBrowserPlayableVideo() && !videoError()} fallback={
+              <div class="text-neutral-400 text-sm text-center pointer-events-auto" onClick={(e) => e.stopPropagation()}>
                 <button
-                  class="absolute w-20 h-20 rounded-full bg-black/40 hover:bg-black/60 flex items-center justify-center cursor-pointer transition-colors"
-                  onClick={() => setVideoStarted(true)}
-                  aria-label="Play video"
+                  class="w-20 h-20 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer transition-colors mb-4"
+                  onClick={() => openVideoExternal()}
                 >
-                  <span class="text-white text-3xl ml-1">&#9654;</span>
+                  <span class="text-white/80 text-3xl ml-1">&#9654;</span>
                 </button>
+                <div>{isWeb() ? "Open / download video" : "Open in external player"}</div>
+                <div class="text-neutral-600 mt-1">{filename()}</div>
               </div>
             }>
-              <video
-                src={mediaUrl(currentPath())}
-                class="max-w-[100vw] max-h-[100vh] outline-none pointer-events-auto"
-                controls
-                autoplay
-                // Keep playback inside our viewer instead of iOS's native
-                // fullscreen player, which autoplay otherwise triggers.
-                playsinline
-                attr:webkit-playsinline="true"
-                preload="auto"
-                onLoadedData={() => setLoaded(true)}
-                onEnded={(e) => {
-                  // Auto-replay. We deliberately avoid the native `loop`
-                  // attribute: on WebKitGTK/GStreamer with our streamed HTTP
-                  // source, looping does a non-flushing segment seek that
-                  // drifts the clock (playback speeds up after the first
-                  // pass) and re-issues a Range request that can stall the
-                  // pipeline (freeze / jump to a random spot). A manual
-                  // flushing seek to 0 followed by play() restarts cleanly.
-                  if (!settings().display.video_autoplay_loop) return;
-                  const v = e.currentTarget;
-                  try { v.currentTime = 0; } catch { /* not seekable yet */ }
-                  void v.play().catch(() => {});
-                }}
-                onError={(e) => {
-                  const v = e.currentTarget as HTMLVideoElement;
-                  const codeNames: Record<number, string> = {
-                    1: "ABORTED",
-                    2: "NETWORK",
-                    3: "DECODE",
-                    4: "SRC_NOT_SUPPORTED",
-                  };
-                  console.error(
-                    "Video load failed:",
-                    "code=" + (v.error?.code ?? "null"),
-                    codeNames[v.error?.code ?? -1] ?? "",
-                    "message=" + JSON.stringify(v.error?.message ?? ""),
-                    "src=" + v.src,
-                  );
-                  setVideoError(true);
-                }}
-                onClick={(e) => e.stopPropagation()}
-              />
+              <Show when={videoStarted()} fallback={
+                <div class="relative max-w-[100vw] max-h-[100vh] flex items-center justify-center pointer-events-auto">
+                  <img
+                    src={thumbUrl(currentPath(), "p")}
+                    class="max-w-[100vw] max-h-[100vh] object-contain"
+                    draggable={false}
+                    onError={(e) => {
+                      (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
+                    }}
+                  />
+                  <button
+                    class="absolute w-20 h-20 rounded-full bg-black/40 hover:bg-black/60 flex items-center justify-center cursor-pointer transition-colors"
+                    onClick={() => { clearAutoplayTimer(); setVideoAutoMuted(false); setVideoStarted(true); }}
+                    aria-label="Play video"
+                  >
+                    <span class="text-white text-3xl ml-1">&#9654;</span>
+                  </button>
+                </div>
+              }>
+                <VideoPlayer
+                  src={mediaUrl(currentPath())}
+                  startMuted={videoAutoMuted()}
+                  chromeVisible={chromeVisible()}
+                  onLoaded={() => setLoaded(true)}
+                  onError={() => setVideoError(true)}
+                  onChromeShow={() => setChromeVisible(true)}
+                  onChromeHide={() => setChromeVisible(false)}
+                />
+              </Show>
             </Show>
           </Show>
         </div>
-      </Show>
 
-      {/* Media display — image filmstrip. A horizontally-sliding track holds
-          the previous / current / next photos so a swipe glides between them
-          (neighbours are only mounted during a swipe). Only the current slide
-          carries the imperative cache-swapped <img> plus zoom/pan. The track is
-          click-through except the current photo, so a backdrop tap/click in the
-          surrounding margin still closes the viewer. */}
-      <Show when={!isVideo()}>
-        <div ref={trackRef} class="absolute inset-0 pointer-events-none">
-          {/* Previous neighbour slide */}
-          <Show when={swiping() && prevPath()}>
-            <div class="absolute inset-0 flex items-center justify-center" style={{ transform: neighbourTransform(-1) }}>
-              <img
-                src={neighbourSrc(prevPath()!)}
-                class="max-w-[100vw] max-h-[100vh] object-contain"
-                draggable={false}
-                onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }}
-              />
-            </div>
-          </Show>
-
-          {/* Current slide */}
-          <div class="absolute inset-0 flex items-center justify-center">
-            {/* Preview tier underlay — shown while the full-resolution image
-                is still decoding. Fails silently (404) until the tier is
-                ready, then a natural re-render swaps it in. Sized to contain
-                in the full viewport so it aligns with the full image. */}
-            <Show when={!loaded()}>
-              <img
-                src={thumbUrl(currentPath(), "p")}
-                class="absolute inset-0 w-full h-full object-contain pointer-events-none"
-                style={{ filter: "blur(2px)" }}
-                draggable={false}
-                onError={(e) => {
-                  (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
-                }}
-              />
-            </Show>
-
-            {/* Image container — preloaded Image elements are swapped in
-                directly. pointer-events-auto so a click/tap on the photo
-                doesn't fall through to the backdrop's click-to-close. */}
-            <div ref={imageContainerRef} class="flex items-center justify-center pointer-events-auto" />
-
-            {/* Canvas GIF playback (desktop) — replaces the imperative <img>
-                for GIFs. Zoom/pan don't apply here (the transform targets the
-                image container); acceptable for animated GIFs. */}
-            <Show when={useGifCanvas()}>
-              <GifCanvas
-                url={gifAtlasUrl(currentPath(), "p")}
-                class="max-w-[100vw] max-h-[100vh] pointer-events-auto"
-                style={{ "object-fit": "contain" }}
-              />
-            </Show>
-
-            <Show when={!loaded()}>
-              <svg
-                width="48"
-                height="48"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="text-white/20 pointer-events-none"
-              >
-                <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                <circle cx="8.5" cy="8.5" r="1.5" />
-                <polyline points="21 15 16 10 5 21" />
-              </svg>
-            </Show>
+        {/* Next neighbour slide */}
+        <Show when={swiping() && nextPath()}>
+          <div class="absolute inset-0 flex items-center justify-center" style={{ transform: neighbourTransform(1) }}>
+            <img
+              src={neighbourSrc(nextPath()!)}
+              class="max-w-[100vw] max-h-[100vh] object-contain"
+              draggable={false}
+              onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }}
+            />
           </div>
-
-          {/* Next neighbour slide */}
-          <Show when={swiping() && nextPath()}>
-            <div class="absolute inset-0 flex items-center justify-center" style={{ transform: neighbourTransform(1) }}>
-              <img
-                src={neighbourSrc(nextPath()!)}
-                class="max-w-[100vw] max-h-[100vh] object-contain"
-                draggable={false}
-                onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = "hidden"; }}
-              />
-            </div>
-          </Show>
-        </div>
-      </Show>
+        </Show>
+      </div>
 
       {/* Navigation — right. Hidden on touch (swipe navigates instead). */}
       <Show when={!hasTouch()}>
@@ -1049,12 +1141,18 @@ export function MediaViewer(props: MediaViewerProps) {
         />
       </Show>
 
-      {/* Bottom info bar — fades with the chrome on a touch tap. */}
+      {/* Bottom info bar — fades with the chrome on a touch tap. Lifted clear
+          of the video control bar (including its safe-area padding) when the
+          player is active. Never interactive: without pointer-events none it
+          would sit over the seek bar and steal its taps. */}
       <div
-        class="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/40 text-xs font-mono transition-opacity duration-200"
+        class="absolute left-1/2 -translate-x-1/2 text-white/40 text-xs font-mono transition-opacity duration-200 pointer-events-none"
         style={{
+          bottom:
+            isVideo() && videoStarted()
+              ? "calc(env(safe-area-inset-bottom, 0px) + 76px)"
+              : "1rem",
           opacity: chromeVisible() ? undefined : "0",
-          "pointer-events": chromeVisible() ? undefined : "none",
         }}
       >
         {filename()} — {props.currentIndex + 1} / {props.paths.length}{pixelRatioLabel()}
@@ -1076,7 +1174,7 @@ export function MediaViewer(props: MediaViewerProps) {
           opacity: chromeVisible() ? undefined : "0",
           "pointer-events": chromeVisible() ? undefined : "none",
         }}
-        onClick={props.onClose}
+        onClick={requestClose}
       >
         &times;
       </button>
@@ -1084,6 +1182,27 @@ export function MediaViewer(props: MediaViewerProps) {
       {/* Info panel */}
       <Show when={infoPanelOpen()}>
         <InfoPanel path={currentPath()} filename={filename()} />
+      </Show>
+
+      {/* Shared-element transition clone — flies between the grid cell rect
+          and the fitted media rect (see onMount / requestClose). */}
+      <Show when={cloneState()}>
+        <div
+          ref={cloneRef}
+          class="fixed z-[70] overflow-hidden pointer-events-none"
+          style={{
+            left: `${cloneState()!.from.left}px`,
+            top: `${cloneState()!.from.top}px`,
+            width: `${cloneState()!.from.width}px`,
+            height: `${cloneState()!.from.height}px`,
+          }}
+        >
+          <img
+            src={cloneState()!.src}
+            class="w-full h-full object-cover"
+            draggable={false}
+          />
+        </div>
       </Show>
     </div>
   );

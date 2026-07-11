@@ -266,6 +266,9 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
   return (
     <div
       ref={cellRef}
+      // Lets the viewer find this cell's on-screen rect for the shared-element
+      // open/close transition (lib/viewerTransition.ts).
+      data-vt-path={props.path}
       class={`thumb-cell relative overflow-hidden cursor-pointer ${props.freeSize ? "w-full h-full" : "aspect-square"}`}
       style={{
         background: "#1a1a1a",

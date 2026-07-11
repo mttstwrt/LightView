@@ -190,6 +190,13 @@ export interface AppSettings {
      *  in, instead of upscaling the 512px tier. Generated for visible cells
      *  only, so disk cost scales with what you actually view zoomed in. */
     justified_high_detail: boolean;
+    /** Where the mobile filter/sort sheet (opened by the search button)
+     *  appears: pinned to the top under the safe-area inset, or as a
+     *  thumb-reachable sheet sliding up from the bottom. Mobile web only. */
+    mobile_filter_sheet: "top" | "bottom";
+    /** Start playing a video automatically when you settle on it in the
+     *  viewer (always muted, with a tap-to-unmute pill). Off = tap play. */
+    video_autoplay_viewer: boolean;
   };
   performance: {
     preload_count: number;

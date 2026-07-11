@@ -17,7 +17,7 @@ const DIR_THRESHOLD = 6;
  *
  *  `onUploaded` is called after a successful upload so the gallery can refresh
  *  to show the new items (the web client gets no fs-watch push from the host). */
-export function UploadButton(props: { onUploaded?: () => void }) {
+export function UploadButton(props: { onUploaded?: () => void; hidden?: boolean }) {
   const [config, setConfig] = createSignal<UploadConfig | null>(null);
   const [open, setOpen] = createSignal(false);
   const [files, setFiles] = createSignal<File[]>([]);
@@ -27,9 +27,10 @@ export function UploadButton(props: { onUploaded?: () => void }) {
   const [result, setResult] = createSignal<UploadResult | null>(null);
   const [error, setError] = createSignal("");
   // Slide the FAB away on scroll-down, reveal on scroll-up — mirrors the
-  // filter bar. Never hide while the sheet is open.
+  // filter bar. Never hide while the sheet is open. `props.hidden` (viewer
+  // open) hides it unconditionally — it would sit on the video mute button.
   const [scrollHidden, setScrollHidden] = createSignal(false);
-  const hidden = () => scrollHidden() && !open();
+  const hidden = () => props.hidden || (scrollHidden() && !open());
 
   let fileInput: HTMLInputElement | undefined;
 

@@ -1,7 +1,8 @@
 import { createSignal, createEffect, Show, For, onCleanup, onMount } from "solid-js";
 import { Portal, Dynamic } from "solid-js/web";
+import { GearIcon, CloseIcon } from "./icons";
 import { settings, setSettings } from "../../stores/settingsStore";
-import { displayPaths, setSettingsOpen, viewMode, setViewMode } from "../../stores/galleryStore";
+import { displayPaths, settingsOpen, setSettingsOpen, viewMode, setViewMode } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
 import {
@@ -67,12 +68,12 @@ const GAP_PRESETS = [
   { label: "Wide", value: 8 },
 ] as const;
 
-export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onOpenTrash?: () => void; onRequestShow?: () => void }) {
-  const [open, setOpen] = createSignal(false);
-
-  // Mirror open state into the store so App can hide the grid behind the
-  // full-screen mobile settings page. Cleared on unmount.
-  createEffect(() => setSettingsOpen(open()));
+export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onOpenTrash?: () => void; onRequestShow?: () => void; hideTrigger?: boolean }) {
+  // Open state lives in the store (`settingsOpen`) so external chrome — e.g. the
+  // mobile floating gear button — can open this panel, and so App can hide the
+  // grid behind the full-screen mobile settings page. Cleared on unmount.
+  const open = settingsOpen;
+  const setOpen = setSettingsOpen;
   onCleanup(() => setSettingsOpen(false));
 
   // Web: re-sync worker/job state whenever the menu opens, so the Remote
@@ -592,26 +593,18 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
   return (
     <div class="relative">
-      {/* Gear button */}
+      {/* Gear button — hidden when an external trigger (the mobile floating
+          button) drives the panel instead. */}
+      <Show when={!props.hideTrigger}>
       <button
         onClick={toggle}
         class="shrink-0 w-8 h-8 flex items-center justify-center text-neutral-400 hover:text-neutral-200 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors cursor-pointer"
         title="Settings"
+        aria-label="Settings"
       >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <circle cx="12" cy="12" r="3" />
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-        </svg>
+        <GearIcon size={16} />
       </button>
+      </Show>
 
       {/* Dropdown panel (desktop) / full-screen page (mobile) */}
       <Show when={open()}>
@@ -641,7 +634,12 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
           }
           style={
             isMobile()
-              ? { background: "#121212" }
+              ? {
+                  background: "#121212",
+                  // Clear the notch/dynamic island and the home-indicator area.
+                  "padding-top": "env(safe-area-inset-top)",
+                  "padding-bottom": "env(safe-area-inset-bottom)",
+                }
               : {
                   background: "rgba(18, 18, 18, 0.96)",
                   "backdrop-filter": "blur(16px)",
@@ -663,18 +661,17 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             <Show when={isMobile()}>
               <button
                 onClick={() => setOpen(false)}
-                class="w-7 h-7 -mr-1 flex items-center justify-center rounded text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 cursor-pointer"
+                class="w-10 h-10 -mr-2 flex items-center justify-center rounded text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 cursor-pointer"
                 title="Close"
+                aria-label="Close settings"
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M18 6L6 18M6 6l12 12" />
-                </svg>
+                <CloseIcon size={16} />
               </button>
             </Show>
           </div>
 
           <div
-            class="px-4 py-3 flex flex-col gap-4 overflow-y-auto flex-1 min-h-0"
+            class="px-4 py-3 flex flex-col gap-4 overflow-y-auto overscroll-contain flex-1 min-h-0"
             classList={{
               "hide-scrollbar": isMobile(),
               "dupes-scroll": !isMobile(),
@@ -876,6 +873,14 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 onChange={(v) => updateDisplay("video_autoplay_loop", v)}
               />
               <Toggle
+                label="Autoplay videos in viewer"
+                checked={settings().display.video_autoplay_viewer}
+                onChange={(v) => updateDisplay("video_autoplay_viewer", v)}
+              />
+              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
+                Starts muted — tap the pill or the speaker button for sound.
+              </p>
+              <Toggle
                 label="Thumbnail fade-in"
                 checked={settings().display.scroll_blur}
                 onChange={(v) => updateDisplay("scroll_blur", v)}
@@ -894,6 +899,39 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 Generates sharper thumbnails when zoomed into the justified view.
                 Uses more disk for the images you view zoomed in.
               </p>
+
+              {/* Mobile-only: where the search/sort sheet appears. */}
+              <Show when={isMobile()}>
+                <div class="flex flex-col gap-1.5">
+                  <span class="text-xs text-neutral-300">Filter sheet position</span>
+                  <div class="flex items-center gap-1 p-0.5 rounded bg-neutral-800/60">
+                    <For each={[
+                      { value: "top" as const, label: "Top" },
+                      { value: "bottom" as const, label: "Bottom" },
+                    ]}>
+                      {(opt) => {
+                        const active = () =>
+                          settings().display.mobile_filter_sheet === opt.value;
+                        return (
+                          <button
+                            class="flex-1 px-2 py-1 text-xs rounded cursor-pointer transition-colors"
+                            classList={{
+                              "bg-neutral-700 text-white": active(),
+                              "text-neutral-300": !active(),
+                            }}
+                            onClick={() => updateDisplay("mobile_filter_sheet", opt.value)}
+                          >
+                            {opt.label}
+                          </button>
+                        );
+                      }}
+                    </For>
+                  </div>
+                  <p class="text-[10px] text-neutral-500 pl-0.5">
+                    Bottom is easier to reach one-handed on large phones.
+                  </p>
+                </div>
+              </Show>
 
             </Section>
 
