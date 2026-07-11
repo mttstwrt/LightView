@@ -61,7 +61,7 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libxdo-dev \
             cmake libde265-dev libaom-dev libdav1d-dev libx265-dev
-          git clone --depth 1 --branch v1.21.3 https://github.com/strukturag/libheif
+          git clone --depth 1 --branch v1.21.2 https://github.com/strukturag/libheif
           cmake -S libheif -B libheif/build \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
             -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF
@@ -142,8 +142,15 @@ jobs:
             lightview-headless-*.zip
 
   # ---- Container image → GHCR ---------------------------------------------
+  # Depends on `desktop` for ORDERING only — so that job creates the GitHub
+  # Release before the compose-file upload below, avoiding a duplicate-create
+  # race. The `!cancelled()` guard decouples it from desktop's *outcome*: the
+  # headless image still builds and pushes even when the desktop installers
+  # fail, because it's built from the self-contained Arch Dockerfile, not the
+  # desktop matrix's per-OS libheif provisioning.
   container:
-    needs: desktop           # let the desktop job create the release first
+    needs: desktop
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
