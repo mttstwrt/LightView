@@ -894,24 +894,61 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     });
   });
 
-  // Reset streaming state when the path list changes.
+  // Prune per-path streaming state when the path list changes. Surgical, not
+  // a wholesale wipe: the assign effect above has already run for this update
+  // (skipping cells that still had a rung) and won't fire again until the
+  // visible range moves — wiping surviving cells here would blank the grid
+  // until the next scroll (e.g. after deleting one image). Cells whose path
+  // survives keep their thumbMap URL and decoded <img>.
   createEffect(on(() => props.paths, (paths) => {
-    setThumbMap(reconcile({}));
-    assignedRung.clear();
-    swapper.cancelAll();
-    needsGeneration.clear();
-    inFlightSet.clear();
-    failedSet.clear();
-    urlVersions.clear();
-    jhPrecached.clear();
-    landingWarmed.clear();
-    setMeasuredAspects(new Map());
-    bgCursor = 0;
-    thumbGenTotal = 0;
-    thumbGenDone = 0;
     pathToIndex.clear();
     for (let i = 0; i < paths.length; i++) pathToIndex.set(paths[i], i);
-    setGeneration((g) => g + 1);
+
+    const gone = new Set<string>();
+    for (const p of Object.keys(thumbMap)) if (!pathToIndex.has(p)) gone.add(p);
+    for (const p of assignedRung.keys()) if (!pathToIndex.has(p)) gone.add(p);
+    if (gone.size > 0) {
+      batch(() => {
+        for (const p of gone) setThumbMap(p, undefined as any);
+      });
+      for (const p of gone) {
+        assignedRung.delete(p);
+        swapper.cancel(p);
+        urlVersions.delete(p);
+      }
+    }
+    const pruneAbsent = (s: Set<string>) => {
+      for (const p of s) if (!pathToIndex.has(p)) s.delete(p);
+    };
+    pruneAbsent(inFlightSet);
+    pruneAbsent(failedSet);
+    pruneAbsent(jhPrecached);
+    pruneAbsent(landingWarmed);
+    let droppedQueued = 0;
+    for (const p of needsGeneration) {
+      if (!pathToIndex.has(p)) {
+        needsGeneration.delete(p);
+        droppedQueued++;
+      }
+    }
+    if (droppedQueued > 0) {
+      thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - droppedQueued);
+      if (needsGeneration.size === 0 && inFlightSet.size === 0) {
+        thumbGenFinished(thumbGenDone);
+        thumbGenTotal = 0;
+        thumbGenDone = 0;
+      }
+    }
+    if (measuredAspects().size > 0) {
+      let changed = false;
+      const next = new Map<string, number>();
+      for (const [p, a] of measuredAspects()) {
+        if (pathToIndex.has(p)) next.set(p, a);
+        else changed = true;
+      }
+      if (changed) setMeasuredAspects(next);
+    }
+    bgCursor = 0;
     recalcRange?.();
   }));
 

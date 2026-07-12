@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setTotalCount, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, totalCount, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
@@ -211,7 +211,6 @@ export function App() {
     try {
       const result = await openGallery(path);
       setGalleryPath(result.path);
-      setTotalCount(result.total_media);
 
       // Restore per-gallery settings from .lightview folder
       await loadSettingsFromGallery();
@@ -247,7 +246,6 @@ export function App() {
       const info = await getGalleryInfo();
       if (info) {
         setGalleryPath(info.path);
-        setTotalCount(info.total_media);
         const filtered = await applyDefaultFilter();
         const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filtered, subSortField(), subSortOrder());
         setSortedItems(sorted.items);
@@ -266,7 +264,6 @@ export function App() {
       const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
       setSortedItems(sorted.items);
       setDisplayPaths(sorted.items.map((item) => item.path));
-      setTotalCount(sorted.items.length);
     } catch (e) {
       console.error("Failed to refresh after upload:", e);
     }
@@ -285,13 +282,19 @@ export function App() {
   const handleFsChange = async (added: string[], removed: string[]) => {
     if (removed.length > 0) {
       const removedSet = new Set(removed);
-      setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
-      setSortedItems(sortedItems().filter((item) => !removedSet.has(item.path)));
-      setSelectedPaths((prev) => {
-        const next = new Set(prev);
-        for (const p of removed) next.delete(p);
-        return next.size !== prev.size ? next : prev;
-      });
+      const remaining = sortedItems().filter((item) => !removedSet.has(item.path));
+      // When the app itself deleted the file (trash/move), onFilesRemoved has
+      // already dropped it from the lists — the watcher's echo matches nothing,
+      // so skip the writes and spare the grid a no-op paths-change pass.
+      if (remaining.length !== sortedItems().length) {
+        setSortedItems(remaining);
+        setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+        setSelectedPaths((prev) => {
+          const next = new Set(prev);
+          for (const p of removed) next.delete(p);
+          return next.size !== prev.size ? next : prev;
+        });
+      }
     }
 
     if (added.length > 0 || removed.length === 0) {
@@ -300,14 +303,10 @@ export function App() {
         const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
         setSortedItems(sorted.items);
         setDisplayPaths(sorted.items.map((item) => item.path));
-        setTotalCount(sorted.items.length);
-        return;
       } catch (e) {
         console.error("Failed to refresh after file addition:", e);
       }
     }
-
-    setTotalCount((c) => c + added.length - removed.length);
   };
 
   // Desktop: external filesystem changes arrive as a Tauri event. (On the web
@@ -561,7 +560,6 @@ export function App() {
               setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
               setSortedItems(sortedItems().filter((item) => !removedSet.has(item.path)));
               clearSelection();
-              setTotalCount((c) => Math.max(0, c - removed.length));
             }}
             onFilesMoved={(moved) => {
               // Files stayed in the gallery — re-key the cells to their new

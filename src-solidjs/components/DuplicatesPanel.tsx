@@ -1,7 +1,6 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
 import { findDuplicates, markNotDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
 import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
-import { setTotalCount } from "../stores/galleryStore";
 import { capabilities } from "../stores/capabilitiesStore";
 import { InfoPanel } from "./viewer/InfoPanel";
 import { MergeDialog } from "./MergeDialog";
@@ -153,7 +152,6 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
       // Remove from gallery display
       const removedSet = new Set([path]);
       setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
-      setTotalCount((c) => Math.max(0, c - 1));
     } catch (e) {
       console.error("Trash failed:", e);
     }
@@ -177,7 +175,6 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
       return updated;
     });
     setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
-    setTotalCount((c) => Math.max(0, c - discarded.length));
     setMergeGroup(null);
   };
 

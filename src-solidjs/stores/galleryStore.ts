@@ -13,7 +13,6 @@ import { setRating as setRatingIpc } from "../lib/ipc";
 // ---------------------------------------------------------------------------
 
 const [galleryPath, setGalleryPath] = createSignal<string | null>(null);
-const [totalCount, setTotalCount] = createSignal(0);
 const [thumbnailsReady, setThumbnailsReady] = createSignal(0);
 const [indexingProgress, setIndexingProgress] = createSignal(0);
 const [loading, setLoading] = createSignal(false);
@@ -106,7 +105,6 @@ const [settingsOpen, setSettingsOpen] = createSignal(false);
 
 export {
   galleryPath, setGalleryPath,
-  totalCount, setTotalCount,
   thumbnailsReady, setThumbnailsReady,
   indexingProgress, setIndexingProgress,
   loading, setLoading,
