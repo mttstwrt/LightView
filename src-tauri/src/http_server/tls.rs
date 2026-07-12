@@ -31,6 +31,12 @@ const VALIDITY_DAYS: i64 = 730;
 /// an expired cert.
 const RENEW_MARGIN_DAYS: i64 = 30;
 
+/// Bump when `generate()` starts emitting extensions a persisted cert must
+/// have (e.g. the serverAuth EKU iOS requires): certs minted by older builds
+/// then regenerate on the next start instead of being served until expiry.
+/// 1 = KeyUsage(digitalSignature) + EKU(serverAuth).
+const CERT_SCHEMA: u32 = 1;
+
 /// Sidecar metadata so we can decide whether the persisted cert is still
 /// usable without pulling in an x509 parser.
 #[derive(Serialize, Deserialize)]
@@ -39,6 +45,9 @@ struct CertMeta {
     sans: Vec<String>,
     /// Unix seconds of the cert's notAfter.
     not_after: i64,
+    /// `CERT_SCHEMA` at generation time; absent in pre-schema meta files.
+    #[serde(default)]
+    schema: u32,
 }
 
 pub struct TlsMaterial {
@@ -78,6 +87,10 @@ fn san_strings(lan_ip: Option<IpAddr>) -> Vec<String> {
 /// close to expiry.
 fn load_existing(dir: &PathBuf, sans: &[String]) -> Option<TlsMaterial> {
     let meta: CertMeta = serde_json::from_slice(&fs::read(dir.join(META_FILE)).ok()?).ok()?;
+    if meta.schema < CERT_SCHEMA {
+        log::info!("TLS cert predates schema {CERT_SCHEMA}; regenerating");
+        return None;
+    }
     if !sans.iter().all(|s| meta.sans.contains(s)) {
         log::info!("TLS cert SANs no longer cover {:?}; regenerating", sans);
         return None;
@@ -110,6 +123,19 @@ fn generate(sans: &[String]) -> Result<(TlsMaterial, i64), String> {
         params.subject_alt_names.push(san_type);
     }
 
+    // iOS/macOS won't trust a TLS server cert — even one the user manually
+    // installs — unless it carries the serverAuth EKU and a matching KeyUsage
+    // (Apple's "Requirements for trusted certificates in iOS 13+"). Without
+    // them Safari rejects the cert and drops the `Secure` pairing cookie, so a
+    // paired device bounces straight back to the pairing screen; Chromium is
+    // laxer and accepts the click-through, which is why it works there.
+    params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+
     let now = time::OffsetDateTime::now_utc();
     // Backdate slightly so clients with mild clock skew accept it immediately.
     params.not_before = now - time::Duration::hours(1);
@@ -141,6 +167,7 @@ fn persist(dir: &PathBuf, material: &TlsMaterial, sans: &[String], not_after: i6
         let meta = CertMeta {
             sans: sans.to_vec(),
             not_after,
+            schema: CERT_SCHEMA,
         };
         fs::write(dir.join(META_FILE), serde_json::to_vec_pretty(&meta)?)?;
         Ok(())
