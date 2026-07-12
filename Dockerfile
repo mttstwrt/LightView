@@ -41,11 +41,13 @@ FROM archlinux:latest AS runtime
 
 # Shared libs the binary links against at load time (webkit2gtk pulled in by
 # Tauri, libheif for HEIC/HEIF, the appindicator/rsvg deps of webkit).
+# ffmpeg is invoked as a subprocess for video thumbnails + metadata probing.
 RUN pacman -Syu --noconfirm --needed \
       webkit2gtk-4.1 \
       libheif \
       libayatana-appindicator \
       librsvg \
+      ffmpeg \
       ca-certificates \
  && pacman -Scc --noconfirm
 

@@ -572,13 +572,17 @@ impl CacheDb {
         }
     }
 
-    /// Drop every row keyed by a media path: metadata, tags, and every
-    /// thumbnail LOD tier. Used when a file leaves the gallery (trash, move
-    /// out, fs-watch removal) so no tier is left orphaned.
+    /// Drop every row keyed by a media path: metadata, tags, index state,
+    /// hashes, dedup decisions, GIF atlases, and every thumbnail LOD tier.
+    /// Used when a file leaves the gallery (trash, move out, fs-watch
+    /// removal) so no row is left orphaned.
     pub fn remove_media_rows(&self, path: &str) {
-        const TABLES: [&str; 9] = [
+        const TABLES: [&str; 12] = [
             "media_meta",
             "tag_index",
+            "index_state",
+            "file_hashes",
+            "gif_atlas",
             "thumbnails",
             "thumbnails_micro",
             "thumbnails_large",
@@ -593,5 +597,225 @@ impl CacheDb {
                 rusqlite::params![path],
             );
         }
+        let _ = self.conn.execute(
+            "DELETE FROM not_duplicates WHERE path_a = ?1 OR path_b = ?1",
+            rusqlite::params![path],
+        );
+    }
+
+    /// Rewrite the gallery-root prefix of every path-keyed row after a gallery
+    /// directory moves (new mount point, renamed folder, copied to another
+    /// machine). Carries thumbnails, ratings, view history, tag index, file
+    /// hashes, and dedup decisions to the new root without regeneration.
+    ///
+    /// `OR REPLACE`: a bare row may already exist under the new root (the
+    /// gallery was opened there before this rebase ran) — the relocated row
+    /// wins, since it carries the accumulated history.
+    ///
+    /// Returns the number of rows rewritten across all tables.
+    pub fn rebase_root(&self, old_root: &str, new_root: &str) -> Result<u64, CacheError> {
+        const PATH_TABLES: [&str; 12] = [
+            "media_meta",
+            "tag_index",
+            "index_state",
+            "file_hashes",
+            "thumbnails",
+            "thumbnails_micro",
+            "thumbnails_large",
+            "thumbnails_preview",
+            "thumbnails_justified",
+            "thumbnails_justified_mid",
+            "thumbnails_justified_high",
+            "gif_atlas",
+        ];
+
+        let old_root = old_root.trim_end_matches('/');
+        let new_root = new_root.trim_end_matches('/');
+        if old_root == new_root || old_root.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut rewritten = 0u64;
+        // Match on `old_root || '/'` so a sibling like `/data/photos2` is never
+        // rewritten when the old root is `/data/photos`.
+        for table in PATH_TABLES {
+            rewritten += tx.execute(
+                &format!(
+                    "UPDATE OR REPLACE {table}
+                     SET path = ?2 || substr(path, length(?1) + 1)
+                     WHERE substr(path, 1, length(?1) + 1) = ?1 || '/'"
+                ),
+                rusqlite::params![old_root, new_root],
+            )? as u64;
+        }
+        for col in ["path_a", "path_b"] {
+            rewritten += tx.execute(
+                &format!(
+                    "UPDATE OR REPLACE not_duplicates
+                     SET {col} = ?2 || substr({col}, length(?1) + 1)
+                     WHERE substr({col}, 1, length(?1) + 1) = ?1 || '/'"
+                ),
+                rusqlite::params![old_root, new_root],
+            )? as u64;
+        }
+        tx.commit()?;
+        Ok(rewritten)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_db() -> (tempfile::TempDir, CacheDb) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CacheDb::open(tmp.path()).unwrap();
+        (tmp, db)
+    }
+
+    #[test]
+    fn rebase_root_rewrites_all_path_tables() {
+        let (_tmp, db) = open_db();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO media_meta (path, file_size, media_type, rating) VALUES
+                     ('/old/root/a.jpg', 1, 'image', 4),
+                     ('/old/root/sub/b.jpg', 1, 'image', 2),
+                     ('/old/rootling/c.jpg', 1, 'image', 5);
+                 INSERT INTO tag_index (path, namespace, tag) VALUES
+                     ('/old/root/a.jpg', 'user', 'cat');
+                 INSERT INTO not_duplicates (path_a, path_b) VALUES
+                     ('/old/root/a.jpg', '/old/root/sub/b.jpg');
+                 INSERT INTO thumbnails (path, media_type, mtime, width, height, thumbnail)
+                     VALUES ('/old/root/a.jpg', 'image', 1, 8, 8, x'00');",
+            )
+            .unwrap();
+
+        // 2 media_meta + 1 tag_index + 1 thumbnail + 2 not_duplicates columns
+        let n = db.rebase_root("/old/root", "/new/spot").unwrap();
+        assert_eq!(n, 6);
+
+        let rating: u8 = db
+            .conn()
+            .query_row(
+                "SELECT rating FROM media_meta WHERE path = '/new/spot/sub/b.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rating, 2);
+
+        // Sibling directory sharing the prefix string must be untouched.
+        let untouched: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM media_meta WHERE path = '/old/rootling/c.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, 1);
+
+        let tag_path: String = db
+            .conn()
+            .query_row("SELECT path FROM tag_index WHERE tag = 'cat'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(tag_path, "/new/spot/a.jpg");
+
+        let pair: (String, String) = db
+            .conn()
+            .query_row("SELECT path_a, path_b FROM not_duplicates", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(pair.0, "/new/spot/a.jpg");
+        assert_eq!(pair.1, "/new/spot/sub/b.jpg");
+    }
+
+    #[test]
+    fn rebase_root_replaces_bare_rows_under_new_root() {
+        let (_tmp, db) = open_db();
+        // The gallery was already opened at the new root once, so a bare row
+        // (no rating) exists alongside the history-carrying old row.
+        db.conn()
+            .execute_batch(
+                "INSERT INTO media_meta (path, file_size, media_type, rating) VALUES
+                     ('/old/root/a.jpg', 1, 'image', 5),
+                     ('/new/spot/a.jpg', 1, 'image', NULL);",
+            )
+            .unwrap();
+
+        db.rebase_root("/old/root", "/new/spot").unwrap();
+
+        let (count, rating): (i64, Option<u8>) = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), MAX(rating) FROM media_meta WHERE path = '/new/spot/a.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rating, Some(5));
+    }
+
+    #[test]
+    fn remove_media_rows_clears_every_path_keyed_table() {
+        let (_tmp, db) = open_db();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO media_meta (path, file_size, media_type) VALUES ('/g/a.jpg', 1, 'image');
+                 INSERT INTO tag_index (path, namespace, tag) VALUES ('/g/a.jpg', 'user', 'cat');
+                 INSERT INTO index_state (path, companion_mtime) VALUES ('/g/a.jpg', 42);
+                 INSERT INTO file_hashes (path, hash, mtime) VALUES ('/g/a.jpg', 'abc', 1);
+                 INSERT INTO gif_atlas (path, tier, mtime, frame_count, frame_w, frame_h, cols, delays, atlas)
+                     VALUES ('/g/a.jpg', 'm', 1, 1, 8, 8, 1, '100', x'00');
+                 INSERT INTO not_duplicates (path_a, path_b) VALUES ('/g/a.jpg', '/g/b.jpg');
+                 INSERT INTO not_duplicates (path_a, path_b) VALUES ('/g/b.jpg', '/g/c.jpg');",
+            )
+            .unwrap();
+
+        db.remove_media_rows("/g/a.jpg");
+
+        for table in [
+            "media_meta",
+            "tag_index",
+            "index_state",
+            "file_hashes",
+            "gif_atlas",
+        ] {
+            let left: i64 = db
+                .conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE path = '/g/a.jpg'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "{table} row not removed");
+        }
+        // The pair involving the removed file goes; the unrelated pair stays.
+        let pairs: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM not_duplicates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pairs, 1);
+    }
+
+    #[test]
+    fn rebase_root_noops_on_same_or_empty_root() {
+        let (_tmp, db) = open_db();
+        db.conn()
+            .execute(
+                "INSERT INTO media_meta (path, file_size, media_type) VALUES ('/g/a.jpg', 1, 'image')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.rebase_root("/g", "/g").unwrap(), 0);
+        assert_eq!(db.rebase_root("", "/x").unwrap(), 0);
+        assert_eq!(db.rebase_root("/g/", "/g").unwrap(), 0); // trailing slash normalized
     }
 }

@@ -168,7 +168,9 @@ fn backfill_gps_meta(db: &CacheDb) -> Result<(), String> {
 /// Walk all companion files in the gallery and index their tags into the
 /// cache DB.  Rebuilds `tag_counts` from `tag_index` at the end so that
 /// autocomplete and filter reflect every tag on disk — including those
-/// written by plugins or carried over from previous sessions.
+/// written by plugins or carried over from previous sessions. Also mirrors
+/// each companion's rating into `media_meta` so ratings survive a gallery
+/// move/copy where the cached absolute paths no longer match.
 fn index_companions(db: &CacheDb, gallery_path: &str) {
     let ext = crate::companion::schema::COMPANION_EXTENSION;
 
@@ -176,30 +178,22 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
     // check is an in-memory lookup rather than a SQL round-trip per file.
     let index_state = db.load_index_state().unwrap_or_default();
 
-    // Gather companion files without walking the media tree through .lightview.
-    // Two sources:
-    //   1. the dedicated `.lightview/companions/` directory (default location,
-    //      where plugin output lands) — scanned directly.
-    //   2. side-by-side companions in the media tree — found by walking the
-    //      gallery while pruning the entire `.lightview` subtree so we don't
-    //      re-stat the cache db, atlas, thumbnails, or the companions dir.
+    // Gather companion files in a single walk. Companions live either
+    // alongside media or in a per-directory `.lightview/companions/` tree —
+    // every folder with media has its own — so the walk must descend into
+    // each `.lightview` dir, but only its `companions/` subtree: the cache
+    // db, atlas, and thumbnails that live next to it stay pruned.
     let mut companions: Vec<walkdir::DirEntry> = Vec::new();
-
-    let companions_dir = Path::new(gallery_path).join(".lightview").join("companions");
-    if companions_dir.is_dir() {
-        for entry in walkdir::WalkDir::new(&companions_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.path().to_string_lossy().ends_with(ext) {
-                companions.push(entry);
-            }
-        }
-    }
-
     for entry in walkdir::WalkDir::new(gallery_path)
         .into_iter()
-        .filter_entry(|e| e.file_name() != ".lightview")
+        .filter_entry(|e| {
+            let inside_lightview = e
+                .path()
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == ".lightview");
+            !inside_lightview || e.file_name() == "companions"
+        })
         .filter_map(|e| e.ok())
     {
         if entry.path().to_string_lossy().ends_with(ext) {
@@ -244,6 +238,15 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("Failed to prepare index_state statement: {}", e);
+                return;
+            }
+        };
+        let mut rating_stmt = match tx.prepare_cached(
+            "UPDATE media_meta SET rating = ?2, last_rated = ?3 WHERE path = ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to prepare rating statement: {}", e);
                 return;
             }
         };
@@ -298,6 +301,17 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
                         let _ =
                             ins_stmt.execute(rusqlite::params![media_path_str, namespace, tag]);
                     }
+                    // Mirror the companion's rating into media_meta. The row is
+                    // keyed by absolute path, so after a gallery move/copy it
+                    // starts NULL even though the companion holds a rating.
+                    let core = companion.meta.core.as_ref();
+                    let rating = core.and_then(|c| c.rating);
+                    let last_rated = core
+                        .and_then(|c| c.date_rated.as_deref())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|d| d.timestamp());
+                    let _ = rating_stmt
+                        .execute(rusqlite::params![media_path_str, rating, last_rated]);
                     let _ = state_stmt.execute(rusqlite::params![media_path_str, companion_mtime]);
                     indexed += 1;
                 }
@@ -320,6 +334,131 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
             skipped
         );
     }
+}
+
+/// `gallery_meta` key recording the absolute root the cached paths are
+/// keyed under, so a moved gallery can be detected and rebased on open.
+const GALLERY_ROOT_KEY: &str = "gallery_root";
+
+/// Detect a moved gallery directory and rebase the cache's absolute paths so
+/// thumbnails, ratings, view history, and dedup state survive the move.
+/// Runs before `populate_media_meta`, which would otherwise insert bare rows
+/// under the new root and shadow the relocated history.
+fn adopt_gallery_root(db: &CacheDb, root: &str, entries: &[crate::provider::FileEntry]) {
+    let root = root.trim_end_matches('/');
+    let stored = db
+        .get_gallery_meta(GALLERY_ROOT_KEY)
+        .ok()
+        .flatten()
+        .map(|s| s.trim_end_matches('/').to_string());
+
+    let old_root = match stored.as_deref() {
+        Some(s) if s == root => return, // unchanged — the common case
+        Some(s) => Some(s.to_string()),
+        // Cache predates root tracking: infer the old root from the rows.
+        None => infer_old_root(db, root, entries),
+    };
+
+    if let Some(old_root) = old_root {
+        match db.rebase_root(&old_root, root) {
+            Ok(0) => {}
+            Ok(n) => log::info!(
+                "Gallery moved: rebased {} cached rows from {} to {}",
+                n,
+                old_root,
+                root
+            ),
+            Err(e) => log::warn!("Cache rebase {} -> {} failed: {}", old_root, root, e),
+        }
+    }
+    let _ = db.set_gallery_meta(GALLERY_ROOT_KEY, root);
+}
+
+/// Infer the previous gallery root of a cache that predates root tracking:
+/// match a few on-disk files against cached rows by gallery-relative suffix
+/// and require every sample to agree on a single foreign prefix. Returns
+/// `None` (skipping the rebase — safe no-op) when there is nothing foreign
+/// in the cache or the evidence is ambiguous.
+fn infer_old_root(
+    db: &CacheDb,
+    root: &str,
+    entries: &[crate::provider::FileEntry],
+) -> Option<String> {
+    let foreign: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM media_meta
+             WHERE substr(path, 1, length(?1) + 1) != ?1 || '/'",
+            rusqlite::params![root],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if foreign == 0 {
+        return None;
+    }
+
+    let mut candidate: Option<String> = None;
+    let mut agreed = 0;
+    for entry in entries.iter().filter(|e| !e.is_dir) {
+        // Keep the leading '/' so the prefix comes out without a trailing one.
+        let Some(rel) = entry.path.strip_prefix(root) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        // SQLite length()/substr() count characters, not bytes.
+        let rel_chars = rel.chars().count() as i64;
+        let prefixes: Vec<String> = db
+            .conn()
+            .prepare_cached(
+                "SELECT DISTINCT substr(path, 1, length(path) - ?2) FROM media_meta
+                 WHERE length(path) > ?2
+                   AND substr(path, length(path) - ?2 + 1) = ?1",
+            )
+            .ok()?
+            .query_map(rusqlite::params![rel, rel_chars], |r| r.get::<_, String>(0))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .filter(|p| p != root && !p.is_empty())
+            .collect();
+
+        match prefixes.as_slice() {
+            [] => continue, // no cached history for this file under any root
+            [one] => match &candidate {
+                Some(c) if c != one => {
+                    log::info!(
+                        "Gallery root inference ambiguous ({} vs {}); skipping rebase",
+                        c,
+                        one
+                    );
+                    return None;
+                }
+                _ => {
+                    candidate = Some(one.clone());
+                    agreed += 1;
+                }
+            },
+            _ => {
+                log::info!(
+                    "Gallery root inference ambiguous for {}; skipping rebase",
+                    rel
+                );
+                return None;
+            }
+        }
+        if agreed >= 5 {
+            break;
+        }
+    }
+    if candidate.is_some() {
+        log::info!(
+            "Inferred previous gallery root {} from {} matching file(s)",
+            candidate.as_deref().unwrap_or(""),
+            agreed
+        );
+    }
+    candidate
 }
 
 /// Payload emitted for `gallery:fs-changed` events.
@@ -605,6 +744,13 @@ pub async fn open_gallery_impl(
         .map_err(|e| format!("Failed to scan directory: {}", e))?;
 
     let media_count = entries.len();
+
+    // If the gallery directory moved since the cache was built (new mount
+    // point, renamed folder, copied to another machine), rewrite the cached
+    // absolute paths before populate_media_meta inserts bare rows under the
+    // new root. Must run before the read-only pool opens below so the pool
+    // never sees mid-rebase state.
+    adopt_gallery_root(&cache_db, &path, &entries);
 
     // Populate media_meta table so sorting works immediately
     populate_media_meta(&cache_db, &entries)?;
