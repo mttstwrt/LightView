@@ -24,6 +24,11 @@ there. Gotchas learned the hard way:
 - Startup log lines need `RUST_LOG=info` in the environment.
 - Kill the server with `pkill -f 'lightview-headles[s] serve'` — the bracket
   keeps pkill from matching (and killing) your own shell command line, which
-  otherwise dies with exit 144.
+  otherwise dies with exit 144. The bracket does NOT save you if another part
+  of the same compound command contains the literal string (e.g. a later
+  `lightview-headless serve` restart) — run the pkill as its own Bash call.
+- `apply_filter` matches user tags as bare terms (`{"query":"my-tag"}`);
+  `tag:my-tag` and `user:my-tag` silently return `[]`. Namespaced forms in
+  the grammar: `type:image`, `has::plugin.<name>`.
 - Test video for ffmpeg paths:
   `ffmpeg -f lavfi -i testsrc=duration=1:size=128x128:rate=10 -pix_fmt yuv420p clip.mp4`
