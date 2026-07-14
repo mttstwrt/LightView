@@ -79,13 +79,39 @@ async fn serve(path: PathBuf, port: u16) -> ExitCode {
 
     let state = AppState::new();
 
+    let web_root = resolve_web_root();
+    if web_root.is_none() {
+        log::warn!(
+            "No dist/ directory found in the CWD or next to the binary — the web \
+             UI will not load. Build it with `npm run build` and place dist/ here."
+        );
+    }
+
+    // Bind the listener *before* the gallery scan, which can take minutes on
+    // a large library. Until the gallery finishes opening, the gallery gate
+    // in the HTTP layer answers every request with a 503 "starting" page —
+    // a sign of life instead of a refused connection.
+    let config = HttpConfig::remote(port, web_root);
+    let server = match http_server::start(config, state.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to start server on port {port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    log::info!(
+        "LightView headless listening on https://0.0.0.0:{} (self-signed cert) — \
+         serving a 503 \"starting\" page until the gallery finishes opening",
+        server.addr.port()
+    );
+
     log::info!("Opening gallery: {path_str}");
     match open_gallery_impl(&state, path_str.clone(), || {
         log::info!("Background tag indexing complete");
     })
     .await
     {
-        Ok(info) => log::info!("Gallery opened: {} media files", info.total_media),
+        Ok(info) => log::info!("Gallery opened: {} media files — serving", info.total_media),
         Err(e) => {
             eprintln!("error: failed to open gallery: {e}");
             return ExitCode::FAILURE;
@@ -102,27 +128,6 @@ async fn serve(path: PathBuf, port: u16) -> ExitCode {
     // under data/plugins) alongside any remote lightview-worker.
     lightview_lib::tagging::local::ensure_started(&state);
 
-    let web_root = resolve_web_root();
-    if web_root.is_none() {
-        log::warn!(
-            "No dist/ directory found in the CWD or next to the binary — the web \
-             UI will not load. Build it with `npm run build` and place dist/ here."
-        );
-    }
-
-    let config = HttpConfig::remote(port, web_root);
-    let server = match http_server::start(config, state).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to start server on port {port}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    log::info!(
-        "LightView headless serving on https://0.0.0.0:{} (self-signed cert)",
-        server.addr.port()
-    );
     log::info!("Pair a device with:  lightview-headless pair {path_str}");
 
     // Park on the server task — it only resolves if axum::serve returns/errors.
@@ -137,6 +142,22 @@ async fn serve(path: PathBuf, port: u16) -> ExitCode {
 /// in the gallery's `.lightview/cache.db`, so the running `serve` process (which
 /// shares that db) will accept it at `/pair/redeem`.
 fn pair(path: &Path) -> ExitCode {
+    // Refuse to invent a gallery: opening a path with no cache would silently
+    // create a fresh cache.db and mint a PIN the running server never sees
+    // (its migration log lines are the tell). The path must be exactly what
+    // the server is serving — its startup log says `Opening gallery: <path>`
+    // — and the server must have opened it at least once.
+    let db_file = path.join(".lightview").join("cache.db");
+    if !db_file.is_file() {
+        eprintln!("error: no gallery cache at {}", db_file.display());
+        eprintln!(
+            "`pair` must be given the same path the running server is serving \
+             (check its `Opening gallery:` log line — inside Docker that's the \
+             container-side path, e.g. /gallery), and the server must have been \
+             started against it at least once."
+        );
+        return ExitCode::FAILURE;
+    }
     let db = match CacheDb::open(path) {
         Ok(db) => db,
         Err(e) => {

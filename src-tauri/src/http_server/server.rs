@@ -147,6 +147,13 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     }
 
     let router = router
+        // Hold every route (except /healthz) behind a 503 "starting" page
+        // until a gallery is open — the headless server binds before the
+        // gallery scan finishes.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            mw::gallery_gate,
+        ))
         // Outermost layer: count remote peers across every route (including
         // unauthenticated static assets — the first thing a browser fetches).
         .layer(middleware::from_fn_with_state(

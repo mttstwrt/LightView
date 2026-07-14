@@ -462,8 +462,12 @@ fn error(status: StatusCode) -> Response<Body> {
         .unwrap()
 }
 
-pub async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+/// `GET /healthz` — liveness probe. Always 200 once the listener is up;
+/// the body distinguishes "process alive, gallery still opening" from ready.
+/// Exempt from the gallery gate so it answers during the startup scan.
+pub async fn healthz(State(state): State<ServerState>) -> impl IntoResponse {
+    let ready = state.app.current_gallery.read().await.is_some();
+    (StatusCode::OK, if ready { "ok" } else { "starting" })
 }
 
 /// `GET /api/events` — Server-Sent Events stream of gallery changes.

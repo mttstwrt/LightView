@@ -31,6 +31,42 @@ pub async fn track_remote_hits(
     next.run(request).await
 }
 
+/// Readiness gate: until a gallery is open (`AppState::current_gallery` set),
+/// every route except `/healthz` answers 503 with a tiny self-refreshing
+/// "starting" page. The headless server binds its listener before the
+/// (potentially minutes-long) gallery scan, so early requests get a sign of
+/// life instead of a refused connection; the page reloads itself and flips to
+/// the app the moment the scan finishes.
+pub async fn gallery_gate(
+    State(state): State<ServerState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() != "/healthz" && state.app.current_gallery.read().await.is_none() {
+        return starting_response();
+    }
+    next.run(request).await
+}
+
+fn starting_response() -> Response {
+    const BODY: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+        <meta http-equiv=\"refresh\" content=\"3\">\
+        <title>LightView &mdash; starting</title></head>\
+        <body style=\"font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0\">\
+        <p>LightView is starting &mdash; indexing the gallery&hellip; \
+        This page retries automatically.</p></body></html>";
+    let mut resp = Response::new(axum::body::Body::from(BODY));
+    *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    resp.headers_mut()
+        .insert("Retry-After", HeaderValue::from_static("3"));
+    resp.headers_mut().insert(
+        "Content-Type",
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    resp
+}
+
 /// Cache policy for the statically-served SPA.
 ///
 /// Build assets carry a content hash in their filename (`main-<hash>.js`), so a
