@@ -77,7 +77,7 @@ pub async fn media(
     // thread (and transfers far fewer bytes — matters for remote providers).
     if let Some(edge) = query.fit {
         if edge > 0 && is_fit_resizable(&ext) {
-            return serve_fit_image(&state, &path, edge).await;
+            return serve_fit_image(&state, &path, edge, &headers).await;
         }
     }
 
@@ -155,6 +155,45 @@ async fn serve_image(path: &str, mime: &'static str, headers: &HeaderMap) -> Res
     builder.body(Body::from(data)).unwrap()
 }
 
+/// Strong ETag for a thumbnail body: truncated SHA-256 of the bytes. ~50µs on
+/// a 20KB blob — negligible next to the SQLite read it validates.
+fn body_etag(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(34);
+    hex.push('"');
+    for b in &digest[..16] {
+        use std::fmt::Write;
+        let _ = write!(hex, "{:02x}", b);
+    }
+    hex.push('"');
+    hex
+}
+
+/// Does an `If-None-Match` header value match `etag`? Handles comma lists and
+/// weak validators (`W/"..."` compares equal — fine for a GET cache check).
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|t| t.trim().trim_start_matches("W/") == etag || t.trim() == "*")
+        })
+}
+
+/// 304 with the validators re-attached (per RFC 9110 the 304 must carry the
+/// headers a cache needs to refresh the stored response's freshness).
+fn not_modified(etag: &str, cache_control: &'static str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// Serves an aspect-preserving resize of a native raster still to `edge`
 /// (longest-edge) pixels, encoded WebP. The decode + downscale runs on the
 /// shared thumb pool — the same bounded rayon pool the thumbnail tiers use — so
@@ -162,8 +201,37 @@ async fn serve_image(path: &str, mime: &'static str, headers: &HeaderMap) -> Res
 /// scroll burst. Cached like the thumbnail route (`max-age`, ?fit= makes the URL
 /// content-stable), so the webview holds the resized bytes without a disk cache
 /// on our side. Falls back to the full file if the resize fails.
-async fn serve_fit_image(state: &ServerState, path: &str, edge: u32) -> Response<Body> {
+///
+/// Revalidation: the ETag derives from the *source* file (mtime + size +
+/// edge), checked before any decoding — an `If-None-Match` hit answers 304
+/// without paying the resize, which is the whole point on a busy phone
+/// revisit after max-age expiry.
+async fn serve_fit_image(
+    state: &ServerState,
+    path: &str,
+    edge: u32,
+    headers: &HeaderMap,
+) -> Response<Body> {
     let target = edge.clamp(16, FIT_MAX_EDGE);
+
+    let etag = match tokio::fs::metadata(path).await {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(format!("\"fit-{}-{}-{}\"", mtime, meta.len(), target))
+        }
+        Err(_) => None,
+    };
+    if let Some(etag) = &etag {
+        if if_none_match(headers, etag) {
+            return not_modified(etag, "public, max-age=3600");
+        }
+    }
+
     let src = path.to_string();
     let pool = state.app.thumb_pool.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -179,16 +247,20 @@ async fn serve_fit_image(state: &ServerState, path: &str, edge: u32) -> Response
     });
 
     match rx.await {
-        Ok(Ok(thumb)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/webp")
-            .header(header::CONTENT_LENGTH, thumb.data.len().to_string())
-            // Same caching contract as the thumbnail route: the URL is keyed by
-            // path + fit edge, so within a session its bytes don't change; the
-            // max-age bounds cross-session staleness if the source is edited.
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
-            .body(Body::from(thumb.data))
-            .unwrap(),
+        Ok(Ok(thumb)) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/webp")
+                .header(header::CONTENT_LENGTH, thumb.data.len().to_string())
+                // Same caching contract as the thumbnail route: the URL is keyed by
+                // path + fit edge, so within a session its bytes don't change; the
+                // max-age bounds cross-session staleness if the source is edited.
+                .header(header::CACHE_CONTROL, "public, max-age=3600");
+            if let Some(etag) = &etag {
+                builder = builder.header(header::ETAG, etag);
+            }
+            builder.body(Body::from(thumb.data)).unwrap()
+        }
         // Resize failed (decode error, dropped task) — fall back to the whole
         // file so the cell still shows something rather than breaking.
         other => {
@@ -264,6 +336,7 @@ pub async fn gif_atlas(
 pub async fn thumb(
     State(state): State<ServerState>,
     Path((tier, rel)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response<Body> {
     let Some(tier) = ThumbTier::from_segment(&tier) else {
         return error(StatusCode::BAD_REQUEST);
@@ -280,13 +353,23 @@ pub async fn thumb(
 
     match thumb_serve::get_or_generate(&state.app, tier, path).await {
         // Cacheable: mirrors the lightview:// protocol handler — the frontend
-        // cache-busts with ?v= whenever bytes change.
-        ThumbOutcome::Hit { data, format } => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, thumb_serve::thumb_mime(&format))
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
-            .body(Body::from(data))
-            .unwrap(),
+        // cache-busts with ?v= whenever bytes change. The ETag makes the
+        // post-max-age revisit a 304 instead of a full re-download: a phone
+        // returning after an hour revalidates its whole cached grid for a few
+        // hundred bytes per thumb.
+        ThumbOutcome::Hit { data, format } => {
+            let etag = body_etag(&data);
+            if if_none_match(&headers, &etag) {
+                return not_modified(&etag, "public, max-age=3600");
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, thumb_serve::thumb_mime(&format))
+                .header(header::CACHE_CONTROL, "public, max-age=3600")
+                .header(header::ETAG, etag)
+                .body(Body::from(data))
+                .unwrap()
+        }
         ThumbOutcome::NoGallery => error(StatusCode::SERVICE_UNAVAILABLE),
         ThumbOutcome::Miss => error(StatusCode::NOT_FOUND),
     }
