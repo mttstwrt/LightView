@@ -24,6 +24,7 @@
     "@tailwindcss/vite": "^4.0.0",
     "@types/leaflet": "^1.9.12",
     "@webgpu/types": "^0.1.69",
+    "playwright": "^1.61.1",
     "solid-devtools": "^0.34.5",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.4.0",
