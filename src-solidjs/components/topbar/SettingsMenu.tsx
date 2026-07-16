@@ -455,6 +455,9 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
   const [pluginStatus, setPluginStatus] = createSignal("");
 
   const refreshPlugins = async () => {
+    // Same capability gate as ContextMenu: the web /api/invoke allowlist
+    // rejects list_plugins, so calling it on boot is a guaranteed 403.
+    if (!capabilities().plugins) return;
     try {
       setPlugins(await listPlugins());
     } catch {}
