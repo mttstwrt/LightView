@@ -27,6 +27,14 @@ const THUMB_CACHE_MAX_ENTRIES = 2000;
 const TRIM_EVERY_N_PUTS = 50;
 let putsSinceTrim = 0;
 
+// How long a cached thumb serves without any network at all (matches the
+// server's max-age). Revalidating on *every* hit — the textbook SWR shape —
+// was a measured disaster on scroll: once the browser's HTTP cache expires
+// (any phone revisiting after an hour), each cache hit spawned a full 200
+// re-download in the background. A 12s scroll re-transferred ~3 MB of thumbs
+// the user was already seeing, starving the real tier-upgrade fetches.
+const THUMB_FRESH_MS = 3600 * 1000;
+
 self.addEventListener("install", () => {
   self.skipWaiting();
 });
@@ -64,26 +72,39 @@ async function trimThumbCache(cache) {
 async function staleWhileRevalidate(event, request) {
   const cache = await caches.open(THUMB_CACHE);
   const hit = await cache.match(request);
-  const revalidate = fetch(request)
-    .then(async (res) => {
-      if (res.ok) {
-        await cache.put(request, res.clone());
-        if (++putsSinceTrim >= TRIM_EVERY_N_PUTS) {
-          putsSinceTrim = 0;
-          await trimThumbCache(cache);
-        }
-      }
-      return res;
-    })
-    .catch(() => undefined);
   if (hit) {
-    // Serve cached bytes now; refresh in the background for next time.
-    event.waitUntil(revalidate);
+    // Fresh enough (by the Date header captured at put time): pure cache
+    // hit, zero network. A missing/unparseable Date reads as stale.
+    const storedAt = Date.parse(hit.headers.get("date") ?? "") || 0;
+    if (Date.now() - storedAt < THUMB_FRESH_MS) return hit;
+    // Stale: serve cached bytes now, refresh in the background. The refresh
+    // rides the HTTP cache's conditional machinery when validators exist
+    // (the server ETags thumbs), and the put refreshes the stored Date so
+    // this URL stays quiet for another freshness window.
+    event.waitUntil(
+      fetch(request)
+        .then(async (res) => {
+          if (res.ok) await putAndTrim(cache, request, res);
+        })
+        .catch(() => {}),
+    );
     return hit;
   }
-  const res = await revalidate;
-  if (res) return res;
-  return Response.error();
+  try {
+    const res = await fetch(request);
+    if (res.ok) await putAndTrim(cache, request, res);
+    return res;
+  } catch {
+    return Response.error();
+  }
+}
+
+async function putAndTrim(cache, request, res) {
+  await cache.put(request, res.clone());
+  if (++putsSinceTrim >= TRIM_EVERY_N_PUTS) {
+    putsSinceTrim = 0;
+    await trimThumbCache(cache);
+  }
 }
 
 async function networkFirstShell(request) {
