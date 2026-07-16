@@ -991,3 +991,90 @@ pub async fn get_gallery_info_impl(
         None => Ok(None),
     }
 }
+
+/// Everything the web client needs to render its first frame, in one
+/// round-trip: gallery info, the gallery-wide default filter, and the sorted
+/// item list (with the default filter already applied server-side). The old
+/// boot was three serial invokes — on a phone that's three network RTTs
+/// between opening the app and the grid having data.
+#[derive(Debug, Serialize)]
+pub struct BootState {
+    pub gallery: Option<GalleryOpenResult>,
+    /// The stored default filter, so the client can seed its FilterBar with
+    /// the query that `sorted` already reflects.
+    pub default_filter: Option<crate::commands::settings::DefaultFilter>,
+    /// None when no gallery is open.
+    pub sorted: Option<crate::commands::sort::SortedResult>,
+}
+
+pub async fn get_boot_state_impl(
+    state: &AppState,
+    sort_field: crate::sort::sorter::SortField,
+    sort_order: crate::sort::sorter::SortOrder,
+    group_by: crate::sort::grouper::GroupBy,
+    sub_sort_field: Option<crate::sort::sorter::SortField>,
+    sub_sort_order: Option<crate::sort::sorter::SortOrder>,
+) -> Result<BootState, String> {
+    let gallery = get_gallery_info_impl(state).await?;
+    if gallery.is_none() {
+        return Ok(BootState { gallery: None, default_filter: None, sorted: None });
+    }
+
+    // Absent gallery settings read as "no default filter", same as the
+    // client-side fallback this replaces.
+    let default_filter = crate::commands::settings::get_gallery_default_filter_impl(state)
+        .await
+        .unwrap_or(None);
+
+    // A default filter that fails to parse/apply degrades to the unfiltered
+    // list rather than failing the boot — mirrors applyDefaultFilter() in the
+    // frontend, which catches and falls back to all items.
+    let filter_paths = match &default_filter {
+        Some(df) if df.enabled && !df.query.trim().is_empty() => {
+            match crate::commands::filter::apply_filter_impl(state, df.query.trim().to_string())
+                .await
+            {
+                Ok(paths) => Some(paths),
+                Err(e) => {
+                    log::warn!("Boot-state default filter failed, serving unfiltered: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let sorted = crate::commands::sort::get_sorted_items_impl(
+        state,
+        sort_field,
+        sort_order,
+        group_by,
+        filter_paths,
+        sub_sort_field,
+        sub_sort_order,
+    )
+    .await?;
+
+    Ok(BootState { gallery, default_filter, sorted: Some(sorted) })
+}
+
+/// Single-round-trip boot for the web client (also callable over Tauri IPC).
+#[tauri::command]
+pub async fn get_boot_state(
+    state: tauri::State<'_, AppState>,
+    sort_field: crate::sort::sorter::SortField,
+    sort_order: crate::sort::sorter::SortOrder,
+    group_by: crate::sort::grouper::GroupBy,
+    sub_sort_field: Option<crate::sort::sorter::SortField>,
+    sub_sort_order: Option<crate::sort::sorter::SortOrder>,
+) -> Result<BootState, String> {
+    get_boot_state_impl(
+        &state,
+        sort_field,
+        sort_order,
+        group_by,
+        sub_sort_field,
+        sub_sort_order,
+    )
+    .await
+}

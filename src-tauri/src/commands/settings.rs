@@ -789,7 +789,7 @@ pub async fn load_gallery_settings(
 /// web client. Lives inside the full app-settings blob, but is exposed on its
 /// own so the read-only web bridge can read it without leaking the rest of the
 /// local settings (display prefs, external app commands, etc.).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DefaultFilter {
     pub enabled: bool,
     pub query: String,

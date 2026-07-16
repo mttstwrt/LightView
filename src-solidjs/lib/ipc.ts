@@ -116,6 +116,30 @@ export const closeGallery = () => invoke<void>("close_gallery");
 export const getGalleryInfo = () =>
   invoke<GalleryOpenResult | null>("get_gallery_info");
 
+/** Everything the web client's first frame needs, in one round-trip:
+ *  gallery info + default filter + sorted items (filter pre-applied
+ *  server-side). Replaces three serial invokes on boot. */
+export interface BootState {
+  gallery: GalleryOpenResult | null;
+  default_filter: { enabled: boolean; query: string } | null;
+  sorted: SortedResult | null;
+}
+
+export const getBootState = (
+  sortField: SortField,
+  sortOrder: SortOrder,
+  groupBy: GroupBy,
+  subSortField?: SortField,
+  subSortOrder?: SortOrder,
+) =>
+  invoke<BootState>("get_boot_state", {
+    sortField,
+    sortOrder,
+    groupBy,
+    subSortField,
+    subSortOrder,
+  });
+
 // ---------------------------------------------------------------------------
 // Media
 // ---------------------------------------------------------------------------

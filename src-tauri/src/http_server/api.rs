@@ -86,6 +86,30 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
     match command {
         "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
 
+        // Single-round-trip boot: gallery info + default filter + sorted
+        // items. The phone client's whole first paint hangs on this.
+        "get_boot_state" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct A {
+                sort_field: SortField,
+                sort_order: SortOrder,
+                group_by: GroupBy,
+                sub_sort_field: Option<SortField>,
+                sub_sort_order: Option<SortOrder>,
+            }
+            let a: A = parse(args)?;
+            ok(gallery::get_boot_state_impl(
+                app,
+                a.sort_field,
+                a.sort_order,
+                a.group_by,
+                a.sub_sort_field,
+                a.sub_sort_order,
+            )
+            .await)
+        }
+
         "get_gallery_default_filter" => {
             ok(settings::get_gallery_default_filter_impl(app).await)
         }

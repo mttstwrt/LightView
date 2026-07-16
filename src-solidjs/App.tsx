@@ -8,7 +8,7 @@ import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths,
 import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
-import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
+import { openGallery, getBootState, getSortedItems, getRecentGalleries, removeRecentGallery, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
 import { setFilterQuery } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { JustifiedGrid } from "./components/gallery/JustifiedGrid";
@@ -257,14 +257,20 @@ export function App() {
       }
     });
 
+    // Single-round-trip boot: gallery info + default filter + sorted items
+    // (filter pre-applied server-side). The old path was three serial
+    // invokes — three network RTTs before the grid had any data.
     try {
-      const info = await getGalleryInfo();
-      if (info) {
-        setGalleryPath(info.path);
-        const filtered = await applyDefaultFilter();
-        const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filtered, subSortField(), subSortOrder());
-        setSortedItems(sorted.items);
-        setDisplayPaths(sorted.items.map((item) => item.path));
+      const boot = await getBootState(sortField(), sortOrder(), groupBy(), subSortField(), subSortOrder());
+      if (boot.gallery) {
+        setGalleryPath(boot.gallery.path);
+        const df = boot.default_filter;
+        const query = df?.enabled ? (df.query ?? "").trim() : "";
+        if (query) setFilterQuery(query); // seed the FilterBar; boot.sorted already reflects it
+        if (boot.sorted) {
+          setSortedItems(boot.sorted.items);
+          setDisplayPaths(boot.sorted.items.map((item) => item.path));
+        }
       }
     } catch (e) {
       console.error("Failed to load current gallery:", e);

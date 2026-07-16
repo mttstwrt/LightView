@@ -310,6 +310,7 @@ fn main() {
             commands::gallery::open_gallery,
             commands::gallery::close_gallery,
             commands::gallery::get_gallery_info,
+            commands::gallery::get_boot_state,
 
             // Media commands
             commands::media::get_thumbnail,
