@@ -396,14 +396,18 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           the items payload alone, before any thumbnail bytes arrive. Sits
           under the main <img> (z-index -1, like the underlay) and under the
           underlay itself (earlier in DOM order), so real pixels always win.
-          Hidden once the current image has revealed. */}
+          Only participates when the cell has nothing real to show: hidden
+          once the current image reveals AND whenever the underlay holds the
+          previous image (tier upgrades belong to the underlay — the
+          placeholder must never be able to flash mid-upgrade, whatever an
+          engine's decode timing does). */}
       <img
         src={thumbhashDataUrl(props.path) ?? undefined}
         alt=""
         aria-hidden="true"
         class="absolute inset-0 w-full h-full object-cover"
         style={{
-          display: thumbhashDataUrl(props.path) && !loaded() ? undefined : "none",
+          display: thumbhashDataUrl(props.path) && !loaded() && !prevSrc() ? undefined : "none",
           "z-index": -1,
         }}
         draggable={false}
