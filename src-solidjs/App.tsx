@@ -1,10 +1,11 @@
-import { Show, createSignal, onCleanup, onMount } from "solid-js";
+import { Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
+import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getGalleryInfo, getSortedItems, getRecentGalleries, removeRecentGallery, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
@@ -242,6 +243,20 @@ export function App() {
     // Restore this browser's per-client display settings (GIF-in-grid, etc.).
     loadWebSettings();
 
+    // Hydrate the grid from the last session's IndexedDB snapshot while the
+    // real boot waterfall runs. IDB resolves in a few ms, the network in a
+    // few hundred — so the full grid (ThumbHash placeholders + any service-
+    // worker-cached thumbnails) paints before the first response arrives,
+    // and the app opens offline. Guarded so late-resolving IDB can never
+    // clobber fresh network data.
+    void loadBootSnapshot().then((snap) => {
+      if (snap && snap.items.length > 0 && sortedItems().length === 0) {
+        setGalleryPath(snap.galleryPath);
+        setSortedItems(snap.items);
+        setDisplayPaths(snap.items.map((item) => item.path));
+      }
+    });
+
     try {
       const info = await getGalleryInfo();
       if (info) {
@@ -255,6 +270,21 @@ export function App() {
       console.error("Failed to load current gallery:", e);
     }
   });
+
+  // Persist the grid for next boot (web only) — covers every path that
+  // refreshes sortedItems (boot, uploads, fs-changes, filter edits). Debounced
+  // so scroll-adjacent churn doesn't rewrite a large snapshot repeatedly.
+  if (isWeb()) {
+    let snapshotTimer: number | undefined;
+    createEffect(() => {
+      const items = sortedItems();
+      const path = galleryPath();
+      if (!path || items.length === 0) return;
+      clearTimeout(snapshotTimer);
+      snapshotTimer = window.setTimeout(() => saveBootSnapshot(path, items), 1500);
+    });
+    onCleanup(() => clearTimeout(snapshotTimer));
+  }
 
   // Web client: re-fetch items after a device upload so the new photos show
   // up (the browser gets no fs-watch push from the host). Mirrors the file-

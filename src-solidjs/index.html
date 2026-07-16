@@ -22,6 +22,16 @@
       content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <title>LightView</title>
+    <!-- PWA: installable, standalone chrome on phones. The manifest and icons
+         live in public/ (served from the web root); the service worker is
+         registered in index.tsx, web client only. theme-color keeps the iOS
+         status bar / Android task switcher matched to the app background. -->
+    <meta name="theme-color" content="#0a0a0a" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="LightView" />
   </head>
   <body>
     <div id="root"></div>
