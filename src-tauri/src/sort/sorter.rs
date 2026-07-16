@@ -39,6 +39,11 @@ pub struct SortedItem {
     /// (e.g. the justified gallery view) without an extra round-trip.
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Base64 of the ~25-byte ThumbHash placeholder, when a thumbnail has
+    /// been generated. Inlined here so the grid can paint every cell as a
+    /// blurry placeholder from the items payload alone — no per-cell
+    /// round-trip before first paint (crucial on the remote web client).
+    pub thumbhash: Option<String>,
 }
 
 impl CacheDb {
@@ -83,17 +88,20 @@ impl CacheDb {
             order_clause.push_str(&Self::order_expr(sub_field, sub_order));
         }
 
-        let cols = "path, date_taken, file_size, media_type, rating, last_viewed, date_added, last_rated, duration, width, height";
+        let cols = "m.path, m.date_taken, m.file_size, m.media_type, m.rating, m.last_viewed, m.date_added, m.last_rated, m.duration, m.width, m.height, t.thumbhash";
         let sql = if filter_paths.is_some() {
             format!(
-                "SELECT {} FROM media_meta
-                 WHERE path IN (SELECT value FROM json_each(?1))
+                "SELECT {} FROM media_meta m
+                 LEFT JOIN thumbnails t ON t.path = m.path
+                 WHERE m.path IN (SELECT value FROM json_each(?1))
                  ORDER BY {}",
                 cols, order_clause
             )
         } else {
             format!(
-                "SELECT {} FROM media_meta ORDER BY {}",
+                "SELECT {} FROM media_meta m
+                 LEFT JOIN thumbnails t ON t.path = m.path
+                 ORDER BY {}",
                 cols, order_clause
             )
         };
@@ -179,6 +187,8 @@ impl CacheDb {
 }
 
 fn map_sorted_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
+    use base64::Engine;
+    let thumbhash: Option<Vec<u8>> = row.get(11)?;
     Ok(SortedItem {
         path: row.get(0)?,
         date_taken: row.get(1)?,
@@ -191,5 +201,6 @@ fn map_sorted_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
         duration: row.get(8)?,
         width: row.get(9)?,
         height: row.get(10)?,
+        thumbhash: thumbhash.map(|h| base64::engine::general_purpose::STANDARD.encode(h)),
     })
 }

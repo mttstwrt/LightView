@@ -7,6 +7,7 @@ import { LONG_PRESS_MS, TAP_SLOP_PX, suppressNextClick } from "../../lib/touch";
 import { hapticTick } from "../../lib/haptics";
 import { isTauri } from "../../lib/runtime";
 import { recordImageLoad } from "../../lib/perfMonitor";
+import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
 import { GifCanvas } from "../GifCanvas";
 
 interface ThumbnailCellProps {
@@ -383,11 +384,29 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         }
       }}
     >
-      {/* Skeleton: hidden when img has a URL. Always present to avoid
-          DOM creation/destruction during <Index> recycling. */}
+      {/* Skeleton: hidden when img has a URL or a ThumbHash placeholder can
+          paint instead. Always present to avoid DOM creation/destruction
+          during <Index> recycling. */}
       <div
         class="absolute inset-0 skeleton-pulse"
-        style={{ display: hasUrl() ? "none" : undefined }}
+        style={{ display: hasUrl() || thumbhashDataUrl(props.path) ? "none" : undefined }}
+      />
+
+      {/* ThumbHash placeholder: a blurry ~1KB data-URL preview painted from
+          the items payload alone, before any thumbnail bytes arrive. Sits
+          under the main <img> (z-index -1, like the underlay) and under the
+          underlay itself (earlier in DOM order), so real pixels always win.
+          Hidden once the current image has revealed. */}
+      <img
+        src={thumbhashDataUrl(props.path) ?? undefined}
+        alt=""
+        aria-hidden="true"
+        class="absolute inset-0 w-full h-full object-cover"
+        style={{
+          display: thumbhashDataUrl(props.path) && !loaded() ? undefined : "none",
+          "z-index": -1,
+        }}
+        draggable={false}
       />
 
       {/* Underlay: the previous image held during a same-cell src swap so

@@ -122,6 +122,10 @@ export interface SortedItem {
   duration?: number | null;
   width?: number | null;
   height?: number | null;
+  /** Base64 ThumbHash placeholder (~25 bytes decoded); null until the item's
+   *  thumbnail has been generated at least once. Decoded client-side into a
+   *  blurry data-URL placeholder — see lib/thumbhashPlaceholder.ts. */
+  thumbhash?: string | null;
 }
 
 // ---------------------------------------------------------------------------
