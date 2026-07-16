@@ -30,6 +30,15 @@ const THUMB_BATCH: usize = 8;
 /// Phashes computed per DB-lock acquisition.
 const PHASH_BATCH: usize = 64;
 
+/// Tiers the worker pre-warms. Standard ("m") backs the square grid;
+/// Justified ("j") backs the justified layout's base zoom — the phone web
+/// client's default view. Justified is aspect-preserving, so it cannot be
+/// derived from the square-cropped Standard bytes; it needs its own source
+/// decode, which is exactly what idle time is for. Work cycles rotate
+/// between the tiers (rather than draining one first) so both views' newest
+/// items warm early on a large cold backlog.
+const PREWARM_TIERS: [ThumbTier; 2] = [ThumbTier::Standard, ThumbTier::Justified];
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -54,9 +63,13 @@ pub fn start_idle_worker(state: &AppState) {
 
     tauri::async_runtime::spawn(async move {
         log::info!("Idle backfill worker started (gen {my_gen})");
-        // Paths that failed generation once — skip them instead of retrying
-        // (and re-logging) forever. Reset on restart.
-        let mut failed: HashSet<String> = HashSet::new();
+        // Path+tier pairs that failed generation once — skip them instead of
+        // retrying (and re-logging) forever. Reset on restart.
+        let mut failed: HashSet<(String, ThumbTier)> = HashSet::new();
+        // Round-robin position so a long backlog in one tier doesn't starve
+        // the other — each work cycle takes one batch from the next tier
+        // with pending work.
+        let mut tier_cursor = 0usize;
 
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(POLL_SECS)).await;
@@ -67,8 +80,16 @@ pub fn start_idle_worker(state: &AppState) {
                 continue;
             }
 
-            let worked = backfill_thumbnails(&state, &mut failed).await
-                || backfill_phashes(&state).await;
+            let mut worked = false;
+            for offset in 0..PREWARM_TIERS.len() {
+                let tier = PREWARM_TIERS[(tier_cursor + offset) % PREWARM_TIERS.len()];
+                if backfill_thumbnails(&state, tier, &mut failed).await {
+                    tier_cursor = (tier_cursor + offset + 1) % PREWARM_TIERS.len();
+                    worked = true;
+                    break;
+                }
+            }
+            let worked = worked || backfill_phashes(&state).await;
 
             if !worked {
                 // Backlog drained — check back occasionally for new files.
@@ -79,20 +100,35 @@ pub fn start_idle_worker(state: &AppState) {
     });
 }
 
-/// Generate standard-tier thumbnails for a small batch of unthumbnailed media.
+/// Generate one tier's thumbnails for a small batch of unthumbnailed media.
 /// Returns whether any work was attempted (i.e. the backlog isn't empty).
-async fn backfill_thumbnails(state: &AppState, failed: &mut HashSet<String>) -> bool {
+///
+/// The backlog walks newest-first (`date_taken` falls back to file mtime at
+/// index time, `date_added` breaks ties) — the same order the default
+/// date-descending sort presents, so the first screen a phone opens onto is
+/// the first thing warmed rather than whatever the table scan happened upon.
+async fn backfill_thumbnails(
+    state: &AppState,
+    tier: ThumbTier,
+    failed: &mut HashSet<(String, ThumbTier)>,
+) -> bool {
     let batch: Vec<String> = {
         let db = state.cache_db.lock().await;
         let Some(db) = db.as_ref() else { return false };
-        let mut stmt = match db.conn().prepare_cached(
+        // The SQL string is per-tier but each is stable, so prepare_cached
+        // still keys on a small fixed set of statements.
+        let sql = format!(
             "SELECT m.path FROM media_meta m
-             LEFT JOIN thumbnails t ON t.path = m.path
-             WHERE t.path IS NULL LIMIT ?1",
-        ) {
+             LEFT JOIN {} t ON t.path = m.path
+             WHERE t.path IS NULL
+             ORDER BY m.date_taken DESC NULLS LAST, m.date_added DESC
+             LIMIT ?1",
+            tier.table()
+        );
+        let mut stmt = match db.conn().prepare_cached(&sql) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("Idle worker: missing-thumbnail query failed: {e}");
+                log::warn!("Idle worker: missing-thumbnail query failed ({tier:?}): {e}");
                 return false;
             }
         };
@@ -102,11 +138,11 @@ async fn backfill_thumbnails(state: &AppState, failed: &mut HashSet<String>) -> 
         match stmt.query_map([limit], |row| row.get::<_, String>(0)) {
             Ok(rows) => rows
                 .filter_map(|r| r.ok())
-                .filter(|p| !failed.contains(p))
+                .filter(|p| !failed.contains(&(p.clone(), tier)))
                 .take(THUMB_BATCH)
                 .collect(),
             Err(e) => {
-                log::warn!("Idle worker: missing-thumbnail query failed: {e}");
+                log::warn!("Idle worker: missing-thumbnail query failed ({tier:?}): {e}");
                 return false;
             }
         }
@@ -120,11 +156,11 @@ async fn backfill_thumbnails(state: &AppState, failed: &mut HashSet<String>) -> 
         if !is_idle(state) {
             return true; // someone showed up mid-batch — yield now
         }
-        match thumb_serve::get_or_generate(state, ThumbTier::Standard, path.clone()).await {
+        match thumb_serve::get_or_generate(state, tier, path.clone()).await {
             ThumbOutcome::Hit { .. } => {}
             ThumbOutcome::Miss => {
-                log::debug!("Idle worker: thumbnail generation failed for {path}");
-                failed.insert(path);
+                log::debug!("Idle worker: thumbnail generation failed for {path} ({tier:?})");
+                failed.insert((path, tier));
             }
             ThumbOutcome::NoGallery => return false,
         }
