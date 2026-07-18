@@ -109,6 +109,7 @@ export function GifCanvas(props: {
   url: string;
   class?: string;
   style?: JSX.CSSProperties | string;
+  onClick?: (e: MouseEvent) => void;
 }) {
   let canvas: HTMLCanvasElement | undefined;
 
@@ -166,5 +167,5 @@ export function GifCanvas(props: {
     });
   });
 
-  return <canvas ref={canvas} class={props.class} style={props.style} />;
+  return <canvas ref={canvas} class={props.class} style={props.style} onClick={props.onClick} />;
 }

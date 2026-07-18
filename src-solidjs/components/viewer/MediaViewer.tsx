@@ -1,4 +1,4 @@
-import { Show, createSignal, createEffect, on, onMount, onCleanup, batch } from "solid-js";
+import { Show, For, createSignal, createEffect, on, onMount, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { isWeb, hasTouch, isTauri, isMobile } from "../../lib/runtime";
 import {
@@ -8,7 +8,7 @@ import {
   rectKeyframe,
   type Rect,
 } from "../../lib/viewerTransition";
-import { aspectByPath } from "../../stores/galleryStore";
+import { aspectByPath, sortedItems, rateItem } from "../../stores/galleryStore";
 import { applyQueryAndRefresh } from "../../stores/filterStore";
 import { TitleBar } from "../topbar/TitleBar";
 import {
@@ -118,6 +118,33 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   const isVideo = () => isVideoPath(currentPath());
+
+  // Low-profile rating stars next to the filename. Seeded from `sortedItems`
+  // (already loaded, so no IPC round-trip on every navigation) and kept in
+  // sync with the info panel / context menu / keyboard rating shortcuts via
+  // the same `lightview:rating-changed` event they all dispatch.
+  const [rating, setRatingSignal] = createSignal(0);
+  createEffect(
+    on(currentPath, (path) => {
+      setRatingSignal(path ? (sortedItems().find((it) => it.path === path)?.rating ?? 0) : 0);
+    }),
+  );
+  const onRatingChanged = (e: Event) => {
+    const { path, rating: newRating } = (e as CustomEvent).detail;
+    if (path === currentPath()) setRatingSignal(newRating);
+  };
+  window.addEventListener("lightview:rating-changed", onRatingChanged);
+  onCleanup(() => window.removeEventListener("lightview:rating-changed", onRatingChanged));
+
+  // Mirrors InfoPanel's handleSetRating: tapping the star matching the
+  // current rating clears it, otherwise sets the rating to that star.
+  const handleSetRating = (value: number) => {
+    const path = currentPath();
+    if (!path) return;
+    rateItem(path, value === rating() ? 0 : value).catch((err) => {
+      console.error("Failed to set rating:", err);
+    });
+  };
 
   // Tapping a tag chip in the info panel filters the gallery to that tag and
   // drops back to the grid. Close instantly (no fly-back) — the cell likely
@@ -359,6 +386,28 @@ export function MediaViewer(props: MediaViewerProps) {
     }
   };
 
+  // A plain click on the media itself toggles the chrome overlay (rating stars
+  // + filename + close button) instead of closing — so a click clears the
+  // corner text that crowds (and on mobile can clip off the edge of) the image.
+  // Deferred behind a short timer so a desktop double-click (zoom) cancels the
+  // toggle rather than flashing the chrome off and back on. Touch taps already
+  // toggle chrome through the gesture machine and set `suppressBackdropClick`,
+  // so their synthesized click is swallowed here without a second toggle.
+  let mediaClickTimer: number | null = null;
+  const cancelMediaClick = () => {
+    if (mediaClickTimer !== null) { clearTimeout(mediaClickTimer); mediaClickTimer = null; }
+  };
+  const handleMediaClick = (e: MouseEvent) => {
+    e.stopPropagation();
+    if (suppressBackdropClick) { suppressBackdropClick = false; return; }
+    if (didDrag) { didDrag = false; return; }
+    cancelMediaClick();
+    mediaClickTimer = window.setTimeout(() => {
+      mediaClickTimer = null;
+      setChromeVisible((v) => !v);
+    }, 250);
+  };
+
   // --- Zoom / Pan ---
 
   const handleWheel = (e: WheelEvent) => {
@@ -414,6 +463,7 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   const handleDblClick = (e: MouseEvent) => {
+    cancelMediaClick(); // the two clicks that precede this shouldn't toggle chrome
     if (isVideo()) return;
     if (zoom() !== 1) {
       // Reset to fit
@@ -848,6 +898,7 @@ export function MediaViewer(props: MediaViewerProps) {
 
   onCleanup(() => {
     cancelLongPress();
+    cancelMediaClick();
     if (singleTapTimer !== null) clearTimeout(singleTapTimer);
     if (snapTimer !== null) clearTimeout(snapTimer);
     if (navTimer !== null) clearTimeout(navTimer);
@@ -876,6 +927,7 @@ export function MediaViewer(props: MediaViewerProps) {
         gestureMode = "none";
         gestureMoved = false;
         cancelLongPress();
+        cancelMediaClick();
         longPressFired = false;
         if (swipeEndTimer !== null) { clearTimeout(swipeEndTimer); swipeEndTimer = null; }
         setSwiping(false);
@@ -1090,7 +1142,7 @@ export function MediaViewer(props: MediaViewerProps) {
                 {/* Image container — preloaded Image elements are swapped in
                     directly. pointer-events-auto so a click/tap on the photo
                     doesn't fall through to the backdrop's click-to-close. */}
-                <div ref={imageContainerRef} class="flex items-center justify-center pointer-events-auto" />
+                <div ref={imageContainerRef} class="flex items-center justify-center pointer-events-auto" onClick={handleMediaClick} />
 
                 {/* Canvas GIF playback (desktop) — replaces the imperative
                     <img> for GIFs. Zoom/pan don't apply here (the transform
@@ -1100,6 +1152,7 @@ export function MediaViewer(props: MediaViewerProps) {
                     url={gifAtlasUrl(currentPath(), "p")}
                     class="max-w-[100vw] max-h-[100vh] pointer-events-auto"
                     style={{ "object-fit": "contain" }}
+                    onClick={handleMediaClick}
                   />
                 </Show>
 
@@ -1205,10 +1258,14 @@ export function MediaViewer(props: MediaViewerProps) {
 
       {/* Bottom info bar — fades with the chrome on a touch tap. Lifted clear
           of the video control bar (including its safe-area padding) when the
-          player is active. Never interactive: without pointer-events none it
-          would sit over the seek bar and steal its taps. */}
+          player is active. The row itself is never interactive (pointer-events
+          none, so it doesn't sit over the seek bar and steal its taps); the
+          rating stars opt back in so they stay tappable. Bounded to the
+          viewport (max-w) so a long filename wraps instead of clipping off the
+          edge; the stars are shrink-0 (always visible) and the text clamps to
+          two lines. */}
       <div
-        class="absolute left-1/2 -translate-x-1/2 text-white/40 text-xs font-mono transition-opacity duration-200 pointer-events-none"
+        class="absolute left-1/2 -translate-x-1/2 flex items-center gap-1.5 max-w-[90vw] text-white/40 text-xs font-mono transition-opacity duration-200 pointer-events-none"
         style={{
           bottom:
             isVideo() && videoStarted()
@@ -1217,7 +1274,22 @@ export function MediaViewer(props: MediaViewerProps) {
           opacity: chromeVisible() ? undefined : "0",
         }}
       >
-        {filename()} — {props.currentIndex + 1} / {props.paths.length}{pixelRatioLabel()}
+        <div class="flex items-center gap-0.5 shrink-0" style={{ "pointer-events": chromeVisible() ? "auto" : "none" }}>
+          <For each={[1, 2, 3, 4, 5]}>
+            {(star) => (
+              <button
+                class="leading-none hover:text-white/70 transition-colors cursor-pointer"
+                classList={{ "p-1 -m-1": hasTouch() }}
+                style={{ color: star <= rating() ? "#f59e0b" : undefined }}
+                onClick={() => handleSetRating(star)}
+                aria-label={`Rate ${star} star${star > 1 ? "s" : ""}`}
+              >
+                {star <= rating() ? "★" : "☆"}
+              </button>
+            )}
+          </For>
+        </div>
+        <span class="min-w-0 line-clamp-2 break-words">{filename()} — {props.currentIndex + 1} / {props.paths.length}{pixelRatioLabel()}</span>
       </div>
 
       {/* Close button — fades with the chrome on a touch tap. On touch it's
