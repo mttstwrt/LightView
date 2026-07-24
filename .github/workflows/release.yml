@@ -1,17 +1,16 @@
 name: Release
 
-# Tag-triggered release. Push a tag like `v0.1.0-beta.1` to build all three
-# artifacts and publish them to a GitHub Release (marked pre-release):
-#   - desktop installers (.AppImage/.deb, .dmg, .msi/.exe) via tauri-action
-#   - standalone headless server zips (binary + dist/)
-#   - a container image pushed to GHCR (ghcr.io/<owner>/lightview)
+# Tag-triggered release. Push a tag like `v0.1.0-beta.1` to build and publish
+# to a GitHub Release (marked pre-release):
+#   - a container image pushed to GHCR (ghcr.io/<owner>/lightview) — built first
+#   - Linux desktop installers (.AppImage/.deb) via tauri-action
+#   - a standalone headless server zip (binary + dist/)
 #
 #   git tag v0.1.0-beta.1 && git push origin v0.1.0-beta.1
 #
-# NOTE: libheif-rs needs libheif >= 1.21, which the CI runners don't ship, so
-# each OS provisions it below (source build on Linux, brew on macOS, vcpkg on
-# Windows). The Windows path is the least battle-tested — see the release notes
-# in the PR/commit that added this file.
+# macOS/Windows desktop builds are disabled for now — Linux only. libheif-rs
+# needs libheif >= 1.21, which the CI runner doesn't ship, so the desktop job
+# builds it from source.
 
 on:
   push:
@@ -23,137 +22,35 @@ permissions:
   packages: write   # push to GHCR
 
 jobs:
-  # ---- Desktop installers + standalone headless zips ----------------------
-  desktop:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            tauri_args: "--bundles appimage,deb"   # skip rpm (needs rpmbuild)
-          - os: macos-latest
-            tauri_args: ""
-          - os: windows-latest
-            tauri_args: ""
-    runs-on: ${{ matrix.os }}
+  # ---- Container image → GHCR (built first) --------------------------------
+  # Runs first so the image is available without waiting on the desktop build.
+  # It also owns GitHub Release creation (its first step) so both jobs upload to
+  # one release with no duplicate-create race — and, because that step runs
+  # before the image build, the release exists (and `desktop` can proceed) even
+  # if the image push below fails.
+  container:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "src-tauri -> target"
-
-      - name: Install frontend deps
-        run: npm ci
-
-      # --- libheif >= 1.21 + Tauri system deps, per OS ---
-      - name: Linux — Tauri deps + build libheif from source
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev \
-            cmake libde265-dev libaom-dev libdav1d-dev libx265-dev
-          git clone --depth 1 --branch v1.21.2 https://github.com/strukturag/libheif
-          cmake -S libheif -B libheif/build \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF
-          cmake --build libheif/build --parallel
-          sudo cmake --install libheif/build
-          sudo ldconfig
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig" >> "$GITHUB_ENV"
-
-      - name: macOS — libheif via Homebrew
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install libheif create-dmg
-          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
-
-      - name: Windows — libheif via vcpkg + pkg-config
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          vcpkg install libheif:x64-windows
-          choco install pkgconfiglite -y
-          $vroot = $env:VCPKG_INSTALLATION_ROOT
-          echo "PKG_CONFIG_PATH=$vroot\installed\x64-windows\lib\pkgconfig" >> $env:GITHUB_ENV
-          echo "$vroot\installed\x64-windows\bin" >> $env:GITHUB_PATH
-
-      # --- Desktop bundles + a GitHub Release (created once, reused) ---
-      - name: Build desktop app + publish release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "LightView ${{ github.ref_name }}"
-          prerelease: true
-          releaseBody: |
-            **Beta / pre-release.** Three ways to run LightView:
-
-            - **Desktop app** — download the installer for your OS below
-              (`.AppImage`/`.deb` on Linux, `.dmg` on macOS, `.msi`/`.exe` on Windows).
-            - **Headless server** — grab `lightview-headless-*`: unpack it and run
-              `lightview-headless serve /path/to/gallery` (see the README → *Headless server*).
-            - **Container** — `ghcr.io/${{ github.repository_owner }}/lightview:${{ github.ref_name }}`;
-              the attached `docker-compose.yml` runs it (swap `build: .` for the image ref).
-          args: ${{ matrix.tauri_args }}
-
-      # --- Standalone headless server (no GPU feature — server use) ---
-      - name: Build headless binary
-        run: >
-          cargo build --release --manifest-path src-tauri/Cargo.toml
-          --no-default-features --features custom-protocol
-          --bin lightview-headless
-
-      - name: Package headless (unix)
-        if: runner.os != 'Windows'
-        run: |
-          stage="lightview-headless-${{ github.ref_name }}-${{ runner.os }}"
-          mkdir "$stage"
-          cp src-tauri/target/release/lightview-headless "$stage"/
-          cp -r dist "$stage"/dist
-          tar -czf "$stage.tar.gz" "$stage"
-
-      - name: Package headless (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $stage = "lightview-headless-${{ github.ref_name }}-Windows"
-          New-Item -ItemType Directory $stage | Out-Null
-          Copy-Item src-tauri\target\release\lightview-headless.exe $stage\
-          Copy-Item -Recurse dist "$stage\dist"
-          Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip"
-
-      - name: Upload headless to release
+      - name: Create release + attach compose file
+        id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          name: "LightView ${{ github.ref_name }}"
           prerelease: true
-          files: |
-            lightview-headless-*.tar.gz
-            lightview-headless-*.zip
+          body: |
+            **Beta / pre-release.** Three ways to run LightView:
 
-  # ---- Container image → GHCR ---------------------------------------------
-  # Depends on `desktop` for ORDERING only — so that job creates the GitHub
-  # Release before the compose-file upload below, avoiding a duplicate-create
-  # race. The `!cancelled()` guard decouples it from desktop's *outcome*: the
-  # headless image still builds and pushes even when the desktop installers
-  # fail, because it's built from the self-contained Arch Dockerfile, not the
-  # desktop matrix's per-OS libheif provisioning.
-  container:
-    needs: desktop
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+            - **Container** — `ghcr.io/${{ github.repository_owner }}/lightview:${{ github.ref_name }}`;
+              the attached `docker-compose.yml` runs it (swap `build: .` for the image ref).
+            - **Headless server** — grab `lightview-headless-*`: unpack it and run
+              `lightview-headless serve /path/to/gallery` (see the README → *Headless server*).
+            - **Desktop app** — download the Linux installer below (`.AppImage` / `.deb`).
+          files: docker-compose.yml
 
       - uses: docker/setup-buildx-action@v3
 
@@ -173,17 +70,92 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=beta
 
+      - name: Short commit sha
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          # Stamps the SPA's Settings → About with the source commit.
+          build-args: |
+            GIT_SHA=${{ steps.sha.outputs.short }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Attach compose file to release
+  # ---- Linux desktop installer + standalone headless zip ------------------
+  # Runs after `container`. Uploads to the release the container job created
+  # (via `releaseId`), so it never races on release creation. `!cancelled()`
+  # decouples it from the container image build's *outcome*: the installers and
+  # headless zip still publish even if the image push failed, because the
+  # release already exists.
+  desktop:
+    needs: container
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # libheif >= 1.21 (built from source) + Tauri system deps.
+      - name: Tauri deps + build libheif from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev \
+            cmake libde265-dev libaom-dev libdav1d-dev libx265-dev
+          git clone --depth 1 --branch v1.21.2 https://github.com/strukturag/libheif
+          cmake -S libheif -B libheif/build \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF
+          cmake --build libheif/build --parallel
+          sudo cmake --install libheif/build
+          sudo ldconfig
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig" >> "$GITHUB_ENV"
+
+      # Desktop bundles, uploaded to the release the container job created.
+      - name: Build desktop app + upload to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.container.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          args: "--bundles appimage,deb"   # skip rpm (needs rpmbuild)
+
+      # --- Standalone headless server (no GPU feature — server use) ---
+      - name: Build headless binary
+        run: >
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+          --no-default-features --features custom-protocol
+          --bin lightview-headless
+
+      - name: Package headless
+        run: |
+          stage="lightview-headless-${{ github.ref_name }}-${{ runner.os }}"
+          mkdir "$stage"
+          cp src-tauri/target/release/lightview-headless "$stage"/
+          cp -r dist "$stage"/dist
+          tar -czf "$stage.tar.gz" "$stage"
+
+      - name: Upload headless to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: true
-          files: docker-compose.yml
+          files: lightview-headless-*.tar.gz
