@@ -950,6 +950,13 @@ export function GalleryGrid(props: GalleryGridProps) {
       }),
     );
 
+    // Drain the landing viewport whenever scrolling settles, however that was
+    // detected. `scrollend` (→ onScrollEnd) already does this, but it's not
+    // universal on mobile; scrollDynamics also flips `settled` true via its own
+    // fling debounce, and that path had no fetch trigger — so a fast flick on a
+    // browser without `scrollend` left cells blank until the 500ms poll.
+    createEffect(on(dynamics.settled, (s) => { if (s) scheduleFetch(); }, { defer: true }));
+
     // Listen for thumbnail invalidation (e.g. after rebuild). Thumbnail
     // responses are cacheable, so bump the epoch: every rebuilt URL must
     // differ from the one the webview may have cached.

@@ -858,6 +858,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
     createEffect(on(generation, () => { scheduleFetch(); }));
 
+    // Drain the landing viewport whenever scrolling settles, however that was
+    // detected. `scrollend` (→ onScrollEnd) already does this, but it's not
+    // universal on mobile; scrollDynamics also flips `settled` true via its own
+    // fling debounce, and that path had no fetch trigger — so a fast flick on a
+    // browser without `scrollend` left cells blank until the 500ms poll.
+    createEffect(on(dynamics.settled, (s) => { if (s) scheduleFetch(); }, { defer: true }));
+
     // Re-run the visible range whenever the layout changes (width / zoom).
     createEffect(on(layout, () => { recalcRange?.(); }));
 

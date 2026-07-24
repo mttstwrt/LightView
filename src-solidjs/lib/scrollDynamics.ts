@@ -163,6 +163,15 @@ export function createScrollDynamics(opts: {
   };
 
   const markSettled = () => {
+    // Scrolling has stopped — collapse the tracked velocity to 0 immediately.
+    // Without this, `velocity()` keeps reporting the last fling speed for up to
+    // VELOCITY_STALE_MS after the final scroll frame. `scrollend` (which calls
+    // this) routinely fires inside that window, so the grids' scheduleFetch
+    // would take the `velocity() > VELOCITY_FAST` fling branch — warming a
+    // *projected* landing zone instead of generating thumbnails for the viewport
+    // the fling actually landed on. That left hard flicks with blank/late cells
+    // until the next 500ms poll or a manual scroll (docs/scrollLoadingRedesign).
+    vel = 0;
     if (untrack(decodeGate)) setDecodeGate(false);
     if (settleDebounce) clearTimeout(settleDebounce);
     if (!untrack(settled)) setSettled(true);
