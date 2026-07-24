@@ -12,7 +12,14 @@
 
 services:
   lightview:
-    build: .
+    build:
+      context: .
+      # Optional: stamp the built SPA with the source commit so Settings → About
+      # shows it. Supply via env, e.g.:
+      #   GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
+      # Unset, the per-build timestamp still distinguishes rebuilds.
+      args:
+        GIT_SHA: ${GIT_SHA:-}
     image: lightview-headless
     container_name: lightview
     restart: unless-stopped

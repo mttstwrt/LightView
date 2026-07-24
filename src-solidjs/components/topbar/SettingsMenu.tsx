@@ -5,6 +5,7 @@ import { settings, setSettings } from "../../stores/settingsStore";
 import { displayPaths, settingsOpen, setSettingsOpen, viewMode, setViewMode } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
+import { versionLabel, GIT_SHA } from "../../lib/version";
 import {
   rebuildThumbnails,
   getSortedItems,
@@ -1491,6 +1492,10 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 </button>
               </div>
             </Show>
+
+            {/* ── Build identity — always last. Lets a running client be matched
+                to a build (e.g. confirming a container actually updated). ── */}
+            <AboutFooter />
           </div>
         </div>
         </Dynamic>
@@ -1505,6 +1510,33 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
  *  desktop settings dropdown stays in place while the mobile page portals out. */
 function InPlace(props: { children: any }) {
   return props.children;
+}
+
+/** Build identity line pinned to the bottom of the settings panel. Tap/click to
+ *  copy the full label (version · commit · build time) so it can be pasted into
+ *  a bug report or checked against what a deploy is meant to be running. */
+function AboutFooter() {
+  const [copied, setCopied] = createSignal(false);
+  const label = versionLabel();
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(GIT_SHA ? `${label} (${GIT_SHA})` : label);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      /* clipboard blocked (insecure context) — the text is on screen anyway */
+    }
+  };
+  return (
+    <button
+      onClick={copy}
+      title="Copy build info"
+      style={{ order: 99 }}
+      class="mt-1 pt-3 border-t border-neutral-800/60 text-left text-[10px] font-mono text-neutral-600 hover:text-neutral-400 transition-colors cursor-pointer select-text"
+    >
+      <span class="text-neutral-500">LightView</span> {copied() ? "copied ✓" : label}
+    </button>
+  );
 }
 
 function Section(props: { label: string; children: any; order?: number }) {

@@ -26,6 +26,13 @@ RUN pacman -Syu --noconfirm --needed \
 WORKDIR /app
 COPY . .
 
+# Optional short commit id baked into the SPA's build stamp (Settings → About).
+# .git is dockerignored, so pass it explicitly to get a real commit:
+#   GIT_SHA=$(git rev-parse --short HEAD) docker compose build
+# Left empty, the build-time stamp alone still tells rebuilds apart.
+ARG GIT_SHA=""
+ENV VITE_GIT_SHA=$GIT_SHA
+
 # Frontend SPA → dist/ (served by the headless binary).
 RUN npm ci && npm run build
 
