@@ -117,6 +117,24 @@ export function recordCacheMiss() {
 
 let imageLoadSum = 0;
 let imageLoadCount = 0;
+/** Loads started but not yet finished (or failed). The difference between "idle"
+ *  and "stalled": a sample window with no completions reads the same either way,
+ *  but only one of them has requests outstanding. */
+let imageLoadsInFlight = 0;
+
+export function recordImageLoadStart() {
+  imageLoadsInFlight++;
+}
+
+/** Settle a load started with `recordImageLoadStart` that produced no timing
+ *  (error, abort, or a src swapped out from under it). */
+export function recordImageLoadSettled() {
+  if (imageLoadsInFlight > 0) imageLoadsInFlight--;
+}
+
+export function inFlightImageLoads(): number {
+  return imageLoadsInFlight;
+}
 
 // Always-on EWMA of image load latency, independent of the overlay's `_active`
 // gate: the grids size their look-ahead buffer by velocity × this latency
@@ -132,6 +150,7 @@ export function ewmaImageLoadMs(): number {
 }
 
 export function recordImageLoad(durationMs: number) {
+  if (imageLoadsInFlight > 0) imageLoadsInFlight--;
   // Seed with the first sample so the estimate doesn't crawl up from 0.
   imageLoadEwma =
     imageLoadEwma === 0
@@ -243,8 +262,15 @@ async function sampleTick() {
   prevCacheMissCount = cacheMissCount;
   cacheMisses.push(missDelta / dtSec);
 
-  // Image load latency (avg ms over this tick) + load rate
-  imageLoadLatency.push(imageLoadCount > 0 ? imageLoadSum / imageLoadCount : 0);
+  // Image load latency (avg ms over this tick) + load rate.
+  //
+  // NaN — not 0 — when nothing completed. Pushing 0 made a stall read as
+  // "instant": a burst of slow tier upgrades shows one huge sample, then a run
+  // of 0s while the requests are still outstanding, which looks like the
+  // problem fixed itself. NaN gaps the sparkline and blanks the readout, so a
+  // dead window is visibly dead; pair it with `inFlightImageLoads()` to tell
+  // idle (nothing pending) from stalled (plenty pending, none landing).
+  imageLoadLatency.push(imageLoadCount > 0 ? imageLoadSum / imageLoadCount : NaN);
   imageLoadRate.push(imageLoadCount / dtSec);
   imageLoadSum = 0;
   imageLoadCount = 0;

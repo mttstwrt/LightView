@@ -6,7 +6,7 @@ import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback
 import { LONG_PRESS_MS, TAP_SLOP_PX, suppressNextClick } from "../../lib/touch";
 import { hapticTick } from "../../lib/haptics";
 import { isTauri } from "../../lib/runtime";
-import { recordImageLoad } from "../../lib/perfMonitor";
+import { recordImageLoad, recordImageLoadStart, recordImageLoadSettled } from "../../lib/perfMonitor";
 import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
 import { GifCanvas } from "../GifCanvas";
 
@@ -257,9 +257,17 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       // Timestamp every fresh load (seen URLs still skipped): the sample feeds
       // the always-on load-latency EWMA that sizes the grids' look-ahead
       // buffer, not just the debug overlay.
+      // A pending load that never completed (src swapped mid-flight, cell
+      // recycled) has to be settled here or the in-flight count only grows.
+      if (loadStart > 0) recordImageLoadSettled();
       loadStart = url && !seen ? performance.now() : 0;
+      if (loadStart > 0) recordImageLoadStart();
     },
   ));
+
+  onCleanup(() => {
+    if (loadStart > 0) recordImageLoadSettled();
+  });
 
   // Whether we have a valid URL to attempt loading.
   const hasUrl = () => !!props.thumbSrc && !errored();
@@ -479,6 +487,11 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         onError={() => {
           // Don't treat media URL errors as thumbnail errors
           if (isGif() && hovered()) return;
+          // A failed load produces no latency sample, so settle it explicitly.
+          if (loadStart > 0) {
+            recordImageLoadSettled();
+            loadStart = 0;
+          }
           setPrevSrc(null); // don't leave a stale image under the skeleton
           setErrored(true);
           props.onError?.(props.path);

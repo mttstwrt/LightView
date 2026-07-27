@@ -12,6 +12,7 @@ import {
   cacheMisses,
   imageLoadLatency,
   imageLoadRate,
+  inFlightImageLoads,
   domNodes,
   diskReadRate,
   diskWriteRate,
@@ -165,7 +166,18 @@ export function DebugOverlay() {
           />
           <MetricRow
             label="Img Load"
-            value={() => `${fmt(imageLoadLatency.last)} ms`}
+            value={() => {
+              void tick();
+              const last = imageLoadLatency.last;
+              // No completions in the last window. Distinguish the two reasons:
+              // nothing was asked for, versus requests are outstanding and not
+              // landing — which is the stall this metric used to report as 0 ms.
+              if (!Number.isFinite(last)) {
+                const pending = inFlightImageLoads();
+                return pending > 0 ? `stalled (${pending} in flight)` : "idle";
+              }
+              return `${fmt(last)} ms`;
+            }}
             data={() => { void tick(); return imageLoadLatency.toArray(); }}
             color="#a3e635"
           />
