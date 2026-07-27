@@ -72,6 +72,30 @@ Clipboard API and friends. The self-signed ECDSA cert persists at
 (`src-tauri/src/http_server/tls.rs`). The desktop's loopback media server
 stays plain HTTP (the webview won't accept a self-signed cert).
 
+**Cert SANs behind NAT/Docker.** `detect_lan_ip()` sees only the interface this
+process routes through — inside a container that's the bridge IP, never the host
+address clients dial — so the cert fails hostname verification everywhere. Name
+the reachable address explicitly with `--tls-san <ip-or-host>` (repeatable,
+comma-separated) or `LIGHTVIEW_TLS_SAN`; docker-compose.yml wires the env var
+through. Getting this wrong is quiet: desktop browsers keep working on a
+click-through exception, but iOS drops that exception readily and a standalone
+PWA can't render the prompt to re-accept it, so the app opens from its cached
+shell (`sw.js` + `loadBootSnapshot()`) and looks connected while every `/thumb`
+and `/media` fetch fails. Adding a SAN re-mints the cert, re-prompting every
+paired browser once.
+
+**Zoomed-in tier disk budget.** The `jm`/`jh` justified tiers cache whatever you
+view zoomed in, so they're bounded by a byte budget (10% of free disk, floored
+at 512 MiB, capped at 8 GiB) with LRU eviction keyed on an `accessed_at` column
+(schema v15). Serves buffer access marks in `AppState::pending_tier_accesses` —
+the read path holds a read-only connection and must not take the writer lock —
+and `enforce_tier_budget` flushes them right before evicting. Both tier write
+paths enforce the budget, and eviction only fires past 1.25× it, so passes stay
+small; when only the batch path evicted, the table grew unbounded between calls
+and then shed the whole overshoot in one multi-second `DELETE`. Override with
+`LIGHTVIEW_TIER_BUDGET_MB` (per tier, MiB, bypasses the floor) to pin the cache
+on a small box or in a test.
+
 ### Remote tagging worker (test the job queue end-to-end, no ML needed)
 
 `lightview-worker` (feature-gated bin; see `docs/workerTagging.md`) runs tagger
