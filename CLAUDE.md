@@ -121,6 +121,22 @@ curl -sk --cookie "$COOKIE" -X POST https://localhost:8799/api/invoke -H 'Conten
   -d '{"command":"apply_filter","args":{"query":"NOT has::plugin.example"}}'   # → []
 ```
 
+**Remote jobs hang at exactly 64 images.** The worker keeps a bounded number
+of downloaded files on disk (`MAX_PENDING_FILES`, a `Semaphore(64)`), and a
+permit is released only when *that file's* result is matched back in the
+`pending` map. So a plugin that skips a request, or answers with a path the
+worker can't match (canonicalizing under a symlinked `TMPDIR` is enough),
+leaks a slot each time — at 64 the downloader blocks forever, the plugin stops
+receiving stdin, and no result ever arrives. Jobs under ~64 images finish
+normally, which makes it read as "large batches fail." It is also *silent*:
+the worker's heartbeat refreshes `updated_at` whether or not anything is being
+tagged, so the 90 s stall reaper stays satisfied and the job shows `running`
+forever. Mitigations, all three needed: `pending` is keyed on the temp file
+name rather than the full path; the worker fails the job after 20 min with no
+result; and the server tracks `progressed_at` separately from `updated_at` and
+fails a job that goes 30 min without its counts moving. Grep the worker log for
+`plugin result for unknown path`. Full contract in `docs/workerTagging.md`.
+
 Notes: the *server itself* also runs jobs when plugins are installed in **its**
 `data_dir()/plugins` (same `target/debug/data/plugins/` when server and worker
 share an exe dir) — it registers as worker `local-server` / "Server (<host>)"

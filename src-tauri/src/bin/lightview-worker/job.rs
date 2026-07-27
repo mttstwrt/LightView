@@ -34,6 +34,17 @@ const APPLY_BATCH: usize = 32;
 const HEARTBEAT_SECS: u64 = 10;
 /// Announce cadence (server worker TTL is 45s).
 const ANNOUNCE_SECS: u64 = 15;
+/// How long the plugin may sit on downloaded files without producing a single
+/// result before the job is failed instead of left hanging.
+///
+/// Every unanswered file holds one of the `MAX_PENDING_FILES` disk slots; once
+/// they are all held the downloader blocks on the semaphore, the plugin stops
+/// receiving stdin lines, and no result ever arrives — while the heartbeat
+/// below keeps the server's stall timer fresh, so the job would otherwise show
+/// "running" forever with no error. Generous because a tagger's first run
+/// downloads and loads its model before the first result, which looks exactly
+/// the same from here.
+const NO_RESULT_STALL_SECS: u64 = 20 * 60;
 
 /// Job snapshot as returned by `claim_tagging_job` (camelCase, flattened with
 /// the resolved path list).
@@ -179,7 +190,21 @@ async fn announce(
 /// lands and the temp file is deleted.
 struct Pending {
     server_path: String,
+    temp_path: PathBuf,
     _permit: OwnedSemaphorePermit,
+}
+
+/// Key a temp file by its name rather than the full path we handed the plugin.
+/// Temp names are `<seq>.<ext>`, unique within a job, so this still identifies
+/// the file exactly — but it survives a plugin that echoes back a canonicalized
+/// or relative form of its input (a symlinked temp dir is enough to change it).
+/// An unmatched result would otherwise strand its `Pending` entry, and with it
+/// a disk slot, for the rest of the job.
+fn pending_key(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
 }
 
 enum Outcome {
@@ -252,7 +277,7 @@ async fn drive_plugin(
         Err(e) => return Outcome::Failed(format!("failed to start plugin: {e}")),
     };
 
-    // temp path (as handed to the plugin) → origin server path + disk permit.
+    // temp file name (see `pending_key`) → origin server path + disk permit.
     let pending: Arc<Mutex<HashMap<String, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
     // Files that never reached the plugin (download errors).
     let download_failed = Arc::new(AtomicUsize::new(0));
@@ -272,6 +297,9 @@ async fn drive_plugin(
     let mut batch: Vec<serde_json::Value> = Vec::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     heartbeat.reset(); // don't fire immediately
+    // Plugin liveness, as distinct from worker liveness. Starts at claim so the
+    // model-load window counts against it.
+    let mut last_result = tokio::time::Instant::now();
 
     let outcome = loop {
         tokio::select! {
@@ -288,11 +316,13 @@ async fn drive_plugin(
                     break Outcome::Finished;
                 };
 
-                let Some(item) = pending.lock().await.remove(&result.path) else {
+                last_result = tokio::time::Instant::now();
+
+                let Some(item) = pending.lock().await.remove(&pending_key(&result.path)) else {
                     log::warn!("plugin result for unknown path: {}", result.path);
                     continue;
                 };
-                let _ = tokio::fs::remove_file(&result.path).await;
+                let _ = tokio::fs::remove_file(&item.temp_path).await;
 
                 if let Some(err) = result.error {
                     log::debug!("{}: plugin error: {err}", item.server_path);
@@ -331,23 +361,36 @@ async fn drive_plugin(
                     }
                     continue; // push_batch already reported progress
                 }
-                // Zero results with the disk budget exhausted usually means
-                // the plugin buffers stdin to EOF instead of streaming —
-                // that deadlocks against this bounded pipeline. Warn loudly;
-                // it's indistinguishable from a very slow first model load,
-                // so don't fail the job outright.
-                if succeeded == 0
-                    && failed == 0
-                    && pending.lock().await.len() >= MAX_PENDING_FILES
-                {
-                    log::warn!(
-                        "job {}: {MAX_PENDING_FILES} images delivered but no results yet — \
-                         if this persists, plugin '{}' likely buffers stdin until EOF, \
-                         which deadlocks remote jobs (plugins must stream results; \
-                         see docs/pluginExtensibility.md)",
-                        job.id,
-                        job.plugin_name,
-                    );
+                // Files delivered to the plugin with nothing coming back is the
+                // signature of a wedge: a plugin that buffers stdin to EOF
+                // instead of streaming, or one that silently drops requests
+                // (each dropped request strands a disk slot, and once all
+                // MAX_PENDING_FILES are stranded the downloader blocks for
+                // good). It is indistinguishable from a very slow first model
+                // load, so warn early but only fail once it is truly hopeless —
+                // the alternative, left as-is, is a job that runs forever.
+                let pending_now = pending.lock().await.len();
+                if pending_now > 0 {
+                    let idle = last_result.elapsed();
+                    if idle >= Duration::from_secs(NO_RESULT_STALL_SECS) {
+                        break Outcome::Failed(format!(
+                            "plugin '{}' returned no result for {}s while holding {pending_now} \
+                             downloaded file(s) — the job cannot progress. Plugins must stream \
+                             results and answer every request (see docs/pluginExtensibility.md).",
+                            job.plugin_name,
+                            idle.as_secs(),
+                        ));
+                    }
+                    if pending_now >= MAX_PENDING_FILES {
+                        log::warn!(
+                            "job {}: all {MAX_PENDING_FILES} download slots held with no result \
+                             for {}s — plugin '{}' is not answering requests; failing the job \
+                             at {NO_RESULT_STALL_SECS}s",
+                            job.id,
+                            idle.as_secs(),
+                            job.plugin_name,
+                        );
+                    }
                 }
                 let total_failed = failed + download_failed.load(Ordering::Relaxed);
                 let update: Result<UpdateResult, _> = client.invoke(
@@ -482,20 +525,22 @@ fn spawn_downloader(
             {
                 Ok(dest) => {
                     let temp_path = dest.to_string_lossy().to_string();
+                    let key = pending_key(&temp_path);
                     pending.lock().await.insert(
-                        temp_path.clone(),
+                        key.clone(),
                         Pending {
                             server_path,
+                            temp_path: dest,
                             _permit: permit,
                         },
                     );
                     let request = PluginRequest {
                         action: "tag".to_string(),
-                        path: temp_path.clone(),
+                        path: temp_path,
                     };
                     if req_tx.send(request).await.is_err() {
                         // Plugin died; the result loop will surface it.
-                        pending.lock().await.remove(&temp_path);
+                        pending.lock().await.remove(&key);
                         return;
                     }
                 }

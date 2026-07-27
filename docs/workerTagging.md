@@ -86,16 +86,31 @@ pub struct TaggingJob {            // serialized camelCase
     worker_name: Option<String>,
     pinned_worker: Option<String>, // only this workerId may claim (validated at enqueue)
     error: Option<String>,
-    created_at: i64, updated_at: i64,
+    created_at: i64,
+    updated_at: i64,               // last contact from the worker (liveness)
+    progressed_at: i64,            // last time completed+failed actually moved
 }
 
 pub struct WorkerEntry { worker_id, worker_name, plugins: Vec<PluginInfo>, last_seen, busy_job, local: bool }
 ```
 
 Constants: worker TTL **45 s** (worker announces every 15 s), job stall
-**90 s** (worker updates at least every 10 s), last **50** finished jobs
-retained. Stalled running jobs are requeued lazily inside claim/status calls
-— the worker's poll makes this run constantly, so there is no reaper task.
+**90 s** (worker updates at least every 10 s), no-progress **30 min**, last
+**50** finished jobs retained. Stalled running jobs are requeued lazily inside
+claim/status calls — the worker's poll makes this run constantly, so there is
+no reaper task.
+
+**Liveness and progress are separate clocks, deliberately.** The heartbeat
+refreshes `updated_at` unconditionally — it proves the worker *process* is
+alive, not that the job is moving — because a tagger's first run legitimately
+produces nothing for minutes while it downloads and loads its model. So a
+worker that is alive but wedged would hold a job in `Running` forever, with no
+error anywhere: it keeps the 90 s stall reaper permanently satisfied. Hence
+`progressed_at`, advanced only when `completed + failed` actually increases,
+and a 30-minute backstop that marks such a job **Failed** (not requeued —
+requeueing just hands the same wedge to the same worker, and the job would
+loop re-claiming itself forever). Tag writes are idempotent and filter targets
+skip what's already tagged, so re-enqueueing resumes rather than redoes.
 
 AppState additions (`src-tauri/src/lib.rs`):
 
@@ -181,6 +196,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
      PIL sniffs content so extension doesn't matter; HEIC arrives transcoded),
      bounded by a `Semaphore(64)` on files-on-disk; feeds temp paths into the
      plugin's request channel; download failure counts as failed and skips.
+     The client sets a 60 s **idle-read** timeout (resets on every byte, so a
+     big slow download is fine) — without it a stalled connection parks the
+     downloader forever while the job loop keeps heartbeating.
   5. Result loop: map temp → server path, batch 32 →
      `apply_plugin_tags` → `update_tagging_job`; delete temp files as results
      land. A 10 s tick sends a pure-heartbeat update (first-run model
@@ -205,9 +223,35 @@ and `plugin/runner.rs`:
   queue runs dry.
 - The host exports **`LIGHTVIEW_JOB_TOTAL`** (expected request count) to the
   plugin subprocess, replacing the read-to-EOF sizing pattern.
+- Plugins **must emit exactly one result per request** — including a
+  `{"path": ..., "tags": [], "error": ...}` line for anything they can't
+  process. Silently skipping a request is not free: each one strands a
+  disk slot for the rest of the job (see below).
 - The worker can't reliably distinguish a buffering plugin from a slow first
-  run (model downloads), so it doesn't fail the job — but once the bound is
-  full with zero results it logs a pointed warning naming the plugin.
+  run (model downloads), so it warns as soon as the bound is full with no
+  results and only fails the job after **20 min** of total silence
+  (`NO_RESULT_STALL_SECS`). Left unbounded, that state is a permanent hang.
+
+### Disk slots are released by matching results, not by count
+
+Each downloaded file holds one of the 64 semaphore permits until *its* result
+comes back and the entry is removed from the worker's `pending` map. Two ways
+a permit leaks, both of which stall the job permanently once 64 accumulate —
+the downloader blocks on `acquire_owned()`, the plugin stops receiving stdin
+lines, and no result ever arrives again:
+
+1. **The plugin never answers a request** (see the rule above).
+2. **The plugin answers with a path the worker can't match.** This is easy to
+   hit by accident: a plugin that canonicalizes its input (`os.path.realpath`)
+   under a symlinked `TMPDIR` echoes back a different string for the same
+   file. `pending` is therefore keyed on the temp **file name** — `<seq>.<ext>`,
+   unique within a job — not the full path handed to the plugin, so
+   directory-level rewriting is harmless. A result that still doesn't match
+   logs `plugin result for unknown path`.
+
+Because the failure only bites once 64 slots are gone, jobs under ~64 images
+complete normally and larger ones hang — a confusing signature worth
+recognizing. Watch for `plugin result for unknown path` in the worker log.
 
 ## Server-local execution (`tagging/local.rs`)
 
