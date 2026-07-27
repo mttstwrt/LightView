@@ -80,7 +80,13 @@ pub fn read_cached_thumbnail(state: &AppState, tier: ThumbTier, path: &str) -> T
         })
     });
     match result {
-        Ok((data, format)) => ThumbOutcome::Hit { data, format },
+        Ok((data, format)) => {
+            // Mark the row warm for the LRU-capped tiers. Buffered in memory —
+            // this connection is read-only, and taking the writer lock on every
+            // thumbnail request would serialize the grid behind it.
+            state.record_tier_access(tier, path);
+            ThumbOutcome::Hit { data, format }
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => ThumbOutcome::Miss,
         Err(e) => {
             log::warn!("thumb cache read failed for {} (tier {:?}): {}", path, tier, e);

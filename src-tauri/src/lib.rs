@@ -257,9 +257,58 @@ pub struct AppState {
     /// One-shot guard for the in-process tagging executor (`tagging::local`),
     /// which is started lazily by headless `serve` / `enable_remote_access`.
     pub local_tagger_started: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Paths served from LRU-capped tiers since the last eviction pass, awaiting
+    /// a batched `accessed_at` write. See [`AppState::record_tier_access`].
+    /// A std mutex, not tokio's: this is taken from the synchronous serve path
+    /// and only ever held for a set insert.
+    pub pending_tier_accesses: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                cache::thumbnails::ThumbTier,
+                std::collections::HashSet<String>,
+            >,
+        >,
+    >,
 }
 
+/// Per-tier ceiling on buffered access marks before the oldest batch is dropped.
+/// Sized so a long browse is covered but a runaway can't grow without bound;
+/// each entry is one path string.
+const MAX_PENDING_TIER_ACCESSES: usize = 20_000;
+
 impl AppState {
+    /// Note that `path` was served from an LRU-capped tier, so the next
+    /// eviction pass treats it as warm.
+    ///
+    /// Buffered in memory rather than written through: the serve path reads via
+    /// the read-only connection pool and must not take the writer lock — an
+    /// `UPDATE` per thumbnail request would serialize the whole grid behind the
+    /// single cache-db mutex. `take_tier_accesses` drains this from a writer.
+    pub fn record_tier_access(&self, tier: cache::thumbnails::ThumbTier, path: &str) {
+        if !cache::thumbnails::is_lru_capped(tier) {
+            return;
+        }
+        let mut pending = self.pending_tier_accesses.lock().unwrap();
+        let set = pending.entry(tier).or_default();
+        // Bound the buffer: a very long browse between eviction passes would
+        // otherwise accumulate one entry per distinct path viewed. Dropping the
+        // oldest marks only costs those rows their warm status.
+        if set.len() >= MAX_PENDING_TIER_ACCESSES {
+            set.clear();
+        }
+        set.insert(path.to_string());
+    }
+
+    /// Drain the buffered access marks for `tier`.
+    pub fn take_tier_accesses(&self, tier: cache::thumbnails::ThumbTier) -> Vec<String> {
+        let mut pending = self.pending_tier_accesses.lock().unwrap();
+        pending
+            .get_mut(&tier)
+            .map(|set| std::mem::take(set).into_iter().collect())
+            .unwrap_or_default()
+    }
+
     /// Record user-driven thumbnail activity so the idle backfill worker backs
     /// off while someone is actively browsing (see `last_thumb_activity`).
     pub fn touch_thumb_activity(&self) {
@@ -338,6 +387,9 @@ impl AppState {
             tagging: Arc::new(Mutex::new(tagging::TaggingState::default())),
             tagging_event_tx: tokio::sync::broadcast::channel(64).0,
             local_tagger_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_tier_accesses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 

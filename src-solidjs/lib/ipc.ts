@@ -267,12 +267,21 @@ export interface ThumbHashResult {
 export const getThumbhashes = (paths: string[]) =>
   invoke<ThumbHashResult[]>("get_thumbhashes", { paths });
 
-/** Lazily generate high-resolution tier thumbnails (L / P). Re-decodes
- *  each source image at the tier's target size. Returns the count of
- *  newly cached thumbnails; the caller should refetch the tier URL
- *  (with a new cache-buster) after this resolves. */
+/** Outcome of a tier warm-up. `generated` counts newly cached thumbnails; the
+ *  caller should refetch the tier URL (with a new cache-buster) after this
+ *  resolves. `evicted` lists paths the backend dropped to stay inside the
+ *  tier's disk budget — callers that memo "already warmed" paths must forget
+ *  these, or those cells never get re-warmed and fall through to the slow
+ *  one-at-a-time serve path. */
+export interface EnsureTierResult {
+  generated: number;
+  evicted: string[];
+}
+
+/** Lazily generate high-resolution tier thumbnails (L / P). Re-decodes each
+ *  source image at the tier's target size. */
 export const ensureTierThumbnails = (paths: string[], tier: ThumbTier) =>
-  invoke<number>("ensure_tier_thumbnails", { paths, tier });
+  invoke<EnsureTierResult>("ensure_tier_thumbnails", { paths, tier });
 
 export const getThumbnail = (path: string) =>
   invoke<ThumbnailResult | null>("get_thumbnail", { path });

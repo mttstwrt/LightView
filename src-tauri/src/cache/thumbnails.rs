@@ -190,11 +190,23 @@ pub fn write_tier_row(
     format: &str,
 ) -> Result<(), CacheError> {
     debug_assert!(!matches!(tier, ThumbTier::Standard));
-    let sql = format!(
-        "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        tier.table()
-    );
+    // LRU-capped tiers carry `accessed_at`; seed it to now on write. Leaving it
+    // at the column default (0) would mark every freshly generated row as
+    // maximally cold, so the next eviction would delete exactly the rows just
+    // generated for the current viewport.
+    let sql = if is_lru_capped(tier) {
+        format!(
+            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format, accessed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'))",
+            tier.table()
+        )
+    } else {
+        format!(
+            "INSERT OR REPLACE INTO {} (path, media_type, mtime, width, height, thumbnail, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            tier.table()
+        )
+    };
     conn.execute(
         &sql,
         rusqlite::params![path, media_type, mtime, width, height, thumbnail, format],
@@ -202,29 +214,109 @@ pub fn write_tier_row(
     Ok(())
 }
 
-/// Bound a tier table to its `max_rows` most-recently-inserted rows, deleting
-/// the oldest beyond that. Ordering is by `rowid` (insertion order), so this is
-/// FIFO eviction, not strict LRU — true LRU would need an access-time write on
-/// every cache read, which we deliberately avoid on the hot serve path. Used to
-/// cap the high justified tier, whose 2560 px WebP rows are generated for
-/// whatever you view zoomed in and would otherwise grow without limit.
-/// Returns the number of rows evicted.
-pub fn evict_tier_fifo(
+/// Whether a tier is bounded by the byte-budgeted LRU (and therefore carries an
+/// `accessed_at` column). Only the two zoomed-in justified tiers are: they're
+/// generated for whatever you view zoomed in, so they'd otherwise grow without
+/// limit, and their rows are big enough that the bound has to be real.
+pub fn is_lru_capped(tier: ThumbTier) -> bool {
+    matches!(tier, ThumbTier::JustifiedMid | ThumbTier::JustifiedHigh)
+}
+
+/// Mark `paths` as accessed now, so the LRU eviction treats them as warm.
+///
+/// Serving a thumbnail can't do this inline: the read path runs on the
+/// read-only connection pool. Instead the serve path records hits in memory and
+/// this flushes them from a writer, which is also the only moment the value
+/// matters (immediately before an eviction pass).
+pub fn touch_accessed(
     conn: &rusqlite::Connection,
     tier: ThumbTier,
-    max_rows: u32,
-) -> Result<usize, CacheError> {
-    debug_assert!(!matches!(tier, ThumbTier::Standard));
-    // Keep the newest `max_rows` (highest rowids); delete everything older.
-    // `LIMIT -1 OFFSET n` skips the n newest, yielding the rest (the oldest).
+    paths: &[String],
+) -> Result<(), CacheError> {
+    if !is_lru_capped(tier) || paths.is_empty() {
+        return Ok(());
+    }
     let sql = format!(
-        "DELETE FROM {} WHERE rowid IN (
-            SELECT rowid FROM {} ORDER BY rowid DESC LIMIT -1 OFFSET ?1
-        )",
-        tier.table(),
-        tier.table(),
+        "UPDATE {} SET accessed_at = strftime('%s','now') WHERE path = ?1",
+        tier.table()
     );
-    let evicted = conn.execute(&sql, rusqlite::params![max_rows])?;
+    let mut stmt = conn.prepare_cached(&sql)?;
+    for path in paths {
+        stmt.execute(rusqlite::params![path])?;
+    }
+    Ok(())
+}
+
+/// Fraction over budget a tier must climb before an eviction pass runs. The
+/// pass then trims all the way back to the budget, so evictions are occasional
+/// and proportional instead of firing on every write.
+///
+/// Without this the two write paths fought: on-demand serves grew the table
+/// while never evicting, then a single batch write snapped it back to the cap
+/// in one `DELETE` — a multi-second stall holding the cache mutex, which
+/// dropped a large slice of the working set at once.
+const EVICT_HIGH_WATER: f64 = 1.25;
+
+/// Current total size of a tier's stored blobs, in bytes.
+pub fn tier_bytes(conn: &rusqlite::Connection, tier: ThumbTier) -> Result<u64, CacheError> {
+    let sql = format!("SELECT COALESCE(SUM(LENGTH(thumbnail)), 0) FROM {}", tier.table());
+    let bytes: i64 = conn.prepare_cached(&sql)?.query_row([], |row| row.get(0))?;
+    Ok(bytes.max(0) as u64)
+}
+
+/// Evict a tier's coldest rows until its stored blobs fit `budget_bytes`,
+/// keeping the most-recently-accessed ones. Returns the evicted paths.
+///
+/// Byte-budgeted rather than row-capped because row size varies by more than an
+/// order of magnitude across these tiers (a 2560 px WebP of a flat sky versus a
+/// dense forest), so a fixed row count maps to a wildly variable footprint. The
+/// running-total window function keeps exactly the warm prefix that fits.
+///
+/// No-ops until the tier exceeds [`EVICT_HIGH_WATER`] × budget — see that
+/// constant for why the hysteresis matters.
+pub fn evict_tier_lru(
+    conn: &rusqlite::Connection,
+    tier: ThumbTier,
+    budget_bytes: u64,
+) -> Result<Vec<String>, CacheError> {
+    debug_assert!(is_lru_capped(tier));
+    let used = tier_bytes(conn, tier)?;
+    if used as f64 <= budget_bytes as f64 * EVICT_HIGH_WATER {
+        return Ok(Vec::new());
+    }
+
+    // Walk rows warmest-first, accumulating their sizes; everything past the
+    // point where the running total exceeds the budget is cold enough to drop.
+    // `rowid DESC` breaks ties so rows touched in the same second (the
+    // timestamp's resolution) evict newest-last rather than arbitrarily.
+    let sql = format!(
+        "DELETE FROM {table} WHERE path IN (
+            SELECT path FROM (
+                SELECT path,
+                       SUM(LENGTH(thumbnail)) OVER (
+                           ORDER BY accessed_at DESC, rowid DESC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS running
+                FROM {table}
+            ) WHERE running > ?1
+        ) RETURNING path",
+        table = tier.table()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let evicted: Vec<String> = stmt
+        .query_map(rusqlite::params![budget_bytes], |row| row.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+
+    if !evicted.is_empty() {
+        log::debug!(
+            "{} tier eviction: {} rows dropped ({} MiB used vs {} MiB budget)",
+            tier.as_segment(),
+            evicted.len(),
+            used / (1024 * 1024),
+            budget_bytes / (1024 * 1024),
+        );
+    }
     Ok(evicted)
 }
 
@@ -490,5 +582,139 @@ impl CacheDb {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+    use crate::cache::db::CacheDb;
+
+    const JH: ThumbTier = ThumbTier::JustifiedHigh;
+
+    fn open_db() -> (tempfile::TempDir, CacheDb) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CacheDb::open(tmp.path()).unwrap();
+        (tmp, db)
+    }
+
+    /// Insert a row whose blob is exactly `bytes` long.
+    fn insert(conn: &rusqlite::Connection, path: &str, bytes: usize) {
+        write_tier_row(conn, JH, path, "image", 0, 100, 100, &vec![0u8; bytes], "webp").unwrap();
+    }
+
+    fn set_accessed(conn: &rusqlite::Connection, path: &str, at: i64) {
+        conn.execute(
+            "UPDATE thumbnails_justified_high SET accessed_at = ?1 WHERE path = ?2",
+            rusqlite::params![at, path],
+        )
+        .unwrap();
+    }
+
+    fn paths(conn: &rusqlite::Connection) -> Vec<String> {
+        conn.prepare("SELECT path FROM thumbnails_justified_high ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The hysteresis is the whole point of the rewrite: without it the two
+    /// write paths alternated between growing the table and snapping it back in
+    /// one huge DELETE.
+    #[test]
+    fn does_not_evict_until_past_the_high_water_mark() {
+        let (_tmp, db) = open_db();
+        for i in 0..10 {
+            insert(db.conn(), &format!("/a/{i}.jpg"), 100);
+        }
+        // 1000 bytes used against a 900-byte budget is over budget but under
+        // the 1.25× high-water mark.
+        let evicted = evict_tier_lru(db.conn(), JH, 900).unwrap();
+        assert!(evicted.is_empty(), "should tolerate a small overshoot");
+        assert_eq!(paths(db.conn()).len(), 10);
+    }
+
+    #[test]
+    fn evicts_down_to_budget_once_triggered() {
+        let (_tmp, db) = open_db();
+        for i in 0..10 {
+            insert(db.conn(), &format!("/a/{i}.jpg"), 100);
+        }
+        let evicted = evict_tier_lru(db.conn(), JH, 500).unwrap();
+        assert_eq!(evicted.len(), 5);
+        assert_eq!(tier_bytes(db.conn(), JH).unwrap(), 500);
+    }
+
+    /// The regression the LRU column exists for: under the old rowid FIFO, rows
+    /// inserted first were dropped first even if they were the ones being
+    /// actively viewed.
+    #[test]
+    fn keeps_recently_accessed_rows_over_recently_inserted_ones() {
+        let (_tmp, db) = open_db();
+        for i in 0..10 {
+            insert(db.conn(), &format!("/a/{i}.jpg"), 100);
+        }
+        // The two oldest-inserted rows are the warmest; the rest are cold.
+        for i in 0..10 {
+            set_accessed(db.conn(), &format!("/a/{i}.jpg"), if i < 2 { 9_000 } else { 1_000 });
+        }
+        let evicted = evict_tier_lru(db.conn(), JH, 200).unwrap();
+        assert_eq!(evicted.len(), 8);
+        assert_eq!(paths(db.conn()), vec!["/a/0.jpg", "/a/1.jpg"]);
+    }
+
+    /// A freshly generated row must not read as maximally cold, or the next
+    /// eviction deletes exactly what was just generated for the viewport.
+    #[test]
+    fn newly_written_rows_are_warm() {
+        let (_tmp, db) = open_db();
+        insert(db.conn(), "/old.jpg", 100);
+        set_accessed(db.conn(), "/old.jpg", 1_000);
+        insert(db.conn(), "/new.jpg", 100);
+
+        let evicted = evict_tier_lru(db.conn(), JH, 100).unwrap();
+        assert_eq!(evicted, vec!["/old.jpg".to_string()]);
+        assert_eq!(paths(db.conn()), vec!["/new.jpg"]);
+    }
+
+    /// Byte budgets, not row counts: one huge row must not survive just because
+    /// it is a single row.
+    #[test]
+    fn budget_is_measured_in_bytes_not_rows() {
+        let (_tmp, db) = open_db();
+        insert(db.conn(), "/huge.jpg", 10_000);
+        set_accessed(db.conn(), "/huge.jpg", 1_000);
+        for i in 0..3 {
+            insert(db.conn(), &format!("/small{i}.jpg"), 100);
+            set_accessed(db.conn(), &format!("/small{i}.jpg"), 9_000);
+        }
+        let evicted = evict_tier_lru(db.conn(), JH, 1_000).unwrap();
+        assert_eq!(evicted, vec!["/huge.jpg".to_string()]);
+        assert_eq!(tier_bytes(db.conn(), JH).unwrap(), 300);
+    }
+
+    #[test]
+    fn touch_accessed_marks_rows_warm() {
+        let (_tmp, db) = open_db();
+        insert(db.conn(), "/a.jpg", 100);
+        insert(db.conn(), "/b.jpg", 100);
+        set_accessed(db.conn(), "/a.jpg", 1_000);
+        set_accessed(db.conn(), "/b.jpg", 1_000);
+
+        touch_accessed(db.conn(), JH, &["/a.jpg".to_string()]).unwrap();
+
+        let evicted = evict_tier_lru(db.conn(), JH, 100).unwrap();
+        assert_eq!(evicted, vec!["/b.jpg".to_string()]);
+    }
+
+    /// Uncapped tiers have no `accessed_at` column; the helpers must be inert
+    /// for them rather than producing a SQL error.
+    #[test]
+    fn uncapped_tiers_are_left_alone() {
+        let (_tmp, db) = open_db();
+        assert!(!is_lru_capped(ThumbTier::Justified));
+        touch_accessed(db.conn(), ThumbTier::Justified, &["/a.jpg".to_string()]).unwrap();
     }
 }

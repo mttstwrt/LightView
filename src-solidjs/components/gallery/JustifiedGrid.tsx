@@ -314,8 +314,16 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   let versionEpoch = 0;
   const pathToIndex = new Map<string, number>();
   // Paths already requested for high-tier (jh) look-ahead precache, so we don't
-  // re-issue IPC for them while zoomed in.
+  // re-issue IPC for them while zoomed in. The backend evicts from these tiers
+  // to stay inside a disk budget, so this memo can go stale — every warm call
+  // reports what it dropped and `forgetEvicted` takes those back out. Without
+  // that, an evicted cell is never re-warmed: the look-ahead still believes it's
+  // cached, so the cell falls through to the slow per-cell generate-on-serve.
   const jhPrecached = new Set<string>();
+  const forgetEvicted = (evicted: string[] | undefined) => {
+    if (!evicted?.length) return;
+    for (const p of evicted) jhPrecached.delete(p);
+  };
   // Paths already sent to the backend by landing-zone warming during a fling,
   // so successive drains of the same fling don't re-issue them.
   const landingWarmed = new Set<string>();
@@ -758,7 +766,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
           }
           inFlightFetch = (async () => {
             try {
-              await ensureTierThumbnails(toGenerate, thumbTier());
+              forgetEvicted((await ensureTierThumbnails(toGenerate, thumbTier())).evicted);
               if (fetchAbort || generation() !== gen) return;
               batch(() => {
                 for (const p of toGenerate) {
@@ -819,7 +827,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         if (want.length > 0) {
           const tier = thumbTier();
           inFlightFetch = (async () => {
-            try { await ensureTierThumbnails(want, tier); }
+            try { forgetEvicted((await ensureTierThumbnails(want, tier)).evicted); }
             catch (e) { console.error("Justified jh look-ahead failed:", e); }
             inFlightFetch = null;
           })();
