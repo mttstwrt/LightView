@@ -9,6 +9,14 @@
 #
 # The server is HTTPS with a self-signed cert, so the browser will warn once —
 # that's expected (a secure context is required for clipboard/upload APIs).
+#
+# IMPORTANT: set LIGHTVIEW_TLS_SAN below to this host's LAN IP (or DNS name).
+# The container can only detect its own bridge address (172.x.y.z), so without
+# it the cert never covers the address your devices actually dial and every
+# client fails hostname verification. Desktop browsers survive that on a
+# click-through exception, but iOS drops the exception readily and a
+# home-screen PWA can't display the prompt to re-accept it — the app then opens
+# from its cached shell and silently loads no thumbnails or full images.
 
 services:
   lightview:
@@ -34,6 +42,12 @@ services:
       - lightview-data:/opt/lightview/data
     environment:
       - RUST_LOG=info
+      # Addresses the TLS cert must cover, beyond loopback and the container's
+      # own (useless) bridge IP. Set this to the LAN IP or DNS name devices use
+      # to reach this host; comma-separate to list several. Changing it re-mints
+      # the cert, so every browser shows the trust prompt once more.
+      #   - LIGHTVIEW_TLS_SAN=192.168.1.2,gallery.lan
+      - LIGHTVIEW_TLS_SAN=${LIGHTVIEW_TLS_SAN:-}
     # To change the port, update BOTH the mapping above and this command's port.
     command: ["serve", "/gallery", "--port", "8787"]
     # The SSE change-stream holds connections open; without this, `down` waits
