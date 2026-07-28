@@ -73,6 +73,8 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     );
 
     let use_tls = config.tls;
+    // Captured before `config` moves into the state, which the router consumes.
+    let tls_sans = config.tls_sans.clone();
     let remote_hits = Arc::new(AtomicU64::new(0));
     let state = ServerState {
         config: Arc::new(config),
@@ -169,7 +171,7 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     let handle = if use_tls {
         // Browsers only grant secure-context APIs over HTTPS, so the remote
         // server terminates TLS with a persisted self-signed cert (tls.rs).
-        let material = tls::load_or_generate().map_err(std::io::Error::other)?;
+        let material = tls::load_or_generate(&tls_sans).map_err(std::io::Error::other)?;
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem(material.cert_pem, material.key_pem)
                 .await?;

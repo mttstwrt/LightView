@@ -968,15 +968,24 @@ pub async fn get_thumbhashes_impl(
 /// that fail to generate are silently dropped (the frontend will fall
 /// back to the next lower tier).
 ///
-/// Returns the number of thumbnails successfully written. The frontend
-/// should retry its `lightview://thumb/<tier>/<path>` URL (with a new
-/// cache-buster) after this resolves.
+/// Returns the number of thumbnails successfully written, plus any paths
+/// evicted while making room. The frontend should retry its
+/// `lightview://thumb/<tier>/<path>` URL (with a new cache-buster) after this
+/// resolves, and drop the evicted paths from its "already warmed" memo so they
+/// get re-warmed rather than left to the slow one-at-a-time serve path.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureTierResult {
+    pub generated: usize,
+    pub evicted: Vec<String>,
+}
+
 #[tauri::command]
 pub async fn ensure_tier_thumbnails(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
     tier: String,
-) -> Result<usize, String> {
+) -> Result<EnsureTierResult, String> {
     ensure_tier_thumbnails_impl(&state, paths, tier).await
 }
 
@@ -986,7 +995,7 @@ pub async fn ensure_tier_thumbnails_impl(
     state: &AppState,
     paths: Vec<String>,
     tier: String,
-) -> Result<usize, String> {
+) -> Result<EnsureTierResult, String> {
     state.touch_thumb_activity();
     let tier = ThumbTier::from_segment(&tier).ok_or_else(|| format!("unknown tier: {}", tier))?;
     if matches!(tier, ThumbTier::Standard) {
@@ -1005,7 +1014,16 @@ pub async fn ensure_tier_thumbnails_impl(
     };
 
     if missing.is_empty() {
-        return Ok(0);
+        // Nothing to generate, but this is exactly the case where the user is
+        // scrolling through already-warm cells — land those access marks so the
+        // rows they're looking at read as warm at the next eviction, and so the
+        // pending set doesn't grow unbounded during a long cached browse.
+        let mut db = state.cache_db.lock().await;
+        let evicted = match db.as_mut() {
+            Some(db) => enforce_tier_budget(state, db, tier),
+            None => Vec::new(),
+        };
+        return Ok(EnsureTierResult { generated: 0, evicted });
     }
 
     let target = tier.target_size();
@@ -1077,31 +1095,86 @@ pub async fn ensure_tier_thumbnails_impl(
     }
     txn.commit().map_err(|e| e.to_string())?;
 
-    // Cap the zoomed-in justified tiers' footprint. They're generated for
-    // whatever you view zoomed in (visible cells + look-ahead), so without a
-    // bound they grow with everything you've ever scrolled past at high zoom.
-    // FIFO-evict the oldest rows beyond the cap; the working set while browsing
-    // is contiguous, so this drops far-away cells, which regenerate lazily if
-    // revisited.
-    if let Some(cap) = jh_tier_cap(tier) {
-        if let Err(e) = crate::cache::thumbnails::evict_tier_fifo(db.conn(), tier, cap) {
-            log::warn!("{} tier eviction failed: {e}", tier.as_segment());
-        }
-    }
+    let evicted = enforce_tier_budget(state, db, tier);
 
-    Ok(written)
+    Ok(EnsureTierResult { generated: written, evicted })
 }
 
-/// Max rows retained for a zoomed-in justified tier, or `None` for tiers that
-/// aren't FIFO-bounded. The jm tier's 1280 px WebP rows are ~a quarter the bytes
-/// of the jh tier's 2560 px rows, so it gets a proportionally larger row budget
-/// for roughly the same disk footprint (~half a gigabyte each).
-fn jh_tier_cap(tier: ThumbTier) -> Option<u32> {
-    match tier {
-        ThumbTier::JustifiedMid => Some(4800),
-        ThumbTier::JustifiedHigh => Some(1200),
-        _ => None,
+/// Flush pending access marks and run an eviction pass for `tier`, returning
+/// the evicted paths. Shared by both tier write paths so the bound is enforced
+/// steadily wherever rows are added, rather than only on batch writes.
+///
+/// Errors are logged, not propagated: an eviction failure must not fail the
+/// generation that just succeeded — the bytes are already on disk and useful.
+pub(crate) fn enforce_tier_budget(
+    state: &AppState,
+    db: &crate::cache::db::CacheDb,
+    tier: ThumbTier,
+) -> Vec<String> {
+    use crate::cache::thumbnails as thumbs;
+    if !thumbs::is_lru_capped(tier) {
+        return Vec::new();
     }
+
+    // Serves accumulate in memory (the read path holds a read-only connection);
+    // land them before deciding what's cold.
+    let touched = state.take_tier_accesses(tier);
+    if let Err(e) = thumbs::touch_accessed(db.conn(), tier, &touched) {
+        log::warn!("{} tier access flush failed: {e}", tier.as_segment());
+    }
+
+    match thumbs::evict_tier_lru(db.conn(), tier, tier_budget_bytes(tier)) {
+        Ok(evicted) => evicted,
+        Err(e) => {
+            log::warn!("{} tier eviction failed: {e}", tier.as_segment());
+            Vec::new()
+        }
+    }
+}
+
+/// Disk budget for a zoomed-in justified tier.
+///
+/// Scaled to free disk rather than fixed: these tiers cache whatever you view
+/// zoomed in, so a roomy machine should keep far more of it warm than the old
+/// row caps allowed (~0.5 GiB each, which on a large library thrashed), while a
+/// nearly-full disk must not be filled by a cache. The mid tier's 1280 px rows
+/// are ~a quarter the bytes of high's 2560 px rows, so an equal byte budget
+/// holds roughly four times as many of them — which matches usage, since mid
+/// zoom covers more cells per screen.
+fn tier_budget_bytes(tier: ThumbTier) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// Never take more than this share of what's currently free.
+    const FREE_SHARE: f64 = 0.10;
+    let (floor, ceiling) = match tier {
+        ThumbTier::JustifiedMid | ThumbTier::JustifiedHigh => (GIB / 2, 8 * GIB),
+        _ => return u64::MAX,
+    };
+    // Escape hatch, per tier in MiB: `LIGHTVIEW_TIER_BUDGET_MB=256`. Bypasses
+    // the floor so a small NAS or a test can pin the cache well below it.
+    if let Some(mb) = std::env::var("LIGHTVIEW_TIER_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return mb.saturating_mul(1024 * 1024);
+    }
+    let share = (free_disk_bytes().unwrap_or(0) as f64 * FREE_SHARE) as u64;
+    share.clamp(floor, ceiling)
+}
+
+/// Free bytes on the filesystem holding the gallery cache. `None` when the
+/// platform lookup finds no matching mount, in which case callers fall back to
+/// the budget floor.
+fn free_disk_bytes() -> Option<u64> {
+    use sysinfo::Disks;
+    let data = crate::util::paths::data_dir();
+    let disks = Disks::new_with_refreshed_list();
+    // Longest matching mount point wins — `/home` should beat `/` for a path
+    // under it.
+    disks
+        .iter()
+        .filter(|d| data.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
 }
 
 /// Extras derived from a Standard-tier thumbnail: ThumbHash placeholder +
@@ -1322,6 +1395,14 @@ pub async fn generate_and_store_tier(
             );
         }
     }
+
+    // Enforce the tier budget here too, not just on the batch path. Serving a
+    // cache miss writes a row like any other, and when this path was exempt the
+    // table grew unbounded between batch calls — so the next batch's single
+    // eviction had to delete the entire overshoot at once, stalling every DB
+    // user and dropping a large slice of the working set. Evicting from both
+    // paths (past the high-water mark) keeps each pass small.
+    enforce_tier_budget(state, db, tier);
 
     Ok((bytes, fmt_str))
 }

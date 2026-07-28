@@ -22,6 +22,16 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
+/// Idle-read timeout: how long a request may go without receiving *any* bytes
+/// before it errors. Resets on every successful read, so a large but steadily
+/// progressing `/media` download is never cut off — only a genuinely stalled
+/// connection is. Without this a single wedged download parks the downloader
+/// task forever, and since the job loop keeps heartbeating, the server's stall
+/// reaper never fires and the job runs forever with no error. Generous enough
+/// that a busy server thinking about an `apply_plugin_tags` batch doesn't trip
+/// it.
+const READ_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Accepts only the certificate whose SHA-256 matches the pinned digest.
 #[derive(Debug)]
 struct PinnedVerifier {
@@ -154,6 +164,7 @@ fn client_with_verifier(
     reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(READ_STALL_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())
 }

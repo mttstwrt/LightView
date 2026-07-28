@@ -15,6 +15,12 @@ pub struct HttpConfig {
     /// HTTP — the desktop webview won't accept a self-signed cert, and
     /// 127.0.0.1 is already a secure context.
     pub tls: bool,
+    /// Extra SANs the TLS cert must carry beyond loopback and the auto-detected
+    /// LAN IP. Detection reads the interface this process routes through, which
+    /// inside a container is the bridge address rather than the host address
+    /// clients dial — so containerized deployments must name the reachable
+    /// address here or every client fails hostname verification.
+    pub tls_sans: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,11 +45,14 @@ impl HttpConfig {
             auth: AuthMode::None,
             web_root: None,
             tls: false,
+            tls_sans: Vec::new(),
         }
     }
 
     /// LAN-accessible, per-device cookie auth, serving the SPA from `web_root`.
-    /// `port` of 0 lets the OS assign one.
+    /// `port` of 0 lets the OS assign one. Seeds `tls_sans` from the
+    /// environment so a container can declare its reachable address without a
+    /// CLI flag; callers append their own with [`Self::with_tls_sans`].
     pub fn remote(port: u16, web_root: Option<PathBuf>) -> Self {
         Self {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -51,6 +60,14 @@ impl HttpConfig {
             auth: AuthMode::DeviceCookie,
             web_root,
             tls: true,
+            tls_sans: super::tls::sans_from_env(),
         }
+    }
+
+    /// Append additional TLS SANs (from a CLI flag) to whatever the
+    /// environment already supplied.
+    pub fn with_tls_sans(mut self, sans: impl IntoIterator<Item = String>) -> Self {
+        self.tls_sans.extend(sans);
+        self
     }
 }

@@ -72,6 +72,30 @@ Clipboard API and friends. The self-signed ECDSA cert persists at
 (`src-tauri/src/http_server/tls.rs`). The desktop's loopback media server
 stays plain HTTP (the webview won't accept a self-signed cert).
 
+**Cert SANs behind NAT/Docker.** `detect_lan_ip()` sees only the interface this
+process routes through — inside a container that's the bridge IP, never the host
+address clients dial — so the cert fails hostname verification everywhere. Name
+the reachable address explicitly with `--tls-san <ip-or-host>` (repeatable,
+comma-separated) or `LIGHTVIEW_TLS_SAN`; docker-compose.yml wires the env var
+through. Getting this wrong is quiet: desktop browsers keep working on a
+click-through exception, but iOS drops that exception readily and a standalone
+PWA can't render the prompt to re-accept it, so the app opens from its cached
+shell (`sw.js` + `loadBootSnapshot()`) and looks connected while every `/thumb`
+and `/media` fetch fails. Adding a SAN re-mints the cert, re-prompting every
+paired browser once.
+
+**Zoomed-in tier disk budget.** The `jm`/`jh` justified tiers cache whatever you
+view zoomed in, so they're bounded by a byte budget (10% of free disk, floored
+at 512 MiB, capped at 8 GiB) with LRU eviction keyed on an `accessed_at` column
+(schema v15). Serves buffer access marks in `AppState::pending_tier_accesses` —
+the read path holds a read-only connection and must not take the writer lock —
+and `enforce_tier_budget` flushes them right before evicting. Both tier write
+paths enforce the budget, and eviction only fires past 1.25× it, so passes stay
+small; when only the batch path evicted, the table grew unbounded between calls
+and then shed the whole overshoot in one multi-second `DELETE`. Override with
+`LIGHTVIEW_TIER_BUDGET_MB` (per tier, MiB, bypasses the floor) to pin the cache
+on a small box or in a test.
+
 ### Remote tagging worker (test the job queue end-to-end, no ML needed)
 
 `lightview-worker` (feature-gated bin; see `docs/workerTagging.md`) runs tagger
@@ -96,6 +120,22 @@ curl -sk --cookie "$COOKIE" -X POST https://localhost:8799/api/invoke -H 'Conten
 curl -sk --cookie "$COOKIE" -X POST https://localhost:8799/api/invoke -H 'Content-Type: application/json' \
   -d '{"command":"apply_filter","args":{"query":"NOT has::plugin.example"}}'   # → []
 ```
+
+**Remote jobs hang at exactly 64 images.** The worker keeps a bounded number
+of downloaded files on disk (`MAX_PENDING_FILES`, a `Semaphore(64)`), and a
+permit is released only when *that file's* result is matched back in the
+`pending` map. So a plugin that skips a request, or answers with a path the
+worker can't match (canonicalizing under a symlinked `TMPDIR` is enough),
+leaks a slot each time — at 64 the downloader blocks forever, the plugin stops
+receiving stdin, and no result ever arrives. Jobs under ~64 images finish
+normally, which makes it read as "large batches fail." It is also *silent*:
+the worker's heartbeat refreshes `updated_at` whether or not anything is being
+tagged, so the 90 s stall reaper stays satisfied and the job shows `running`
+forever. Mitigations, all three needed: `pending` is keyed on the temp file
+name rather than the full path; the worker fails the job after 20 min with no
+result; and the server tracks `progressed_at` separately from `updated_at` and
+fails a job that goes 30 min without its counts moving. Grep the worker log for
+`plugin result for unknown path`. Full contract in `docs/workerTagging.md`.
 
 Notes: the *server itself* also runs jobs when plugins are installed in **its**
 `data_dir()/plugins` (same `target/debug/data/plugins/` when server and worker

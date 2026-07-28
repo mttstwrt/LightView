@@ -285,6 +285,23 @@ const MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    // v15: last-access timestamps for the two capped justified tiers, so
+    // eviction can drop genuinely cold rows instead of the oldest-inserted
+    // ones. Under the previous rowid FIFO, scrolling back over cells you were
+    // just looking at could miss: they were *inserted* early, which is what
+    // rowid order encodes. Backfilled to the current time so existing rows
+    // aren't all treated as equally ancient on the first pass after upgrade.
+    Migration {
+        version: 15,
+        sql: "
+            ALTER TABLE thumbnails_justified_mid ADD COLUMN accessed_at INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE thumbnails_justified_high ADD COLUMN accessed_at INTEGER NOT NULL DEFAULT 0;
+            UPDATE thumbnails_justified_mid SET accessed_at = strftime('%s','now') WHERE accessed_at = 0;
+            UPDATE thumbnails_justified_high SET accessed_at = strftime('%s','now') WHERE accessed_at = 0;
+            CREATE INDEX IF NOT EXISTS idx_jm_accessed ON thumbnails_justified_mid(accessed_at);
+            CREATE INDEX IF NOT EXISTS idx_jh_accessed ON thumbnails_justified_high(accessed_at);
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.

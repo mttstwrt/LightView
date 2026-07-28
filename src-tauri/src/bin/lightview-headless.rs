@@ -8,12 +8,18 @@
 //! `lv_device` cookie to the origin (host:port) it paired against.
 //!
 //! Usage:
-//!   lightview-headless serve <gallery-path> [--port <port>]
+//!   lightview-headless serve <gallery-path> [--port <port>] [--tls-san <host>]
 //!   lightview-headless pair  <gallery-path>
 //!
 //! `serve` opens the gallery and listens on 0.0.0.0 with per-device cookie auth,
 //! serving the built SPA from `./dist`. `pair` mints a single 6-digit PIN,
-//! prints it, and exits — redeem it at `http://<host>:<port>/pair` on the device.
+//! prints it, and exits — redeem it at `https://<host>:<port>/pair` on the device.
+//!
+//! `--tls-san` names an address the cert must cover that this process can't
+//! detect on its own. In Docker that's mandatory: detection sees the container's
+//! bridge IP, so without it every client fails hostname verification and lands
+//! on a fragile click-through exception (which a standalone PWA cannot even
+//! re-accept). See `http_server::tls`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,7 +42,7 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("serve") => match parse_serve(&args[2..]) {
-            Ok((path, port)) => serve(path, port).await,
+            Ok((path, port, tls_sans)) => serve(path, port, tls_sans).await,
             Err(e) => {
                 eprintln!("error: {e}\n");
                 usage();
@@ -63,7 +69,7 @@ async fn main() -> ExitCode {
 }
 
 /// Open the gallery and serve it over the LAN until the server task ends.
-async fn serve(path: PathBuf, port: u16) -> ExitCode {
+async fn serve(path: PathBuf, port: u16, tls_sans: Vec<String>) -> ExitCode {
     let path = match std::fs::canonicalize(&path) {
         Ok(p) => p,
         Err(e) => {
@@ -91,7 +97,7 @@ async fn serve(path: PathBuf, port: u16) -> ExitCode {
     // a large library. Until the gallery finishes opening, the gallery gate
     // in the HTTP layer answers every request with a 503 "starting" page —
     // a sign of life instead of a refused connection.
-    let config = HttpConfig::remote(port, web_root);
+    let config = HttpConfig::remote(port, web_root).with_tls_sans(tls_sans);
     let server = match http_server::start(config, state.clone()).await {
         Ok(s) => s,
         Err(e) => {
@@ -183,16 +189,26 @@ fn pair(path: &Path) -> ExitCode {
 }
 
 /// Parse `serve` args: a single positional gallery path plus optional
-/// `--port`/`-p`.
-fn parse_serve(args: &[String]) -> Result<(PathBuf, u16), String> {
+/// `--port`/`-p` and repeatable `--tls-san`.
+fn parse_serve(args: &[String]) -> Result<(PathBuf, u16, Vec<String>), String> {
     let mut path: Option<PathBuf> = None;
     let mut port: u16 = DEFAULT_PORT;
+    let mut tls_sans: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--port" | "-p" => {
                 let v = args.get(i + 1).ok_or("--port requires a value")?;
                 port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                i += 2;
+            }
+            "--tls-san" => {
+                let v = args.get(i + 1).ok_or("--tls-san requires a value")?;
+                let parsed = lightview_lib::http_server::tls::split_sans(v);
+                if parsed.is_empty() {
+                    return Err("--tls-san requires a non-empty value".to_string());
+                }
+                tls_sans.extend(parsed);
                 i += 2;
             }
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
@@ -205,7 +221,7 @@ fn parse_serve(args: &[String]) -> Result<(PathBuf, u16), String> {
             }
         }
     }
-    Ok((path.ok_or("`serve` requires a gallery path")?, port))
+    Ok((path.ok_or("`serve` requires a gallery path")?, port, tls_sans))
 }
 
 /// Resolve the built SPA directory (`dist/`). Mirrors the desktop app's lookup:
@@ -228,10 +244,19 @@ fn usage() {
     eprintln!(
         "LightView headless server\n\n\
          USAGE:\n  \
-         lightview-headless serve <gallery-path> [--port <port>]\n  \
+         lightview-headless serve <gallery-path> [--port <port>] [--tls-san <host>]\n  \
          lightview-headless pair  <gallery-path>\n\n\
          COMMANDS:\n  \
          serve   Open a gallery and serve it over the LAN (default port {DEFAULT_PORT}).\n  \
-         pair    Mint a one-time 6-digit pairing PIN for the gallery and exit.\n"
+         pair    Mint a one-time 6-digit pairing PIN for the gallery and exit.\n\n\
+         OPTIONS:\n  \
+         --tls-san <host>  Additional IP or DNS name the TLS certificate must cover.\n                    \
+         Repeatable; also accepts a comma-separated list. Required when the\n                    \
+         address clients dial isn't one this process can detect — notably in\n                    \
+         Docker, where detection sees only the container's bridge IP and every\n                    \
+         client would otherwise fail hostname verification. May also be set via\n                    \
+         the {san_env} environment variable. Changing it re-mints the cert, so\n                    \
+         each browser shows the trust prompt once more.\n",
+        san_env = lightview_lib::http_server::tls::SAN_ENV_VAR
     );
 }

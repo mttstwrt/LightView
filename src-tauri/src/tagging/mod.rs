@@ -34,6 +34,17 @@ pub const WORKER_TTL_SECS: i64 = 45;
 /// A running job whose worker hasn't updated for this long is requeued.
 /// Workers heartbeat via `update_tagging_job` at least every ~10s.
 pub const JOB_STALL_SECS: i64 = 90;
+/// A running job that keeps heartbeating but whose counts haven't moved for
+/// this long is failed.
+///
+/// The heartbeat proves the *worker process* is alive, not that the job is
+/// progressing — it refreshes `updated_at` unconditionally — so without this a
+/// worker that is alive but wedged holds a job in `Running` forever, with no
+/// error anywhere. The worker's own watchdog (`NO_RESULT_STALL_SECS`) should
+/// catch that first; this is the backstop for the cases it can't see. Well
+/// clear of a tagger's first-run model download, which legitimately produces
+/// nothing for minutes.
+pub const JOB_NO_PROGRESS_SECS: i64 = 30 * 60;
 /// Finished (done/failed/cancelled) jobs retained for the web UI's job list.
 pub const MAX_FINISHED_JOBS: usize = 50;
 
@@ -84,7 +95,12 @@ pub struct TaggingJob {
     pub worker_name: Option<String>,
     pub error: Option<String>,
     pub created_at: i64,
+    /// Last contact from the worker — refreshed by every heartbeat, whether or
+    /// not anything was tagged. Drives `JOB_STALL_SECS`.
     pub updated_at: i64,
+    /// Last time `completed + failed` actually advanced (reset at claim time).
+    /// Drives `JOB_NO_PROGRESS_SECS`.
+    pub progressed_at: i64,
 }
 
 /// Registry entry for an announced worker.
@@ -154,6 +170,8 @@ pub struct TaggingState {
 pub struct ReapOutcome {
     pub workers_changed: bool,
     pub requeued: Vec<TaggingJob>,
+    /// Jobs given up on because they stopped making progress.
+    pub failed: Vec<TaggingJob>,
 }
 
 impl TaggingState {
@@ -168,7 +186,12 @@ impl TaggingState {
         out.workers_changed = self.workers.len() != before;
 
         for job in &mut self.jobs {
-            if job.state == JobState::Running && job.updated_at + JOB_STALL_SECS <= now {
+            if job.state != JobState::Running {
+                continue;
+            }
+            if job.updated_at + JOB_STALL_SECS <= now {
+                // The worker went silent — put the job back in line for
+                // whoever picks it up next.
                 job.state = JobState::Queued;
                 job.claimed_by = None;
                 job.worker_name = None;
@@ -177,7 +200,25 @@ impl TaggingState {
                 job.failed = 0;
                 job.updated_at = now;
                 out.requeued.push(job.clone());
+            } else if job.progressed_at + JOB_NO_PROGRESS_SECS <= now {
+                // Still heartbeating, but nothing has been tagged for half an
+                // hour. Requeueing would just hand the same wedge to the same
+                // worker, so fail it visibly instead — tag writes are
+                // idempotent and filter targets skip what's already tagged, so
+                // re-enqueueing resumes rather than redoes the work.
+                job.state = JobState::Failed;
+                job.error = Some(format!(
+                    "no progress for {} minutes (worker '{}' still responding but tagged \
+                     nothing) — check the worker log, then re-enqueue to resume",
+                    JOB_NO_PROGRESS_SECS / 60,
+                    job.worker_name.as_deref().unwrap_or("unknown"),
+                ));
+                job.updated_at = now;
+                out.failed.push(job.clone());
             }
+        }
+        if !out.failed.is_empty() {
+            self.prune_finished();
         }
         out
     }
@@ -288,6 +329,7 @@ impl TaggingState {
             error: None,
             created_at: now,
             updated_at: now,
+            progressed_at: now,
         };
         self.jobs.push(job.clone());
         self.prune_finished();
@@ -323,6 +365,11 @@ impl TaggingState {
         };
         if job.state != JobState::Running || job.claimed_by.as_deref() != Some(worker_id) {
             return (UpdateResult { cancelled: true }, None);
+        }
+        // Only real forward motion counts as progress; a heartbeat that repeats
+        // the same counts refreshes liveness but not the no-progress deadline.
+        if completed + failed > job.completed + job.failed {
+            job.progressed_at = now;
         }
         job.completed = completed;
         job.failed = failed;
@@ -444,7 +491,7 @@ fn broadcast(state: &AppState, event: TaggingSseEvent) {
 }
 
 fn broadcast_reap(state: &AppState, tagging: &TaggingState, outcome: ReapOutcome) {
-    for job in outcome.requeued {
+    for job in outcome.requeued.into_iter().chain(outcome.failed) {
         broadcast(state, TaggingSseEvent::Job(job));
     }
     if outcome.workers_changed {
@@ -468,6 +515,7 @@ pub async fn announce_worker(
     let outcome = ReapOutcome {
         workers_changed: reaped.workers_changed || changed,
         requeued: reaped.requeued,
+        failed: reaped.failed,
     };
     broadcast_reap(state, &tagging, outcome);
     Ok(())
@@ -555,6 +603,7 @@ pub async fn claim_job(
         job.completed = 0;
         job.failed = 0;
         job.updated_at = now;
+        job.progressed_at = now;
         let snapshot = job.clone();
         broadcast(state, TaggingSseEvent::Job(snapshot.clone()));
         return Ok(Some(ClaimedJob {
@@ -720,6 +769,7 @@ mod tests {
         job.claimed_by = Some(worker_id.to_string());
         job.total = total;
         job.updated_at = now;
+        job.progressed_at = now;
     }
 
     #[test]
@@ -824,6 +874,57 @@ mod tests {
         assert_eq!(j.state, JobState::Queued);
         assert!(j.claimed_by.is_none());
         assert_eq!((j.total, j.completed, j.failed), (0, 0, 0));
+    }
+
+    /// A worker can stay perfectly responsive while getting nothing done — the
+    /// heartbeat refreshes `updated_at` either way, so `JOB_STALL_SECS` never
+    /// fires and only the no-progress deadline ends the job.
+    #[test]
+    fn heartbeating_jobs_that_never_progress_are_failed() {
+        let mut s = state_with_worker(100);
+        let job = enqueue_paths(&mut s, 100);
+        mark_running(&mut s, &job.id, "w1", 2, 100);
+
+        // Heartbeat every 10s, always reporting the same counts.
+        let mut t = 100;
+        while t + 10 < 100 + JOB_NO_PROGRESS_SECS {
+            t += 10;
+            let (res, _) = s.update(&job.id, "w1", 0, 0, t);
+            assert!(!res.cancelled, "liveness heartbeat kept the claim at t={t}");
+            assert!(s.reap(t).failed.is_empty(), "failed early at t={t}");
+            assert_eq!(s.jobs[0].state, JobState::Running);
+        }
+
+        let out = s.reap(100 + JOB_NO_PROGRESS_SECS);
+        assert_eq!(out.failed.len(), 1);
+        assert!(out.requeued.is_empty(), "a wedge should fail, not requeue");
+        let j = &s.jobs[0];
+        assert_eq!(j.state, JobState::Failed);
+        assert!(j.error.as_deref().unwrap().contains("no progress"));
+
+        // The worker's next heartbeat now tells it to give up.
+        assert!(s.update(&job.id, "w1", 0, 0, t + 10).0.cancelled);
+    }
+
+    /// Real progress pushes the deadline out, so a slow-but-working job runs
+    /// as long as it needs to.
+    #[test]
+    fn progress_resets_the_no_progress_deadline() {
+        let mut s = state_with_worker(100);
+        let job = enqueue_paths(&mut s, 100);
+        mark_running(&mut s, &job.id, "w1", 100, 100);
+
+        let mut completed = 0;
+        let mut t = 100;
+        // One tagged file every 20 minutes, for three times the deadline.
+        for _ in 0..3 {
+            t += JOB_NO_PROGRESS_SECS - 60;
+            completed += 1;
+            s.update(&job.id, "w1", completed, 0, t);
+            assert!(s.reap(t).failed.is_empty());
+            assert_eq!(s.jobs[0].state, JobState::Running);
+        }
+        assert_eq!(s.jobs[0].completed, 3);
     }
 
     #[test]
