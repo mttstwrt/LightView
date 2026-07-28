@@ -15,6 +15,8 @@ import {
   pointerDistance,
   pointerMidpoint,
   DOUBLE_TAP_MS,
+  DOUBLE_TAP_SLOP_PX,
+  SYNTHETIC_MOUSE_MS,
   TAP_SLOP_PX,
   AXIS_LOCK_PX,
   SWIPE_NAV_RATIO,
@@ -462,8 +464,21 @@ export function MediaViewer(props: MediaViewerProps) {
     isDragging = false;
   };
 
+  // Timestamp of the last touch pointer lift, used to recognise the mouse
+  // events the platform synthesizes from a touch gesture. Assigned by the
+  // touch handlers further down.
+  let lastTouchEndT = -Infinity;
+
   const handleDblClick = (e: MouseEvent) => {
     cancelMediaClick(); // the two clicks that precede this shouldn't toggle chrome
+    // A touch double-tap is already handled by the gesture machine
+    // (`touchDoubleTap`), but the platform *also* synthesizes a `dblclick` for
+    // it. Letting that through ran this handler against the zoom the tap had
+    // just applied and toggled it straight back — so a quick double-tap
+    // appeared to do nothing at all, while a slower one (past DOUBLE_TAP_MS,
+    // inside the platform's own threshold) worked because only this path
+    // fired. Ignore the synthetic one; real mice are unaffected.
+    if (e.timeStamp - lastTouchEndT < SYNTHETIC_MOUSE_MS) return;
     if (isVideo()) return;
     if (zoom() !== 1) {
       // Reset to fit
@@ -518,8 +533,12 @@ export function MediaViewer(props: MediaViewerProps) {
   let pinchStartZoom = 1;
   let pinchAnchorX = 0;
   let pinchAnchorY = 0;
-  // Double-tap detection.
-  let lastTapT = 0;
+  // Double-tap detection. `lastTapT` is the previous tap's *lift*; `tapDownT`
+  // the current tap's *touchdown* — the gap between those two is what
+  // DOUBLE_TAP_MS bounds, so how long the second tap is held doesn't count
+  // against it.
+  let lastTapT = -Infinity;
+  let tapDownT = 0;
   let lastTapX = 0;
   let lastTapY = 0;
   // Suppresses the compatibility click a tap synthesizes (so a backdrop tap
@@ -676,7 +695,7 @@ export function MediaViewer(props: MediaViewerProps) {
     if (pointers.size === 1) {
       startX = lastX = prevX = e.clientX;
       startY = lastY = prevY = e.clientY;
-      lastT = prevT = e.timeStamp;
+      lastT = prevT = tapDownT = e.timeStamp;
       gestureMoved = false;
       panStartTX = panX();
       panStartTY = panY();
@@ -831,14 +850,15 @@ export function MediaViewer(props: MediaViewerProps) {
       setInfoPanelOpen(false);
       return;
     }
-    const now = e.timeStamp;
-    const near = Math.abs(e.clientX - lastTapX) < 40 && Math.abs(e.clientY - lastTapY) < 40;
-    if (now - lastTapT < DOUBLE_TAP_MS && near) {
-      lastTapT = 0;
+    const near =
+      Math.abs(e.clientX - lastTapX) < DOUBLE_TAP_SLOP_PX &&
+      Math.abs(e.clientY - lastTapY) < DOUBLE_TAP_SLOP_PX;
+    if (tapDownT - lastTapT < DOUBLE_TAP_MS && near) {
+      lastTapT = -Infinity; // a third tap starts a fresh pair, not another zoom
       touchDoubleTap(e.clientX, e.clientY);
       return;
     }
-    lastTapT = now;
+    lastTapT = e.timeStamp;
     lastTapX = e.clientX;
     lastTapY = e.clientY;
     // Toggle immediately rather than waiting out the double-tap window. The
@@ -854,6 +874,7 @@ export function MediaViewer(props: MediaViewerProps) {
   const onPointerUp = (e: PointerEvent) => {
     if (e.pointerType !== "touch" || !pointers.has(e.pointerId)) return;
     pointers.delete(e.pointerId);
+    lastTouchEndT = e.timeStamp; // marks the mouse events that follow as synthetic
     cancelLongPress();
     if (longPressFired) {
       // The hold already opened the context menu; swallow the compatibility
@@ -881,6 +902,7 @@ export function MediaViewer(props: MediaViewerProps) {
   const onPointerCancel = (e: PointerEvent) => {
     if (e.pointerType !== "touch" || !pointers.has(e.pointerId)) return;
     pointers.delete(e.pointerId);
+    lastTouchEndT = e.timeStamp;
     cancelLongPress();
     longPressFired = false;
     if (gestureMode === "horizontal" || gestureMode === "vertical" || gestureMode === "info") {
@@ -922,6 +944,7 @@ export function MediaViewer(props: MediaViewerProps) {
         pointers.clear();
         gestureMode = "none";
         gestureMoved = false;
+        lastTapT = -Infinity; // a tap on the new photo can't pair with the old one
         cancelLongPress();
         cancelMediaClick();
         longPressFired = false;
