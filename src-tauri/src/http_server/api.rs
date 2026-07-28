@@ -7,7 +7,8 @@
 //! even if a client forges the name.
 //!
 //! The allowlist is mostly read-only, plus a small set of metadata writes
-//! (tag add/remove and rating, per-item and batch) so a paired device can edit
+//! (tag add/remove and rating, per-item and batch, plus the `last_viewed`
+//! stamp behind the "Recently Viewed" sort) so a paired device can edit
 //! from the viewer and multi-select, and the app-managed trash commands —
 //! reversible deletes, additionally gated by the per-gallery
 //! `remote.allow_delete` flag. Host-level operations — file ops (copy/move)
@@ -81,7 +82,10 @@ fn ok<T: Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
 }
 
 async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, DispatchError> {
-    use crate::commands::{autocomplete, duplicates, filter, gallery, geo, media, plugins, settings, sort, tags, trash};
+    use crate::commands::{
+        autocomplete, duplicates, filter, gallery, geo, media, plugins, settings, sort, tags,
+        trash, viewer,
+    };
 
     match command {
         "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
@@ -291,6 +295,19 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(tags::set_rating_impl(app, a.path, a.rating).await)
+        }
+
+        // Stamps `last_viewed` so the "Recently Viewed" sort reflects what was
+        // opened on a phone, not just on the desktop. Writes one timestamp
+        // column for a path the client can already read — the narrowest write
+        // on this list.
+        "record_view" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+            }
+            let a: A = parse(args)?;
+            ok(viewer::record_view_impl(app, a.path).await)
         }
 
         "add_user_tag_batch" => {

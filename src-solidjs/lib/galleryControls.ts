@@ -15,6 +15,10 @@ import { createSignal, createEffect, onMount, onCleanup } from "solid-js";
 export interface SelectionControlProps {
   paths: string[];
   selectedPaths: Set<string>;
+  /** Explicit multi-select mode (the mobile Select button). While on, a plain
+   *  click/tap toggles the cell instead of opening the viewer — the touch
+   *  stand-in for holding Ctrl/Cmd. */
+  selectionMode?: boolean;
   onItemClick: (index: number) => void;
   onItemSelect: (path: string) => void;
   onDragSelect?: (paths: string[]) => void;
@@ -115,7 +119,7 @@ export function createDragSelect(props: SelectionControlProps): DragSelectContro
       suppressClick = false;
       return;
     }
-    if (e.ctrlKey || e.metaKey) {
+    if (e.ctrlKey || e.metaKey || props.selectionMode) {
       props.onItemSelect(item.path);
     } else if (props.selectedPaths.size > 0) {
       // Clear selection first — don't open the viewer until selection is gone.
@@ -126,6 +130,10 @@ export function createDragSelect(props: SelectionControlProps): DragSelectContro
   };
 
   const handleBackgroundClick = (e: MouseEvent) => {
+    // In explicit selection mode the gaps between cells are wide targets for a
+    // stray thumb — dropping the whole selection there would be a nasty
+    // surprise, so only the Done/Clear button leaves.
+    if (props.selectionMode) return;
     // Only fire when the bare background is clicked, not a thumbnail.
     const target = e.target as HTMLElement;
     if (!target.closest(".thumb-cell") && !e.ctrlKey && !e.metaKey) {

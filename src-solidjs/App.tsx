@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
 import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
@@ -35,12 +35,32 @@ import type { SortedItem, SortField } from "./lib/types";
 // Scrollbar indicator helpers
 // ---------------------------------------------------------------------------
 
+/** The timestamp column a sort field orders by, for the date-shaped fields.
+ *  Returns null for fields that aren't dates — those get their own labelling
+ *  below. Keeps "Recently Viewed" and friends navigable on the scrollbar
+ *  instead of falling through to a blank track. */
+function dateAccessor(field: SortField): ((item: SortedItem) => number | null) | null {
+  switch (field) {
+    case "date":
+      return (it) => it.date_taken;
+    case "lastviewed":
+      return (it) => it.last_viewed;
+    case "dateadded":
+      return (it) => it.date_added;
+    case "lastrated":
+      return (it) => it.last_rated;
+    default:
+      return null;
+  }
+}
+
 function buildScrollIndicators(items: SortedItem[], field: SortField): ScrollIndicator[] {
   if (items.length === 0) return [];
 
+  const getDate = dateAccessor(field);
+  if (getDate) return buildDateIndicators(items, getDate);
+
   switch (field) {
-    case "date":
-      return buildDateIndicators(items);
     case "name":
       return buildNameIndicators(items);
     case "size":
@@ -52,11 +72,14 @@ function buildScrollIndicators(items: SortedItem[], field: SortField): ScrollInd
   }
 }
 
-function buildDateIndicators(items: SortedItem[]): ScrollIndicator[] {
+function buildDateIndicators(
+  items: SortedItem[],
+  getDate: (item: SortedItem) => number | null,
+): ScrollIndicator[] {
   const indicators: ScrollIndicator[] = [];
   let lastLabel = "";
   for (let i = 0; i < items.length; i++) {
-    const ts = items[i].date_taken;
+    const ts = getDate(items[i]);
     if (!ts) continue;
     const d = new Date(ts * 1000);
     const label = d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
@@ -146,13 +169,17 @@ function getThumbLabelForItems(items: SortedItem[], field: SortField, fraction: 
   const idx = Math.min(Math.floor(fraction * items.length), items.length - 1);
   const item = items[idx];
 
+  const getDate = dateAccessor(field);
+  if (getDate) {
+    const ts = getDate(item);
+    // "Never" reads right for the un-stamped tail of viewed/rated/added sorts,
+    // which SQL parks at the end via NULLS LAST.
+    if (!ts) return field === "date" ? "No date" : "Never";
+    const d = new Date(ts * 1000);
+    return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  }
+
   switch (field) {
-    case "date": {
-      const ts = item.date_taken;
-      if (!ts) return "No date";
-      const d = new Date(ts * 1000);
-      return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-    }
     case "name": {
       const name = item.path.split("/").pop() ?? "";
       return name.length > 20 ? name.slice(0, 20) + "\u2026" : name;
@@ -489,7 +516,7 @@ export function App() {
       }
     } else {
       if (e.key === "Escape") {
-        clearSelection();
+        exitSelectionMode();
       }
       if ((e.ctrlKey || e.metaKey) && e.key === "a" && galleryPath()) {
         e.preventDefault();
@@ -546,6 +573,7 @@ export function App() {
               onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
               onBackgroundClick={clearSelection}
               selectedPaths={selectedPaths()}
+              selectionMode={selectionMode()}
               onItemContextMenu={(e, path, index) => {
                 setContextMenu({ x: e.clientX, y: e.clientY, path, index });
               }}
@@ -567,6 +595,7 @@ export function App() {
               onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
               onBackgroundClick={clearSelection}
               selectedPaths={selectedPaths()}
+              selectionMode={selectionMode()}
               onItemContextMenu={(e, path, index) => {
                 setContextMenu({ x: e.clientX, y: e.clientY, path, index });
               }}
@@ -579,10 +608,15 @@ export function App() {
             indicators={scrollIndicators()}
             getThumbLabel={thumbLabel}
           />
-          <Show when={selectedPaths().size > 0}>
+          {/* Also shown at zero selected while selection mode is on — it's the
+              mode's only exit, and the empty count tells the user the taps are
+              landing somewhere. */}
+          <Show when={selectedPaths().size > 0 || selectionMode()}>
             <SelectionBar
               selectedPaths={selectedPaths()}
-              onClear={clearSelection}
+              selectionMode={selectionMode()}
+              onSelectAll={() => selectAll(displayPaths())}
+              onClear={exitSelectionMode}
             />
           </Show>
           <ContextMenu
@@ -646,8 +680,15 @@ export function App() {
         <Show when={isWeb()}>
           {/* Hidden (not unmounted — that would refetch the upload config)
               while the viewer is open: it floats bottom-right, on top of the
-              video player's mute button. */}
-          <UploadButton hidden={viewerOpen()} onUploaded={refreshAfterUpload} />
+              video player's mute button. Same for the mobile selection bar,
+              which spans that whole bottom edge. */}
+          <UploadButton
+            hidden={
+              viewerOpen() ||
+              (isMobile() && (selectionMode() || selectedPaths().size > 0))
+            }
+            onUploaded={refreshAfterUpload}
+          />
         </Show>
       </Show>
       <Show when={debugOpen()}>

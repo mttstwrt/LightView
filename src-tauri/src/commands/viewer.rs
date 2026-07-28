@@ -10,6 +10,13 @@ pub async fn record_view(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    record_view_impl(&state, path).await
+}
+
+/// Shared by the Tauri command and the web client's `/api/invoke` bridge —
+/// a phone browsing the gallery remotely feeds the same "Recently Viewed"
+/// history the desktop app does.
+pub async fn record_view_impl(state: &AppState, path: String) -> Result<(), String> {
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;
     db.record_view(&path).map_err(|e| e.to_string())

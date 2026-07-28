@@ -20,8 +20,12 @@ export function pointerMidpoint(a: Point, b: Point): Point {
 
 // --- Tuning constants ---------------------------------------------------
 
-/** Max ms between two taps to count as a double-tap. */
-export const DOUBLE_TAP_MS = 300;
+/** Max ms between two taps to count as a double-tap. Deliberately tighter
+ *  than the platform's own ~300 ms: nothing waits out this window any more
+ *  (the single-tap action fires immediately — see MediaViewer's `handleTap`),
+ *  so its only job is to keep two deliberate taps together while a slow
+ *  tap-pause-tap stays two separate taps. */
+export const DOUBLE_TAP_MS = 250;
 
 /** Movement (px) below which a touch is still considered a tap, not a drag. */
 export const TAP_SLOP_PX = 10;

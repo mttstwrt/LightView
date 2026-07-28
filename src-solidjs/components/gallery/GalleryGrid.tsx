@@ -20,6 +20,8 @@ interface GalleryGridProps {
   onDragSelect?: (paths: string[]) => void;
   onBackgroundClick?: () => void;
   selectedPaths: Set<string>;
+  /** Tap-to-toggle multi-select mode (mobile Select button). */
+  selectionMode?: boolean;
   onItemContextMenu?: (e: MouseEvent, path: string, index: number) => void;
   loading: boolean;
   onContentHeight?: (height: number) => void;

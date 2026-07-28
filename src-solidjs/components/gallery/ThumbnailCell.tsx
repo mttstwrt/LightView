@@ -1,5 +1,6 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show } from "solid-js";
 import { settings } from "../../stores/settingsStore";
+import { selectionMode } from "../../stores/galleryStore";
 import { mediaUrl, gifAtlasUrl, type ThumbTier } from "../../lib/ipc";
 import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
@@ -537,12 +538,18 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         />
       </Show>
 
-      {/* Selection check indicator — always present, toggled via display */}
+      {/* Selection check indicator — always present, toggled via display. In
+          selection mode unselected cells show an empty ring instead of
+          nothing, so it's obvious every cell is a checkbox right now. */}
       <div
         class="absolute top-1.5 left-1.5 w-5 h-5 rounded-full flex items-center justify-center text-white text-xs"
-        style={{ background: "#3b82f6", display: props.selected ? undefined : "none" }}
+        style={{
+          background: props.selected ? "#3b82f6" : "rgba(0, 0, 0, 0.35)",
+          border: props.selected ? "none" : "1.5px solid rgba(255, 255, 255, 0.8)",
+          display: props.selected || selectionMode() ? undefined : "none",
+        }}
       >
-        &#10003;
+        <Show when={props.selected}>&#10003;</Show>
       </div>
 
       {/* Media badge — always present, toggled via display */}

@@ -20,6 +20,25 @@ export function GearIcon(props: { size: number }) {
   );
 }
 
+/** Ticked box — the mobile Select button's glyph. */
+export function SelectIcon(props: { size: number }) {
+  return (
+    <svg
+      width={props.size}
+      height={props.size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    >
+      <path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9" />
+      <path d="M8.5 11.5l3 3L21 5" />
+    </svg>
+  );
+}
+
 export function CloseIcon(props: { size: number }) {
   return (
     <svg

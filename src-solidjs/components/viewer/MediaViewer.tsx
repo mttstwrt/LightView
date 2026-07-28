@@ -522,7 +522,6 @@ export function MediaViewer(props: MediaViewerProps) {
   let lastTapT = 0;
   let lastTapX = 0;
   let lastTapY = 0;
-  let singleTapTimer: number | null = null;
   // Suppresses the compatibility click a tap synthesizes (so a backdrop tap
   // toggles chrome instead of also closing the viewer).
   let suppressBackdropClick = false;
@@ -835,10 +834,6 @@ export function MediaViewer(props: MediaViewerProps) {
     const now = e.timeStamp;
     const near = Math.abs(e.clientX - lastTapX) < 40 && Math.abs(e.clientY - lastTapY) < 40;
     if (now - lastTapT < DOUBLE_TAP_MS && near) {
-      if (singleTapTimer !== null) {
-        clearTimeout(singleTapTimer);
-        singleTapTimer = null;
-      }
       lastTapT = 0;
       touchDoubleTap(e.clientX, e.clientY);
       return;
@@ -846,12 +841,14 @@ export function MediaViewer(props: MediaViewerProps) {
     lastTapT = now;
     lastTapX = e.clientX;
     lastTapY = e.clientY;
-    // Defer the single-tap action so a following tap can upgrade to double.
-    if (singleTapTimer !== null) clearTimeout(singleTapTimer);
-    singleTapTimer = window.setTimeout(() => {
-      singleTapTimer = null;
-      setChromeVisible((v) => !v);
-    }, DOUBLE_TAP_MS);
+    // Toggle immediately rather than waiting out the double-tap window. The
+    // mouse path has to defer (a double-click's two clicks would each toggle,
+    // flashing the chrome off and back on), but a touch double-tap is caught
+    // above and returns before toggling a second time — so the only thing
+    // waiting bought was a tap that felt a beat behind the finger. A
+    // double-tap-to-zoom now carries the first tap's toggle with it, which is
+    // what the platform photo viewers do anyway.
+    setChromeVisible((v) => !v);
   };
 
   const onPointerUp = (e: PointerEvent) => {
@@ -899,7 +896,6 @@ export function MediaViewer(props: MediaViewerProps) {
   onCleanup(() => {
     cancelLongPress();
     cancelMediaClick();
-    if (singleTapTimer !== null) clearTimeout(singleTapTimer);
     if (snapTimer !== null) clearTimeout(snapTimer);
     if (navTimer !== null) clearTimeout(navTimer);
     if (swipeEndTimer !== null) clearTimeout(swipeEndTimer);

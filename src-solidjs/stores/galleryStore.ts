@@ -80,6 +80,11 @@ const [timeline, setTimeline] = createSignal<TimelineEntry[]>([]);
 // Selected items (multi-select)
 const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
 
+// Explicit multi-select mode. Desktop reaches selection through Ctrl/Cmd+click,
+// which touch has no equivalent for — so a phone flips this on from the Select
+// button and every tap toggles a cell instead of opening the viewer.
+const [selectionMode, setSelectionMode] = createSignal(false);
+
 // View mode: grid (uniform squares), justified (aspect-preserving rows), or
 // map (geographic browsing).
 export type ViewMode = "grid" | "justified" | "map";
@@ -116,6 +121,7 @@ export {
   groups, setGroups,
   timeline, setTimeline,
   selectedPaths, setSelectedPaths,
+  selectionMode,
   viewMode, setViewMode,
   settingsOpen, setSettingsOpen,
 };
@@ -159,6 +165,23 @@ export function toggleSelection(path: string) {
 
 export function clearSelection() {
   setSelectedPaths(new Set<string>());
+}
+
+/** Enter multi-select mode (tap-to-toggle). */
+export function enterSelectionMode() {
+  setSelectionMode(true);
+}
+
+/** Leave multi-select mode, dropping whatever was selected — the two always
+ *  go together, so no caller has to remember to do both. */
+export function exitSelectionMode() {
+  setSelectionMode(false);
+  clearSelection();
+}
+
+export function toggleSelectionMode() {
+  if (selectionMode()) exitSelectionMode();
+  else enterSelectionMode();
 }
 
 export function selectAll(paths: string[]) {

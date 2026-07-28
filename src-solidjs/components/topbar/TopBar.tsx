@@ -3,8 +3,8 @@ import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
 import { TitleBar } from "./TitleBar";
-import { GearIcon, CloseIcon } from "./icons";
-import { viewMode, setViewMode, displayPaths, settingsOpen, setSettingsOpen } from "../../stores/galleryStore";
+import { GearIcon, CloseIcon, SelectIcon } from "./icons";
+import { viewMode, setViewMode, displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode } from "../../stores/galleryStore";
 import { settings } from "../../stores/settingsStore";
 import { isMobile, isTauri } from "../../lib/runtime";
 
@@ -248,11 +248,12 @@ export function TopBar(props: TopBarProps) {
       </Show>
 
       {/* ── Mobile chrome ──────────────────────────────────────────────── */}
-      {/* Two opaque floating buttons over an edge-to-edge grid instead of a
+      {/* Opaque floating buttons over an edge-to-edge grid instead of a
           full-width bar: a search button (left) that expands filter + sort,
-          and a settings gear (right). Both sit below the safe-area inset so
-          they clear the notch / dynamic island, and both slide away on
-          scroll-down (reusing the scroll-direction `visible()` signal). */}
+          then a Select toggle and a settings gear (right). All sit below the
+          safe-area inset so they clear the notch / dynamic island, and all
+          slide away on scroll-down (reusing the scroll-direction `visible()`
+          signal). */}
       <Show when={isMobile()}>
         {/* Search / filter button */}
         <button
@@ -274,6 +275,33 @@ export function TopBar(props: TopBarProps) {
             <circle cx="11" cy="11" r="7" />
             <path d="M21 21l-4.3-4.3" />
           </svg>
+        </button>
+
+        {/* Select-mode toggle. Touch has no Ctrl/Cmd, so this is the only way
+            into multi-select on a phone: while it's lit, a tap on a cell
+            toggles that cell instead of opening the viewer. Stays put when the
+            bar hides on scroll-down like its neighbours. */}
+        <button
+          class="fixed z-40 w-11 h-11 flex items-center justify-center rounded-full shadow-lg transition-[transform,opacity,background] duration-200"
+          style={{
+            // Sits one button-width (44px) plus a 8px gap left of the gear.
+            right: "calc(env(safe-area-inset-right, 0px) + 64px)",
+            top: "calc(env(safe-area-inset-top, 0px) + 8px)",
+            background: selectionMode() ? "rgb(37, 99, 235)" : "rgba(23, 23, 23, 0.92)",
+            color: selectionMode() ? "#fff" : "rgb(245, 245, 245)",
+            border: selectionMode()
+              ? "1px solid rgba(255, 255, 255, 0.25)"
+              : "1px solid rgba(255, 255, 255, 0.10)",
+            transform: visible() ? "translateY(0)" : "translateY(-150%)",
+            opacity: visible() ? "1" : "0",
+            "pointer-events": visible() ? "auto" : "none",
+          }}
+          onClick={() => toggleSelectionMode()}
+          title={selectionMode() ? "Exit selection" : "Select items"}
+          aria-label={selectionMode() ? "Exit selection" : "Select items"}
+          aria-pressed={selectionMode()}
+        >
+          <SelectIcon size={20} />
         </button>
 
         {/* Settings gear button */}
