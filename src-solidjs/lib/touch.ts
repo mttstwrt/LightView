@@ -20,12 +20,23 @@ export function pointerMidpoint(a: Point, b: Point): Point {
 
 // --- Tuning constants ---------------------------------------------------
 
-/** Max ms between two taps to count as a double-tap. Deliberately tighter
- *  than the platform's own ~300 ms: nothing waits out this window any more
- *  (the single-tap action fires immediately — see MediaViewer's `handleTap`),
- *  so its only job is to keep two deliberate taps together while a slow
- *  tap-pause-tap stays two separate taps. */
-export const DOUBLE_TAP_MS = 250;
+/** Max ms between the first tap's lift and the second tap's touchdown for the
+ *  pair to count as a double-tap. Nothing waits out this window (the
+ *  single-tap action fires immediately — see MediaViewer's `handleTap`), so
+ *  it costs nothing to sit above the platform's own ~300 ms: its only job is
+ *  to keep two deliberate taps together while a slow tap-pause-tap stays two
+ *  separate taps. Measured lift→touchdown rather than lift→lift on purpose —
+ *  lift→lift also charges the window for however long the second tap is held
+ *  down, which made an ordinary unhurried double-tap miss. */
+export const DOUBLE_TAP_MS = 400;
+
+/** Max px between two taps for them to count as the same spot. Generous
+ *  because a fast double-tap lands less precisely than a careful one. */
+export const DOUBLE_TAP_SLOP_PX = 48;
+
+/** Window after a touch gesture in which mouse events are assumed to be the
+ *  compatibility ones the platform synthesizes from it, not a real mouse. */
+export const SYNTHETIC_MOUSE_MS = 700;
 
 /** Movement (px) below which a touch is still considered a tap, not a drag. */
 export const TAP_SLOP_PX = 10;
