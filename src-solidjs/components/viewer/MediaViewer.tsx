@@ -1279,10 +1279,12 @@ export function MediaViewer(props: MediaViewerProps) {
           of the video control bar (including its safe-area padding) when the
           player is active. The row itself is never interactive (pointer-events
           none, so it doesn't sit over the seek bar and steal its taps); the
-          rating stars opt back in so they stay tappable. Bounded to the
-          viewport (max-w) so a long filename wraps instead of clipping off the
-          edge; the stars are shrink-0 (always visible) and the text clamps to
-          two lines. */}
+          rating stars opt back in so they stay tappable — on touch they're
+          drawn larger and padded out to a ~36px hit target (the negative
+          y-margin keeps the row's height, and so the bar's position, put).
+          Bounded to the viewport (max-w) so a long filename wraps instead of
+          clipping off the edge; the stars are shrink-0 (always visible) and
+          the text clamps to two lines. */}
       <div
         class="absolute left-1/2 -translate-x-1/2 flex items-center gap-1.5 max-w-[90vw] text-white/40 text-xs font-mono transition-opacity duration-200 pointer-events-none"
         style={{
@@ -1293,12 +1295,12 @@ export function MediaViewer(props: MediaViewerProps) {
           opacity: chromeVisible() ? undefined : "0",
         }}
       >
-        <div class="flex items-center gap-0.5 shrink-0" style={{ "pointer-events": chromeVisible() ? "auto" : "none" }}>
+        <div class="flex items-center shrink-0" classList={{ "gap-0.5": !hasTouch() }} style={{ "pointer-events": chromeVisible() ? "auto" : "none" }}>
           <For each={[1, 2, 3, 4, 5]}>
             {(star) => (
               <button
                 class="leading-none hover:text-white/70 transition-colors cursor-pointer"
-                classList={{ "p-1 -m-1": hasTouch() }}
+                classList={{ "text-xl px-2 py-2 -my-2": hasTouch() }}
                 style={{ color: star <= rating() ? "#f59e0b" : undefined }}
                 onClick={() => handleSetRating(star)}
                 aria-label={`Rate ${star} star${star > 1 ? "s" : ""}`}

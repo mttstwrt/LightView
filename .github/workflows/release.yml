@@ -2,11 +2,15 @@ name: Release
 
 # Tag-triggered release. Push a tag like `v0.1.0-beta.1` to build and publish
 # to a GitHub Release (marked pre-release):
-#   - a container image pushed to GHCR (ghcr.io/<owner>/lightview) — built first
+#   - a container image pushed to GHCR (ghcr.io/<owner>/lightview) — built first,
+#     tagged with the version only (`0.1.0-beta.1` + `v0.1.0-beta.1`)
 #   - Linux desktop installers (.AppImage/.deb) via tauri-action
 #   - a standalone headless server zip (binary + dist/)
 #
 #   git tag v0.1.0-beta.1 && git push origin v0.1.0-beta.1
+#
+# The moving `:beta` / `:release` / `:latest` channel tags are NOT set here —
+# container.yml owns those, off ordinary branch pushes.
 #
 # macOS/Windows desktop builds are disabled for now — Linux only. libheif-rs
 # needs libheif >= 1.21, which the CI runner doesn't ship, so the desktop job
@@ -68,7 +72,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/lightview
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=beta
+            type=semver,pattern={{raw}}
 
       - name: Short commit sha
         id: sha
