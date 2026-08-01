@@ -12,6 +12,13 @@ export interface Rect {
   height: number;
 }
 
+/** `CustomEvent<string | null>` the viewer dispatches with the path it is
+ *  currently showing (null when it closes). The justified grid uses it to hold
+ *  that cell at its full-resolution rung, so the close transition flies back
+ *  down onto the same image quality it flew out of. Same DOM-query spirit as
+ *  `findCellImage` — no store plumbing between the two components. */
+export const VIEWER_PATH_EVENT = "lightview:viewer-path";
+
 /** The grid cell's thumbnail <img> for a path, or null when the cell isn't
  *  currently rendered. Cells contain several stacked same-rect <img>s
  *  (underlay, main, hover overlays) — prefer the last one with decoded

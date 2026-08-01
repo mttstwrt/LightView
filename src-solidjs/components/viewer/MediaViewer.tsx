@@ -6,6 +6,7 @@ import {
   prefersReducedMotion,
   viewportContainRect,
   rectKeyframe,
+  VIEWER_PATH_EVENT,
   type Rect,
 } from "../../lib/viewerTransition";
 import { aspectByPath, sortedItems, rateItem } from "../../stores/galleryStore";
@@ -31,6 +32,7 @@ import { hapticTick } from "../../lib/haptics";
 import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { mediaUrl, thumbUrl, ensureTierThumbnails, gifAtlasUrl } from "../../lib/ipc";
+import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
 import { isVideoPath, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { GifCanvas } from "../GifCanvas";
 import { ViewerImageCache } from "../../lib/viewerCache";
@@ -55,6 +57,8 @@ export function MediaViewer(props: MediaViewerProps) {
   onCleanup(() => {
     setViewerCacheCountSource(null);
     cache.destroy();
+    // Release the grid's full-resolution pin on the item we were showing.
+    window.dispatchEvent(new CustomEvent<string | null>(VIEWER_PATH_EVENT, { detail: null }));
   });
 
   // Container ref for direct DOM image swapping
@@ -213,35 +217,92 @@ export function MediaViewer(props: MediaViewerProps) {
     );
   };
 
-  /** Mount an image element into the container. */
-  const mountImage = (img: HTMLImageElement, alreadyLoaded: boolean) => {
+  // --- Loading placeholder ------------------------------------------------
+  // The viewer always refetches: the grid holds a `?fit=`-resized original or
+  // a jm/jh tier, never the unresized file this requests, so there is no URL
+  // for the two to share. What the grid *does* have is those bytes already
+  // fetched and decoded — so the cell's own image is the best possible
+  // stand-in, and painting it here is free. That beats the "p" tier underlay
+  // this used to show alone, which is generated lazily *after* the viewer
+  // opens (so it 404s on the first look at any image) and is a square centre
+  // crop besides, letterboxed into a full-viewport box at whatever shape the
+  // photo isn't.
+  const [gridSrc, setGridSrc] = createSignal<string | null>(null);
+  // Aspect measured off the grid cell's own thumbnail. The j/jm/jh tiers and
+  // the `?fit=` resize all preserve aspect, so a loaded cell gives the exact
+  // source ratio.
+  const [gridAspect, setGridAspect] = createSignal<number | null>(null);
+  const captureGridSrc = (path: string) => {
+    const cellImg = path ? findCellImage(path) : null;
+    const loaded = !!cellImg && cellImg.naturalWidth > 0 && cellImg.naturalHeight > 0;
+    setGridSrc(loaded ? cellImg!.currentSrc || cellImg!.src : null);
+    setGridAspect(loaded ? cellImg!.naturalWidth / cellImg!.naturalHeight : null);
+  };
+
+  /** The rect the full image will occupy once it loads. The placeholder is
+   *  drawn into exactly this box so it has the photo's dimensions from the
+   *  first frame and nothing shifts on reveal.
+   *
+   *  Indexed dimensions first, then the grid cell's measured aspect. That
+   *  fallback is not a nicety: a file whose dimensions haven't been indexed
+   *  yet has no `aspectByPath` entry at all, and defaulting to 1:1 would put
+   *  a square box around a landscape photo — the exact mis-shaped placeholder
+   *  this is meant to fix. The justified grid keeps its own `measuredAspects`
+   *  map for the same reason. */
+  const placeholderRect = (): Rect | null => {
+    const a = aspectByPath().get(currentPath()) ?? gridAspect();
+    return a && a > 0 ? viewportContainRect(a) : null;
+  };
+  const placeholderBox = () => {
+    const r = placeholderRect();
+    return r
+      ? { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` }
+      : { inset: "0" };
+  };
+  /** Best real pixels available before the full image lands. */
+  const placeholderSrc = (): string | null =>
+    gridSrc() ?? (currentPath() ? thumbUrl(currentPath(), "p") : null);
+
+  /** Mount an image element into the container. `path` is captured at call
+   *  time — the async reveal below can outlive a navigation. */
+  const mountImage = (img: HTMLImageElement, alreadyLoaded: boolean, path: string) => {
     if (!imageContainerRef) return;
     imageContainerRef.replaceChildren(img);
-    if (alreadyLoaded) {
+    const reveal = () => {
+      // A navigation (or another mount) may have landed during the decode.
+      if (imageContainerRef?.firstChild !== img) return;
       img.style.opacity = "1";
       img.style.position = "relative";
       setLoaded(true);
       setImgNaturalWidth(img.naturalWidth);
-    } else {
-      img.style.opacity = "0";
-      img.style.position = "absolute";
-      setLoaded(false);
-      img.onload = () => {
-        img.style.opacity = "1";
-        img.style.position = "relative";
-        setLoaded(true);
-        setImgNaturalWidth(img.naturalWidth);
-        // Cache this freshly-loaded element for if the user navigates back
-        cache.insert(currentPath(), img);
-      };
+      cache.insert(path, img);
+    };
+    if (alreadyLoaded) {
+      reveal();
+      return;
     }
+    img.style.opacity = "0";
+    img.style.position = "absolute";
+    setLoaded(false);
+    img.onload = () => {
+      // onload means fetched, not decoded. Revealing here tears the
+      // placeholder down a frame or more before the real pixels can paint,
+      // which is the flash of empty backdrop between the open transition and
+      // the photo. Wait for the decode (skipped on WebKitGTK, which decodes
+      // on the main thread at paint time — there's no gap to cover).
+      if (isTauri() || !img.decode) {
+        reveal();
+        return;
+      }
+      img.decode().then(reveal, reveal);
+    };
   };
 
   // When a preloaded image becomes ready, swap it in if it's the current image
   cache.onReady((path) => {
     if (path !== currentPath() || isVideo()) return;
     const img = cache.get(path);
-    if (img) mountImage(img, true);
+    if (img) mountImage(img, true, path);
   });
 
   // Schedule non-critical work (neighbour preload, preview-tier generation)
@@ -952,6 +1013,14 @@ export function MediaViewer(props: MediaViewerProps) {
         setSwiping(false);
 
         const path = props.paths[idx];
+        // Read the grid cell's image before anything else moves — it's the
+        // placeholder for the load that's about to start.
+        captureGridSrc(path);
+        // Tell the grid which cell is being viewed so it holds that one at
+        // full resolution for the close transition to land on.
+        window.dispatchEvent(
+          new CustomEvent<string | null>(VIEWER_PATH_EVENT, { detail: path ?? null }),
+        );
         clearAutoplayTimer();
         setVideoStarted(false);
         setVideoError(false);
@@ -987,7 +1056,7 @@ export function MediaViewer(props: MediaViewerProps) {
           // Mount the current image first, before queueing background work.
           const cached = cache.get(path);
           if (cached) {
-            mountImage(cached, true);
+            mountImage(cached, true, path);
           } else {
             const img = new Image();
             img.style.maxWidth = "100vw";
@@ -996,7 +1065,7 @@ export function MediaViewer(props: MediaViewerProps) {
             img.draggable = false;
             img.alt = filename();
             img.src = mediaUrl(path);
-            mountImage(img, false);
+            mountImage(img, false, path);
           }
         }
 
@@ -1141,21 +1210,63 @@ export function MediaViewer(props: MediaViewerProps) {
             when={isVideo()}
             fallback={
               <>
-                {/* Preview tier underlay — shown while the full-resolution
-                    image is still decoding. Fails silently (404) until the
-                    tier is ready, then a natural re-render swaps it in. Sized
-                    to contain in the full viewport so it aligns with the full
-                    image. */}
+                {/* Loading placeholder — occupies the exact rect the full
+                    image will fill (from its indexed aspect), so it reads as
+                    the photo arriving rather than an unrelated shape being
+                    replaced. Layered floor-first: the ~1KB ThumbHash, then
+                    the best real pixels we have (the grid cell's own image,
+                    else the "p" tier, which fails silently until generated).
+                    Both are object-cover *inside the correct-aspect box*, so
+                    the square-cropped "p" tier crops back to the right shape
+                    instead of letterboxing as a square. */}
                 <Show when={!loaded()}>
-                  <img
-                    src={thumbUrl(currentPath(), "p")}
-                    class="absolute inset-0 w-full h-full object-contain pointer-events-none"
-                    style={{ filter: "blur(2px)" }}
-                    draggable={false}
-                    onError={(e) => {
-                      (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
-                    }}
-                  />
+                  <div class="absolute overflow-hidden pointer-events-none" style={placeholderBox()}>
+                    <Show when={thumbhashDataUrl(currentPath())}>
+                      <img
+                        src={thumbhashDataUrl(currentPath())!}
+                        alt=""
+                        aria-hidden="true"
+                        class="absolute inset-0 w-full h-full"
+                        style={{
+                          "object-fit": placeholderRect() ? "cover" : "contain",
+                          // Slightly overscanned: the blur would otherwise
+                          // fade out at the clipped edges of the box and let
+                          // the backdrop show through as a halo.
+                          filter: "blur(8px)",
+                          transform: "scale(1.06)",
+                        }}
+                        draggable={false}
+                      />
+                    </Show>
+                    <Show when={placeholderSrc()}>
+                      <img
+                        src={placeholderSrc()!}
+                        alt=""
+                        aria-hidden="true"
+                        class="absolute inset-0 w-full h-full"
+                        style={{
+                          "object-fit": placeholderRect() ? "cover" : "contain",
+                          // The grid's image is already a high-resolution
+                          // render of this photo — blurring it would make the
+                          // handoff worse, not softer. The "p" tier fallback
+                          // keeps the blur that hides its lower detail.
+                          filter: gridSrc() ? undefined : "blur(2px)",
+                        }}
+                        draggable={false}
+                        // This one <img> node is reused across navigations, so
+                        // a hide from one item's missing "p" tier has to be
+                        // undone when the next item's source does load —
+                        // otherwise one 404 blanks the placeholder for the
+                        // rest of the session.
+                        onLoad={(e) => {
+                          (e.currentTarget as HTMLImageElement).style.visibility = "";
+                        }}
+                        onError={(e) => {
+                          (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
+                        }}
+                      />
+                    </Show>
+                  </div>
                 </Show>
 
                 {/* Image container — preloaded Image elements are swapped in
@@ -1176,8 +1287,10 @@ export function MediaViewer(props: MediaViewerProps) {
                 </Show>
 
                 {/* Spinner — suppressed while the open-transition clone is
-                    flying so it doesn't flash behind it. */}
-                <Show when={!loaded() && !cloneState()}>
+                    flying so it doesn't flash behind it, and whenever a
+                    placeholder is already showing the photo (a spinner over a
+                    visible image just reads as breakage). */}
+                <Show when={!loaded() && !cloneState() && !gridSrc() && !thumbhashDataUrl(currentPath())}>
                   <svg
                     width="48"
                     height="48"
