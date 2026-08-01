@@ -607,11 +607,20 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // left nothing outstanding. A full-rung source costs the backend's bounded
     // pool a decode per request, and the full window is several rows deep —
     // upgrading it all in one sweep put ~7x more expensive requests in flight
-    // than the viewport needed, and the cells the user was actually looking at
-    // finished last. Ordering has to happen *within* the pass, not just across
-    // re-runs: on the sweep right after a scroll, `waiting` is still zero from
-    // the settled previous screen, so a single loop would issue the whole
-    // window at once before any of it registered.
+    // than the viewport needed. Ordering has to happen *within* the pass, not
+    // just across re-runs: on the sweep right after a scroll, `waiting` is
+    // still zero from the settled previous screen, so a single loop would
+    // issue the whole window at once before any of it registered.
+    //
+    // Measured neutral on the web client, where the browser decodes off the
+    // main thread and the backend's pool already serves in arrival order (the
+    // viewport is requested first either way). The reason to keep it is the
+    // desktop webview: WebKitGTK decodes on the main thread — the premise of
+    // the decode gate and of every isTauri() branch in this file — so cutting
+    // concurrent full-res decodes from ~17 to ~5 is main-thread work not done
+    // while the user is waiting on the visible rows. That platform is exactly
+    // what this harness cannot measure, so treat the win as reasoned, not
+    // demonstrated.
     const onScreenOf = (row: number) => row >= viewStart && row < viewEnd;
     const apply = (cell: ReturnType<typeof visibleCells>[number], mayTakeFull: boolean) => {
       // The viewer's current item is always treated as full-res and never
