@@ -279,6 +279,42 @@ pub async fn list_user_tags_impl(state: &AppState) -> Result<Vec<UserTagSummary>
         .collect())
 }
 
+/// Paths of every file carrying any of the given user tags.
+///
+/// Backs the tag manager's preview strip: it shows what a rename/merge/delete
+/// is about to touch. Goes through the tag index rather than the filter
+/// grammar because a tag may contain spaces or operator-like words, which a
+/// query string can't express unambiguously.
+#[tauri::command]
+pub async fn paths_for_user_tags(
+    state: tauri::State<'_, AppState>,
+    tags: Vec<String>,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    paths_for_user_tags_impl(&state, tags, limit).await
+}
+
+pub async fn paths_for_user_tags_impl(
+    state: &AppState,
+    tags: Vec<String>,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+
+    let mut paths = BTreeSet::new();
+    for tag in &tags {
+        for path in db.query_tag("user", tag).map_err(|e| e.to_string())? {
+            paths.insert(path);
+        }
+    }
+
+    Ok(match limit {
+        Some(n) => paths.into_iter().take(n).collect(),
+        None => paths.into_iter().collect(),
+    })
+}
+
 /// Rename a user tag across the whole gallery. If `to` already exists on a
 /// file, the two collapse into one (i.e. a rename onto an existing tag is a
 /// merge).

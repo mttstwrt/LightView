@@ -334,6 +334,7 @@ fn main() {
             commands::tags::remove_user_tag_batch,
             commands::tags::set_rating_batch,
             commands::tags::list_user_tags,
+            commands::tags::paths_for_user_tags,
             commands::tags::rename_user_tag,
             commands::tags::merge_user_tags,
             commands::tags::delete_user_tags,

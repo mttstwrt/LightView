@@ -1,22 +1,37 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   deleteUserTags,
   listUserTags,
   mergeUserTags,
+  pathsForUserTags,
   renameUserTag,
+  thumbUrl,
   type TagEditResult,
   type UserTagSummary,
 } from "../lib/ipc";
 import { ConfirmButton } from "./shared/ConfirmButton";
+import { isMobile } from "../lib/runtime";
 
 type SortMode = "count" | "name";
 
 /** Gallery-wide user-tag management: rename, merge, and delete tags across
  *  every file that carries them.
  *
+ *  Laid out as a wrapping cloud of chips rather than a list of rows: tag names
+ *  are short, so one-per-line burned most of the width and put the actions in
+ *  10px buttons no thumb can hit. Chips pack the full width, each one shaded
+ *  in proportion to how many files carry it — so "most used" stays readable
+ *  even in A–Z order — and the actions move to a single bar that follows the
+ *  selection. One target field serves both rename (one tag selected) and merge
+ *  (several), which is the same operation on the backend.
+ *
+ *  The space below the cloud shows the files the selection actually covers —
+ *  these edits rewrite every file carrying the tag, and the count alone is a
+ *  thin thing to confirm a gallery-wide delete against.
+ *
  *  Edits go straight to the companion sidecars on disk, so the panel reloads
  *  its list from the backend after each one rather than patching local state —
- *  a merge can change several rows at once, and the counts must stay honest.
+ *  a merge can change several chips at once, and the counts must stay honest.
  *  `onChanged` re-runs the active filter so the grid behind reflects the new
  *  tags (a tag-based filter may now match a different set of files). */
 export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => void }) {
@@ -28,11 +43,15 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
   const [search, setSearch] = createSignal("");
   const [sortMode, setSortMode] = createSignal<SortMode>("count");
   const [selected, setSelected] = createSignal<Set<string>>(new Set());
-  const [editing, setEditing] = createSignal<string | null>(null);
-  const [editValue, setEditValue] = createSignal("");
-  const [mergeTarget, setMergeTarget] = createSignal("");
-  // Once the user types a target of their own, stop auto-filling it.
+  const [target, setTarget] = createSignal("");
+  // Once the user types a target of their own, stop tracking the selection.
   const [targetEdited, setTargetEdited] = createSignal(false);
+  const [preview, setPreview] = createSignal<string[]>([]);
+  let targetRef: HTMLInputElement | undefined;
+
+  // Enough to fill the preview area on a large screen without pulling tens of
+  // thousands of paths back for a tag that covers the whole gallery.
+  const PREVIEW_LIMIT = 120;
 
   const load = async () => {
     setError(null);
@@ -40,7 +59,7 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
       const list = await listUserTags();
       setTags(list);
       // Drop selections for tags that no longer exist (merged away, deleted,
-      // or renamed) so the merge bar can't act on a stale name.
+      // or renamed) so the action bar can't act on a stale name.
       const live = new Set(list.map((t) => t.tag));
       setSelected((prev) => new Set([...prev].filter((t) => live.has(t))));
     } catch (e) {
@@ -53,14 +72,9 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
   const handleKey = (e: KeyboardEvent) => {
     if (e.key !== "Escape") return;
     e.stopPropagation();
-    // Escape backs out of the rename field first, then out of the panel.
-    // Clearing the draft makes the blur that follows a no-op commit.
-    if (editing()) {
-      setEditValue("");
-      setEditing(null);
-    } else {
-      props.onClose();
-    }
+    // Escape drops the selection first, then closes the panel.
+    if (selected().size > 0) clearSelection();
+    else props.onClose();
   };
   window.addEventListener("keydown", handleKey, true);
   onCleanup(() => window.removeEventListener("keydown", handleKey, true));
@@ -73,7 +87,19 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
       : list; // backend already returns count desc, tag asc
   });
 
-  const selectedTags = () => tags().filter((t) => selected().has(t.tag));
+  const maxCount = createMemo(() => tags().reduce((m, t) => Math.max(m, t.count), 1));
+  /** Selected tags in backend order, i.e. most-used first. */
+  const selectedTags = createMemo(() => tags().filter((t) => selected().has(t.tag)));
+
+  const syncTarget = () => {
+    if (!targetEdited()) setTarget(selectedTags()[0]?.tag ?? "");
+  };
+
+  const clearSelection = () => {
+    setSelected(new Set<string>());
+    setTargetEdited(false);
+    setTarget("");
+  };
 
   const toggle = (tag: string) => {
     setSelected((prev) => {
@@ -82,11 +108,42 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
       else next.add(tag);
       return next;
     });
-    // Default the merge target to the most-used selected tag — the usual
-    // intent is folding strays into the established spelling. Tracks the
-    // selection until the user types a target of their own.
-    if (!targetEdited()) setMergeTarget(selectedTags()[0]?.tag ?? "");
+    // Default the target to the most-used selected tag: renaming pre-fills
+    // with the current name, merging folds strays into the established
+    // spelling. Tracks the selection until the user types something else.
+    syncTarget();
   };
+
+  const selectOnly = (tag: string) => {
+    setSelected(new Set([tag]));
+    setTargetEdited(false);
+    syncTarget();
+    // Desktop double-click is the "rename this one" shortcut, so put the
+    // cursor where the typing goes. Never on touch — it would throw up the
+    // keyboard over the tags on every tap.
+    if (!isMobile()) requestAnimationFrame(() => targetRef?.select());
+  };
+
+  const selectAllVisible = () => {
+    setSelected(new Set(visible().map((t) => t.tag)));
+    syncTarget();
+  };
+
+  // What the selection covers. Re-fetched whenever it changes — including
+  // after an edit, since `selected` is rebuilt against the reloaded tag list.
+  // The token drops a slow response that lands after a newer one.
+  let previewToken = 0;
+  createEffect(() => {
+    const tagList = [...selected()];
+    const token = ++previewToken;
+    if (tagList.length === 0) {
+      setPreview([]);
+      return;
+    }
+    pathsForUserTags(tagList, PREVIEW_LIMIT)
+      .then((paths) => token === previewToken && setPreview(paths))
+      .catch(() => token === previewToken && setPreview([]));
+  });
 
   /** Run one edit, then reload the list and refresh the gallery behind. */
   const run = async (action: () => Promise<TagEditResult>, describe: (r: TagEditResult) => string) => {
@@ -113,33 +170,43 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
 
   const fileWord = (n: number) => `${n} file${n === 1 ? "" : "s"}`;
 
-  const commitRename = (from: string) => {
-    const to = editValue().trim();
-    setEditing(null);
-    if (!to || to === from) return;
-    const merging = tags().some((t) => t.tag === to);
-    run(
-      () => renameUserTag(from, to),
-      (r) =>
-        merging
-          ? `Merged "${from}" into "${to}" across ${fileWord(r.filesChanged)}`
-          : `Renamed "${from}" to "${to}" across ${fileWord(r.filesChanged)}`,
-    );
+  // A single selected tag renamed onto an existing name is a merge — same
+  // command either way, but the button should say what will happen.
+  const isMerge = () =>
+    selected().size > 1 || tags().some((t) => t.tag === target().trim() && !selected().has(t.tag));
+
+  const canApply = () => {
+    const to = target().trim();
+    if (busy() || !to || selected().size === 0) return false;
+    // Renaming a lone tag to itself is the pre-filled state — nothing to do.
+    return selected().size > 1 || selectedTags()[0]?.tag !== to;
   };
 
-  const handleMerge = () => {
-    const target = mergeTarget().trim();
+  const apply = () => {
+    if (!canApply()) return;
+    const to = target().trim();
     const sources = selectedTags().map((t) => t.tag);
-    if (!target || sources.length === 0) return;
-    run(
-      () => mergeUserTags(sources, target),
-      (r) => `Merged ${sources.length} tags into "${target}" across ${fileWord(r.filesChanged)}`,
-    );
-    setSelected(new Set<string>());
-    setTargetEdited(false);
+    const merging = isMerge();
+    if (sources.length === 1) {
+      const from = sources[0];
+      run(
+        () => renameUserTag(from, to),
+        (r) =>
+          merging
+            ? `Merged "${from}" into "${to}" across ${fileWord(r.filesChanged)}`
+            : `Renamed "${from}" to "${to}" across ${fileWord(r.filesChanged)}`,
+      );
+    } else {
+      run(
+        () => mergeUserTags(sources, to),
+        (r) => `Merged ${sources.length} tags into "${to}" across ${fileWord(r.filesChanged)}`,
+      );
+    }
+    clearSelection();
   };
 
-  const handleDelete = (tagList: string[]) => {
+  const deleteSelected = () => {
+    const tagList = selectedTags().map((t) => t.tag);
     if (tagList.length === 0) return;
     run(
       () => deleteUserTags(tagList),
@@ -148,12 +215,64 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
           ? `Deleted "${tagList[0]}" from ${fileWord(r.filesChanged)}`
           : `Deleted ${tagList.length} tags from ${fileWord(r.filesChanged)}`,
     );
-    setSelected((prev) => {
-      const next = new Set(prev);
-      for (const t of tagList) next.delete(t);
-      return next;
-    });
+    clearSelection();
   };
+
+  // ── Pieces shared by both layouts ──────────────────────────────────────
+
+  const searchBox = (extraClass: string) => (
+    <input
+      value={search()}
+      onInput={(e) => setSearch(e.currentTarget.value)}
+      placeholder="Search tags..."
+      // 16px keeps iOS Safari from zooming the page on focus.
+      style={isMobile() ? { "font-size": "16px" } : undefined}
+      class={`px-2.5 rounded bg-neutral-900 text-neutral-200 placeholder-neutral-600 border border-neutral-800 focus:border-neutral-600 focus:outline-none ${extraClass}`}
+    />
+  );
+
+  const sortToggle = () => (
+    <div class="flex shrink-0 rounded overflow-hidden border border-neutral-800">
+      <For each={[["count", "Most used"], ["name", "A–Z"]] as const}>
+        {([mode, label]) => (
+          <button
+            onClick={() => setSortMode(mode)}
+            class="px-2.5 text-[11px] cursor-pointer transition-colors whitespace-nowrap"
+            classList={{
+              "h-9": isMobile(),
+              "h-7": !isMobile(),
+              "bg-neutral-700 text-neutral-100": sortMode() === mode,
+              "bg-neutral-900 text-neutral-500 hover:text-neutral-300": sortMode() !== mode,
+            }}
+          >
+            {label}
+          </button>
+        )}
+      </For>
+    </div>
+  );
+
+  const closeButton = () => (
+    <button
+      onClick={props.onClose}
+      class="w-9 h-9 shrink-0 flex items-center justify-center text-neutral-400 hover:text-neutral-200 rounded transition-colors cursor-pointer"
+    >
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 6L6 18M6 6l12 12" />
+      </svg>
+    </button>
+  );
+
+  // The "edits apply to the whole gallery" caveat is the point of the screen,
+  // but it doesn't survive a phone's header width — there the action bar's
+  // hint carries the meaning instead.
+  const summary = () => (
+    <span class="text-xs text-neutral-500 truncate">
+      {tags().length} user {tags().length === 1 ? "tag" : "tags"}
+      {search().trim() ? ` · ${visible().length} shown` : ""}
+      {isMobile() ? "" : " · edits apply to the whole gallery"}
+    </span>
+  );
 
   return (
     <div
@@ -166,97 +285,51 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
       class="fixed inset-0 z-[200] flex flex-col"
       style={{ background: "rgba(10, 10, 10, 0.98)" }}
     >
-      {/* Header */}
-      <div class="flex items-center justify-between gap-4 px-6 py-4 border-b border-neutral-800/60">
-        <div class="flex items-center gap-4 min-w-0">
-          <span class="text-sm font-medium text-neutral-200 whitespace-nowrap">Manage Tags</span>
-          <Show when={!loading()}>
-            <span class="text-xs text-neutral-500 whitespace-nowrap">
-              {tags().length} user {tags().length === 1 ? "tag" : "tags"} · edits apply to the whole
-              gallery
-            </span>
-          </Show>
-        </div>
-        <div class="flex items-center gap-3">
-          <input
-            value={search()}
-            onInput={(e) => setSearch(e.currentTarget.value)}
-            placeholder="Search tags..."
-            class="w-44 px-2.5 py-1 text-xs rounded bg-neutral-900 text-neutral-200 placeholder-neutral-600 border border-neutral-800 focus:border-neutral-600 focus:outline-none"
-          />
-          <button
-            onClick={() => setSortMode(sortMode() === "count" ? "name" : "count")}
-            class="px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200 whitespace-nowrap"
-          >
-            Sort: {sortMode() === "count" ? "Most used" : "A–Z"}
-          </button>
-          <button
-            onClick={props.onClose}
-            class="w-8 h-8 flex items-center justify-center text-neutral-400 hover:text-neutral-200 rounded transition-colors cursor-pointer"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M18 6L6 18M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
+      {/* ── Header. One row on desktop; on a phone the controls need the full
+             width, so the title/close row sits above search + sort. ── */}
+      <div class="shrink-0 border-b border-neutral-800/60">
+        <Show
+          when={isMobile()}
+          fallback={
+            <div class="flex items-center gap-4 px-6 py-3">
+              <span class="text-sm font-medium text-neutral-200 whitespace-nowrap">Manage Tags</span>
+              <Show when={!loading()}>{summary()}</Show>
+              <div class="flex-1" />
+              {searchBox("w-52 h-7 text-xs")}
+              {sortToggle()}
+              {closeButton()}
+            </div>
+          }
+        >
+          <div class="flex flex-col gap-2 px-3 py-2.5">
+            <div class="flex items-center gap-3">
+              <span class="text-sm font-medium text-neutral-200 whitespace-nowrap">Manage Tags</span>
+              <Show when={!loading()}>{summary()}</Show>
+              <div class="flex-1" />
+              {closeButton()}
+            </div>
+            <div class="flex items-center gap-2">
+              {searchBox("flex-1 min-w-0 h-9 text-sm")}
+              {sortToggle()}
+            </div>
+          </div>
+        </Show>
       </div>
 
-      {/* Merge bar — only meaningful with a selection */}
-      <Show when={selected().size > 0}>
-        <div class="flex items-center gap-3 px-6 py-2 border-b border-neutral-800/60 bg-neutral-900/40 flex-wrap">
-          <span class="text-xs text-neutral-400 whitespace-nowrap">
-            {selected().size} selected
-          </span>
-          <span class="text-[11px] text-neutral-500 whitespace-nowrap">merge into</span>
-          <input
-            value={mergeTarget()}
-            onInput={(e) => {
-              setTargetEdited(true);
-              setMergeTarget(e.currentTarget.value);
-            }}
-            onKeyDown={(e) => e.key === "Enter" && handleMerge()}
-            placeholder="target tag"
-            class="w-48 px-2.5 py-1 text-xs rounded bg-neutral-900 text-neutral-200 placeholder-neutral-600 border border-neutral-800 focus:border-neutral-600 focus:outline-none"
-          />
-          <button
-            onClick={handleMerge}
-            disabled={busy() || !mergeTarget().trim()}
-            class="px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors bg-teal-700/50 text-teal-200 hover:bg-teal-600/60 disabled:opacity-40 disabled:cursor-default whitespace-nowrap"
-          >
-            Merge
-          </button>
-          <ConfirmButton
-            label="Delete Selected"
-            confirmLabel="Delete from all files?"
-            disabled={busy()}
-            onConfirm={() => handleDelete([...selected()])}
-          />
-          <button
-            onClick={() => {
-              setSelected(new Set<string>());
-              setTargetEdited(false);
-              setMergeTarget("");
-            }}
-            class="px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
-          >
-            Clear
-          </button>
-        </div>
-      </Show>
-
       <Show when={error()}>
-        <div class="px-6 py-2 text-xs text-red-400 border-b border-red-900/40 bg-red-950/20">
+        <div class="shrink-0 px-6 py-2 text-xs text-red-400 border-b border-red-900/40 bg-red-950/20">
           {error()}
         </div>
       </Show>
       <Show when={notice() && !error()}>
-        <div class="px-6 py-2 text-xs text-teal-300/80 border-b border-teal-900/30 bg-teal-950/10">
+        <div class="shrink-0 px-6 py-2 text-xs text-teal-300/80 border-b border-teal-900/30 bg-teal-950/10">
           {notice()}
         </div>
       </Show>
 
-      {/* Tag list */}
-      <div class="flex-1 overflow-y-auto px-6 py-4">
+      {/* ── Tag cloud, over a preview of what the selection covers ── */}
+      <div class="flex-1 min-h-0 flex flex-col">
+      <div class="flex-1 min-h-0 overflow-y-auto px-3 sm:px-6 py-4">
         <Show when={loading()}>
           <div class="flex items-center justify-center h-full text-neutral-500 text-sm">
             Loading...
@@ -273,71 +346,191 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
           </div>
         </Show>
         <Show when={visible().length > 0}>
-          <div class="flex flex-col gap-1 max-w-3xl mx-auto">
+          <div class="flex flex-wrap content-start gap-2 max-w-[1400px] mx-auto">
             <For each={visible()}>
-              {(entry) => (
-                <div
-                  class="flex items-center gap-3 px-3 py-2 rounded-lg transition-colors hover:bg-neutral-900/60"
-                  style={{ border: "1px solid rgba(255,255,255,0.04)" }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={selected().has(entry.tag)}
-                    onChange={() => toggle(entry.tag)}
-                    class="cursor-pointer accent-teal-600"
-                  />
-                  <div class="flex-1 min-w-0">
-                    <Show
-                      when={editing() === entry.tag}
-                      fallback={
-                        <span class="text-xs text-neutral-200 truncate" title={entry.tag}>
-                          {entry.tag}
-                        </span>
-                      }
-                    >
-                      <input
-                        ref={(el) => requestAnimationFrame(() => { el.focus(); el.select(); })}
-                        value={editValue()}
-                        onInput={(e) => setEditValue(e.currentTarget.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") commitRename(entry.tag);
-                        }}
-                        onBlur={() => commitRename(entry.tag)}
-                        class="w-full px-2 py-0.5 text-xs rounded bg-neutral-900 text-neutral-100 border border-neutral-700 focus:border-neutral-500 focus:outline-none"
-                      />
-                    </Show>
-                  </div>
-                  <span class="text-[10px] text-neutral-500 whitespace-nowrap">
-                    {entry.count} {entry.count === 1 ? "file" : "files"}
-                  </span>
+              {(entry) => {
+                const isSelected = () => selected().has(entry.tag);
+                return (
                   <button
-                    onClick={() => {
-                      setEditValue(entry.tag);
-                      setEditing(entry.tag);
+                    onClick={() => toggle(entry.tag)}
+                    onDblClick={() => selectOnly(entry.tag)}
+                    title={`${entry.tag} — ${entry.count} ${entry.count === 1 ? "file" : "files"}`}
+                    class="relative overflow-hidden flex items-center gap-2 rounded-full border cursor-pointer transition-colors max-w-full"
+                    classList={{
+                      "px-3.5 h-9 text-[13px]": isMobile(),
+                      "px-3 h-7 text-xs": !isMobile(),
+                      "border-teal-500/70 bg-teal-500/15 text-teal-100": isSelected(),
+                      "border-neutral-800 bg-neutral-900/60 text-neutral-300 hover:border-neutral-600 hover:text-neutral-100":
+                        !isSelected(),
                     }}
-                    disabled={busy()}
-                    class="px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200 disabled:opacity-40 disabled:cursor-default"
                   >
-                    Rename
+                    {/* Usage bar: how much of the gallery's most-used tag this
+                        one reaches. Redundant with the count beside it — it
+                        just makes the shape of the tag set scannable. */}
+                    <span
+                      aria-hidden="true"
+                      class="absolute inset-y-0 left-0 pointer-events-none"
+                      style={{
+                        width: `${(entry.count / maxCount()) * 100}%`,
+                        background: isSelected()
+                          ? "rgba(45, 212, 191, 0.18)"
+                          : "rgba(255, 255, 255, 0.05)",
+                      }}
+                    />
+                    <span class="relative truncate">{entry.tag}</span>
+                    <span
+                      class="relative text-[10px] tabular-nums shrink-0"
+                      classList={{
+                        "text-teal-300/70": isSelected(),
+                        "text-neutral-500": !isSelected(),
+                      }}
+                    >
+                      {entry.count}
+                    </span>
                   </button>
-                  <ConfirmButton
-                    label="Delete"
-                    confirmLabel={`Remove from ${entry.count}?`}
-                    disabled={busy()}
-                    onConfirm={() => handleDelete([entry.tag])}
-                  />
-                </div>
-              )}
+                );
+              }}
             </For>
           </div>
         </Show>
       </div>
 
-      <Show when={busy()}>
-        <div class="px-6 py-2 text-xs text-neutral-400 border-t border-neutral-800/60">
-          Rewriting companion files...
+      {/* Preview: the files a rename/merge/delete would rewrite. Fills the
+          space the old row list wasted, and turns "22 files" into something
+          you can actually check before a gallery-wide edit. On a phone the
+          vertical space isn't there, so it's a scrolling strip instead. */}
+      <Show when={selected().size > 0 && preview().length > 0}>
+        <div
+          class="shrink-0 min-h-0 flex flex-col border-t border-neutral-800/60 bg-neutral-950/40"
+          // Sized to its content, capped at 45% — a single row of thumbnails
+          // shouldn't reserve half the panel, and a hundred shouldn't push the
+          // cloud off screen.
+          style={isMobile() ? { height: "7.5rem" } : { "max-height": "45%" }}
+        >
+          <div class="shrink-0 px-3 sm:px-6 pt-2 pb-1.5 text-[11px] text-neutral-500">
+            {preview().length === PREVIEW_LIMIT
+              ? `First ${PREVIEW_LIMIT} files`
+              : `${preview().length} ${preview().length === 1 ? "file" : "files"}`}
+            {selected().size === 1
+              ? ` tagged "${[...selected()][0]}"`
+              : ` carrying ${selected().size} selected tags`}
+          </div>
+          <div
+            class="flex-1 min-h-0 overflow-auto px-3 sm:px-6 pb-3"
+            classList={{ "flex gap-1.5": isMobile() }}
+          >
+            <div
+              classList={{
+                "flex gap-1.5": isMobile(),
+                "grid gap-1.5 max-w-[1400px] mx-auto": !isMobile(),
+              }}
+              style={
+                isMobile()
+                  ? undefined
+                  : { "grid-template-columns": "repeat(auto-fill, minmax(88px, 1fr))" }
+              }
+            >
+              <For each={preview()}>
+                {(path) => (
+                  <img
+                    src={thumbUrl(path, "s")}
+                    alt=""
+                    loading="lazy"
+                    title={path}
+                    class="rounded object-cover bg-neutral-900"
+                    classList={{
+                      "h-full w-auto aspect-square shrink-0": isMobile(),
+                      "w-full aspect-square": !isMobile(),
+                    }}
+                  />
+                )}
+              </For>
+            </div>
+          </div>
         </div>
       </Show>
+      </div>
+
+      {/* ── Action bar. Always present so the controls live in one place: with
+             nothing selected it explains the gesture and offers select-all;
+             with a selection it renames (one tag) or merges (several) through
+             the same target field, since that's one command on the backend. ── */}
+      <div
+        class="shrink-0 border-t border-neutral-800/60 px-3 sm:px-6 py-2.5"
+        style={{
+          background: "rgba(16, 16, 16, 0.95)",
+          "padding-bottom": isMobile()
+            ? "calc(env(safe-area-inset-bottom, 0px) + 0.625rem)"
+            : undefined,
+        }}
+      >
+        <Show
+          when={selected().size > 0}
+          fallback={
+            <div class="flex items-center gap-3 max-w-[1400px] mx-auto">
+              <span class="text-[11px] text-neutral-500">
+                {busy()
+                  ? "Rewriting companion files..."
+                  : "Select tags to rename, merge, or delete"}
+              </span>
+              <div class="flex-1" />
+              <Show when={visible().length > 0}>
+                <button
+                  onClick={selectAllVisible}
+                  class="px-2.5 text-[11px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200 whitespace-nowrap"
+                  classList={{ "h-9": isMobile(), "h-7": !isMobile() }}
+                >
+                  Select all {visible().length}
+                </button>
+              </Show>
+            </div>
+          }
+        >
+          <div class="flex items-center gap-2 flex-wrap max-w-[1400px] mx-auto">
+            <span class="text-xs text-teal-300 tabular-nums whitespace-nowrap">
+              {selected().size} selected
+            </span>
+            <span class="text-[11px] text-neutral-500 whitespace-nowrap">
+              {selected().size === 1 ? "rename to" : "merge into"}
+            </span>
+            <input
+              ref={targetRef}
+              value={target()}
+              onInput={(e) => {
+                setTargetEdited(true);
+                setTarget(e.currentTarget.value);
+              }}
+              onKeyDown={(e) => e.key === "Enter" && apply()}
+              placeholder="target tag"
+              style={isMobile() ? { "font-size": "16px" } : undefined}
+              class="flex-1 min-w-[8rem] max-w-xs px-2.5 rounded bg-neutral-900 text-neutral-200 placeholder-neutral-600 border border-neutral-800 focus:border-neutral-600 focus:outline-none"
+              classList={{ "h-9 text-sm": isMobile(), "h-7 text-xs": !isMobile() }}
+            />
+            <button
+              onClick={apply}
+              disabled={!canApply()}
+              class="px-3 text-[11px] rounded cursor-pointer transition-colors bg-teal-700/50 text-teal-200 hover:bg-teal-600/60 disabled:opacity-40 disabled:cursor-default whitespace-nowrap"
+              classList={{ "h-9": isMobile(), "h-7": !isMobile() }}
+            >
+              {isMerge() ? "Merge" : "Rename"}
+            </button>
+            <ConfirmButton
+              label={selected().size === 1 ? "Delete" : `Delete ${selected().size}`}
+              confirmLabel="Remove from all files?"
+              disabled={busy()}
+              onConfirm={deleteSelected}
+              class={isMobile() ? "h-9" : "h-7"}
+            />
+            <button
+              onClick={clearSelection}
+              class="px-2.5 text-[11px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
+              classList={{ "h-9": isMobile(), "h-7": !isMobile() }}
+            >
+              Clear
+            </button>
+          </div>
+        </Show>
+      </div>
     </div>
   );
 }

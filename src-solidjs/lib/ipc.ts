@@ -358,6 +358,10 @@ export interface TagEditResult {
 
 export const listUserTags = () => invoke<UserTagSummary[]>("list_user_tags");
 
+/** Files carrying any of `tags` — what a rename/merge/delete would touch. */
+export const pathsForUserTags = (tags: string[], limit?: number) =>
+  invoke<string[]>("paths_for_user_tags", { tags, limit });
+
 export const renameUserTag = (from: string, to: string) =>
   invoke<TagEditResult>("rename_user_tag", { from, to });
 

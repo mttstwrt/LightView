@@ -348,6 +348,18 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
         // wide. The UI confirms before calling; no media file is touched.
         "list_user_tags" => ok(tags::list_user_tags_impl(app).await),
 
+        // Read-only: which files carry these tags (the manager's preview).
+        "paths_for_user_tags" => {
+            #[derive(Deserialize)]
+            struct A {
+                tags: Vec<String>,
+                #[serde(default)]
+                limit: Option<usize>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::paths_for_user_tags_impl(app, a.tags, a.limit).await)
+        }
+
         "rename_user_tag" => {
             #[derive(Deserialize)]
             struct A {
