@@ -69,7 +69,7 @@ const GAP_PRESETS = [
   { label: "Wide", value: 8 },
 ] as const;
 
-export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onOpenTrash?: () => void; onRequestShow?: () => void; hideTrigger?: boolean }) {
+export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onOpenTrash?: () => void; onOpenTagManager?: () => void; onRequestShow?: () => void; hideTrigger?: boolean }) {
   // Open state lives in the store (`settingsOpen`) so external chrome — e.g. the
   // mobile floating gear button — can open this panel, and so App can hide the
   // grid behind the full-screen mobile settings page. Cleared on unmount.
@@ -1448,6 +1448,21 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                   </For>
                 </div>
               </Show>
+            </Section>
+            </Show>
+
+            {/* ── Tags ── */}
+            <Show when={props.onOpenTagManager}>
+            <Section label="Tags" order={1}>
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  props.onOpenTagManager?.();
+                }}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+              >
+                Manage Tags...
+              </button>
             </Section>
             </Show>
 

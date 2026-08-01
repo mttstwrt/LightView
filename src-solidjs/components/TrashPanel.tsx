@@ -1,5 +1,6 @@
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { listTrash, restoreTrash, purgeTrash, type TrashEntry } from "../lib/ipc";
+import { ConfirmButton } from "./shared/ConfirmButton";
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -172,34 +173,5 @@ export function TrashPanel(props: { onClose: () => void }) {
         </Show>
       </div>
     </div>
-  );
-}
-
-/** Destructive-action button requiring a second click; disarms after 3s. */
-function ConfirmButton(props: { label: string; confirmLabel: string; onConfirm: () => void }) {
-  const [armed, setArmed] = createSignal(false);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  onCleanup(() => clearTimeout(timer));
-
-  return (
-    <button
-      onClick={() => {
-        if (armed()) {
-          setArmed(false);
-          props.onConfirm();
-        } else {
-          setArmed(true);
-          clearTimeout(timer);
-          timer = setTimeout(() => setArmed(false), 3000);
-        }
-      }}
-      class={`px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors whitespace-nowrap ${
-        armed()
-          ? "bg-red-700/70 text-red-100"
-          : "bg-red-900/30 text-red-400 hover:bg-red-800/40 hover:text-red-300"
-      }`}
-    >
-      {armed() ? props.confirmLabel : props.label}
-    </button>
   );
 }

@@ -7,7 +7,8 @@
 //! even if a client forges the name.
 //!
 //! The allowlist is mostly read-only, plus a small set of metadata writes
-//! (tag add/remove and rating, per-item and batch, plus the `last_viewed`
+//! (tag add/remove and rating, per-item and batch, the gallery-wide user-tag
+//! rename/merge/delete behind the tag manager, plus the `last_viewed`
 //! stamp behind the "Recently Viewed" sort) so a paired device can edit
 //! from the viewer and multi-select, and the app-managed trash commands —
 //! reversible deletes, additionally gated by the per-gallery
@@ -338,6 +339,54 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(tags::set_rating_batch_impl(app, a.paths, a.rating).await)
+        }
+
+        // --- Gallery-wide tag management -----------------------------------
+        // Still the metadata-write tier — these only rewrite the `user` tag
+        // list inside companion sidecars, exactly like add/remove_user_tag —
+        // but they fan out over every file carrying the tag, so a mistake is
+        // wide. The UI confirms before calling; no media file is touched.
+        "list_user_tags" => ok(tags::list_user_tags_impl(app).await),
+
+        // Read-only: which files carry these tags (the manager's preview).
+        "paths_for_user_tags" => {
+            #[derive(Deserialize)]
+            struct A {
+                tags: Vec<String>,
+                #[serde(default)]
+                limit: Option<usize>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::paths_for_user_tags_impl(app, a.tags, a.limit).await)
+        }
+
+        "rename_user_tag" => {
+            #[derive(Deserialize)]
+            struct A {
+                from: String,
+                to: String,
+            }
+            let a: A = parse(args)?;
+            ok(tags::rename_user_tag_impl(app, a.from, a.to).await)
+        }
+
+        "merge_user_tags" => {
+            #[derive(Deserialize)]
+            struct A {
+                sources: Vec<String>,
+                target: String,
+            }
+            let a: A = parse(args)?;
+            ok(tags::merge_user_tags_impl(app, a.sources, a.target).await)
+        }
+
+        "delete_user_tags" => {
+            #[derive(Deserialize)]
+            struct A {
+                tags: Vec<String>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::delete_user_tags_impl(app, a.tags).await)
         }
 
         // --- Remote tag application (worker tagging) ------------------------
