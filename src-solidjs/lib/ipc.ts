@@ -341,6 +341,32 @@ export const removeUserTagBatch = (paths: string[], tag: string) =>
 export const setRatingBatch = (paths: string[], rating: number) =>
   invoke<number>("set_rating_batch", { paths, rating });
 
+// --- Gallery-wide tag management (the tag manager panel) -------------------
+
+/** A user tag and how many files in the gallery carry it. */
+export interface UserTagSummary {
+  tag: string;
+  count: number;
+}
+
+/** Files rewritten by a rename/merge/delete, and files that could not be
+ *  (missing or unwritable companion) — those keep the old tag on disk. */
+export interface TagEditResult {
+  filesChanged: number;
+  filesFailed: number;
+}
+
+export const listUserTags = () => invoke<UserTagSummary[]>("list_user_tags");
+
+export const renameUserTag = (from: string, to: string) =>
+  invoke<TagEditResult>("rename_user_tag", { from, to });
+
+export const mergeUserTags = (sources: string[], target: string) =>
+  invoke<TagEditResult>("merge_user_tags", { sources, target });
+
+export const deleteUserTags = (tags: string[]) =>
+  invoke<TagEditResult>("delete_user_tags", { tags });
+
 // ---------------------------------------------------------------------------
 // Filter
 // ---------------------------------------------------------------------------

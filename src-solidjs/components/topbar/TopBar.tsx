@@ -12,6 +12,7 @@ interface TopBarProps {
   onOpenFolder: () => void;
   onOpenDuplicates?: () => void;
   onOpenTrash?: () => void;
+  onOpenTagManager?: () => void;
 }
 
 // Pixels the user must scroll past 0 before we'll consider hiding the bar.
@@ -243,7 +244,7 @@ export function TopBar(props: TopBarProps) {
               )}
             </For>
           </div>
-          <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onOpenTrash={props.onOpenTrash} onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
+          <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onOpenTrash={props.onOpenTrash} onOpenTagManager={props.onOpenTagManager} onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
         </div>
       </Show>
 
@@ -386,6 +387,7 @@ export function TopBar(props: TopBarProps) {
           onOpenFolder={props.onOpenFolder}
           onOpenDuplicates={props.onOpenDuplicates}
           onOpenTrash={props.onOpenTrash}
+          onOpenTagManager={props.onOpenTagManager}
           onRequestShow={() => { setScrollHidden(false); }}
         />
       </Show>

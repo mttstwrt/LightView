@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 
 use crate::companion::reader;
@@ -231,6 +233,238 @@ pub async fn remove_user_tag_batch_impl(
     Ok(count)
 }
 
+// ---------------------------------------------------------------------------
+// Gallery-wide user-tag management (rename / merge / delete)
+// ---------------------------------------------------------------------------
+
+/// One user tag in the gallery, with the number of files carrying it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserTagSummary {
+    pub tag: String,
+    pub count: u32,
+}
+
+/// Outcome of a gallery-wide tag rewrite.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagEditResult {
+    /// Files whose companion was rewritten.
+    pub files_changed: usize,
+    /// Files indexed under a source tag that could not be rewritten (sidecar
+    /// missing, unreadable, or read-only) — the tag may still be on disk there.
+    pub files_failed: usize,
+}
+
+/// List every user tag in the open gallery with its file count.
+#[tauri::command]
+pub async fn list_user_tags(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<UserTagSummary>, String> {
+    list_user_tags_impl(&state).await
+}
+
+pub async fn list_user_tags_impl(state: &AppState) -> Result<Vec<UserTagSummary>, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+
+    Ok(db
+        .tags_in_namespace_with_counts("user")
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|c| UserTagSummary {
+            tag: c.tag,
+            count: c.count,
+        })
+        .collect())
+}
+
+/// Rename a user tag across the whole gallery. If `to` already exists on a
+/// file, the two collapse into one (i.e. a rename onto an existing tag is a
+/// merge).
+#[tauri::command]
+pub async fn rename_user_tag(
+    state: tauri::State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<TagEditResult, String> {
+    rename_user_tag_impl(&state, from, to).await
+}
+
+pub async fn rename_user_tag_impl(
+    state: &AppState,
+    from: String,
+    to: String,
+) -> Result<TagEditResult, String> {
+    rewrite_user_tags(state, vec![from], Some(to)).await
+}
+
+/// Merge several user tags into one across the whole gallery. `target` need
+/// not already exist, and may be one of `sources` (the others fold into it).
+#[tauri::command]
+pub async fn merge_user_tags(
+    state: tauri::State<'_, AppState>,
+    sources: Vec<String>,
+    target: String,
+) -> Result<TagEditResult, String> {
+    merge_user_tags_impl(&state, sources, target).await
+}
+
+pub async fn merge_user_tags_impl(
+    state: &AppState,
+    sources: Vec<String>,
+    target: String,
+) -> Result<TagEditResult, String> {
+    rewrite_user_tags(state, sources, Some(target)).await
+}
+
+/// Delete user tags from every file in the gallery.
+#[tauri::command]
+pub async fn delete_user_tags(
+    state: tauri::State<'_, AppState>,
+    tags: Vec<String>,
+) -> Result<TagEditResult, String> {
+    delete_user_tags_impl(&state, tags).await
+}
+
+pub async fn delete_user_tags_impl(
+    state: &AppState,
+    tags: Vec<String>,
+) -> Result<TagEditResult, String> {
+    rewrite_user_tags(state, tags, None).await
+}
+
+/// Shared engine behind rename / merge / delete: rewrite `sources` to `target`
+/// (or drop them when `target` is `None`) on every file the tag index says
+/// carries one of them.
+async fn rewrite_user_tags(
+    state: &AppState,
+    sources: Vec<String>,
+    target: Option<String>,
+) -> Result<TagEditResult, String> {
+    let mut sources: Vec<String> = sources
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    sources.sort();
+    sources.dedup();
+    if sources.is_empty() {
+        return Err("No tags given".to_string());
+    }
+
+    let target = match target {
+        Some(t) => {
+            let t = t.trim().to_string();
+            if t.is_empty() {
+                return Err("Target tag is empty".to_string());
+            }
+            Some(t)
+        }
+        None => None,
+    };
+
+    // Merging a tag into itself is a no-op for that source; the rest still fold
+    // into it. Renaming a tag to its own name drops out here entirely.
+    if let Some(t) = &target {
+        sources.retain(|s| s != t);
+    }
+    if sources.is_empty() {
+        return Ok(TagEditResult::default());
+    }
+
+    // Snapshot the affected paths and release the lock before touching disk —
+    // the rewrite below is file I/O over an unbounded number of files and must
+    // not hold the single SQLite connection for its whole duration.
+    let paths: BTreeSet<String> = {
+        let db = state.cache_db.lock().await;
+        let db = db.as_ref().ok_or("No gallery open")?;
+        let mut set = BTreeSet::new();
+        for source in &sources {
+            for path in db.query_tag("user", source).map_err(|e| e.to_string())? {
+                set.insert(path);
+            }
+        }
+        set
+    };
+
+    let mut result = TagEditResult::default();
+    for path in &paths {
+        match rewrite_companion_user_tags(path, &sources, target.as_deref()) {
+            Ok(Some(companion)) => {
+                let db = state.cache_db.lock().await;
+                if let Some(db) = db.as_ref() {
+                    let _ = db.reindex_tags_for_file(path, &companion);
+                }
+                result.files_changed += 1;
+            }
+            // Indexed under the tag but the companion no longer has it —
+            // nothing to write, and the reindex below fixes the stale row.
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!("Failed to rewrite tags for {}: {}", path, e);
+                result.files_failed += 1;
+            }
+        }
+    }
+
+    // Counts are rebuilt wholesale instead of nudged per file: one rewrite
+    // touches every file carrying the tag, and the resulting per-tag deltas are
+    // exactly what a single GROUP BY already computes.
+    let db = state.cache_db.lock().await;
+    if let Some(db) = db.as_ref() {
+        let _ = db.rebuild_tag_counts();
+        if let Ok(counts) = db.query_all_tag_counts() {
+            state.autocomplete.refresh(counts).await;
+        }
+    }
+
+    Ok(result)
+}
+
+/// Apply a source→target rewrite to one companion file, writing it back only
+/// if something actually changed. Returns the rewritten companion, or `None`
+/// when the file carried none of the source tags.
+fn rewrite_companion_user_tags(
+    path: &str,
+    sources: &[String],
+    target: Option<&str>,
+) -> Result<Option<CompanionFile>, String> {
+    let media_path = std::path::Path::new(path);
+    let mut companion = reader::read_companion_optional(media_path)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "companion file missing".to_string())?;
+
+    let mut changed = false;
+    let mut next: Vec<String> = Vec::with_capacity(companion.tags.user.len());
+    for tag in std::mem::take(&mut companion.tags.user) {
+        if sources.iter().any(|s| s == &tag) {
+            changed = true;
+            // The target takes the first matched source's slot, so a renamed
+            // tag keeps its place in the list instead of jumping to the end.
+            if let Some(t) = target {
+                if !next.iter().any(|e| e == t) {
+                    next.push(t.to_string());
+                }
+            }
+        } else if next.iter().any(|e| e == &tag) {
+            // Collapsed into an earlier entry (target already present).
+            changed = true;
+        } else {
+            next.push(tag);
+        }
+    }
+
+    if !changed {
+        companion.tags.user = next;
+        return Ok(None);
+    }
+
+    companion.tags.user = next;
+    writer::write_companion(media_path, &mut companion).map_err(|e| e.to_string())?;
+    Ok(Some(companion))
+}
+
 /// Set the rating for multiple media files at once (0-5, 0 = unrated).
 #[tauri::command]
 pub async fn set_rating_batch(
@@ -332,4 +566,99 @@ pub async fn set_notes(
         core.notes = notes;
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a media file with a companion carrying `tags` as user tags.
+    fn seed(dir: &std::path::Path, name: &str, tags: &[&str]) -> String {
+        let media = dir.join(name);
+        std::fs::write(&media, b"jpegbytes").unwrap();
+        let mut companion = CompanionFile::new(name, MediaType::Image);
+        companion.tags.user = tags.iter().map(|t| t.to_string()).collect();
+        writer::write_companion(&media, &mut companion).unwrap();
+        media.to_string_lossy().to_string()
+    }
+
+    fn user_tags(path: &str) -> Vec<String> {
+        reader::read_companion(std::path::Path::new(path))
+            .unwrap()
+            .tags
+            .user
+    }
+
+    #[test]
+    fn rename_keeps_the_tag_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = seed(tmp.path(), "a.jpg", &["beach", "sunset", "family"]);
+
+        let changed =
+            rewrite_companion_user_tags(&path, &["sunset".to_string()], Some("golden hour"))
+                .unwrap();
+
+        assert!(changed.is_some());
+        assert_eq!(user_tags(&path), ["beach", "golden hour", "family"]);
+    }
+
+    #[test]
+    fn merge_collapses_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Both a source and the target on the same file: one entry must survive.
+        let path = seed(tmp.path(), "a.jpg", &["dog", "puppy", "pet"]);
+
+        rewrite_companion_user_tags(
+            &path,
+            &["dog".to_string(), "puppy".to_string()],
+            Some("pet"),
+        )
+        .unwrap();
+
+        assert_eq!(user_tags(&path), ["pet"]);
+    }
+
+    #[test]
+    fn delete_drops_only_the_named_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = seed(tmp.path(), "a.jpg", &["beach", "sunset", "family"]);
+
+        rewrite_companion_user_tags(&path, &["beach".to_string(), "family".to_string()], None)
+            .unwrap();
+
+        assert_eq!(user_tags(&path), ["sunset"]);
+    }
+
+    #[test]
+    fn untouched_file_is_not_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = seed(tmp.path(), "a.jpg", &["beach"]);
+        let before = std::fs::read_to_string(reader::companion_path(
+            std::path::Path::new(&path),
+            crate::companion::reader::CompanionLocation::default(),
+        ))
+        .unwrap();
+
+        // A stale index row can point here even though the tag is gone.
+        let result = rewrite_companion_user_tags(&path, &["sunset".to_string()], Some("x")).unwrap();
+        assert!(result.is_none());
+
+        let after = std::fs::read_to_string(reader::companion_path(
+            std::path::Path::new(&path),
+            crate::companion::reader::CompanionLocation::default(),
+        ))
+        .unwrap();
+        assert_eq!(before, after, "companion rewritten despite no change");
+    }
+
+    #[test]
+    fn missing_companion_is_an_error_not_a_new_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("orphan.jpg");
+        std::fs::write(&media, b"jpegbytes").unwrap();
+        let path = media.to_string_lossy().to_string();
+
+        assert!(rewrite_companion_user_tags(&path, &["beach".to_string()], None).is_err());
+        assert!(!tmp.path().join(".lightview").exists());
+    }
 }

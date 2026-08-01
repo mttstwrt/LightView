@@ -9,7 +9,7 @@ import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getBootState, getSortedItems, getRecentGalleries, removeRecentGallery, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
-import { setFilterQuery } from "./stores/filterStore";
+import { setFilterQuery, refreshFilteredItems } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { JustifiedGrid } from "./components/gallery/JustifiedGrid";
 import { MapView } from "./components/map/MapView";
@@ -28,6 +28,7 @@ import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
 import { DebugOverlay } from "./components/debug/DebugOverlay";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { TrashPanel } from "./components/TrashPanel";
+import { TagManagerPanel } from "./components/TagManagerPanel";
 import { UploadButton } from "./components/upload/UploadButton";
 import type { SortedItem, SortField } from "./lib/types";
 
@@ -199,6 +200,7 @@ export function App() {
   const [debugOpen, setDebugOpen] = createSignal(false);
   const [duplicatesOpen, setDuplicatesOpen] = createSignal(false);
   const [trashOpen, setTrashOpen] = createSignal(false);
+  const [tagManagerOpen, setTagManagerOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
 
@@ -560,7 +562,7 @@ export function App() {
           </>
         }
       >
-        <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} onOpenTrash={() => setTrashOpen(true)} />
+        <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} onOpenTrash={() => setTrashOpen(true)} onOpenTagManager={() => setTagManagerOpen(true)} />
         <Show when={(viewMode() === "grid" || viewMode() === "justified") && !contentHidden()}>
           <Show when={viewMode() === "grid"}>
             <GalleryGrid
@@ -676,6 +678,14 @@ export function App() {
         </Show>
         <Show when={trashOpen()}>
           <TrashPanel onClose={() => setTrashOpen(false)} />
+        </Show>
+        <Show when={tagManagerOpen()}>
+          {/* Renaming/merging a tag can change what the active filter matches,
+              so re-run it after every edit rather than on close. */}
+          <TagManagerPanel
+            onClose={() => setTagManagerOpen(false)}
+            onChanged={() => { void refreshFilteredItems(); }}
+          />
         </Show>
         <Show when={isWeb()}>
           {/* Hidden (not unmounted — that would refetch the upload config)

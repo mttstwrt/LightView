@@ -65,6 +65,34 @@ impl CacheDb {
         Ok(result)
     }
 
+    /// List every tag in a namespace with the number of files carrying it.
+    ///
+    /// Reads `tag_index` directly rather than `tag_counts`: the counts table is
+    /// maintained incrementally (increment/decrement per edit) and can drift,
+    /// and the tag manager shows these numbers to the user right before they
+    /// merge or delete something.
+    pub fn tags_in_namespace_with_counts(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<TagCount>, CacheError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT tag, COUNT(*) FROM tag_index WHERE namespace = ?1
+             GROUP BY tag ORDER BY COUNT(*) DESC, tag ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![namespace], |row| {
+            Ok(TagCount {
+                namespace: namespace.to_string(),
+                tag: row.get(0)?,
+                count: row.get::<_, u32>(1)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// Get the top N most popular tags, optionally filtered by namespace.
     pub fn top_tags(
         &self,
