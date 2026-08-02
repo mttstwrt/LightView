@@ -1,7 +1,8 @@
-import { Show, createSignal, onMount, onCleanup } from "solid-js";
+import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
 import { safeListen as listen } from "../../lib/runtime";
 import { getDebugInfo, type DebugInfo } from "../../lib/ipc";
 import type { MetricSnapshot, MetricEntry } from "../../lib/perfMonitor";
+import { METRIC_ROWS } from "./metricRows";
 import { Sparkline } from "./Sparkline";
 
 type Tab = "performance" | "hardware";
@@ -38,13 +39,6 @@ export function DevtoolsApp() {
 
   const m = (key: keyof MetricSnapshot): MetricEntry => metrics()?.[key] ?? EMPTY;
 
-  const fmt = (n: number, decimals = 1) => n.toFixed(decimals);
-  const fmtInt = (n: number) => Math.round(n).toString();
-  const fmtBytes = (kb: number) => {
-    if (kb < 1024) return `${kb.toFixed(1)} KB/s`;
-    return `${(kb / 1024).toFixed(2)} MB/s`;
-  };
-
   const tabBtnClass = (t: Tab) =>
     `px-3 py-1 text-xs rounded cursor-pointer transition-colors ${
       tab() === t
@@ -71,20 +65,18 @@ export function DevtoolsApp() {
           <Show when={metrics()} fallback={
             <div class="text-neutral-500 py-8 text-center">Waiting for metrics...</div>
           }>
-            <MetricRow label="FPS" value={fmtInt(m("fps").last)} data={() => m("fps").history} color="#4ade80" />
-            <MetricRow label="IPC In" value={fmtBytes(m("ipcBandwidthIn").last)} data={() => m("ipcBandwidthIn").history} color="#60a5fa" />
-            <MetricRow label="IPC Out" value={fmtBytes(m("ipcBandwidthOut").last)} data={() => m("ipcBandwidthOut").history} color="#a78bfa" />
-            <MetricRow label="IPC Calls" value={`${fmtInt(m("ipcCallRate").last)}/s`} data={() => m("ipcCallRate").history} color="#fbbf24" />
-            <MetricRow label="IPC Latency" value={`${fmt(m("ipcAvgLatency").last)} ms`} data={() => m("ipcAvgLatency").history} color="#f97316" />
-            <MetricRow label="Visible Imgs" value={fmtInt(m("visibleImages").last)} data={() => m("visibleImages").history} color="#2dd4bf" />
-            <MetricRow label="Cached Imgs" value={fmtInt(m("cachedImages").last)} data={() => m("cachedImages").history} color="#14b8a6" />
-            <MetricRow label="Cache Misses" value={`${fmtInt(m("cacheMisses").last)}/s`} data={() => m("cacheMisses").history} color="#f43f5e" />
-            <MetricRow label="Disk Read" value={fmtBytes(m("diskReadRate").last)} data={() => m("diskReadRate").history} color="#38bdf8" />
-            <MetricRow label="Disk Write" value={fmtBytes(m("diskWriteRate").last)} data={() => m("diskWriteRate").history} color="#818cf8" />
-            <MetricRow label="DOM Nodes" value={fmtInt(m("domNodes").last)} data={() => m("domNodes").history} color="#e879f9" />
-            <Show when={m("jsHeapUsed").history.length > 0}>
-              <MetricRow label="JS Heap" value={`${fmt(m("jsHeapUsed").last)} MB`} data={() => m("jsHeapUsed").history} color="#fb923c" />
-            </Show>
+            <For each={METRIC_ROWS}>
+              {(row) => (
+                <Show when={!row.hideWhenEmpty || m(row.name).history.length > 0}>
+                  <MetricRow
+                    label={row.label}
+                    value={row.format(m(row.name).last)}
+                    data={() => m(row.name).history}
+                    color={row.color}
+                  />
+                </Show>
+              )}
+            </For>
           </Show>
         </div>
       </Show>

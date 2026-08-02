@@ -1,12 +1,12 @@
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, isMobile, isTauri, type UnlistenFn } from "../../lib/runtime";
-import { wheelPxPerUnit } from "../../lib/wheel";
+import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, thumbUrl, mediaUrl, THUMB_REGENERATED_EVENT, type ThumbTier } from "../../lib/ipc";
 import type { MediaMeta } from "../../stores/galleryStore";
-import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
+import { createThumbProgress } from "../../lib/thumbProgress";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
@@ -408,8 +408,11 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
 
-  let thumbGenTotal = 0;
-  let thumbGenDone = 0;
+  // Thumbnail generation progress ("Generating N / M"). Idle means nothing is
+  // queued for generation and nothing is in flight.
+  const progress = createThumbProgress(
+    () => needsGeneration.size === 0 && inFlightSet.size === 0,
+  );
 
   // Scroll velocity/direction tracking + the WebKitGTK decode gate (never
   // engages on the web client). Owns the window scroll listener; each frame
@@ -453,8 +456,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     jhPrecached.clear();
     landingWarmed.clear();
     bgCursor = 0;
-    thumbGenTotal = 0;
-    thumbGenDone = 0;
+    progress.reset();
     setGeneration((g) => g + 1);
   };
 
@@ -518,9 +520,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     if (inFlightSet.has(path) || failedSet.has(path)) return;
     recordCacheMiss();
     needsGeneration.set(path, tier);
-    thumbGenTotal++;
-    if (thumbGenTotal === 1) thumbGenStarted(thumbGenTotal);
-    else thumbGenProgress(thumbGenDone, thumbGenTotal);
+    progress.queued();
   };
 
   // Regeneration / one-shot invalidation listener.
@@ -713,38 +713,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       }
     };
 
-    // WebKitGTK doesn't propagate wheel events to window scroll natively, so we
-    // drive the scroll ourselves with momentum smoothing (mirrors GalleryGrid).
-    let wheelTargetY = 0;
-    let wheelCurrentY = 0;
-    let wheelAnimating = false;
-    let wheelRafId = 0;
-    const WHEEL_DECAY = 0.8;
-    const WHEEL_SETTLE = 0.5;
-
-    const wheelDeltaPx = (e: WheelEvent) =>
-      e.deltaY * wheelPxPerUnit(e, targetRowHeight() + gap());
-
-    const drainWheel = () => {
-      const diff = wheelTargetY - wheelCurrentY;
-      if (Math.abs(diff) < WHEEL_SETTLE) {
-        wheelCurrentY = wheelTargetY;
-        window.scrollTo(0, Math.round(wheelTargetY));
-        wheelAnimating = false;
-        wheelRafId = 0;
-        scheduleFetch();
-        return;
-      }
-      wheelCurrentY += diff * (1 - WHEEL_DECAY);
-      window.scrollTo(0, Math.round(wheelCurrentY));
-      wheelRafId = requestAnimationFrame(drainWheel);
-    };
-
-    const onWheel = (e: WheelEvent) => {
-      // Ctrl+wheel zooms (changes the target row height) instead of scrolling.
-      // During a Ctrl+drag selection, fall through to scroll (mirrors GalleryGrid).
-      if ((e.ctrlKey || e.metaKey) && !isDragging()) {
-        e.preventDefault();
+    // Ctrl+wheel zooms (changes the target row height) instead of scrolling.
+    // During a Ctrl+drag selection, fall through to scroll (mirrors GalleryGrid).
+    const detachWheel = createWheelScroll({
+      rowHeight: () => targetRowHeight() + gap(),
+      onSettle: () => scheduleFetch(),
+      onZoom: (e) => {
+        if (isDragging()) return false;
         const cur = settings().display.thumbnail_size;
         const step = Math.max(8, Math.round(cur * 0.12));
         const lo = settings().display.thumb_size_min ?? ROW_HEIGHT_MIN;
@@ -753,19 +728,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         if (next !== cur) {
           setSettings((prev) => ({ ...prev, display: { ...prev.display, thumbnail_size: next } }));
         }
-        return;
-      }
-      e.preventDefault();
-      if (!wheelAnimating) {
-        wheelCurrentY = window.scrollY;
-        wheelTargetY = window.scrollY;
-        wheelAnimating = true;
-      }
-      const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-      wheelTargetY = Math.max(0, Math.min(maxScroll, wheelTargetY + wheelDeltaPx(e)));
-      if (!wheelRafId) wheelRafId = requestAnimationFrame(drainWheel);
-    };
-    window.addEventListener("wheel", onWheel, { passive: false });
+        return true;
+      },
+    }).attach();
 
     recalcRange();
 
@@ -893,13 +858,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       );
       if (stale.length > 0) {
         for (const p of stale) needsGeneration.delete(p);
-        thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - stale.length);
-        // Dropping may have emptied the queue — close out the progress UI.
-        if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-          thumbGenFinished(thumbGenDone);
-          thumbGenTotal = 0;
-          thumbGenDone = 0;
-        }
+        progress.dropped(stale.length);
       }
       if (picked.length === 0) return false;
 
@@ -937,15 +896,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
               if (rung) setThumbMap(p, thumbSrcFor(p, rung === "cheap"));
             }
           });
-          thumbGenDone += toGenerate.length;
           for (const p of toGenerate) inFlightSet.delete(p);
-          if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-            thumbGenFinished(thumbGenDone);
-            thumbGenTotal = 0;
-            thumbGenDone = 0;
-          } else {
-            thumbGenProgress(thumbGenDone, thumbGenTotal);
-          }
+          // After the in-flight set is drained, so "idle" reads correctly.
+          progress.completed(toGenerate.length);
         } catch (e) {
           console.error("Justified tier generation failed:", e);
           for (const p of toGenerate) { inFlightSet.delete(p); failedSet.add(p); }
@@ -1111,11 +1064,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("scrollend", onScrollEnd);
-      window.removeEventListener("wheel", onWheel);
+      detachWheel();
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
       window.removeEventListener(VIEWER_PATH_EVENT, onViewerPath);
-      if (wheelRafId) cancelAnimationFrame(wheelRafId);
       clearInterval(bgIntervalId);
       fetchAbort = true;
     });
@@ -1161,14 +1113,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         droppedQueued++;
       }
     }
-    if (droppedQueued > 0) {
-      thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - droppedQueued);
-      if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-        thumbGenFinished(thumbGenDone);
-        thumbGenTotal = 0;
-        thumbGenDone = 0;
-      }
-    }
+    progress.dropped(droppedQueued);
     if (measuredAspects().size > 0) {
       let changed = false;
       const next = new Map<string, number>();
