@@ -1,6 +1,7 @@
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, isMobile, isTauri, type UnlistenFn } from "../../lib/runtime";
+import { wheelPxPerUnit } from "../../lib/wheel";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, thumbUrl, mediaUrl, THUMB_REGENERATED_EVENT, type ThumbTier } from "../../lib/ipc";
@@ -721,11 +722,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     const WHEEL_DECAY = 0.8;
     const WHEEL_SETTLE = 0.5;
 
-    const wheelDeltaPx = (e: WheelEvent) => {
-      if (e.deltaMode === 1) return e.deltaY * (targetRowHeight() + gap());
-      if (e.deltaMode === 2) return e.deltaY * window.innerHeight;
-      return e.deltaY;
-    };
+    const wheelDeltaPx = (e: WheelEvent) =>
+      e.deltaY * wheelPxPerUnit(e, targetRowHeight() + gap());
 
     const drainWheel = () => {
       const diff = wheelTargetY - wheelCurrentY;

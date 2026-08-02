@@ -1,6 +1,7 @@
 import { Show, For, createSignal, createEffect, on, onMount, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { isWeb, hasTouch, isTauri, isMobile } from "../../lib/runtime";
+import { wheelPxPerUnit } from "../../lib/wheel";
 import {
   findCellImage,
   prefersReducedMotion,
@@ -490,9 +491,11 @@ export function MediaViewer(props: MediaViewerProps) {
       setPanY(my - (my - panY()) * ratio);
       setZoom(newZoom);
     } else if (zoom() > 1) {
-      // Plain scroll when zoomed = pan the image
-      setPanX(panX() - e.deltaX);
-      setPanY(panY() - e.deltaY);
+      // Plain scroll when zoomed = pan the image. Normalize first: Firefox
+      // reports line mode, so raw deltas would pan ~3px per notch.
+      const px = wheelPxPerUnit(e);
+      setPanX(panX() - e.deltaX * px);
+      setPanY(panY() - e.deltaY * px);
     }
   };
 
