@@ -2,6 +2,7 @@ import { For, Show, createSignal, createEffect, createMemo, on, onMount, onClean
 import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, hasTouch, isTauri, type UnlistenFn } from "../../lib/runtime";
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
+import { wheelPxPerUnit } from "../../lib/wheel";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, THUMB_REGENERATED_EVENT, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
@@ -483,8 +484,10 @@ export function GalleryGrid(props: GalleryGridProps) {
     // intercept them and drive the scroll ourselves with momentum smoothing.
     // Two WebKitGTK quirks (vs. Chromium in the web client) need handling:
     //   1. Traditional mouse wheels arrive as DOM_DELTA_LINE (deltaY ±1 per
-    //      notch), not pixels — so we normalize by deltaMode, mapping one line
-    //      to one grid row (= one column width, cells are square).
+    //      notch), not pixels — so we normalize by deltaMode via
+    //      `wheelPxPerUnit`, mapping one WebKitGTK notch to one grid row (= one
+    //      column width, cells are square). Other engines count lines
+    //      differently; `lib/wheel.ts` has the full table.
     //   2. Fractional window.scrollBy() steps get rounded away every frame, so
     //      relative stepping silently drops the tail of each gesture by an
     //      amount that varies with frame timing. We instead animate an absolute
@@ -496,13 +499,10 @@ export function GalleryGrid(props: GalleryGridProps) {
     const WHEEL_DECAY = 0.8; // fraction of remaining distance covered per frame
     const WHEEL_SETTLE = 0.5; // px from target at which we snap and stop
 
-    // Convert a wheel delta to pixels. Line mode maps one line to one row so a
-    // single notch advances exactly one column width; page mode → viewport.
-    const wheelDeltaPx = (e: WheelEvent) => {
-      if (e.deltaMode === 1) return e.deltaY * rowHeight();
-      if (e.deltaMode === 2) return e.deltaY * window.innerHeight;
-      return e.deltaY;
-    };
+    // Convert a wheel delta to pixels. Under WebKitGTK one notch advances
+    // exactly one row (= one column width); other engines' line/page modes are
+    // normalized by `wheelPxPerUnit`, which is where the details live.
+    const wheelDeltaPx = (e: WheelEvent) => e.deltaY * wheelPxPerUnit(e, rowHeight());
 
     const drainWheel = () => {
       const diff = wheelTargetY - wheelCurrentY;
