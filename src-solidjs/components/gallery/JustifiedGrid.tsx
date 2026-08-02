@@ -11,6 +11,7 @@ import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../.
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
 import { createThumbSwapper } from "../../lib/thumbSwap";
+import { VIEWER_PATH_EVENT } from "../../lib/viewerTransition";
 import { pickByPriority } from "../../lib/loadPriority";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
@@ -54,8 +55,23 @@ const EVICT_ROWS = 12;
 // Rows ahead of the viewport (in scroll direction) to warm the high (jh) tier
 // when zoomed in, so cells aren't cold 404→generate round-trips on reveal.
 const JH_PRECACHE_ROWS = 6;
-// How many paths to generate per IPC batch.
+// How many paths to generate per IPC batch. `ensure_tier_thumbnails` decodes
+// the whole batch before it resolves *and* holds the shared rayon thumb pool
+// while it does, so a batch is also the granularity at which the frontend can
+// re-prioritize and at which on-demand serves get the CPU back. 96 is fine for
+// the 512px "j" tier; at 1280/2560px it's tens of seconds of pool time for work
+// that is mostly speculative — hence the much smaller high-tier cap.
 const BATCH_SIZE = 96;
+const HIGH_TIER_BATCH = 12;
+const batchCapFor = (tier: ThumbTier) => (tier === "j" ? BATCH_SIZE : HIGH_TIER_BATCH);
+// Speculative warms (landing zone, background precache) use a much smaller
+// batch than the on-screen drain. Nothing can preempt a batch once it's issued
+// — the backend takes the whole list, holds the pool until the last image is
+// done, and only then resolves — so the batch size *is* the worst-case delay
+// before a scroll that lands on cold cells can get any CPU. A 96-image "j"
+// batch is several seconds of that; 16 keeps the loop responsive at a small
+// cost in per-call overhead.
+const SPECULATIVE_BATCH = 16;
 // Scroll velocity (px/s) above which the fetch loop treats the scroll as a
 // fling: near-viewport generation is skipped (cells fly past unseen) and the
 // projected landing zone is warmed instead. Matches GalleryGrid.
@@ -225,6 +241,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Inner full-resolution row window within [startRow, endRow).
   const [fullStartRow, setFullStartRow] = createSignal(0);
   const [fullEndRow, setFullEndRow] = createSignal(0);
+  // Rows actually intersecting the viewport — the subset of the full-res window
+  // the user can see right now. The full window is deliberately wider (it
+  // pre-loads the rows about to arrive), but "wider" only helps if the visible
+  // rows are served first; see the staged upgrade in the assign effect.
+  const [viewStartRow, setViewStartRow] = createSignal(0);
+  const [viewEndRow, setViewEndRow] = createSignal(0);
   const [generation, setGeneration] = createSignal(0);
   const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
 
@@ -309,7 +331,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // fit-original). Cheap cells upgrade once scrolling settles.
   type Rung = "cheap" | "full";
   const assignedRung = new Map<string, Rung>();
-  const needsGeneration = new Set<string>();
+  // Path → the tier whose URL actually 404'd, so the drain regenerates *that*
+  // tier. Keying the queue on the path alone and generating `thumbTier()` for
+  // everything meant a cheap-rung cell missing its 512px "j" tier triggered a
+  // 2560px "jh" decode that didn't even fix the miss — the single most
+  // expensive way to not solve the problem, repeated for every cell in the
+  // (12–20 row) render buffer whenever the view was zoomed in.
+  const needsGeneration = new Map<string, ThumbTier>();
   const inFlightSet = new Set<string>();
   const failedSet = new Set<string>();
   const urlVersions = new Map<string, number>();
@@ -329,6 +357,53 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Paths already sent to the backend by landing-zone warming during a fling,
   // so successive drains of the same fling don't re-issue them.
   const landingWarmed = new Set<string>();
+  // NB: served-original (`?fit=`) cells are deliberately left un-warmed. They
+  // aren't tier-backed — each is an on-demand source decode inside the request
+  // (`serve_fit_image`) — so the obvious move is to load the same URL off-DOM
+  // ahead of the viewport and let the webview cache it. Measured, that made
+  // things worse: the warm decodes land on the same bounded pool as the cells
+  // already on screen, and a look-ahead only pays off if it wins the race,
+  // which it can't when each decode is seconds long. What actually helps at
+  // this zoom is issuing *less* concurrent work, not more (see the staged
+  // upgrade in the assign effect).
+  // The path the viewer is currently showing (kept in sync via
+  // `lightview:scroll-to-index`). Held at the full rung regardless of where the
+  // inner window lands, so closing the viewer reveals the cell at the same
+  // resolution it was opened from rather than dropping to the cheap tier.
+  const [pinnedPath, setPinnedPath] = createSignal<string | null>(null);
+
+  // Cells that have been pointed at a full-resolution source but haven't
+  // painted it yet — precisely what the user is waiting to watch sharpen.
+  //
+  // This is the budget that actually matters when zoomed in. A full-rung source
+  // (a `jh` tier, or a `?fit=` resize decoded from the original on demand)
+  // costs the backend's bounded thumb pool a decode per request, and the
+  // full-res window spans several rows beyond the viewport — so a screen of 5
+  // images was issuing that many expensive requests for cells nobody can see,
+  // all at once and at equal priority. The five on screen then finished last.
+  // Everything speculative is gated on this reaching zero.
+  const awaitingFull = new Map<string, number>(); // path → assigned-at (ms)
+  const [awaitingCount, setAwaitingCount] = createSignal(0);
+  const markAwaiting = (path: string) => {
+    if (awaitingFull.has(path)) return;
+    awaitingFull.set(path, performance.now());
+    setAwaitingCount(awaitingFull.size);
+  };
+  const clearAwaiting = (path: string) => {
+    if (!awaitingFull.delete(path)) return;
+    setAwaitingCount(awaitingFull.size);
+  };
+  /** Cells still worth deferring speculation for. A source that has been
+   *  pending this long is stuck (a huge file, a stalled request, an <img> whose
+   *  load event never came) and must not disable the look-ahead for the rest of
+   *  the session — the gate is a courtesy to the viewport, not a lock. */
+  const AWAIT_BLOCK_MS = 6000;
+  const blockingCount = (): number => {
+    const now = performance.now();
+    let n = 0;
+    for (const at of awaitingFull.values()) if (now - at < AWAIT_BLOCK_MS) n++;
+    return n;
+  };
   let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
 
@@ -369,6 +444,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     }
     assignedRung.clear();
     swapper.cancelAll();
+    awaitingFull.clear();
+    setAwaitingCount(0);
     needsGeneration.clear();
     inFlightSet.clear();
     failedSet.clear();
@@ -414,13 +491,32 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     urlVersions.set(path, (urlVersions.get(path) ?? 0) + 1);
   };
 
+  /** The tier a cell's *currently assigned* URL comes from — i.e. the one that
+   *  404'd. Cheap-rung cells always show the base "j" tier, whatever the
+   *  detail level says the full source should be. */
+  const missingTierFor = (path: string): ThumbTier =>
+    assignedRung.get(path) === "cheap" ? "j" : thumbTier();
+
   const handleThumbError = (path: string) => {
     // Cells served their original file aren't thumbnail-backed — a load error
-    // here isn't a cache miss, so don't queue thumbnail generation.
-    if (servesOriginal(path)) return;
-    if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path)) return;
+    // there isn't a cache miss, so don't queue thumbnail generation. Only the
+    // *full* rung serves the original though: the same cell on the cheap rung
+    // is showing the "j" tier and a miss on that does need generating.
+    // Failed or not, this cell has stopped waiting — it must not hold the
+    // look-ahead back forever.
+    clearAwaiting(path);
+    if (assignedRung.get(path) !== "cheap" && servesOriginal(path)) return;
+    const tier = missingTierFor(path);
+    const queued = needsGeneration.get(path);
+    if (queued !== undefined) {
+      // Already queued; keep it aimed at whatever the cell shows now (a cell
+      // can be upgraded between the miss and the drain).
+      if (queued !== tier) needsGeneration.set(path, tier);
+      return;
+    }
+    if (inFlightSet.has(path) || failedSet.has(path)) return;
     recordCacheMiss();
-    needsGeneration.add(path);
+    needsGeneration.set(path, tier);
     thumbGenTotal++;
     if (thumbGenTotal === 1) thumbGenStarted(thumbGenTotal);
     else thumbGenProgress(thumbGenDone, thumbGenTotal);
@@ -484,8 +580,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Assign protocol URLs as soon as cells become visible. Cached thumbs load
   // instantly; uncached ones 404 → onError → queued for generation.
   createEffect(on(
-    [visibleCells, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow],
-    ([cells, gated, settled, fullStart, fullEnd]) => {
+    [visibleCells, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow, pinnedPath,
+     viewStartRow, viewEndRow, awaitingCount],
+    ([cells, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting]) => {
     // While the WebKitGTK decode gate is up, leave new cells on their
     // placeholder so the main thread isn't buried under image decodes
     // mid-scroll. When it releases this re-runs and assigns whatever's now on
@@ -502,18 +599,59 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // "j" everywhere beats spending the data budget on jm/jh/fit upgrades.
     const cheapScroll = isTauri() ? gated : !settled || constrainedNetwork();
     const degradable = detailLevel() !== "base";
-    for (const cell of cells as ReturnType<typeof visibleCells>) {
-      const inFull = cell.row >= fullStart && cell.row < fullEnd;
+
+    // Staged upgrade, in two passes over the same cells.
+    //
+    // Pass 1 takes the rows on screen (plus the viewer's pinned cell); pass 2
+    // takes the look-ahead rows inside the full-res window, but only if pass 1
+    // left nothing outstanding. A full-rung source costs the backend's bounded
+    // pool a decode per request, and the full window is several rows deep —
+    // upgrading it all in one sweep put ~7x more expensive requests in flight
+    // than the viewport needed. Ordering has to happen *within* the pass, not
+    // just across re-runs: on the sweep right after a scroll, `waiting` is
+    // still zero from the settled previous screen, so a single loop would
+    // issue the whole window at once before any of it registered.
+    //
+    // Measured neutral on the web client, where the browser decodes off the
+    // main thread and the backend's pool already serves in arrival order (the
+    // viewport is requested first either way). The reason to keep it is the
+    // desktop webview: WebKitGTK decodes on the main thread — the premise of
+    // the decode gate and of every isTauri() branch in this file — so cutting
+    // concurrent full-res decodes from ~17 to ~5 is main-thread work not done
+    // while the user is waiting on the visible rows. That platform is exactly
+    // what this harness cannot measure, so treat the win as reasoned, not
+    // demonstrated.
+    const onScreenOf = (row: number) => row >= viewStart && row < viewEnd;
+    const apply = (cell: ReturnType<typeof visibleCells>[number], mayTakeFull: boolean) => {
+      // The viewer's current item is always treated as full-res and never
+      // degraded — it's the one cell the user is guaranteed to be looking at
+      // closely, and it's what the close transition lands back onto.
+      const forced = cell.path === pinned;
+      const inFull = forced || onScreenOf(cell.row) || (cell.row >= fullStart && cell.row < fullEnd);
+      const takeFull = forced || mayTakeFull;
       const cur = assignedRung.get(cell.path);
       if (cur === undefined) {
-        const rung: Rung = degradable && (cheapScroll || !inFull) ? "cheap" : "full";
+        const rung: Rung =
+          degradable && !forced && (cheapScroll || !inFull || !takeFull) ? "cheap" : "full";
         assignedRung.set(cell.path, rung);
+        if (rung === "full") markAwaiting(cell.path);
         assignSrc(cell.path, thumbSrcFor(cell.path, rung === "cheap"));
-      } else if (cur === "cheap" && inFull && !cheapScroll) {
+      } else if (cur === "cheap" && inFull && takeFull && (forced || !cheapScroll)) {
         assignedRung.set(cell.path, "full");
+        markAwaiting(cell.path);
         assignSrc(cell.path, thumbSrcFor(cell.path));
       }
+    };
+
+    const all = cells as ReturnType<typeof visibleCells>;
+    const lookAhead: typeof all = [];
+    for (const cell of all) {
+      if (onScreenOf(cell.row) || cell.path === pinned) apply(cell, true);
+      else lookAhead.push(cell);
     }
+    // `awaitingFull.size`, not the `waiting` snapshot — pass 1 just changed it.
+    const viewportIdle = blockingCount() === 0 && waiting === 0;
+    for (const cell of lookAhead) apply(cell, viewportIdle);
   }));
 
   // -----------------------------------------------------------------------
@@ -559,13 +697,17 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         newStart !== untrack(startRow) ||
         newEnd !== untrack(endRow) ||
         newFullStart !== untrack(fullStartRow) ||
-        newFullEnd !== untrack(fullEndRow)
+        newFullEnd !== untrack(fullEndRow) ||
+        firstRow !== untrack(viewStartRow) ||
+        lastRow !== untrack(viewEndRow)
       ) {
         batch(() => {
           setStartRow(newStart);
           setEndRow(newEnd);
           setFullStartRow(newFullStart);
           setFullEndRow(newFullEnd);
+          setViewStartRow(firstRow);
+          setViewEndRow(lastRow);
         });
       }
     };
@@ -632,8 +774,16 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // -------------------------------------------------------------------
     // Fetch loop — lazy "j" tier generation + eviction
     // -------------------------------------------------------------------
+    // Two single-flight slots, not one. `inFlightFetch` carries the drain of
+    // cells that are on screen right now and showing nothing; `inFlightWarm`
+    // carries speculation (landing zone, look-ahead, background precache).
+    // Sharing one slot meant a speculative batch — which at mid/high detail is
+    // 1280/2560px decodes — blocked the visible drain for its whole duration,
+    // so scrolling to a fresh row and waiting ten seconds for five images was
+    // the *expected* behavior whenever a warm happened to be in flight.
     let fetchAbort = false;
     let inFlightFetch: Promise<void> | null = null;
+    let inFlightWarm: Promise<void> | null = null;
 
     const evictFaraway = () => {
       const lay = layout();
@@ -655,6 +805,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
             setThumbMap(p, undefined as any);
             assignedRung.delete(p);
             swapper.cancel(p);
+            clearAwaiting(p);
           }
         });
       }
@@ -667,7 +818,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // level). Backend warm via ensureTierThumbnails; on the web client
     // additionally prime the browser's HTTP cache with the same URLs
     // (responses are cacheable for 1h). Reuses the single-flight
-    // inFlightFetch slot — one batch per drain, recomputed from the live
+    // inFlightWarm slot — one batch per drain, recomputed from the live
     // projection each time, so a redirected fling self-corrects and wasted
     // warms stay bounded.
     const warmLandingZone = () => {
@@ -683,7 +834,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       );
 
       const want: string[] = [];
-      for (let r = firstRow; r < lastRow && want.length < BATCH_SIZE; r++) {
+      for (let r = firstRow; r < lastRow && want.length < SPECULATIVE_BATCH; r++) {
         const row = lay.rows[r];
         if (!row) continue;
         for (const cell of row.cells) {
@@ -695,7 +846,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       }
       if (want.length === 0) return;
 
-      inFlightFetch = (async () => {
+      inFlightWarm = (async () => {
         try {
           await ensureTierThumbnails(want, "j");
           // Browser cache warm — low-priority so it can't compete with the
@@ -708,154 +859,198 @@ export function JustifiedGrid(props: JustifiedGridProps) {
           }
         } catch (e) {
           console.error("Landing-zone warm failed:", e);
+        } finally {
+          inFlightWarm = null;
         }
-        inFlightFetch = null;
+      })();
+    };
+
+    // Item-index range covered by a row range. Cell indices are contiguous
+    // across justified rows, so the render/full row windows map straight onto
+    // the index zones `pickByPriority` ranks against.
+    const idxAt = (row: number) => layout().rows[row]?.cells[0]?.index ?? props.paths.length;
+    const idxAfter = (rowExcl: number) => {
+      const last = layout().rows[rowExcl - 1];
+      return last ? last.cells[last.cells.length - 1].index + 1 : 0;
+    };
+
+    /** Generate thumbnails for on-screen cells that are showing nothing.
+     *  Returns true if a batch was issued. */
+    const drainQueued = (): boolean => {
+      if (needsGeneration.size === 0) return false;
+
+      // Drain-time prioritization (mirrors GalleryGrid): full-res window
+      // first, then the rendered buffer by distance; leftovers outside the
+      // rendered window are dropped and re-queue via 404 if scrolled back.
+      const { picked, stale } = pickByPriority(
+        needsGeneration.keys(),
+        (p) => pathToIndex.get(p),
+        {
+          viewStart: idxAt(fullStartRow()),
+          viewEnd: idxAfter(fullEndRow()),
+          renderStart: idxAt(startRow()),
+          renderEnd: idxAfter(endRow()),
+        },
+        BATCH_SIZE,
+      );
+      if (stale.length > 0) {
+        for (const p of stale) needsGeneration.delete(p);
+        thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - stale.length);
+        // Dropping may have emptied the queue — close out the progress UI.
+        if (needsGeneration.size === 0 && inFlightSet.size === 0) {
+          thumbGenFinished(thumbGenDone);
+          thumbGenTotal = 0;
+          thumbGenDone = 0;
+        }
+      }
+      if (picked.length === 0) return false;
+
+      // One tier per batch (the IPC takes a single tier), chosen from the
+      // most urgent queued cell so the viewport always leads. The rest of the
+      // queue keeps its own tiers and drains on a later pass.
+      const tier = needsGeneration.get(picked[0])!;
+      const cap = batchCapFor(tier);
+      const toGenerate: string[] = [];
+      for (const p of picked) {
+        if (needsGeneration.get(p) !== tier) continue;
+        toGenerate.push(p);
+        if (toGenerate.length >= cap) break;
+      }
+      if (toGenerate.length === 0) return false;
+
+      for (const p of toGenerate) {
+        needsGeneration.delete(p);
+        inFlightSet.add(p);
+      }
+      const gen = generation();
+      inFlightFetch = (async () => {
+        try {
+          forgetEvicted((await ensureTierThumbnails(toGenerate, tier)).evicted);
+          if (fetchAbort || generation() !== gen) return;
+          batch(() => {
+            for (const p of toGenerate) {
+              bumpVersion(p);
+              // Re-point each cell at the rung it is actually on. Promoting
+              // everything to "full" here (the old behavior) dragged the whole
+              // render buffer — not just the inner window — up to the 2560px
+              // tier, which is both a wall of decodes and the wrong image for
+              // a cell the ladder had deliberately put on the cheap rung.
+              const rung = assignedRung.get(p);
+              if (rung) setThumbMap(p, thumbSrcFor(p, rung === "cheap"));
+            }
+          });
+          thumbGenDone += toGenerate.length;
+          for (const p of toGenerate) inFlightSet.delete(p);
+          if (needsGeneration.size === 0 && inFlightSet.size === 0) {
+            thumbGenFinished(thumbGenDone);
+            thumbGenTotal = 0;
+            thumbGenDone = 0;
+          } else {
+            thumbGenProgress(thumbGenDone, thumbGenTotal);
+          }
+        } catch (e) {
+          console.error("Justified tier generation failed:", e);
+          for (const p of toGenerate) { inFlightSet.delete(p); failedSet.add(p); }
+        } finally {
+          // `finally`, not a trailing statement: the early return above (stale
+          // generation) used to skip the reset and wedge the slot for the rest
+          // of the session, so every zoom change risked killing the loop.
+          inFlightFetch = null;
+        }
+      })();
+      return true;
+    };
+
+    // Look-ahead precache in the scroll direction when zoomed in. Without it,
+    // every newly-revealed cell at mid/high detail is a cold generate-on-serve
+    // round-trip (the "loads too slowly" symptom). Warming a bounded window
+    // ahead of the viewport means cells are usually ready by the time they
+    // scroll in. Disk stays bounded because the backend LRU-evicts these tiers.
+    // Returns true if it issued work.
+    const warmLookAhead = (): boolean => {
+      if (detailLevel() === "base" || dynamics.velocity() >= 1500) return false;
+      const lay = layout();
+      // Warm ahead of the *full-res* boundary — that's where upgrades request
+      // the high tier, so the look-ahead must cover the rows about to cross it
+      // (the outer cheap-tier window only needs "j").
+      const from = dynamics.direction() === 1 ? fullEndRow() : Math.max(0, fullStartRow() - JH_PRECACHE_ROWS);
+      const to = dynamics.direction() === 1
+        ? Math.min(lay.rows.length, fullEndRow() + JH_PRECACHE_ROWS)
+        : fullStartRow();
+      const tier = thumbTier();
+      const cap = batchCapFor(tier);
+      const want: string[] = [];
+      for (let r = from; r < to; r++) {
+        const row = lay.rows[r];
+        if (!row) continue;
+        for (const cell of row.cells) {
+          const p = props.paths[cell.index];
+          if (!p || failedSet.has(p)) continue;
+          // Originals aren't tier-backed — only tier-served cells need warming.
+          if (servesOriginal(p)) continue;
+          if (jhPrecached.has(p) || want.length >= cap) continue;
+          jhPrecached.add(p);
+          want.push(p);
+        }
+      }
+      if (want.length === 0) return false;
+      inFlightWarm = (async () => {
+        try { forgetEvicted((await ensureTierThumbnails(want, tier)).evicted); }
+        catch (e) { console.error("Justified look-ahead failed:", e); }
+        finally { inFlightWarm = null; }
+      })();
+      return true;
+    };
+
+    // Background precache of upcoming items when idle. Only the base "j" tier
+    // is precached across the whole gallery — the high tiers are warmed via
+    // the look-ahead above (visible + a window ahead) so their disk cost stays
+    // bounded to what's actually viewed zoomed in.
+    //
+    // Deliberately base-detail only. A zoomed-in screen does reveal a couple
+    // of dozen cold cheap-rung cells per scroll, and walking the gallery ahead
+    // of time to warm them looks like the obvious fix — but a 512px "j" still
+    // costs a decode of the full-size original, so it is nearly as expensive
+    // as the full-res sources the visible cells need, on the same bounded
+    // pool. Measured over 4 cold runs of a continuous 3-viewport scroll at
+    // high zoom, enabling it here more than doubled time-to-sharp for the
+    // cells on screen (6.8s → 15.2s mean). Speculation is only free when
+    // there is spare capacity, and at high zoom there isn't any.
+    const warmBackground = () => {
+      if (detailLevel() !== "base" || dynamics.velocity() >= 500) return;
+      if (bgCursor >= props.paths.length) return;
+      const bgNeeded: string[] = [];
+      while (bgNeeded.length < SPECULATIVE_BATCH && bgCursor < props.paths.length) {
+        const p = props.paths[bgCursor];
+        bgCursor++;
+        if (p && !assignedRung.has(p) && !failedSet.has(p)) bgNeeded.push(p);
+      }
+      if (bgNeeded.length === 0) return;
+      inFlightWarm = (async () => {
+        try { await ensureTierThumbnails(bgNeeded, "j"); }
+        catch (e) { console.error("Justified background precache failed:", e); }
+        finally { inFlightWarm = null; }
       })();
     };
 
     const scheduleFetch = () => {
-      if (inFlightFetch) return;
-
       evictFaraway();
 
       // During a fling, near-viewport generation is wasted work — those cells
       // fly past unseen. Warm the projected landing zone instead; queued
       // 404-generation drains on settle (with stale entries dropped).
-      if (dynamics.velocity() > VELOCITY_FAST) {
-        warmLandingZone();
-        return;
-      }
+      const flinging = dynamics.velocity() > VELOCITY_FAST;
+      if (!flinging && !inFlightFetch && drainQueued()) return;
 
-      const gen = generation();
-
-      if (needsGeneration.size > 0) {
-        // Drain-time prioritization (mirrors GalleryGrid): full-res window
-        // first, then the rendered buffer by distance; leftovers outside the
-        // rendered window are dropped and re-queue via 404 if scrolled back.
-        // Row ranges map to item-index ranges through the layout (cell
-        // indices are contiguous across justified rows).
-        const lay = layout();
-        const idxAt = (row: number) => lay.rows[row]?.cells[0]?.index ?? props.paths.length;
-        const idxAfter = (rowExcl: number) => {
-          const last = lay.rows[rowExcl - 1];
-          return last ? last.cells[last.cells.length - 1].index + 1 : 0;
-        };
-        const { picked: toGenerate, stale } = pickByPriority(
-          needsGeneration,
-          (p) => pathToIndex.get(p),
-          {
-            viewStart: idxAt(fullStartRow()),
-            viewEnd: idxAfter(fullEndRow()),
-            renderStart: idxAt(startRow()),
-            renderEnd: idxAfter(endRow()),
-          },
-          BATCH_SIZE,
-        );
-        if (stale.length > 0) {
-          for (const p of stale) needsGeneration.delete(p);
-          thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - stale.length);
-          // Dropping may have emptied the queue — close out the progress UI.
-          if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-            thumbGenFinished(thumbGenDone);
-            thumbGenTotal = 0;
-            thumbGenDone = 0;
-          }
-        }
-        if (toGenerate.length > 0) {
-          for (const p of toGenerate) {
-            needsGeneration.delete(p);
-            inFlightSet.add(p);
-          }
-          inFlightFetch = (async () => {
-            try {
-              forgetEvicted((await ensureTierThumbnails(toGenerate, thumbTier())).evicted);
-              if (fetchAbort || generation() !== gen) return;
-              batch(() => {
-                for (const p of toGenerate) {
-                  bumpVersion(p);
-                  if (assignedRung.has(p)) {
-                    assignedRung.set(p, "full");
-                    setThumbMap(p, thumbSrcFor(p));
-                  }
-                }
-              });
-              thumbGenDone += toGenerate.length;
-              for (const p of toGenerate) inFlightSet.delete(p);
-              if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-                thumbGenFinished(thumbGenDone);
-                thumbGenTotal = 0;
-                thumbGenDone = 0;
-              } else {
-                thumbGenProgress(thumbGenDone, thumbGenTotal);
-              }
-            } catch (e) {
-              console.error("Justified tier generation failed:", e);
-              for (const p of toGenerate) { inFlightSet.delete(p); failedSet.add(p); }
-            }
-            inFlightFetch = null;
-          })();
-          return;
-        }
-      }
-
-      // Look-ahead precache of the high (jh) tier in the scroll direction when
-      // zoomed in. Without it, every newly-revealed cell at mid/high detail is a
-      // cold 404 → generate → re-request round-trip (the "loads too slowly"
-      // symptom). Warming a bounded window ahead of the viewport means cells are
-      // usually ready by the time they scroll in. Disk stays bounded because the
-      // backend FIFO-evicts the jh tier. Skipped while flinging.
-      if (detailLevel() !== "base" && dynamics.velocity() < 1500) {
-        const lay = layout();
-        // Warm ahead of the *full-res* boundary — that's where upgrades
-        // request the jh tier, so the look-ahead must cover the rows about to
-        // cross it (the outer cheap-tier window only needs "j").
-        const from = dynamics.direction() === 1 ? fullEndRow() : Math.max(0, fullStartRow() - JH_PRECACHE_ROWS);
-        const to = dynamics.direction() === 1
-          ? Math.min(lay.rows.length, fullEndRow() + JH_PRECACHE_ROWS)
-          : fullStartRow();
-        const want: string[] = [];
-        for (let r = from; r < to && want.length < BATCH_SIZE; r++) {
-          const row = lay.rows[r];
-          if (!row) continue;
-          for (const cell of row.cells) {
-            const p = props.paths[cell.index];
-            if (!p || jhPrecached.has(p) || failedSet.has(p)) continue;
-            // Originals aren't tier-backed — only jh-served cells need warming.
-            if (servesOriginal(p)) continue;
-            jhPrecached.add(p);
-            want.push(p);
-          }
-        }
-        if (want.length > 0) {
-          const tier = thumbTier();
-          inFlightFetch = (async () => {
-            try { forgetEvicted((await ensureTierThumbnails(want, tier)).evicted); }
-            catch (e) { console.error("Justified jh look-ahead failed:", e); }
-            inFlightFetch = null;
-          })();
-          return;
-        }
-      }
-
-      // Background precache of upcoming items when idle. Only the base "j"
-      // tier is precached across the whole gallery — the high "jh" tier is
-      // warmed via the look-ahead above (visible + a window ahead) so its disk
-      // cost stays bounded to what's actually viewed zoomed in.
-      if (detailLevel() === "base" && dynamics.velocity() < 500 && bgCursor < props.paths.length) {
-        const bgNeeded: string[] = [];
-        while (bgNeeded.length < BATCH_SIZE && bgCursor < props.paths.length) {
-          const p = props.paths[bgCursor];
-          bgCursor++;
-          if (p && !assignedRung.has(p) && !failedSet.has(p)) bgNeeded.push(p);
-        }
-        if (bgNeeded.length > 0) {
-          inFlightFetch = (async () => {
-            try { await ensureTierThumbnails(bgNeeded, "j"); }
-            catch (e) { console.error("Justified background precache failed:", e); }
-            inFlightFetch = null;
-          })();
-        }
-      }
+      // Speculation only runs when nothing the user is waiting on is
+      // outstanding — neither a generation batch nor an on-screen cell still
+      // fetching its full-resolution source. It all lands on one bounded
+      // decode pool, so anything started here comes straight out of the
+      // visible cells' budget.
+      if (inFlightFetch || inFlightWarm || blockingCount() > 0) return;
+      if (flinging) { warmLandingZone(); return; }
+      if (warmLookAhead()) return;
+      warmBackground();
     };
 
     const onScrollEnd = () => {
@@ -864,7 +1059,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     };
     window.addEventListener("scrollend", onScrollEnd);
 
-    const bgIntervalId = setInterval(() => { if (!inFlightFetch) scheduleFetch(); }, 500);
+    const bgIntervalId = setInterval(scheduleFetch, 500);
 
     createEffect(on(generation, () => { scheduleFetch(); }));
 
@@ -880,6 +1075,22 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
     const onInvalidate = () => resetStreaming();
     window.addEventListener("lightview:thumbnails-invalidated", onInvalidate);
+
+    // The viewer announces which item it's showing (VIEWER_PATH_EVENT, null on
+    // close). Hold that cell at the full rung: it's the one the user is looking
+    // at closely, and it's what the close transition flies back down onto — a
+    // cell the ladder had parked on the 512px cheap rung is exactly the
+    // "closing drops back to a blurry thumbnail" pop. Clearing the pin on close
+    // doesn't downgrade anything; the ladder only ever upgrades cheap → full.
+    const onViewerPath = (e: Event) => {
+      const viewed = (e as CustomEvent<string | null>).detail;
+      setPinnedPath(viewed ?? null);
+      if (!viewed || assignedRung.get(viewed) !== "cheap") return;
+      assignedRung.set(viewed, "full");
+      assignSrc(viewed, thumbSrcFor(viewed));
+      scheduleFetch();
+    };
+    window.addEventListener(VIEWER_PATH_EVENT, onViewerPath);
 
     // Keep the viewed image visible (arrow-key nav from the viewer).
     const onScrollToIndex = (e: Event) => {
@@ -905,6 +1116,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
+      window.removeEventListener(VIEWER_PATH_EVENT, onViewerPath);
       if (wheelRafId) cancelAnimationFrame(wheelRafId);
       clearInterval(bgIntervalId);
       fetchAbort = true;
@@ -932,6 +1144,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         assignedRung.delete(p);
         swapper.cancel(p);
         urlVersions.delete(p);
+        clearAwaiting(p);
       }
     }
     const pruneAbsent = (s: Set<string>) => {
@@ -941,8 +1154,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     pruneAbsent(failedSet);
     pruneAbsent(jhPrecached);
     pruneAbsent(landingWarmed);
+    const pinned = untrack(pinnedPath);
+    if (pinned && !pathToIndex.has(pinned)) setPinnedPath(null);
     let droppedQueued = 0;
-    for (const p of needsGeneration) {
+    for (const p of needsGeneration.keys()) {
       if (!pathToIndex.has(p)) {
         needsGeneration.delete(p);
         droppedQueued++;
@@ -1021,7 +1236,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                       onMouseEnter={() => handleDragEnter(index())}
                       onContextMenu={(e) => props.onItemContextMenu?.(e, path, index())}
                       onError={handleThumbError}
-                      onImageLoad={(w, h) => recordMeasuredAspect(path, w, h)}
+                      onImageLoad={(w, h) => {
+                        recordMeasuredAspect(path, w, h);
+                        // A full-rung cell has painted — release its hold on
+                        // the look-ahead.
+                        if (assignedRung.get(path) === "full") clearAwaiting(path);
+                      }}
                     />
                   </div>
                 </Show>
