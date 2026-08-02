@@ -38,18 +38,17 @@ fn extract_route(uri: &str) -> (Route, &str) {
                 return (Route::ThumbHash, p);
             }
             if let Some(p) = rest.strip_prefix("thumb/") {
-                // Check for a tier prefix segment ("s/", "m/", "l/", "p/").
-                for (seg, tier) in &[
-                    ("s/", ThumbTier::Micro),
-                    ("m/", ThumbTier::Standard),
-                    ("l/", ThumbTier::Large),
-                    ("p/", ThumbTier::Preview),
-                    ("jh/", ThumbTier::JustifiedHigh),
-                    ("jm/", ThumbTier::JustifiedMid),
-                    ("j/", ThumbTier::Justified),
-                ] {
-                    if let Some(rest) = p.strip_prefix(*seg) {
-                        return (Route::Thumb(*tier), rest);
+                // The tier is the first path segment ("s/", "m/", "jh/", ...).
+                // The remainder is the percent-encoded absolute path, so it
+                // contains no literal `/` to confuse the split.
+                if let Some((seg, rest)) = p.split_once('/') {
+                    // An empty segment means an unencoded absolute path
+                    // (`thumb//home/...`), not the legacy standard alias — it
+                    // must keep its leading `/`, so fall through.
+                    if !seg.is_empty() {
+                        if let Some(tier) = ThumbTier::from_segment(seg) {
+                            return (Route::Thumb(tier), rest);
+                        }
                     }
                 }
                 // Legacy form: no tier segment → standard.
@@ -60,34 +59,27 @@ fn extract_route(uri: &str) -> (Route, &str) {
     (Route::Unknown, "")
 }
 
-fn thumb_ok_response(data: Vec<u8>, format: &str) -> tauri::http::Response<Vec<u8>> {
-    let mime = match format {
-        "webp" => "image/webp",
-        "png" => "image/png",
-        _ => "image/jpeg",
-    };
+/// An image body with the given MIME and cache policy.
+///
+/// Cacheable bodies rely on the frontend's `?v=` cache-buster: it bumps on
+/// every (re)generation and an epoch on full rebuilds, so within a session a
+/// URL's bytes never change. The max-age bounds cross-session staleness for
+/// plain (un-versioned) URLs.
+fn image_response(
+    data: Vec<u8>,
+    mime: &str,
+    cache_control: &str,
+) -> tauri::http::Response<Vec<u8>> {
     tauri::http::Response::builder()
         .status(200)
         .header("Content-Type", mime)
-        // Cacheable: the frontend bumps a ?v= cache-buster whenever a
-        // thumbnail is (re)generated and bumps an epoch on full rebuilds,
-        // so within a session a URL's bytes never change. max-age bounds
-        // cross-session staleness for plain (un-versioned) URLs.
-        .header("Cache-Control", "public, max-age=3600")
+        .header("Cache-Control", cache_control)
         .header("Access-Control-Allow-Origin", "*")
         .body(data)
         .unwrap()
 }
 
-fn thumb_miss_response() -> tauri::http::Response<Vec<u8>> {
-    tauri::http::Response::builder()
-        .status(404)
-        .header("Cache-Control", "no-store")
-        .header("Access-Control-Allow-Origin", "*")
-        .body(Vec::new())
-        .unwrap()
-}
-
+/// An empty, never-cached error response.
 fn thumb_status_response(status: u16) -> tauri::http::Response<Vec<u8>> {
     tauri::http::Response::builder()
         .status(status)
@@ -105,9 +97,11 @@ async fn serve_thumbnail_generate(
     path: String,
 ) -> tauri::http::Response<Vec<u8>> {
     match thumb_serve::get_or_generate(state, tier, path).await {
-        ThumbOutcome::Hit { data, format } => thumb_ok_response(data, &format),
+        ThumbOutcome::Hit { data, format } => {
+            image_response(data, thumb_serve::thumb_mime(&format), "public, max-age=3600")
+        }
         ThumbOutcome::NoGallery => thumb_status_response(503),
-        ThumbOutcome::Miss => thumb_miss_response(),
+        ThumbOutcome::Miss => thumb_status_response(404),
     }
 }
 
@@ -115,14 +109,10 @@ async fn serve_thumbnail_generate(
 /// webview because the underlying blob is immutable for a given path.
 fn serve_thumbhash(state: &AppState, path: &str) -> tauri::http::Response<Vec<u8>> {
     match thumb_serve::render_thumbhash_png(state, path) {
-        ThumbhashOutcome::Png(png) => tauri::http::Response::builder()
-            .status(200)
-            .header("Content-Type", "image/png")
-            // ThumbHashes are immutable for a given file mtime — long cache OK.
-            .header("Cache-Control", "public, max-age=31536000, immutable")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(png)
-            .unwrap(),
+        // ThumbHashes are immutable for a given file mtime — long cache OK.
+        ThumbhashOutcome::Png(png) => {
+            image_response(png, "image/png", "public, max-age=31536000, immutable")
+        }
         ThumbhashOutcome::NoGallery => thumb_status_response(503),
         ThumbhashOutcome::Miss => thumb_status_response(404),
         ThumbhashOutcome::Error => thumb_status_response(500),
@@ -157,10 +147,6 @@ fn main() {
 
     env_logger::init();
 
-    // TEMP perf instrumentation: record the main (GTK) thread so the thumbnail
-    // handler logs can show whether it runs on it. Remove once measured.
-    log::info!("[perf] main/GTK thread id = {:?}", std::thread::current().id());
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -192,16 +178,6 @@ fn main() {
                     return;
                 }
 
-                // TEMP perf instrumentation: which thread does WebKitGTK invoke
-                // this handler on? If it matches the main/GTK thread logged at
-                // startup, the inline-read fix was relevant; if not, the handler
-                // was already off-thread. Remove once measured.
-                log::debug!(
-                    "[perf] scheme handler entry thread={:?} uri={}",
-                    std::thread::current().id(),
-                    uri
-                );
-
                 match route {
                     Route::Thumb(tier) => {
                         // Always answer off the GTK main thread. The DB read
@@ -212,20 +188,9 @@ fn main() {
                             (*ctx.app_handle().state::<AppState>()).clone();
                         // The desktop user is browsing — hold the idle worker off.
                         state_owned.touch_thumb_activity();
-                        // TEMP perf instrumentation.
-                        let log_path = path.clone();
                         tauri::async_runtime::spawn(async move {
-                            let t0 = std::time::Instant::now();
-                            let resp =
-                                serve_thumbnail_generate(&state_owned, tier, path).await;
-                            log::debug!(
-                                "[perf] thumb served thread={:?} elapsed={:?} status={} path={}",
-                                std::thread::current().id(),
-                                t0.elapsed(),
-                                resp.status(),
-                                log_path
-                            );
-                            responder.respond(resp);
+                            responder
+                                .respond(serve_thumbnail_generate(&state_owned, tier, path).await);
                         });
                     }
                     Route::ThumbHash => {

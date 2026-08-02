@@ -148,33 +148,16 @@ pub async fn move_files(
 
     // Update the cache DB for the moved files.
     if !succeeded.is_empty() {
-        // All thumbnail LOD tiers are keyed by path.
-        const THUMB_TABLES: [&str; 7] = [
-            "thumbnails",
-            "thumbnails_micro",
-            "thumbnails_large",
-            "thumbnails_preview",
-            "thumbnails_justified",
-            "thumbnails_justified_mid",
-            "thumbnails_justified_high",
-        ];
-
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
             let conn = db.conn();
             for (old_path, new_path) in &succeeded {
                 if dest_in_gallery {
-                    let _ = conn.execute(
-                        "UPDATE media_meta SET path = ?1 WHERE path = ?2",
-                        rusqlite::params![new_path, old_path],
-                    );
-                    let _ = conn.execute(
-                        "UPDATE tag_index SET path = ?1 WHERE path = ?2",
-                        rusqlite::params![new_path, old_path],
-                    );
-                    for table in THUMB_TABLES {
+                    // Every path-keyed table follows the file, thumbnail tiers
+                    // included — see `path_keyed_tables`.
+                    for table in crate::cache::db::path_keyed_tables() {
                         let _ = conn.execute(
-                            &format!("UPDATE {table} SET path = ?1 WHERE path = ?2"),
+                            &format!("UPDATE OR REPLACE {table} SET path = ?1 WHERE path = ?2"),
                             rusqlite::params![new_path, old_path],
                         );
                     }

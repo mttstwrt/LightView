@@ -88,24 +88,18 @@ pub async fn add_user_tag_impl(
     path: String,
     tag: String,
 ) -> Result<(), String> {
-    let tag_clone = tag.clone();
-    let companion = modify_companion(&path, |c| {
-        if !c.tags.user.contains(&tag_clone) {
-            c.tags.user.push(tag_clone);
-        }
-    })?;
+    single(add_user_tag_batch_impl(state, vec![path], tag).await)
+}
 
-    let db = state.cache_db.lock().await;
-    if let Some(db) = db.as_ref() {
-        let _ = db.reindex_tags_for_file(&path, &companion);
-        let _ = db.increment_tag_count("user", &tag);
-
-        if let Ok(counts) = db.query_all_tag_counts() {
-            state.autocomplete.refresh(counts).await;
-        }
+/// Adapt a batch impl to a single-file command. The batch impls log and skip a
+/// file they can't write so one bad sidecar doesn't abort the rest; for a
+/// one-file call that "skip" *is* the failure, and the caller (a UI action on a
+/// specific image) needs to hear about it.
+fn single(result: Result<u64, String>) -> Result<(), String> {
+    match result? {
+        0 => Err("Failed to update the file's metadata".to_string()),
+        _ => Ok(()),
     }
-
-    Ok(())
 }
 
 /// Remove a user tag from a media file.
@@ -123,22 +117,7 @@ pub async fn remove_user_tag_impl(
     path: String,
     tag: String,
 ) -> Result<(), String> {
-    let tag_clone = tag.clone();
-    let companion = modify_companion(&path, |c| {
-        c.tags.user.retain(|t| t != &tag_clone);
-    })?;
-
-    let db = state.cache_db.lock().await;
-    if let Some(db) = db.as_ref() {
-        let _ = db.reindex_tags_for_file(&path, &companion);
-        let _ = db.decrement_tag_count("user", &tag);
-
-        if let Ok(counts) = db.query_all_tag_counts() {
-            state.autocomplete.refresh(counts).await;
-        }
-    }
-
-    Ok(())
+    single(remove_user_tag_batch_impl(state, vec![path], tag).await)
 }
 
 /// Add a user tag to multiple media files at once.
@@ -156,25 +135,54 @@ pub async fn add_user_tag_batch_impl(
     paths: Vec<String>,
     tag: String,
 ) -> Result<u64, String> {
+    edit_user_tag_batch(state, paths, tag, TagEdit::Add).await
+}
+
+/// Which way [`edit_user_tag_batch`] moves a tag.
+#[derive(Clone, Copy)]
+enum TagEdit {
+    Add,
+    Remove,
+}
+
+/// Add or remove one user tag across a set of files, reindexing each companion
+/// and nudging its tag count, then refreshing autocomplete once at the end.
+///
+/// The cache lock is taken per file rather than held across the loop: the
+/// companion rewrite in between is synchronous disk I/O, and holding the single
+/// SQLite connection through it would stall every other command for the whole
+/// batch. Per-file failures are logged and skipped so one unwritable sidecar
+/// doesn't abort the rest.
+async fn edit_user_tag_batch(
+    state: &AppState,
+    paths: Vec<String>,
+    tag: String,
+    edit: TagEdit,
+) -> Result<u64, String> {
     let mut count = 0u64;
     for path in &paths {
         let tag_clone = tag.clone();
-        match modify_companion(path, |c| {
-            if !c.tags.user.contains(&tag_clone) {
-                c.tags.user.push(tag_clone);
+        let mutate = |c: &mut CompanionFile| match edit {
+            TagEdit::Add => {
+                if !c.tags.user.contains(&tag_clone) {
+                    c.tags.user.push(tag_clone);
+                }
             }
-        }) {
+            TagEdit::Remove => c.tags.user.retain(|t| t != &tag_clone),
+        };
+        match modify_companion(path, mutate) {
             Ok(companion) => {
                 let db = state.cache_db.lock().await;
                 if let Some(db) = db.as_ref() {
                     let _ = db.reindex_tags_for_file(path, &companion);
-                    let _ = db.increment_tag_count("user", &tag);
+                    let _ = match edit {
+                        TagEdit::Add => db.increment_tag_count("user", &tag),
+                        TagEdit::Remove => db.decrement_tag_count("user", &tag),
+                    };
                 }
                 count += 1;
             }
-            Err(e) => {
-                log::warn!("Failed to tag {}: {}", path, e);
-            }
+            Err(e) => log::warn!("Failed to edit tags on {}: {}", path, e),
         }
     }
 
@@ -203,34 +211,7 @@ pub async fn remove_user_tag_batch_impl(
     paths: Vec<String>,
     tag: String,
 ) -> Result<u64, String> {
-    let mut count = 0u64;
-    for path in &paths {
-        let tag_clone = tag.clone();
-        match modify_companion(path, |c| {
-            c.tags.user.retain(|t| t != &tag_clone);
-        }) {
-            Ok(companion) => {
-                let db = state.cache_db.lock().await;
-                if let Some(db) = db.as_ref() {
-                    let _ = db.reindex_tags_for_file(path, &companion);
-                    let _ = db.decrement_tag_count("user", &tag);
-                }
-                count += 1;
-            }
-            Err(e) => {
-                log::warn!("Failed to remove tag from {}: {}", path, e);
-            }
-        }
-    }
-
-    let db = state.cache_db.lock().await;
-    if let Some(db) = db.as_ref() {
-        if let Ok(counts) = db.query_all_tag_counts() {
-            state.autocomplete.refresh(counts).await;
-        }
-    }
-
-    Ok(count)
+    edit_user_tag_batch(state, paths, tag, TagEdit::Remove).await
 }
 
 // ---------------------------------------------------------------------------
@@ -557,23 +538,7 @@ pub async fn set_rating_impl(
     path: String,
     rating: u8,
 ) -> Result<(), String> {
-    let db_rating = if rating == 0 { None } else { Some(rating) };
-    modify_companion(&path, |c| {
-        let core = c.meta.core.get_or_insert_with(CoreMeta::default);
-        core.rating = db_rating;
-        core.date_rated = if db_rating.is_some() {
-            Some(chrono::Utc::now().to_rfc3339())
-        } else {
-            None
-        };
-    })?;
-
-    let db = state.cache_db.lock().await;
-    if let Some(db) = db.as_ref() {
-        let _ = db.update_rating(&path, db_rating);
-    }
-
-    Ok(())
+    single(set_rating_batch_impl(state, vec![path], rating).await)
 }
 
 /// Set the color label for a media file.

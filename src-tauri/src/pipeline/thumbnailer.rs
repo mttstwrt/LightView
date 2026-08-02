@@ -198,19 +198,9 @@ fn generate_jpeg_thumbnail_inner(path: &Path, filter: ResizeFilter, format: Thum
     };
 
     // Center-crop to square, then resize to target dimensions.
-    let (cx, cy, side) = center_crop_square(dw, dh);
-
-    let final_data = match format {
-        ThumbFormat::Jpeg => {
-            resize_rgb_crop(dw, dh, &rgb_buf, cx, cy, side, side, thumb_w, thumb_h, filter)?
-        }
-        ThumbFormat::Webp => {
-            let rgba_src = rgb_to_rgba(&rgb_buf);
-            resize_rgba_crop(dw, dh, &rgba_src, cx, cy, side, side, thumb_w, thumb_h, filter)?
-        }
-    };
-
-    let data = encode_output(&final_data, thumb_w, thumb_h, format)?;
+    let data = crop_resize_encode(
+        dw, dh, SrcPixels::Rgb(&rgb_buf), thumb_w, thumb_h, format, filter,
+    )?;
 
     Ok(ThumbResult {
         path: path.to_string_lossy().to_string(),
@@ -233,20 +223,19 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
     if w == 0 || h == 0 {
         return Err(ThumbError::Decode(format!("Zero dimensions: {}x{}", w, h)));
     }
-    let (cx, cy, side) = center_crop_square(w, h);
 
-    let final_data = match format {
+    // The `image` crate can hand back either layout, so ask it for the one the
+    // output format wants rather than converting a second time downstream.
+    let data = match format {
         ThumbFormat::Jpeg => {
             let rgb = img.to_rgb8();
-            resize_rgb_crop(w, h, rgb.as_raw(), cx, cy, side, side, thumb_w, thumb_h, filter)?
+            crop_resize_encode(w, h, SrcPixels::Rgb(rgb.as_raw()), thumb_w, thumb_h, format, filter)?
         }
         ThumbFormat::Webp => {
             let rgba = img.to_rgba8();
-            resize_rgba_crop(w, h, rgba.as_raw(), cx, cy, side, side, thumb_w, thumb_h, filter)?
+            crop_resize_encode(w, h, SrcPixels::Rgba(rgba.as_raw()), thumb_w, thumb_h, format, filter)?
         }
     };
-
-    let data = encode_output(&final_data, thumb_w, thumb_h, format)?;
 
     Ok(ThumbResult {
         path: path.to_string_lossy().to_string(),
@@ -267,22 +256,11 @@ fn generate_generic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFo
 /// handle if no embedded thumbnail is large enough.
 fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
     let target_edge = thumb_w.max(thumb_h);
-    let (rgba_buf, _dw, _dh, src_w, src_h) = decode_heic_with_target(path, target_edge)?;
-    let dw = _dw;
-    let dh = _dh;
-    let (cx, cy, side) = center_crop_square(dw, dh);
+    let (rgba_buf, dw, dh, src_w, src_h) = decode_heic_to_rgba(path, target_edge)?;
 
-    let final_data = match format {
-        ThumbFormat::Jpeg => {
-            let rgb = rgba_to_rgb(&rgba_buf);
-            resize_rgb_crop(dw, dh, &rgb, cx, cy, side, side, thumb_w, thumb_h, filter)?
-        }
-        ThumbFormat::Webp => {
-            resize_rgba_crop(dw, dh, &rgba_buf, cx, cy, side, side, thumb_w, thumb_h, filter)?
-        }
-    };
-
-    let data = encode_output(&final_data, thumb_w, thumb_h, format)?;
+    let data = crop_resize_encode(
+        dw, dh, SrcPixels::Rgba(&rgba_buf), thumb_w, thumb_h, format, filter,
+    )?;
 
     Ok(ThumbResult {
         path: path.to_string_lossy().to_string(),
@@ -296,62 +274,79 @@ fn generate_heic_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForma
     })
 }
 
-/// Resize RGBA (U8x4) pixels to target dimensions.
+/// A center-crop rectangle: offset plus a square side length.
+#[derive(Clone, Copy)]
+struct Crop {
+    x: u32,
+    y: u32,
+    side: u32,
+}
+
+/// Resize `src` to `(tw, th)`, optionally cropping to `crop` first.
+///
+/// The crop is applied *inside* fast_image_resize, so the cropped intermediate
+/// buffer (a full-region alloc plus a row-by-row memcpy) is never materialized
+/// — this is the hot path on every generated thumbnail. `pixel` selects the
+/// layout: `U8x3` for RGB (the JPEG path), `U8x4` for RGBA (WebP).
+fn resize_pixels(
+    sw: u32, sh: u32, src: &[u8],
+    tw: u32, th: u32,
+    pixel: fir::PixelType,
+    crop: Option<Crop>,
+    filter: ResizeFilter,
+) -> Result<Vec<u8>, ThumbError> {
+    let src_image = ImageRef::new(sw, sh, src, pixel)
+        .map_err(|e| ThumbError::Decode(format!("Source image error: {e}")))?;
+    let mut dst_image = Image::new(tw, th, pixel);
+    let mut options = fir::ResizeOptions::new().resize_alg(filter.to_fir_alg());
+    if let Some(c) = crop {
+        options = options.crop(c.x as f64, c.y as f64, c.side as f64, c.side as f64);
+    }
+    let mut resizer = fir::Resizer::new();
+    resizer
+        .resize(&src_image, &mut dst_image, &options)
+        .map_err(|e| ThumbError::Encode(format!("Resize failed: {e}")))?;
+    Ok(dst_image.into_vec())
+}
+
+/// Resize RGBA (U8x4) pixels to target dimensions, no crop.
 fn resize_rgba(sw: u32, sh: u32, src: &[u8], tw: u32, th: u32, filter: ResizeFilter) -> Result<Vec<u8>, ThumbError> {
     if sw == tw && sh == th {
         return Ok(src.to_vec());
     }
-    let src_image = ImageRef::new(sw, sh, src, fir::PixelType::U8x4)
-        .map_err(|e| ThumbError::Decode(format!("Source image error: {e}")))?;
-    let mut dst_image = Image::new(tw, th, fir::PixelType::U8x4);
-    let options = fir::ResizeOptions::new().resize_alg(filter.to_fir_alg());
-    let mut resizer = fir::Resizer::new();
-    resizer
-        .resize(&src_image, &mut dst_image, &options)
-        .map_err(|e| ThumbError::Encode(format!("Resize failed: {e}")))?;
-    Ok(dst_image.into_vec())
+    resize_pixels(sw, sh, src, tw, th, fir::PixelType::U8x4, None, filter)
 }
 
-/// Resize the `(cx, cy, cw, ch)` sub-region of an RGB (U8x3) buffer to target
-/// dimensions, cropping *inside* fast_image_resize. This fuses crop+resize so
-/// the square-crop intermediate buffer (a full-region alloc + row-by-row
-/// memcpy) is never materialized — the hot path on every generated thumbnail.
-fn resize_rgb_crop(
-    sw: u32, sh: u32, src: &[u8],
-    cx: u32, cy: u32, cw: u32, ch: u32,
-    tw: u32, th: u32, filter: ResizeFilter,
-) -> Result<Vec<u8>, ThumbError> {
-    let src_image = ImageRef::new(sw, sh, src, fir::PixelType::U8x3)
-        .map_err(|e| ThumbError::Decode(format!("Source image error: {e}")))?;
-    let mut dst_image = Image::new(tw, th, fir::PixelType::U8x3);
-    let options = fir::ResizeOptions::new()
-        .resize_alg(filter.to_fir_alg())
-        .crop(cx as f64, cy as f64, cw as f64, ch as f64);
-    let mut resizer = fir::Resizer::new();
-    resizer
-        .resize(&src_image, &mut dst_image, &options)
-        .map_err(|e| ThumbError::Encode(format!("Resize failed: {e}")))?;
-    Ok(dst_image.into_vec())
+/// Decoded source pixels, tagged with the channel layout the decoder produced.
+enum SrcPixels<'a> {
+    Rgb(&'a [u8]),
+    Rgba(&'a [u8]),
 }
 
-/// Resize the `(cx, cy, cw, ch)` sub-region of an RGBA (U8x4) buffer to target
-/// dimensions, cropping inside fast_image_resize (see [`resize_rgb_crop`]).
-fn resize_rgba_crop(
-    sw: u32, sh: u32, src: &[u8],
-    cx: u32, cy: u32, cw: u32, ch: u32,
-    tw: u32, th: u32, filter: ResizeFilter,
+/// Center-crop `(sw, sh)` to a square, resize it to `(tw, th)`, and encode it
+/// in `format`.
+///
+/// This is the tail every generator shares. JPEG output wants RGB and WebP
+/// wants RGBA, while each decoder produces whichever layout is natural for its
+/// codec — so the one conversion that's actually needed happens here, and the
+/// matching case costs nothing.
+fn crop_resize_encode(
+    sw: u32, sh: u32,
+    src: SrcPixels<'_>,
+    tw: u32, th: u32,
+    format: ThumbFormat,
+    filter: ResizeFilter,
 ) -> Result<Vec<u8>, ThumbError> {
-    let src_image = ImageRef::new(sw, sh, src, fir::PixelType::U8x4)
-        .map_err(|e| ThumbError::Decode(format!("Source image error: {e}")))?;
-    let mut dst_image = Image::new(tw, th, fir::PixelType::U8x4);
-    let options = fir::ResizeOptions::new()
-        .resize_alg(filter.to_fir_alg())
-        .crop(cx as f64, cy as f64, cw as f64, ch as f64);
-    let mut resizer = fir::Resizer::new();
-    resizer
-        .resize(&src_image, &mut dst_image, &options)
-        .map_err(|e| ThumbError::Encode(format!("Resize failed: {e}")))?;
-    Ok(dst_image.into_vec())
+    use fir::PixelType::{U8x3, U8x4};
+    let crop = Some(center_crop_square(sw, sh));
+    let resize = |pixels: &[u8], pixel| resize_pixels(sw, sh, pixels, tw, th, pixel, crop, filter);
+    let resized = match (format, src) {
+        (ThumbFormat::Jpeg, SrcPixels::Rgb(p)) => resize(p, U8x3)?,
+        (ThumbFormat::Jpeg, SrcPixels::Rgba(p)) => resize(&rgba_to_rgb(p), U8x3)?,
+        (ThumbFormat::Webp, SrcPixels::Rgb(p)) => resize(&rgb_to_rgba(p), U8x4)?,
+        (ThumbFormat::Webp, SrcPixels::Rgba(p)) => resize(p, U8x4)?,
+    };
+    encode_output(&resized, tw, th, format)
 }
 
 /// Convert RGB pixel buffer to RGBA (alpha = 255). Writes into a pre-sized
@@ -401,14 +396,7 @@ fn l8_to_rgba(luma: &[u8]) -> Vec<u8> {
 /// for passing the correct layout via `format`.
 fn encode_output(pixels: &[u8], w: u32, h: u32, format: ThumbFormat) -> Result<Vec<u8>, ThumbError> {
     match format {
-        ThumbFormat::Jpeg => {
-            let mut jpeg_buf = std::io::Cursor::new(Vec::with_capacity(32_000));
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 80);
-            encoder
-                .encode(pixels, w, h, image::ExtendedColorType::Rgb8)
-                .map_err(|e| ThumbError::Encode(e.to_string()))?;
-            Ok(jpeg_buf.into_inner())
-        }
+        ThumbFormat::Jpeg => encode_rgb_to_jpeg(pixels, w, h),
         ThumbFormat::Webp => encode_rgba_to_webp(pixels, w, h),
     }
 }
@@ -594,12 +582,13 @@ fn media_type_for_path(path: &Path) -> Option<MediaType> {
 }
 
 /// Compute a center crop region to extract the largest square from an image.
-/// Returns (x_offset, y_offset, side_length).
-fn center_crop_square(w: u32, h: u32) -> (u32, u32, u32) {
+fn center_crop_square(w: u32, h: u32) -> Crop {
     let side = w.min(h);
-    let x = (w - side) / 2;
-    let y = (h - side) / 2;
-    (x, y, side)
+    Crop {
+        x: (w - side) / 2,
+        y: (h - side) / 2,
+        side,
+    }
 }
 
 /// Result of decoding an image without cropping — full RGBA + dimensions + crop rect.
@@ -655,7 +644,7 @@ pub fn decode_image(path: &Path, target_edge: u32) -> Result<DecodedImage, Thumb
         }
     };
 
-    let (cx, cy, side) = center_crop_square(dw, dh);
+    let crop = center_crop_square(dw, dh);
 
     Ok(DecodedImage {
         rgba: rgba_buf,
@@ -663,9 +652,9 @@ pub fn decode_image(path: &Path, target_edge: u32) -> Result<DecodedImage, Thumb
         height: dh,
         src_width: src_w,
         src_height: src_h,
-        crop_x: cx,
-        crop_y: cy,
-        crop_size: side,
+        crop_x: crop.x,
+        crop_y: crop.y,
+        crop_size: crop.side,
         media_type: media_type.to_string(),
         path: path.to_string_lossy().to_string(),
     })
@@ -751,22 +740,15 @@ pub struct HeicDecode {
     pub src_height: u32,
 }
 
-/// Decode a HEIC/HEIF image to RGBA pixels using libheif, preferring an embedded
-/// thumbnail large enough for a `target_edge`-pixel output (much faster than the
-/// full primary decode for camera HEICs), falling back to the primary image.
-pub fn decode_heic_to_rgba(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
-    let dec = decode_heic_internal(path, Some(target_edge))?;
-    Ok(into_rgba_tuple(dec))
-}
-
 /// Decode a HEIC/HEIF image to RGBA pixels, preferring an embedded thumbnail
-/// that is large enough to satisfy a `target_edge`-pixel output. Falls back
-/// to the primary image when no suitable embedded thumbnail exists.
+/// that is large enough to satisfy a `target_edge`-pixel output — iPhone HEICs
+/// ship a ~320px thumb that decodes ~100x faster than the full image. Falls
+/// back to the primary image when no suitable embedded thumbnail exists.
 ///
 /// Returned `src_w`/`src_h` always reflect the original primary image
 /// dimensions; the first three return values describe the actually-decoded
 /// pixels (which may be the embedded thumbnail).
-pub fn decode_heic_with_target(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+pub fn decode_heic_to_rgba(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
     let dec = decode_heic_internal(path, Some(target_edge))?;
     Ok(into_rgba_tuple(dec))
 }
@@ -914,19 +896,9 @@ fn pick_thumbnail_handle(
 fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
     match extract_video_frame(path) {
         Ok((rgba, w, h)) => {
-            let (cx, cy, side) = center_crop_square(w, h);
-
-            let final_data = match format {
-                ThumbFormat::Jpeg => {
-                    let rgb = rgba_to_rgb(&rgba);
-                    resize_rgb_crop(w, h, &rgb, cx, cy, side, side, thumb_w, thumb_h, filter)?
-                }
-                ThumbFormat::Webp => {
-                    resize_rgba_crop(w, h, &rgba, cx, cy, side, side, thumb_w, thumb_h, filter)?
-                }
-            };
-
-            let data = encode_output(&final_data, thumb_w, thumb_h, format)?;
+            let data = crop_resize_encode(
+                w, h, SrcPixels::Rgba(&rgba), thumb_w, thumb_h, format, filter,
+            )?;
 
             Ok(ThumbResult {
                 path: path.to_string_lossy().to_string(),
@@ -1084,24 +1056,13 @@ fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, th
     let grey: u8 = 0x3A;
 
     let data = match format {
-        ThumbFormat::Jpeg => {
-            let rgb = vec![grey; pixel_count * 3];
-            let mut cursor = std::io::Cursor::new(Vec::with_capacity(4096));
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 80);
-            encoder
-                .encode(&rgb, thumb_w, thumb_h, image::ExtendedColorType::Rgb8)
-                .map_err(|e| ThumbError::Encode(e.to_string()))?;
-            cursor.into_inner()
-        }
+        ThumbFormat::Jpeg => encode_output(&vec![grey; pixel_count * 3], thumb_w, thumb_h, format)?,
         ThumbFormat::Webp => {
-            let mut rgba = vec![0u8; pixel_count * 4];
+            let mut rgba = vec![255u8; pixel_count * 4];
             for pixel in rgba.chunks_exact_mut(4) {
-                pixel[0] = grey;
-                pixel[1] = grey;
-                pixel[2] = grey;
-                pixel[3] = 255;
+                pixel[..3].fill(grey);
             }
-            encode_rgba_to_webp(&rgba, thumb_w, thumb_h)?
+            encode_output(&rgba, thumb_w, thumb_h, format)?
         }
     };
 
@@ -1158,26 +1119,20 @@ mod tests {
 
     #[test]
     fn test_center_crop_landscape() {
-        let (x, y, side) = center_crop_square(4000, 3000);
-        assert_eq!(side, 3000);
-        assert_eq!(x, 500);
-        assert_eq!(y, 0);
+        let c = center_crop_square(4000, 3000);
+        assert_eq!((c.x, c.y, c.side), (500, 0, 3000));
     }
 
     #[test]
     fn test_center_crop_portrait() {
-        let (x, y, side) = center_crop_square(3000, 4000);
-        assert_eq!(side, 3000);
-        assert_eq!(x, 0);
-        assert_eq!(y, 500);
+        let c = center_crop_square(3000, 4000);
+        assert_eq!((c.x, c.y, c.side), (0, 500, 3000));
     }
 
     #[test]
     fn test_center_crop_square() {
-        let (x, y, side) = center_crop_square(2000, 2000);
-        assert_eq!(side, 2000);
-        assert_eq!(x, 0);
-        assert_eq!(y, 0);
+        let c = center_crop_square(2000, 2000);
+        assert_eq!((c.x, c.y, c.side), (0, 0, 2000));
     }
 
     #[test]
