@@ -73,20 +73,40 @@ function buildScrollIndicators(items: SortedItem[], field: SortField): ScrollInd
   }
 }
 
+// Lazily-built, reused date formatters. `Date#toLocaleDateString(locale, opts)`
+// constructs a fresh Intl.DateTimeFormat on every call — ~100µs each — so
+// calling it once per item turned this O(n) walk into seconds of blocked main
+// thread on a large gallery. Hoisting the formatter makes the same walk ~40x
+// cheaper; the loop below additionally only formats at a month boundary.
+let _monthFmt: Intl.DateTimeFormat | undefined;
+const monthFormat = (d: Date) =>
+  (_monthFmt ??= new Intl.DateTimeFormat(undefined, { month: "short", year: "numeric" })).format(d);
+
+let _dayFmt: Intl.DateTimeFormat | undefined;
+const dayFormat = (d: Date) =>
+  (_dayFmt ??= new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  })).format(d);
+
 function buildDateIndicators(
   items: SortedItem[],
   getDate: (item: SortedItem) => number | null,
 ): ScrollIndicator[] {
   const indicators: ScrollIndicator[] = [];
-  let lastLabel = "";
+  // Compare a cheap numeric month key rather than the rendered label, so the
+  // formatter runs once per month boundary (a couple of dozen times) instead
+  // of once per item.
+  let lastKey = Number.NaN;
   for (let i = 0; i < items.length; i++) {
     const ts = getDate(items[i]);
     if (!ts) continue;
     const d = new Date(ts * 1000);
-    const label = d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
-    if (label !== lastLabel) {
-      indicators.push({ position: i / items.length, label });
-      lastLabel = label;
+    const key = d.getFullYear() * 12 + d.getMonth();
+    if (key !== lastKey) {
+      indicators.push({ position: i / items.length, label: monthFormat(d) });
+      lastKey = key;
     }
   }
   return dedupeIndicators(indicators);
@@ -176,8 +196,7 @@ function getThumbLabelForItems(items: SortedItem[], field: SortField, fraction: 
     // "Never" reads right for the un-stamped tail of viewed/rated/added sorts,
     // which SQL parks at the end via NULLS LAST.
     if (!ts) return field === "date" ? "No date" : "Never";
-    const d = new Date(ts * 1000);
-    return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+    return dayFormat(new Date(ts * 1000));
   }
 
   switch (field) {
@@ -208,8 +227,30 @@ export function App() {
   // gallery content behind it entirely.
   const contentHidden = () => isMobile() && settingsOpen();
 
-  // Scrollbar sort indicators
-  const scrollIndicators = () => buildScrollIndicators(sortedItems(), sortField());
+  // Scrollbar sort indicators, computed on demand and cached per
+  // (items, sortField).
+  //
+  // `indicators` is a JSX getter prop, so ScrollBar re-invokes this on every
+  // read — and it reads several times per render pass (the `<Show>` gate, then
+  // the `<For>`). Each read walks the whole item list, so on a large gallery
+  // the first touch of the scrollbar (the synthesized `mouseenter` is what
+  // flips `hovering`, the only thing gating this work) blocked the main thread
+  // for seconds at a stretch, and again on every later touch. On a phone that
+  // is long enough for the browser to kill the tab as unresponsive.
+  //
+  // Cached by hand rather than with createMemo: a memo would recompute eagerly
+  // on every sortedItems change even for the many sessions that never touch the
+  // scrollbar. The signal reads stay in the caller's tracking scope, so
+  // consumers still update exactly as before.
+  let indicatorCache: { items: SortedItem[]; field: SortField; value: ScrollIndicator[] } | null = null;
+  const scrollIndicators = (): ScrollIndicator[] => {
+    const items = sortedItems();
+    const field = sortField();
+    if (!indicatorCache || indicatorCache.items !== items || indicatorCache.field !== field) {
+      indicatorCache = { items, field, value: buildScrollIndicators(items, field) };
+    }
+    return indicatorCache.value;
+  };
   const thumbLabel = (fraction: number) => getThumbLabelForItems(sortedItems(), sortField(), fraction);
 
   // Apply the gallery-wide default filter (if enabled) when a gallery first
