@@ -576,17 +576,17 @@ pub(crate) async fn dispatch_thumbnail_fit(
 /// paths that are missing them. Reads the standard thumbnail bytes from
 /// SQLite, decodes to RGBA, downsamples, and writes the micro row + thumbhash.
 async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
-    // Read standard-tier bytes from DB
+    // Read standard-tier bytes from DB — one batched query, not one per path.
     let items: Vec<(String, Vec<u8>, u32, u32, String)> = {
         let db = state.cache_db.lock().await;
         let Some(db) = db.as_ref() else { return };
-        paths
-            .iter()
-            .filter_map(|path| {
-                let row = db.get_thumbnail(path).ok()??;
-                Some((path.clone(), row.thumbnail, row.width, row.height, row.media_type))
-            })
-            .collect()
+        match db.get_thumbnail_blobs_batch(paths) {
+            Ok(items) => items,
+            Err(e) => {
+                log::warn!("micro derivation blob read failed: {e}");
+                return;
+            }
+        }
     };
 
     if items.is_empty() {

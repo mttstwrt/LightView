@@ -450,6 +450,42 @@ impl CacheDb {
         Ok(out)
     }
 
+    /// Bulk-read standard-tier blobs for `paths`, as
+    /// `(path, bytes, width, height, media_type)`. Paths without a cached
+    /// thumbnail are simply absent from the result.
+    ///
+    /// One IN-list query per 900 paths rather than a point query each: the
+    /// micro/thumbhash derivation runs over a whole batch of up to 128 paths
+    /// while holding the single writer connection, so the per-statement
+    /// overhead was paid with every other DB user queued behind it.
+    pub fn get_thumbnail_blobs_batch(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<(String, Vec<u8>, u32, u32, String)>, CacheError> {
+        let mut out = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(IN_CHUNK) {
+            let sql = format!(
+                "SELECT path, thumbnail, width, height, media_type
+                 FROM thumbnails WHERE path IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut stmt = self.conn().prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Get lightweight metadata about a cached thumbnail (no blob read).
     pub fn get_thumbnail_info(
         &self,
