@@ -50,9 +50,6 @@ const BATCH_SIZE = 128;
 const VELOCITY_SLOW = 500;
 const VELOCITY_FAST = 3000;
 
-// Jump detection: scroll delta > 2x viewport height triggers generation bump.
-const JUMP_FACTOR = 2;
-
 // How many paths to send per background precache call.
 const BG_BATCH_SIZE = 64;
 
@@ -297,12 +294,19 @@ export function GalleryGrid(props: GalleryGridProps) {
       const px = TIER_PX[tier() as keyof typeof TIER_PX] ?? TIER_PX.m;
       return px * px;
     },
-    onFrame: ({ dy }) => {
-      // Jump detection: a huge delta means the user warped (scrollbar drag,
-      // scroll-to-index) — drop all queued/in-flight work for the old spot.
-      if (dy > window.innerHeight * JUMP_FACTOR) {
+    onFrame: ({ isJump }) => {
+      // The user warped (scrollbar tap/drag, scroll-to-index) — drop all
+      // queued/in-flight work for the old spot. The generation bump is what
+      // invalidates anything already in flight.
+      //
+      // `assignedRung` is deliberately NOT cleared: it is the index
+      // `evictFaraway` walks to drop a path's thumbMap entry, so clearing it
+      // orphaned every cell displayed before the jump — permanently
+      // un-evictable, since eviction could no longer see them. The next
+      // scheduleFetch evicts them properly instead, which is the same set and
+      // also releases their <img> URLs.
+      if (isJump) {
         setGeneration((g) => g + 1);
-        assignedRung.clear();
         swapper.cancelAll();
         needsGeneration.clear();
         coalescedPaths.clear();
