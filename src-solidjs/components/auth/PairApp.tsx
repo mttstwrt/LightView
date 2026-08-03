@@ -146,6 +146,22 @@ export function PairApp() {
             Access, and scan the QR code or read off the PIN. Codes are
             one-time and expire after a few minutes.
           </p>
+
+          {/* The security warning you clicked through to get here is a
+              short-lived per-origin exception — on iOS especially, it lapses
+              and (in a home-screen app) can't be re-accepted. Installing the
+              certificate replaces it with real trust for the cert's lifetime.
+              Plain <a>, no `download`: iOS routes the response to the profile
+              installer off the navigation. */}
+          <p class="text-[11px] text-neutral-600 leading-relaxed">
+            Saw a security warning?{" "}
+            <a href="/cert" class="text-teal-500/80 hover:text-teal-400 underline">
+              Install this server's certificate
+            </a>{" "}
+            to stop it coming back. On iPhone/iPad, finish in Settings &rarr;
+            Profile Downloaded, then enable it under General &rarr; About &rarr;
+            Certificate Trust Settings.
+          </p>
         </Show>
       </div>
     </div>

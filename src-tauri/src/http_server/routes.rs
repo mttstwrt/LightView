@@ -553,6 +553,40 @@ pub async fn healthz(State(state): State<ServerState>) -> impl IntoResponse {
     (StatusCode::OK, if ready { "ok" } else { "starting" })
 }
 
+/// `GET /cert` — download the server's self-signed certificate so a client can
+/// install it as a trust anchor.
+///
+/// Unauthenticated by design: it's public information (every TLS handshake
+/// already hands it out) and the point is to be reachable *before* the browser
+/// trusts the connection enough to have paired. Served with the
+/// `application/x-x509-ca-cert` type and a `.crt` filename, which is what makes
+/// iOS/macOS hand it to the profile installer rather than rendering it as text.
+///
+/// This is the durable answer to a browser dropping its click-through
+/// exception: on iOS that exception is short-lived, and a home-screen PWA can't
+/// even render the interstitial to re-accept it — so the app opens from its
+/// cached shell and silently fails every request. After installing this and
+/// enabling it under Settings → General → About → Certificate Trust Settings,
+/// the connection is simply trusted for the cert's lifetime.
+pub async fn cert(State(state): State<ServerState>) -> Response<Body> {
+    if !state.config.tls {
+        return error(StatusCode::NOT_FOUND);
+    }
+    let Some(pem) = super::tls::persisted_cert_pem() else {
+        return error(StatusCode::NOT_FOUND);
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-x509-ca-cert")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"lightview.crt\"",
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(pem))
+        .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
 /// `GET /api/events` — Server-Sent Events stream of gallery changes.
 ///
 /// A browser has no Tauri IPC, so this is how the web client learns that files

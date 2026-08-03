@@ -119,7 +119,11 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     // Bootstrap endpoints: pair a device, prove the gallery password, or
     // query auth state. These can't sit behind the auth layer or there's no
     // way to get past it the first time.
+    // `/cert` belongs here too: the whole point of downloading the certificate
+    // is to fix a browser that can't establish trust, which is upstream of
+    // having a device cookie at all.
     let bootstrap = Router::new()
+        .route("/cert", get(routes::cert))
         .route("/pair/redeem", post(auth_routes::redeem))
         .route("/auth/password", post(auth_routes::submit_password))
         .route("/auth/status", get(auth_routes::status));

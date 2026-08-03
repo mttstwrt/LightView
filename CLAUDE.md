@@ -79,10 +79,42 @@ the reachable address explicitly with `--tls-san <ip-or-host>` (repeatable,
 comma-separated) or `LIGHTVIEW_TLS_SAN`; docker-compose.yml wires the env var
 through. Getting this wrong is quiet: desktop browsers keep working on a
 click-through exception, but iOS drops that exception readily and a standalone
-PWA can't render the prompt to re-accept it, so the app opens from its cached
-shell (`sw.js` + `loadBootSnapshot()`) and looks connected while every `/thumb`
-and `/media` fetch fails. Adding a SAN re-mints the cert, re-prompting every
-paired browser once.
+PWA can't render the prompt to re-accept it. Adding a SAN re-mints the cert,
+re-prompting every paired browser once (and breaking any `lightview-worker`
+cert pin — re-pair with `--trust-new`).
+
+**Trusting the cert instead of clicking through.** A click-through exception is
+per-origin and short-lived; the durable fix is installing the certificate. The
+cert carries `basicConstraints CA:TRUE` + `keyCertSign` alongside its serverAuth
+EKU (`CERT_SCHEMA` 2) precisely so iOS/macOS offer the full-trust toggle — they
+only expose it for CA certs. `GET /cert` serves the PEM unauthenticated as
+`application/x-x509-ca-cert` (it's public; every handshake hands it out anyway,
+and it must be reachable *before* the browser trusts the connection enough to
+pair), and `/pair` links to it. iOS: open the link → Settings → Profile
+Downloaded → Install → General → About → Certificate Trust Settings → enable.
+
+**Client-side cache lifetime, and why a dead server used to look alive.** Two
+independent client caches, neither originally time-bounded: the service worker's
+`lv-thumbs-*` Cache Storage (2000 entries, FIFO) and the whole sorted-item list
+in IndexedDB (`loadBootSnapshot()`). When the server became unreachable, the
+worker's network-first navigation fell back to the cached shell, the snapshot
+repainted the entire grid, and cached thumbs rendered — so the app looked
+connected while every `/api`, `/thumb`, and `/media` request failed. Worse, the
+navigation never reached the network, so the browser had nothing to render its
+certificate interstitial for: on iOS the only cure was clearing site data, which
+also drops `lv_device` and forces a re-pair.
+
+Fixed in three places. `networkFirstShell` now serves the cached shell only when
+`navigator.onLine` is false (genuinely offline); network-up-but-origin-dead gets
+a synthetic recovery page whose **Reset connection** button unregisters the
+worker and reloads — the next navigation is uncontrolled, hits the network, and
+the browser can finally show its cert prompt, with cookies and Cache Storage
+left intact so the pairing survives. `?lv_offline=1` opts back into the cached
+shell on demand. Cached thumbs get a 30-day hard ceiling (`THUMB_MAX_STALE_MS`)
+on top of the 1-hour revalidation window, and the boot snapshot honours its
+`savedAt` with the same ceiling. In-app, a failed `getBootState()` sets
+`serverUnreachable` and shows `ConnectionBanner` with the same two actions, so
+the cached-shell path is never silent either.
 
 **Zoomed-in tier disk budget.** The `jm`/`jh` justified tiers cache whatever you
 view zoomed in, so they're bounded by a byte budget (10% of free disk, floored
