@@ -6,6 +6,7 @@ import { displayPaths, settingsOpen, setSettingsOpen, viewMode, setViewMode } fr
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
 import { versionLabel, GIT_SHA } from "../../lib/version";
+import { resetServiceWorker } from "../../lib/swControl";
 import {
   rebuildThumbnails,
   getSortedItems,
@@ -1448,6 +1449,42 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                   </For>
                 </div>
               </Show>
+            </Section>
+            </Show>
+
+            {/* ── Connection (web only) ──
+                The certificate link also lives on /pair, but that page is only
+                reachable while *un*paired — after a successful pair the client
+                redirects to / and never shows it again. Since installing the
+                cert is exactly what a working, paired device wants to do next
+                (to stop the click-through exception lapsing), it needs a home
+                here too. */}
+            <Show when={isWeb()}>
+            <Section label="Connection" order={2}>
+              <a
+                href="/cert"
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 text-center"
+              >
+                Install server certificate
+              </a>
+              <span class="text-[10px] text-neutral-600 leading-relaxed">
+                Replaces the browser's temporary security exception with real
+                trust, so it stops expiring. On iPhone/iPad open this in Safari
+                (not the home-screen app), install from Settings &rarr; Profile
+                Downloaded, then enable it under General &rarr; About &rarr;
+                Certificate Trust Settings.
+              </span>
+              <button
+                onClick={() => void resetServiceWorker()}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+              >
+                Reset connection
+              </button>
+              <span class="text-[10px] text-neutral-600 leading-relaxed">
+                Unregisters the offline worker and reloads, so the next load
+                goes to the network and the browser can show its certificate
+                prompt. Cookies are kept — this device stays paired.
+              </span>
             </Section>
             </Show>
 

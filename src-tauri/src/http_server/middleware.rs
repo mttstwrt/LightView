@@ -32,17 +32,25 @@ pub async fn track_remote_hits(
 }
 
 /// Readiness gate: until a gallery is open (`AppState::current_gallery` set),
-/// every route except `/healthz` answers 503 with a tiny self-refreshing
-/// "starting" page. The headless server binds its listener before the
-/// (potentially minutes-long) gallery scan, so early requests get a sign of
-/// life instead of a refused connection; the page reloads itself and flips to
-/// the app the moment the scan finishes.
+/// every route except those in [`GATE_EXEMPT`] answers 503 with a tiny
+/// self-refreshing "starting" page. The headless server binds its listener
+/// before the (potentially minutes-long) gallery scan, so early requests get a
+/// sign of life instead of a refused connection; the page reloads itself and
+/// flips to the app the moment the scan finishes.
+///
+/// The exemptions serve content that doesn't depend on a gallery at all, and
+/// that a client may specifically need *while* one is opening: `/healthz` is
+/// the liveness probe, and `/cert` hands out the TLS certificate — a browser
+/// trying to establish trust shouldn't be told to come back after the scan.
+const GATE_EXEMPT: [&str; 2] = ["/healthz", "/cert"];
+
 pub async fn gallery_gate(
     State(state): State<ServerState>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() != "/healthz" && state.app.current_gallery.read().await.is_none() {
+    let exempt = GATE_EXEMPT.contains(&request.uri().path());
+    if !exempt && state.app.current_gallery.read().await.is_none() {
         return starting_response();
     }
     next.run(request).await
