@@ -529,11 +529,19 @@ fn mime_for(ext: &str) -> &'static str {
         "bmp" => "image/bmp",
         "avif" => "image/avif",
         "tiff" | "tif" => "image/tiff",
+        "heic" | "heif" => "image/heif",
+        // Every video container the indexer accepts (MediaType::from_extension)
+        // has to map to a `video/*` type here: the caller keys Range streaming
+        // off that prefix, so a missing entry silently downgrades a multi-GB
+        // clip to a fully buffered, unseekable `application/octet-stream`.
         "mp4" => "video/mp4",
+        "m4v" => "video/x-m4v",
         "mov" => "video/quicktime",
         "avi" => "video/x-msvideo",
         "mkv" => "video/x-matroska",
         "webm" => "video/webm",
+        "wmv" => "video/x-ms-wmv",
+        "flv" => "video/x-flv",
         _ => "application/octet-stream",
     }
 }

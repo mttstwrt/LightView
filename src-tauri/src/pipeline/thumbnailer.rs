@@ -3,6 +3,7 @@ use fir::images::{Image, ImageRef};
 use image::GenericImageView;
 use memmap2::Mmap;
 use crate::companion::schema::MediaType;
+use super::video;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -620,9 +621,10 @@ pub struct DecodedImage {
 /// Decoders that can scale during decode (JPEG DCT, HEIC embedded thumbnails)
 /// use it to avoid decoding far more pixels than needed — without it, the JPEG
 /// path silently capped every output at the 512px standard size, so the larger
-/// justified/fit tiers (1280/2560) could never reach their resolution. Decoders
-/// that can't scale (generic `image` crate, video frames) decode full-size and
-/// ignore it; the subsequent resize handles the downscale.
+/// justified/fit tiers (1280/2560) could never reach their resolution. Video
+/// frames scale in ffmpeg's filter graph for the same reason. Decoders that
+/// can't scale (the generic `image` crate path) decode full-size and ignore it;
+/// the subsequent resize handles the downscale.
 pub fn decode_image(path: &Path, target_edge: u32) -> Result<DecodedImage, ThumbError> {
     let ext = path
         .extension()
@@ -635,7 +637,7 @@ pub fn decode_image(path: &Path, target_edge: u32) -> Result<DecodedImage, Thumb
         .unwrap_or("image");
 
     let (rgba_buf, dw, dh, src_w, src_h) = if media_type == "video" {
-        decode_video_to_rgba(path)?
+        decode_video_to_rgba(path, target_edge)?
     } else {
         match ext.as_str() {
             "jpg" | "jpeg" => decode_jpeg_to_rgba(path, target_edge)?,
@@ -894,10 +896,14 @@ fn pick_thumbnail_handle(
 /// Extract a frame from a video file using ffmpeg and generate a thumbnail.
 /// Falls back to a grey placeholder if ffmpeg is not available or extraction fails.
 fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
-    match extract_video_frame(path) {
-        Ok((rgba, w, h)) => {
+    // Decode only as large as the square crop needs, the same rule the JPEG
+    // decoder follows — a 4K clip is downscaled inside ffmpeg rather than piped
+    // back whole.
+    match video::extract_frame(path, thumb_w.max(thumb_h)) {
+        Ok(frame) => {
             let data = crop_resize_encode(
-                w, h, SrcPixels::Rgba(&rgba), thumb_w, thumb_h, format, filter,
+                frame.width, frame.height, SrcPixels::Rgba(&frame.rgba),
+                thumb_w, thumb_h, format, filter,
             )?;
 
             Ok(ThumbResult {
@@ -906,8 +912,10 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
                 height: thumb_h,
                 data,
                 media_type: "video".to_string(),
-                src_width: w,
-                src_height: h,
+                // The clip's true display size, not the size we decoded at —
+                // this is what the grid lays the cell out from.
+                src_width: frame.src_width,
+                src_height: frame.src_height,
                 format,
             })
         }
@@ -918,136 +926,12 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
     }
 }
 
-/// Extract a single frame from a video using ffmpeg.
-/// Seeks to 1 second first; if the clip is shorter than that (no output), retries
-/// at the first frame. Outputs raw RGBA pixels.
-fn extract_video_frame(path: &Path) -> Result<(Vec<u8>, u32, u32), ThumbError> {
-    // Probe dimensions up-front so we know the expected buffer size.
-    let (w, h) = probe_video_dimensions(path)?;
-    let expected = (w as usize) * (h as usize) * 4;
-
-    // First attempt: seek to 1 s (avoids initial black frames on most clips).
-    match run_ffmpeg_frame(path, Some("1"), expected) {
-        Ok(bytes) => Ok((bytes, w, h)),
-        Err(_) => {
-            // Retry from the very start for clips < 1 s or streams that
-            // can't key-seek to that position.
-            let bytes = run_ffmpeg_frame(path, None, expected)?;
-            Ok((bytes, w, h))
-        }
-    }
-}
-
-/// Invoke ffmpeg to decode one frame at the given seek offset (or the first
-/// frame when `seek` is `None`). Returns raw RGBA bytes sized to match `expected`.
-fn run_ffmpeg_frame(path: &Path, seek: Option<&str>, expected: usize) -> Result<Vec<u8>, ThumbError> {
-    let mut cmd = std::process::Command::new("ffmpeg");
-    if let Some(ss) = seek {
-        cmd.args(["-ss", ss]);
-    }
-    cmd.arg("-i").arg(path.as_os_str()).args([
-        "-frames:v", "1",
-        "-f", "rawvideo",
-        "-pix_fmt", "rgba",
-        "-v", "error",
-        "pipe:1",
-    ]);
-
-    let output = cmd
-        .output()
-        .map_err(|e| ThumbError::Decode(format!("ffmpeg not found or failed to run: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ThumbError::Decode(format!("ffmpeg failed: {}", stderr.trim())));
-    }
-
-    if output.stdout.len() != expected {
-        return Err(ThumbError::Decode(format!(
-            "ffmpeg output size mismatch: got {} bytes, expected {}",
-            output.stdout.len(),
-            expected,
-        )));
-    }
-
-    Ok(output.stdout)
-}
-
-/// Get video dimensions using ffprobe.
-fn probe_video_dimensions(path: &Path) -> Result<(u32, u32), ThumbError> {
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0:s=x",
-        ])
-        .arg(path.as_os_str())
-        .output()
-        .map_err(|e| ThumbError::Decode(format!("ffprobe not found: {}", e)))?;
-
-    if !output.status.success() {
-        return Err(ThumbError::Decode("ffprobe failed".to_string()));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    let parts: Vec<&str> = text.split('x').collect();
-    if parts.len() != 2 {
-        return Err(ThumbError::Decode(format!("ffprobe unexpected output: {}", text)));
-    }
-    let w: u32 = parts[0].parse().map_err(|_| ThumbError::Decode("bad width".to_string()))?;
-    let h: u32 = parts[1].parse().map_err(|_| ThumbError::Decode("bad height".to_string()))?;
-    Ok((w, h))
-}
-
-/// Probe video metadata: (width, height, duration_seconds). One ffprobe
-/// call — these spawns add up when a folder full of videos is indexed.
+/// Probe video metadata: (width, height, duration_seconds). Dimensions are
+/// display-oriented — a phone clip recorded sideways reports the portrait size
+/// a player shows, not the landscape size it was encoded at.
 pub fn probe_video_metadata(path: &Path) -> Result<(u32, u32, Option<f64>), ThumbError> {
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,duration",
-            "-show_entries", "format=duration",
-            "-of", "json",
-        ])
-        .arg(path.as_os_str())
-        .output()
-        .map_err(|e| ThumbError::Decode(format!("ffprobe not found: {}", e)))?;
-
-    if !output.status.success() {
-        return Err(ThumbError::Decode("ffprobe failed".to_string()));
-    }
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| ThumbError::Decode(format!("ffprobe json parse error: {}", e)))?;
-
-    let stream = json.get("streams").and_then(|s| s.get(0));
-    let format = json.get("format");
-
-    let w = stream
-        .and_then(|s| s.get("width"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let h = stream
-        .and_then(|s| s.get("height"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-
-    // Duration: prefer stream duration, fall back to format duration
-    let duration = stream
-        .and_then(|s| s.get("duration"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| {
-            format
-                .and_then(|f| f.get("duration"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-        });
-
-    Ok((w, h, duration))
+    let info = video::probe(path)?;
+    Ok((info.width, info.height, info.duration))
 }
 
 /// Grey placeholder fallback when ffmpeg is unavailable.
@@ -1080,9 +964,9 @@ fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, th
 
 /// Decode a video frame to RGBA pixels using ffmpeg.
 /// Returns (rgba, width, height, src_width, src_height).
-fn decode_video_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
-    let (rgba, w, h) = extract_video_frame(path)?;
-    Ok((rgba, w, h, w, h))
+fn decode_video_to_rgba(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
+    let frame = video::extract_frame(path, target_edge)?;
+    Ok((frame.rgba, frame.width, frame.height, frame.src_width, frame.src_height))
 }
 
 /// Decode a non-JPEG image to RGBA pixels.
@@ -1151,5 +1035,68 @@ mod tests {
     fn test_rgb_rgba_roundtrip() {
         let rgb: Vec<u8> = (0..300).map(|i| (i % 256) as u8).collect();
         assert_eq!(rgba_to_rgb(&rgb_to_rgba(&rgb)), rgb);
+    }
+
+    /// Encode a throwaway clip with a display matrix — a stand-in for a phone
+    /// `.MOV`, which is landscape on disk and portrait on screen. Returns None
+    /// when ffmpeg isn't installed, so the test skips instead of failing.
+    fn phone_style_clip(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        if !video::ffmpeg_available() || !video::ffprobe_available() {
+            return None;
+        }
+        let flat = dir.join("flat.mov");
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-v", "error", "-f", "lavfi",
+                "-i", "testsrc=size=640x360:duration=2:rate=10",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&flat)
+            .status()
+            .ok()?
+            .success();
+        assert!(ok, "failed to encode test clip");
+
+        let rotated = dir.join("IMG_0001.MOV");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-display_rotation", "90", "-i"])
+            .arg(&flat)
+            .args(["-c", "copy"])
+            .arg(&rotated)
+            .status()
+            .ok()?
+            .success();
+        assert!(ok, "failed to remux test clip");
+        Some(rotated)
+    }
+
+    #[test]
+    fn a_phone_mov_thumbnails_at_its_display_orientation() {
+        let dir = std::env::temp_dir().join("lightview-thumb-mov-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let Some(clip) = phone_style_clip(&dir) else {
+            eprintln!("skipping: ffmpeg/ffprobe not installed");
+            return;
+        };
+
+        // Square standard tier: the uppercase `.MOV` has to route to the video
+        // generator, and the stored source size is what the grid lays the cell
+        // out from — so it must be the portrait display size, not the landscape
+        // size the container declares.
+        let square = generate_for_path(&clip, ResizeFilter::Bilinear, ThumbFormat::Jpeg, 512, 512)
+            .expect("square thumbnail");
+        assert_eq!(square.media_type, "video");
+        assert_eq!((square.width, square.height), (512, 512));
+        assert_eq!((square.src_width, square.src_height), (360, 640));
+        // A real frame, not the grey placeholder (which encodes to a tiny blob).
+        assert!(square.data.len() > 1000, "looks like the placeholder fallback");
+
+        // Aspect-preserving (justified) tier: same orientation, letterbox-free.
+        let fit = generate_for_path_fit(&clip, ResizeFilter::Bilinear, ThumbFormat::Jpeg, 320)
+            .expect("fit thumbnail");
+        assert_eq!((fit.width, fit.height), (180, 320));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

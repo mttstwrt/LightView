@@ -8,6 +8,7 @@ import {
   viewportContainRect,
   rectKeyframe,
   VIEWER_PATH_EVENT,
+  VIEWER_CLOSE_REQUEST_EVENT,
   type Rect,
 } from "../../lib/viewerTransition";
 import { aspectByPath, sortedItems, rateItem } from "../../stores/galleryStore";
@@ -378,9 +379,10 @@ export function MediaViewer(props: MediaViewerProps) {
     anim.oncancel = () => setCloneState(null);
   });
 
-  /** Close with the fly-back-to-cell transition (or a fade fallback). All
-   *  in-viewer close paths route through here; App-level Escape still closes
-   *  instantly. */
+  /** Close with the fly-back-to-cell transition (or a fade fallback). Every
+   *  close path routes through here — in-viewer ones call it directly, and the
+   *  app-level Escape handler reaches it by dispatching
+   *  `VIEWER_CLOSE_REQUEST_EVENT`. */
   const requestClose = () => {
     if (closingNow) return;
     if (prefersReducedMotion() || zoom() > 1) { props.onClose(); return; }
@@ -439,6 +441,9 @@ export function MediaViewer(props: MediaViewerProps) {
       anim.oncancel = () => props.onClose();
     }));
   };
+
+  window.addEventListener(VIEWER_CLOSE_REQUEST_EVENT, requestClose);
+  onCleanup(() => window.removeEventListener(VIEWER_CLOSE_REQUEST_EVENT, requestClose));
 
   const handleBackdropClick = (e: MouseEvent) => {
     // A touch tap handles itself (toggles chrome); swallow the compatibility

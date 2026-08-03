@@ -19,6 +19,12 @@ export interface Rect {
  *  `findCellImage` — no store plumbing between the two components. */
 export const VIEWER_PATH_EVENT = "lightview:viewer-path";
 
+/** Asks the open viewer to close *through* its fly-back-to-cell transition
+ *  rather than vanishing. Dispatched by close paths that live outside the
+ *  component — the app-level Escape handler — which otherwise have no way to
+ *  reach `requestClose`. Same DOM-event plumbing as `VIEWER_PATH_EVENT`. */
+export const VIEWER_CLOSE_REQUEST_EVENT = "lightview:viewer-close-request";
+
 /** The grid cell's thumbnail <img> for a path, or null when the cell isn't
  *  currently rendered. Cells contain several stacked same-rect <img>s
  *  (underlay, main, hover overlays) — prefer the last one with decoded

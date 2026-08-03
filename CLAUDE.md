@@ -198,7 +198,7 @@ buffer stdin to EOF) — see `docs/workerTagging.md`.
 | `provider/` | `FileProvider` trait + `ProviderRegistry` — file-access abstraction. Only `local` (`LocalProvider`) is implemented today; the trait exists to allow remote backends (SMB/SFTP/S3) later. |
 | `companion/` | Sidecar `.lightview` JSON companion files for per-image metadata (schema, reader, writer, migration) |
 | `cache/` | SQLite-backed cache: `db` (core), `thumbnails`, `index`, `counts`, `duplicates` |
-| `pipeline/` | Thumbnail generation: CPU `thumbnailer`, optional GPU pipeline (`gpu_pipeline` via wgpu) |
+| `pipeline/` | Thumbnail generation: CPU `thumbnailer`, optional GPU pipeline (`gpu_pipeline` via wgpu), `video` (ffmpeg/ffprobe frame extraction + probing) |
 | `filter/` | Query language for filtering media: `ast` → `parser` → `evaluator` |
 | `sort/` | Sorting + grouping: `sorter`, `grouper`, `timeline` |
 | `autocomplete/` | In-memory tag autocomplete engine |
@@ -224,6 +224,7 @@ buffer stdin to EOF) — see `docs/workerTagging.md`.
 - **Shared state**: Rust `AppState` (in `lib.rs`) holds all cross-command state behind `Arc<RwLock<>>` / `Arc<Mutex<>>`. `rusqlite::Connection` uses `Mutex` (not `RwLock`) because it's `Send` but not `Sync`.
 - **Thumbnail pipeline**: Hardware-adaptive — detects NVMe/SSD, discrete GPU, CPU cores. Uses a bounded `rayon::ThreadPool` (`thumb_pool`). Optional GPU path via `wgpu` (feature `gpu`) for fused crop+resize.
 - **Dependencies in dev builds**: `[profile.dev.package."*"] opt-level = 2` — image codecs, SIMD resize, and SQLite are unusably slow at opt-level 0.
+- **Video thumbnails need ffmpeg**: `pipeline/video.rs` shells out to `ffmpeg`/`ffprobe`; without them every clip falls back to a grey placeholder (checked once per process, so a missing binary doesn't cost two failed spawns per file). ffmpeg does the downscale in its filter graph at *exact* pixel dimensions, so the raw output length is known up front — a 4K clip crosses the pipe at ~1.8 MB instead of ~33 MB. Those dimensions come from the probe with the container's **display-matrix rotation applied**: phone clips are landscape on disk and portrait on screen, ffmpeg autorotates ahead of our scale filter, and a mismatch here is what makes `.MOV` thumbnails come back sideways or fail outright. Every invocation is timeout-bounded — a wedged subprocess would otherwise hold a `thumb_pool` thread forever.
 - **Plugin system**: Plugins are directories with a `manifest.json`. Execution is CLI-based: the host spawns the plugin as a subprocess and streams NDJSON image paths in / tag results out (`plugin/runner.rs`). The host only implements the `tag` verb today, so every plugin is effectively an auto-tagger keyed by `tag_prefix`. Example: `plugins/wd-tagger/` (ML image tagger). Roadmap for true extensibility: `docs/pluginExtensibility.md`.
 
 ### Cargo features

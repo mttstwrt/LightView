@@ -43,6 +43,13 @@ fn encode_b64(data: &[u8]) -> String {
 /// row starts with NULL dimensions, and whichever tier happens to be generated
 /// first supplies them. Idempotent, so every generation path can call it.
 fn store_source_dims(conn: &rusqlite::Connection, path: &str, width: u32, height: u32) {
+    // A placeholder thumbnail (no ffmpeg, unreadable file) carries no source
+    // size. Writing 0×0 would leave the row *filled in* with a degenerate
+    // aspect ratio the justified grid then lays out from, and the `width IS
+    // NULL` guard below would stop a later real probe from correcting it.
+    if width == 0 || height == 0 {
+        return;
+    }
     let _ = conn.execute(
         "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
         rusqlite::params![width, height, path],
