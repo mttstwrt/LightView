@@ -11,7 +11,7 @@ import {
   VIEWER_CLOSE_REQUEST_EVENT,
   type Rect,
 } from "../../lib/viewerTransition";
-import { aspectByPath, sortedItems, rateItem } from "../../stores/galleryStore";
+import { aspectByPath, mediaMetaByPath, sortedItems, rateItem } from "../../stores/galleryStore";
 import { applyQueryAndRefresh } from "../../stores/filterStore";
 import { TitleBar } from "../topbar/TitleBar";
 import {
@@ -241,6 +241,13 @@ export function MediaViewer(props: MediaViewerProps) {
     setGridAspect(loaded ? cellImg!.naturalWidth / cellImg!.naturalHeight : null);
   };
 
+  /** Indexed source pixel size, when the backend has it. Caps the fitted rect
+   *  so an item smaller than the window isn't laid out as if it filled it. */
+  const naturalSize = (path: string) => {
+    const m = mediaMetaByPath().get(path);
+    return m && m.width && m.height ? { width: m.width, height: m.height } : null;
+  };
+
   /** The rect the full image will occupy once it loads. The placeholder is
    *  drawn into exactly this box so it has the photo's dimensions from the
    *  first frame and nothing shifts on reveal.
@@ -253,7 +260,7 @@ export function MediaViewer(props: MediaViewerProps) {
    *  map for the same reason. */
   const placeholderRect = (): Rect | null => {
     const a = aspectByPath().get(currentPath()) ?? gridAspect();
-    return a && a > 0 ? viewportContainRect(a) : null;
+    return a && a > 0 ? viewportContainRect(a, naturalSize(currentPath())) : null;
   };
   const placeholderBox = () => {
     const r = placeholderRect();
@@ -368,15 +375,30 @@ export function MediaViewer(props: MediaViewerProps) {
       (cellImg.naturalWidth > 0 ? cellImg.naturalWidth / cellImg.naturalHeight : 1);
     // Backdrop fades in from transparent underneath the flying clone.
     setBackdropAlpha(0);
-    requestAnimationFrame(() => setBackdropAlpha(1));
     setCloneState({ src, from });
-    if (!cloneRef) { setCloneState(null); return; }
-    const anim = cloneRef.animate(
-      [rectKeyframe(from), rectKeyframe(viewportContainRect(aspect))],
-      { duration: 260, easing: "cubic-bezier(0.2, 0, 0.2, 1)", fill: "forwards" },
-    );
-    anim.onfinish = () => setCloneState(null);
-    anim.oncancel = () => setCloneState(null);
+    // Everything below has to wait a frame. `onMount` runs inside Solid's
+    // effect phase, where signal writes are *queued* rather than applied — the
+    // `<Show>` holding the clone (and with it `cloneRef`) is only committed
+    // once the current update batch flushes, after this callback returns. So
+    // reading `cloneRef` on the next line always found `undefined`, took the
+    // no-clone early-out, and silently skipped the open transition entirely;
+    // close worked only because it starts from a rAF callback, outside the
+    // batch. The frame also gives the clone's <img> (already in cache — it is
+    // the cell's own source) a chance to paint at the cell's rect before it
+    // starts moving.
+    requestAnimationFrame(() => {
+      setBackdropAlpha(1);
+      if (!cloneRef) { setCloneState(null); return; }
+      const anim = cloneRef.animate(
+        [
+          rectKeyframe(from),
+          rectKeyframe(viewportContainRect(aspect, naturalSize(currentPath()))),
+        ],
+        { duration: 260, easing: "cubic-bezier(0.2, 0, 0.2, 1)", fill: "forwards" },
+      );
+      anim.onfinish = () => setCloneState(null);
+      anim.oncancel = () => setCloneState(null);
+    });
   });
 
   /** Close with the fly-back-to-cell transition (or a fade fallback). Every
@@ -412,7 +434,7 @@ export function MediaViewer(props: MediaViewerProps) {
       if (mediaEl) from = mediaEl.getBoundingClientRect();
       else {
         const a = mediaAspect();
-        if (a) from = viewportContainRect(a);
+        if (a) from = viewportContainRect(a, naturalSize(path));
       }
       if (!from || from.width < 4) {
         setClosing(true);
