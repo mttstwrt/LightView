@@ -39,6 +39,24 @@ const FLING_VIEWPORTS_PER_SEC = 1.5;
 // Quiet gap (ms) below the fling threshold before the scroll counts as
 // settled — debounces the cheap-rung → target-tier upgrade pass.
 const SETTLE_DEBOUNCE_MS = 150;
+// A single scroll frame moving more than this many viewports is a jump — the
+// user warped (scrollbar tap/drag, scroll-to-index) rather than scrolled.
+const JUMP_VIEWPORTS = 2;
+// How long the view must then sit still before it counts as settled.
+//
+// A jump is instantaneous: one huge-delta frame and `scrollend` right behind
+// it, with no velocity in between. So the fling debounce — which is what keeps
+// cells on the cheap rung while the user is still moving — never engages, and
+// every jump immediately committed a full-resolution upgrade of the whole
+// inner window. Someone tapping around the scrollbar paid a screenful of
+// target-tier decodes per tap, including for positions they left 150 ms later.
+// Those bitmaps stay in the browser's image cache long after their cells are
+// evicted, so on a phone a few dozen jumps exhaust the content process and the
+// tab is killed ("A problem repeatedly occurred").
+//
+// Sized to a human's repeat-tap cadence: land once and you get full resolution
+// a beat later; keep jumping and the intermediate stops never upgrade at all.
+const JUMP_DWELL_MS = 450;
 // How far ahead (seconds) a fling's momentum is projected when estimating
 // where it will land. iOS-style deceleration coasts roughly velocity × 0.5s
 // past the current position; projecting a bit short of that keeps the warm
@@ -82,6 +100,13 @@ export interface ScrollFrame {
   velocity: number;
   /** 1 = down, -1 = up. */
   direction: 1 | -1;
+  /**
+   * This frame warped the view rather than scrolling it (scrollbar tap/drag,
+   * scroll-to-index). The grids drop queued work for the old position on one
+   * of these; [`JUMP_DWELL_MS`] also holds the resolution ladder back until
+   * the view stops moving.
+   */
+  isJump: boolean;
 }
 
 export interface ScrollDynamics {
@@ -141,6 +166,8 @@ export function createScrollDynamics(opts: {
   let rafId = 0;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
   let settleDebounce: ReturnType<typeof setTimeout> | undefined;
+  /** When the last positional jump landed; 0 = none this session. */
+  let lastJumpTs = 0;
 
   const velocity = () =>
     performance.now() - lastTs > VELOCITY_STALE_MS ? 0 : vel;
@@ -174,6 +201,18 @@ export function createScrollDynamics(opts: {
     vel = 0;
     if (untrack(decodeGate)) setDecodeGate(false);
     if (settleDebounce) clearTimeout(settleDebounce);
+
+    // A jump lands with `scrollend` immediately behind it, so settling here
+    // would upgrade the whole inner window to the target tier before the user
+    // has stopped navigating — see JUMP_DWELL_MS. Hold for the rest of the
+    // dwell instead; another jump inside it re-arms, so a run of taps never
+    // pays for the positions it passes through.
+    const remaining = JUMP_DWELL_MS - (performance.now() - lastJumpTs);
+    if (remaining > 0) {
+      if (untrack(settled)) setSettled(false);
+      settleDebounce = setTimeout(() => setSettled(true), remaining);
+      return;
+    }
     if (!untrack(settled)) setSettled(true);
   };
 
@@ -199,13 +238,20 @@ export function createScrollDynamics(opts: {
         }
       }
 
-      if (vel > window.innerHeight * FLING_VIEWPORTS_PER_SEC) {
+      // A warp (scrollbar tap/drag, scroll-to-index) rather than a scroll.
+      const isJump = dy > window.innerHeight * JUMP_VIEWPORTS;
+      if (isJump) lastJumpTs = now;
+
+      if (isJump || vel > window.innerHeight * FLING_VIEWPORTS_PER_SEC) {
         if (untrack(settled)) setSettled(false);
         if (settleDebounce) clearTimeout(settleDebounce);
-        settleDebounce = setTimeout(() => setSettled(true), SETTLE_DEBOUNCE_MS);
+        settleDebounce = setTimeout(
+          () => setSettled(true),
+          isJump ? JUMP_DWELL_MS : SETTLE_DEBOUNCE_MS,
+        );
       }
 
-      opts.onFrame({ y, dy, velocity: vel, direction: dir });
+      opts.onFrame({ y, dy, velocity: vel, direction: dir, isJump });
       rafId = 0;
     });
   };

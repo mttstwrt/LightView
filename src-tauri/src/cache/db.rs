@@ -1,5 +1,21 @@
 use std::path::Path;
 
+use crate::cache::thumbnails::ThumbTier;
+
+/// Every table keyed by a media file's absolute `path` column, thumbnail tiers
+/// included. One list, derived from [`ThumbTier::ALL`], so a new tier is picked
+/// up automatically by every path-keyed maintenance operation (per-file delete,
+/// gallery rebase, stale-row pruning) instead of each repeating the set — which
+/// is how tiers previously got left behind as orphaned rows.
+///
+/// `not_duplicates` is deliberately absent: its paths live in `path_a`/`path_b`,
+/// so callers handle it separately.
+pub fn path_keyed_tables() -> impl Iterator<Item = &'static str> {
+    ["media_meta", "tag_index", "index_state", "file_hashes", "gif_atlas"]
+        .into_iter()
+        .chain(ThumbTier::ALL.into_iter().map(|t| t.table()))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
     #[error("SQLite error: {0}")]
@@ -594,21 +610,7 @@ impl CacheDb {
     /// Used when a file leaves the gallery (trash, move out, fs-watch
     /// removal) so no row is left orphaned.
     pub fn remove_media_rows(&self, path: &str) {
-        const TABLES: [&str; 12] = [
-            "media_meta",
-            "tag_index",
-            "index_state",
-            "file_hashes",
-            "gif_atlas",
-            "thumbnails",
-            "thumbnails_micro",
-            "thumbnails_large",
-            "thumbnails_preview",
-            "thumbnails_justified",
-            "thumbnails_justified_mid",
-            "thumbnails_justified_high",
-        ];
-        for table in TABLES {
+        for table in path_keyed_tables() {
             let _ = self.conn.execute(
                 &format!("DELETE FROM {table} WHERE path = ?1"),
                 rusqlite::params![path],
@@ -631,21 +633,6 @@ impl CacheDb {
     ///
     /// Returns the number of rows rewritten across all tables.
     pub fn rebase_root(&self, old_root: &str, new_root: &str) -> Result<u64, CacheError> {
-        const PATH_TABLES: [&str; 12] = [
-            "media_meta",
-            "tag_index",
-            "index_state",
-            "file_hashes",
-            "thumbnails",
-            "thumbnails_micro",
-            "thumbnails_large",
-            "thumbnails_preview",
-            "thumbnails_justified",
-            "thumbnails_justified_mid",
-            "thumbnails_justified_high",
-            "gif_atlas",
-        ];
-
         let old_root = old_root.trim_end_matches('/');
         let new_root = new_root.trim_end_matches('/');
         if old_root == new_root || old_root.is_empty() {
@@ -656,7 +643,7 @@ impl CacheDb {
         let mut rewritten = 0u64;
         // Match on `old_root || '/'` so a sibling like `/data/photos2` is never
         // rewritten when the old root is `/data/photos`.
-        for table in PATH_TABLES {
+        for table in path_keyed_tables() {
             rewritten += tx.execute(
                 &format!(
                     "UPDATE OR REPLACE {table}
@@ -779,6 +766,10 @@ mod tests {
         assert_eq!(rating, Some(5));
     }
 
+    /// Every path-keyed table must be swept, thumbnail tiers included — the
+    /// reason the table list is derived from `ThumbTier::ALL` rather than
+    /// spelled out per call site. A tier missing from the sweep leaves a
+    /// multi-megabyte blob keyed to a file that no longer exists.
     #[test]
     fn remove_media_rows_clears_every_path_keyed_table() {
         let (_tmp, db) = open_db();
@@ -794,16 +785,23 @@ mod tests {
                  INSERT INTO not_duplicates (path_a, path_b) VALUES ('/g/b.jpg', '/g/c.jpg');",
             )
             .unwrap();
+        // A cached thumbnail in every LOD tier.
+        for tier in ThumbTier::ALL {
+            db.conn()
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (path, media_type, mtime, width, height, thumbnail)
+                         VALUES ('/g/a.jpg', 'image', 1, 8, 8, x'00')",
+                        tier.table()
+                    ),
+                    [],
+                )
+                .unwrap();
+        }
 
         db.remove_media_rows("/g/a.jpg");
 
-        for table in [
-            "media_meta",
-            "tag_index",
-            "index_state",
-            "file_hashes",
-            "gif_atlas",
-        ] {
+        for table in path_keyed_tables() {
             let left: i64 = db
                 .conn()
                 .query_row(

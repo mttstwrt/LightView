@@ -86,19 +86,17 @@ fn populate_media_meta(
 
         if !stale.is_empty() {
             log::info!("Pruning {} stale media_meta entries", stale.len());
-            let mut del_meta = tx
-                .prepare_cached("DELETE FROM media_meta WHERE path = ?1")
-                .map_err(|e| e.to_string())?;
-            let mut del_thumb = tx
-                .prepare_cached("DELETE FROM thumbnails WHERE path = ?1")
-                .map_err(|e| e.to_string())?;
-            let mut del_tag = tx
-                .prepare_cached("DELETE FROM tag_index WHERE path = ?1")
-                .map_err(|e| e.to_string())?;
-            for path in &stale {
-                let _ = del_meta.execute(rusqlite::params![path]);
-                let _ = del_thumb.execute(rusqlite::params![path]);
-                let _ = del_tag.execute(rusqlite::params![path]);
+            // Every path-keyed table, not just media_meta/thumbnails/tag_index:
+            // the other LOD tiers (and the GIF atlas) used to be left behind, so
+            // a gallery that churned files accumulated multi-megabyte blobs for
+            // paths that no longer existed and were never reachable again.
+            for table in crate::cache::db::path_keyed_tables() {
+                let mut del = tx
+                    .prepare_cached(&format!("DELETE FROM {table} WHERE path = ?1"))
+                    .map_err(|e| e.to_string())?;
+                for path in &stale {
+                    let _ = del.execute(rusqlite::params![path]);
+                }
             }
         }
     }

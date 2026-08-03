@@ -2,11 +2,11 @@ import { For, Show, createSignal, createEffect, createMemo, on, onMount, onClean
 import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, hasTouch, isTauri, type UnlistenFn } from "../../lib/runtime";
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
-import { wheelPxPerUnit } from "../../lib/wheel";
+import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
 import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, THUMB_REGENERATED_EVENT, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
-import { thumbGenStarted, thumbGenProgress, thumbGenFinished } from "../../stores/thumbnailProgressStore";
+import { createThumbProgress } from "../../lib/thumbProgress";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
@@ -50,11 +50,14 @@ const BATCH_SIZE = 128;
 const VELOCITY_SLOW = 500;
 const VELOCITY_FAST = 3000;
 
-// Jump detection: scroll delta > 2x viewport height triggers generation bump.
-const JUMP_FACTOR = 2;
-
-// How many paths to send per background precache call.
-const BG_BATCH_SIZE = 64;
+// How many paths a speculative warm (landing zone, background precache) may
+// send at once. Nothing can preempt a batch once it's issued — the backend
+// takes the whole list, holds its bounded decode pool until the last image is
+// done, and only then resolves — so the batch size *is* the worst-case delay
+// before a scroll that lands on cold cells can get any CPU back. At 64 large
+// photos that is tens of seconds; 16 keeps the loop responsive at a small cost
+// in per-call overhead. (JustifiedGrid reached the same number the same way.)
+const SPECULATIVE_BATCH = 16;
 
 // Rows beyond the visible+buffer range before thumbnails are evicted from memory.
 const EVICT_ROWS = 15;
@@ -178,9 +181,11 @@ export function GalleryGrid(props: GalleryGridProps) {
     urlVersions.set(path, (urlVersions.get(path) ?? 0) + 1);
   };
 
-  // Thumbnail generation progress tracking
-  let thumbGenTotal = 0;
-  let thumbGenDone = 0;
+  // Thumbnail generation progress ("Generating N / M"). Idle means nothing is
+  // queued for generation and nothing is in flight.
+  const progress = createThumbProgress(
+    () => needsGeneration.size === 0 && inFlightSet.size === 0,
+  );
 
   /** Called by ThumbnailCell when the protocol handler returns 404. */
   const handleThumbError = (path: string) => {
@@ -190,12 +195,7 @@ export function GalleryGrid(props: GalleryGridProps) {
     // to allow merging with other pending requests.
     needsGeneration.add(path);
     coalescedPaths.add(path);
-    thumbGenTotal++;
-    if (thumbGenTotal === 1) {
-      thumbGenStarted(thumbGenTotal);
-    } else {
-      thumbGenProgress(thumbGenDone, thumbGenTotal);
-    }
+    progress.queued();
   };
 
   // Off-DOM decode-then-swap for tier upgrades on cells already showing an
@@ -300,21 +300,31 @@ export function GalleryGrid(props: GalleryGridProps) {
       const px = TIER_PX[tier() as keyof typeof TIER_PX] ?? TIER_PX.m;
       return px * px;
     },
-    onFrame: ({ dy }) => {
-      // Jump detection: a huge delta means the user warped (scrollbar drag,
-      // scroll-to-index) — drop all queued/in-flight work for the old spot.
-      if (dy > window.innerHeight * JUMP_FACTOR) {
+    onFrame: ({ isJump }) => {
+      // The user warped (scrollbar tap/drag, scroll-to-index) — drop all
+      // queued/in-flight work for the old spot. The generation bump is what
+      // invalidates anything already in flight.
+      //
+      // `assignedRung` is deliberately NOT cleared: it is the index
+      // `evictFaraway` walks to drop a path's thumbMap entry, so clearing it
+      // orphaned every cell displayed before the jump — permanently
+      // un-evictable, since eviction could no longer see them. The next
+      // scheduleFetch evicts them properly instead, which is the same set and
+      // also releases their <img> URLs.
+      if (isJump) {
         setGeneration((g) => g + 1);
-        assignedRung.clear();
         swapper.cancelAll();
         needsGeneration.clear();
         coalescedPaths.clear();
         inFlightSet.clear();
         failedSet.clear();
         landingWarmed.clear();
-        bgCursor = 0;
-        thumbGenTotal = 0;
-        thumbGenDone = 0;
+        progress.reset();
+        // bgCursor is deliberately not reset: `warmBackground` resyncs it to
+        // the viewport, so a jump moves the crawl to the new position instead
+        // of restarting it at the top of the gallery — which is what turned a
+        // helpful startup crawl into one warming everything the user had just
+        // left, for the rest of the session.
       }
       recalcRange?.();
     },
@@ -480,45 +490,6 @@ export function GalleryGrid(props: GalleryGridProps) {
       }
     };
 
-    // WebKitGTK doesn't propagate wheel events to window scroll natively, so we
-    // intercept them and drive the scroll ourselves with momentum smoothing.
-    // Two WebKitGTK quirks (vs. Chromium in the web client) need handling:
-    //   1. Traditional mouse wheels arrive as DOM_DELTA_LINE (deltaY ±1 per
-    //      notch), not pixels — so we normalize by deltaMode via
-    //      `wheelPxPerUnit`, mapping one WebKitGTK notch to one grid row (= one
-    //      column width, cells are square). Other engines count lines
-    //      differently; `lib/wheel.ts` has the full table.
-    //   2. Fractional window.scrollBy() steps get rounded away every frame, so
-    //      relative stepping silently drops the tail of each gesture by an
-    //      amount that varies with frame timing. We instead animate an absolute
-    //      float target and keep our own float position, immune to rounding.
-    let wheelTargetY = 0; // absolute scroll target (float)
-    let wheelCurrentY = 0; // our float view of scrollY, immune to engine rounding
-    let wheelAnimating = false;
-    let wheelRafId = 0;
-    const WHEEL_DECAY = 0.8; // fraction of remaining distance covered per frame
-    const WHEEL_SETTLE = 0.5; // px from target at which we snap and stop
-
-    // Convert a wheel delta to pixels. Under WebKitGTK one notch advances
-    // exactly one row (= one column width); other engines' line/page modes are
-    // normalized by `wheelPxPerUnit`, which is where the details live.
-    const wheelDeltaPx = (e: WheelEvent) => e.deltaY * wheelPxPerUnit(e, rowHeight());
-
-    const drainWheel = () => {
-      const diff = wheelTargetY - wheelCurrentY;
-      if (Math.abs(diff) < WHEEL_SETTLE) {
-        wheelCurrentY = wheelTargetY;
-        window.scrollTo(0, Math.round(wheelTargetY));
-        wheelAnimating = false;
-        wheelRafId = 0;
-        scheduleFetch(); // Wheel scroll settled — fetch now
-        return;
-      }
-      wheelCurrentY += diff * (1 - WHEEL_DECAY);
-      window.scrollTo(0, Math.round(wheelCurrentY));
-      wheelRafId = requestAnimationFrame(drainWheel);
-    };
-
     // Commit a new thumbnail size, keeping the image under the anchor screen
     // point pinned in place. Shared by Ctrl+wheel (anchor = cursor), the column
     // stepper below, and the touch pinch commit (anchor = two-finger midpoint).
@@ -577,41 +548,24 @@ export function GalleryGrid(props: GalleryGridProps) {
       applyThumbSizeAnchored((upper + lower) / 2, anchorX, anchorY);
     };
 
-    const onWheel = (e: WheelEvent) => {
-      // Ctrl+wheel resizes thumbnails instead of scrolling, stepping the column
-      // count by 1 per tick. During a Ctrl+drag selection, fall through to
-      // scroll so the user can extend the drag past the viewport.
-      if ((e.ctrlKey || e.metaKey) && !isDragging()) {
-        e.preventDefault();
+    // Under WebKitGTK one notch advances exactly one row (= one column width;
+    // cells are square). Ctrl+wheel resizes thumbnails instead of scrolling,
+    // stepping the column count by 1 per tick — except during a Ctrl+drag
+    // selection, where returning false falls through to a scroll so the user
+    // can extend the drag past the viewport.
+    const detachWheel = createWheelScroll({
+      rowHeight,
+      onSettle: () => scheduleFetch(),
+      onZoom: (e) => {
+        if (isDragging()) return false;
         const w = containerWidth();
         const g = gap();
-        if (w <= 0) return;
+        if (w <= 0) return true;
         const curCols = Math.max(1, Math.floor((w + g) / (settings().display.thumbnail_size + g)));
         resizeByCols(e.deltaY < 0 ? curCols - 1 : curCols + 1, e.clientX, e.clientY);
-        return;
-      }
-      e.preventDefault();
-      // At the start of a gesture, re-sync our float position from the DOM so
-      // we pick up any scrollbar drag / keyboard scroll that happened between
-      // gestures. While animating we keep accumulating into wheelTargetY.
-      if (!wheelAnimating) {
-        wheelCurrentY = window.scrollY;
-        wheelTargetY = window.scrollY;
-        wheelAnimating = true;
-      }
-      const maxScroll = Math.max(
-        0,
-        document.documentElement.scrollHeight - window.innerHeight,
-      );
-      wheelTargetY = Math.max(
-        0,
-        Math.min(maxScroll, wheelTargetY + wheelDeltaPx(e)),
-      );
-      if (!wheelRafId) {
-        wheelRafId = requestAnimationFrame(drainWheel);
-      }
-    };
-    window.addEventListener("wheel", onWheel, { passive: false });
+        return true;
+      },
+    }).attach();
 
     // -----------------------------------------------------------------------
     // Touch pinch-to-zoom: two fingers smoothly scale the grid (a cheap CSS
@@ -716,8 +670,23 @@ export function GalleryGrid(props: GalleryGridProps) {
     // Thumbnail fetch loop — generation, background precache, and eviction
     // -----------------------------------------------------------------------
 
+    // Two single-flight slots, not one. `inFlightFetch` carries the drain of
+    // cells that are on screen right now and showing nothing; `inFlightWarm`
+    // carries speculation (landing zone, background precache).
+    //
+    // Sharing one slot meant a speculative batch blocked the visible drain for
+    // its whole duration — and `scheduleFetch` bails on the very first line
+    // when the slot is busy, so a single 64-image precache of large photos
+    // could stall *every* subsequent generation request for as long as it ran.
+    // Measured on a 600-photo 12 MP gallery: one background batch issued a
+    // second after load held the slot for the entire session, and cells the
+    // user scrolled to took 30 s to appear (they were left to the /thumb
+    // route's one-at-a-time generate-on-miss, queued behind that same batch).
+    // Touching the scrollbar made it obvious because a jump reveals a whole
+    // screenful of cold cells at once.
     let fetchAbort = false;
     let inFlightFetch: Promise<void> | null = null;
+    let inFlightWarm: Promise<void> | null = null;
 
     /** Remove thumbMap entries for paths far from the current viewport. */
     const evictFaraway = () => {
@@ -767,7 +736,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const endIdx = Math.min(props.paths.length, lastRow * c);
 
       const want: string[] = [];
-      for (let i = startIdx; i < endIdx && want.length < BG_BATCH_SIZE; i++) {
+      for (let i = startIdx; i < endIdx && want.length < SPECULATIVE_BATCH; i++) {
         const p = props.paths[i];
         if (!p || assignedRung.has(p) || inFlightSet.has(p) || failedSet.has(p) || landingWarmed.has(p)) continue;
         landingWarmed.add(p);
@@ -775,7 +744,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       }
       if (want.length === 0) return;
 
-      inFlightFetch = (async () => {
+      inFlightWarm = (async () => {
         try {
           await precacheThumbnails(want);
           // Browser cache warm — low-priority so it can't compete with the
@@ -788,148 +757,155 @@ export function GalleryGrid(props: GalleryGridProps) {
           }
         } catch (e) {
           console.error("Landing-zone precache failed:", e);
+        } finally {
+          inFlightWarm = null;
         }
-        inFlightFetch = null;
+      })();
+    };
+
+    /** Generate thumbnails for cells that 404'd. Returns true if a batch went
+     *  out. Priorities are computed at drain time from the current windows
+     *  (full-res first, then rendered buffer by distance); leftovers outside
+     *  the rendered window are dropped — they were queued during a scroll that
+     *  has since moved past them, and re-queue via 404 if the user scrolls
+     *  back. */
+    const drainQueued = (): boolean => {
+      if (needsGeneration.size === 0) return false;
+      const c = cols();
+      const { picked: toGenerate, stale } = pickByPriority(
+        needsGeneration,
+        (p) => pathToIndex.get(p),
+        {
+          viewStart: fullStartRow() * c,
+          viewEnd: fullEndRow() * c,
+          renderStart: startRow() * c,
+          renderEnd: endRow() * c,
+        },
+        BATCH_SIZE,
+      );
+      if (stale.length > 0) {
+        for (const p of stale) needsGeneration.delete(p);
+        progress.dropped(stale.length);
+      }
+      if (toGenerate.length === 0) return false;
+
+      for (const p of toGenerate) {
+        needsGeneration.delete(p);
+        inFlightSet.add(p);
+      }
+
+      const gen = generation();
+      const activeTier = tier();
+      inFlightFetch = (async () => {
+        try {
+          let resultPaths: Set<string>;
+          let generatedCount = 0;
+          if (activeTier === "l" || activeTier === "p") {
+            await ensureTierThumbnails(toGenerate, activeTier);
+            if (fetchAbort || generation() !== gen) return;
+            resultPaths = new Set(toGenerate);
+            batch(() => {
+              for (const p of toGenerate) {
+                bumpVersion(p);
+                if (assignedRung.has(p)) assignedRung.set(p, activeTier);
+                setThumbMap(p, thumbSrcFor(p, activeTier));
+              }
+            });
+            generatedCount = toGenerate.length;
+          } else {
+            const results = await getThumbnailsBatch(toGenerate);
+            if (fetchAbort || generation() !== gen) return;
+
+            resultPaths = new Set(results.map((r) => r.path));
+            batch(() => {
+              for (const r of results) {
+                bumpVersion(r.path);
+                if (assignedRung.has(r.path)) assignedRung.set(r.path, activeTier);
+                setThumbMap(r.path, thumbSrcFor(r.path, activeTier));
+              }
+            });
+
+            generatedCount = results.length;
+          }
+          for (const p of toGenerate) {
+            inFlightSet.delete(p);
+            if (!resultPaths.has(p)) failedSet.add(p);
+          }
+          // After the in-flight set is drained, so "idle" reads correctly.
+          progress.completed(generatedCount);
+        } catch (e) {
+          console.error("Thumbnail generation batch failed:", e);
+          for (const p of toGenerate) {
+            inFlightSet.delete(p);
+            failedSet.add(p);
+          }
+        } finally {
+          // `finally`, not a trailing statement: the early returns above (stale
+          // generation / abort) would otherwise wedge the slot for the rest of
+          // the session.
+          inFlightFetch = null;
+        }
+      })();
+      return true;
+    };
+
+    /** Walk the gallery warming thumbnails while idle. Silent, no progress. */
+    const warmBackground = () => {
+      if (dynamics.velocity() >= VELOCITY_SLOW) return;
+      // Start from the viewport, never from wherever the cursor happens to
+      // sit: after a jump the useful work is around the new position, and
+      // crawling up to it from behind buys nothing the user can see.
+      const firstVisible = startRow() * cols();
+      if (bgCursor < firstVisible) bgCursor = firstVisible;
+      if (bgCursor >= props.paths.length) return;
+
+      const bgNeeded: string[] = [];
+      const total = props.paths.length;
+      while (bgNeeded.length < SPECULATIVE_BATCH && bgCursor < total) {
+        const p = props.paths[bgCursor];
+        bgCursor++;
+        if (p && !assignedRung.has(p) && !failedSet.has(p)) {
+          bgNeeded.push(p);
+        }
+      }
+      if (bgNeeded.length === 0) return;
+
+      inFlightWarm = (async () => {
+        try {
+          await precacheThumbnails(bgNeeded);
+        } catch (e) {
+          console.error("Background precache failed:", e);
+        } finally {
+          inFlightWarm = null;
+        }
       })();
     };
 
     const scheduleFetch = () => {
-      if (inFlightFetch) return;
-      // During a fling, near-viewport generation is wasted work — those cells
-      // fly past unseen. Warm the projected landing zone instead; queued
-      // 404-generation drains on settle (with stale entries dropped).
-      if (dynamics.velocity() > VELOCITY_FAST) {
-        warmLandingZone();
-        return;
-      }
-
       // Drain coalesced paths into needsGeneration (they're already there,
       // but clear the coalesced set so new items can accumulate during next fetch).
       coalescedPaths.clear();
 
-      // Evict far-from-viewport thumbnails up front. Generation/precache
-      // batches below return early, so running eviction last would starve
-      // it for as long as there's work queued — and it's cheap.
+      // Evict far-from-viewport thumbnails up front. The branches below return
+      // early, so running eviction last would starve it for as long as there's
+      // work queued — and it's cheap.
       evictFaraway();
 
-      const gen = generation();
+      // During a fling, near-viewport generation is wasted work — those cells
+      // fly past unseen. Warm the projected landing zone instead; queued
+      // 404-generation drains on settle (with stale entries dropped).
+      const flinging = dynamics.velocity() > VELOCITY_FAST;
+      if (!flinging && !inFlightFetch && drainQueued()) return;
 
-      // Phase 1: Generate thumbnails that 404'd. Priorities are computed at
-      // drain time from the current windows (full-res first, then rendered
-      // buffer by distance); leftovers outside the rendered window are
-      // dropped — they were queued during a scroll that has since moved past
-      // them, and re-queue via 404 if the user scrolls back.
-      if (needsGeneration.size > 0) {
-        const c = cols();
-        const { picked: toGenerate, stale } = pickByPriority(
-          needsGeneration,
-          (p) => pathToIndex.get(p),
-          {
-            viewStart: fullStartRow() * c,
-            viewEnd: fullEndRow() * c,
-            renderStart: startRow() * c,
-            renderEnd: endRow() * c,
-          },
-          BATCH_SIZE,
-        );
-        if (stale.length > 0) {
-          for (const p of stale) needsGeneration.delete(p);
-          thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - stale.length);
-          // Dropping may have emptied the queue — close out the progress UI
-          // (stale items were counted when queued, so it is showing).
-          if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-            thumbGenFinished(thumbGenDone);
-            thumbGenTotal = 0;
-            thumbGenDone = 0;
-          }
-        }
-
-        if (toGenerate.length > 0) {
-          for (const p of toGenerate) {
-            needsGeneration.delete(p);
-            inFlightSet.add(p);
-          }
-
-          const activeTier = tier();
-          inFlightFetch = (async () => {
-            try {
-              let resultPaths: Set<string>;
-              if (activeTier === "l" || activeTier === "p") {
-                await ensureTierThumbnails(toGenerate, activeTier);
-                if (fetchAbort || generation() !== gen) return;
-                resultPaths = new Set(toGenerate);
-                batch(() => {
-                  for (const p of toGenerate) {
-                    bumpVersion(p);
-                    if (assignedRung.has(p)) assignedRung.set(p, activeTier);
-                    setThumbMap(p, thumbSrcFor(p, activeTier));
-                  }
-                });
-                thumbGenDone += toGenerate.length;
-              } else {
-                const results = await getThumbnailsBatch(toGenerate);
-                if (fetchAbort || generation() !== gen) return;
-
-                resultPaths = new Set(results.map((r) => r.path));
-                batch(() => {
-                  for (const r of results) {
-                    bumpVersion(r.path);
-                    if (assignedRung.has(r.path)) assignedRung.set(r.path, activeTier);
-                    setThumbMap(r.path, thumbSrcFor(r.path, activeTier));
-                  }
-                });
-
-                thumbGenDone += results.length;
-              }
-              for (const p of toGenerate) {
-                inFlightSet.delete(p);
-                if (!resultPaths.has(p)) failedSet.add(p);
-              }
-
-              // Report progress or completion
-              if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-                thumbGenFinished(thumbGenDone);
-                thumbGenTotal = 0;
-                thumbGenDone = 0;
-              } else {
-                thumbGenProgress(thumbGenDone, thumbGenTotal);
-              }
-            } catch (e) {
-              console.error("Thumbnail generation batch failed:", e);
-              for (const p of toGenerate) {
-                inFlightSet.delete(p);
-                failedSet.add(p);
-              }
-            }
-            inFlightFetch = null;
-          })();
-          return;
-        }
+      // Speculation waits for the cells the user is actually looking at. It
+      // all lands on the backend's one bounded decode pool, so anything
+      // started here comes straight out of the visible cells' budget.
+      if (inFlightFetch || inFlightWarm) return;
+      if (flinging) {
+        warmLandingZone();
+        return;
       }
-
-      // Phase 2: Background prefetch (silent, no progress tracking)
-      if (dynamics.velocity() < VELOCITY_SLOW && bgCursor < props.paths.length) {
-        const bgNeeded: string[] = [];
-        const total = props.paths.length;
-        while (bgNeeded.length < BG_BATCH_SIZE && bgCursor < total) {
-          const p = props.paths[bgCursor];
-          bgCursor++;
-          if (p && !assignedRung.has(p) && !failedSet.has(p)) {
-            bgNeeded.push(p);
-          }
-        }
-
-        if (bgNeeded.length > 0) {
-          inFlightFetch = (async () => {
-            try {
-              await precacheThumbnails(bgNeeded);
-            } catch (e) {
-              console.error("Background precache failed:", e);
-            }
-            inFlightFetch = null;
-          })();
-        }
-      }
+      warmBackground();
     };
 
     // scrollend fires when scrolling stops — replaces manual debounce.
@@ -942,7 +918,7 @@ export function GalleryGrid(props: GalleryGridProps) {
 
     // Background interval for precache/eviction when not actively scrolling.
     const bgIntervalId = setInterval(() => {
-      if (!inFlightFetch) scheduleFetch();
+      if (!inFlightFetch || needsGeneration.size > 0) scheduleFetch();
     }, 500);
 
     // Also fire immediately on generation change (jump/path change)
@@ -973,8 +949,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       urlVersions.clear();
       versionEpoch++;
       bgCursor = 0;
-      thumbGenTotal = 0;
-      thumbGenDone = 0;
+      progress.reset();
       setGeneration((g) => g + 1);
     };
     window.addEventListener("lightview:thumbnails-invalidated", onInvalidate);
@@ -1001,10 +976,9 @@ export function GalleryGrid(props: GalleryGridProps) {
     onCleanup(() => {
       ro.disconnect();
       window.removeEventListener("scrollend", onScrollEnd);
-      window.removeEventListener("wheel", onWheel);
+      detachWheel();
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
-      if (wheelRafId) cancelAnimationFrame(wheelRafId);
       clearInterval(bgIntervalId);
       fetchAbort = true;
     });
@@ -1052,14 +1026,7 @@ export function GalleryGrid(props: GalleryGridProps) {
             droppedQueued++;
           }
         }
-        if (droppedQueued > 0) {
-          thumbGenTotal = Math.max(thumbGenDone, thumbGenTotal - droppedQueued);
-          if (needsGeneration.size === 0 && inFlightSet.size === 0) {
-            thumbGenFinished(thumbGenDone);
-            thumbGenTotal = 0;
-            thumbGenDone = 0;
-          }
-        }
+        progress.dropped(droppedQueued);
         bgCursor = 0;
         recalcRange?.();
       },

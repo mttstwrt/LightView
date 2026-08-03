@@ -37,6 +37,129 @@ fn encode_b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+/// Record a file's source dimensions, discovered while thumbnailing it.
+///
+/// Guarded by `width IS NULL` so it only ever fills a gap: a freshly indexed
+/// row starts with NULL dimensions, and whichever tier happens to be generated
+/// first supplies them. Idempotent, so every generation path can call it.
+fn store_source_dims(conn: &rusqlite::Connection, path: &str, width: u32, height: u32) {
+    let _ = conn.execute(
+        "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
+        rusqlite::params![width, height, path],
+    );
+}
+
+/// Record video dimensions + duration from an ffprobe result. Unlike
+/// [`store_source_dims`] this overwrites: ffprobe is authoritative for videos,
+/// where the decoded frame can differ from the container's declared size.
+fn store_video_meta(conn: &rusqlite::Connection, path: &str, w: u32, h: u32, duration: Option<f64>) {
+    let _ = conn.execute(
+        "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
+        rusqlite::params![w, h, duration, path],
+    );
+}
+
+/// A generated Standard-tier thumbnail staged for its SQLite write. Shared by
+/// the batch and precache paths, which both generate on the pool first and then
+/// commit everything in one transaction.
+struct CacheItem {
+    path: String,
+    media_type: String,
+    data: Vec<u8>,
+    format: String,
+    resize_filter: String,
+    width: u32,
+    height: u32,
+    src_width: u32,
+    src_height: u32,
+}
+
+impl CacheItem {
+    fn new(thumb: crate::pipeline::thumbnailer::ThumbResult, filter: ResizeFilter) -> Self {
+        Self {
+            path: thumb.path,
+            media_type: thumb.media_type,
+            format: thumb.format.as_cache_str().to_string(),
+            resize_filter: filter.as_str().to_string(),
+            data: thumb.data,
+            width: thumb.width,
+            height: thumb.height,
+            src_width: thumb.src_width,
+            src_height: thumb.src_height,
+        }
+    }
+
+    fn is_video(&self) -> bool {
+        self.media_type == "video"
+    }
+
+    /// Write the standard-tier row plus the source dimensions it revealed.
+    fn write(&self, conn: &rusqlite::Connection) {
+        let _ = crate::cache::thumbnails::write_standard_row(
+            conn, &self.path, &self.media_type, 0, self.width, self.height,
+            &self.data, &self.format, &self.resize_filter,
+        );
+        store_source_dims(conn, &self.path, self.src_width, self.src_height);
+    }
+}
+
+/// How [`store_derived_extras`] treats rows that already exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Overwrite {
+    /// The Standard tier was just (re)generated, so its derivations are the
+    /// authoritative ones — replace whatever was there.
+    Yes,
+    /// Backfilling derivations from *already cached* Standard bytes. Anything
+    /// already present was derived the same way, so leave it alone.
+    No,
+}
+
+/// Persist the ThumbHash placeholder + Micro-tier row derived from a
+/// Standard-tier thumbnail. Every Standard generation path funnels through
+/// here so the DB always ends up in one shape — standard row + thumbhash +
+/// micro row — rather than each site spelling out its own two statements.
+fn store_derived_extras(
+    conn: &rusqlite::Connection,
+    path: &str,
+    media_type: &str,
+    extras: &DerivedExtras,
+    overwrite: Overwrite,
+) {
+    if let Some(hash) = &extras.thumbhash {
+        let sql = match overwrite {
+            Overwrite::Yes => "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
+            Overwrite::No => {
+                "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2 AND thumbhash IS NULL"
+            }
+        };
+        let _ = conn.execute(sql, rusqlite::params![hash, path]);
+    }
+    if let Some(bytes) = &extras.micro_bytes {
+        match overwrite {
+            Overwrite::Yes => {
+                let _ = crate::cache::thumbnails::write_tier_row(
+                    conn, ThumbTier::Micro, path, media_type, 0,
+                    extras.micro_size, extras.micro_size, bytes, "jpeg",
+                );
+            }
+            Overwrite::No => {
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO thumbnails_micro
+                         (path, media_type, mtime, width, height, thumbnail, format)
+                     VALUES (?1, ?2, 0, ?3, ?4, ?5, 'jpeg')",
+                    rusqlite::params![
+                        path,
+                        media_type,
+                        extras.micro_size,
+                        extras.micro_size,
+                        bytes
+                    ],
+                );
+            }
+        }
+    }
+}
+
 /// Get a single thumbnail. Checks the SQLite cache, then generates on-demand.
 #[tauri::command]
 pub async fn get_thumbnail(
@@ -88,10 +211,7 @@ pub async fn get_thumbnail(
                     fmt_str,
                     filter.as_str(),
                 );
-                let _ = db.conn().execute(
-                    "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
-                    rusqlite::params![thumb.src_width, thumb.src_height, thumb.path],
-                );
+                store_source_dims(db.conn(), &thumb.path, thumb.src_width, thumb.src_height);
 
                 // Extract and store video metadata (duration, dimensions, codec)
                 if thumb.media_type == "video" {
@@ -226,41 +346,17 @@ pub async fn get_thumbnails_batch(
     };
 
     // Phase 3: Cache results and build response in the requested format
-    struct CacheItem {
-        path: String,
-        media_type: String,
-        data: Vec<u8>,
-        format: String,
-        resize_filter: String,
-        width: u32,
-        height: u32,
-        src_width: u32,
-        src_height: u32,
-    }
-    let mut to_cache = Vec::new();
+    let mut to_cache = Vec::with_capacity(generated_thumbs.len());
 
     for thumb in generated_thumbs {
-        let fmt_str = thumb.format.as_cache_str().to_string();
-
-        to_cache.push(CacheItem {
-            path: thumb.path.clone(),
-            media_type: thumb.media_type.clone(),
-            data: thumb.data,
-            format: fmt_str.clone(),
-            resize_filter: filter.as_str().to_string(),
-            width: thumb.width,
-            height: thumb.height,
-            src_width: thumb.src_width,
-            src_height: thumb.src_height,
-        });
-
         results.push(ThumbnailResult {
-            path: thumb.path,
+            path: thumb.path.clone(),
             width: thumb.width,
             height: thumb.height,
-            media_type: thumb.media_type,
-            format: fmt_str,
+            media_type: thumb.media_type.clone(),
+            format: thumb.format.as_cache_str().to_string(),
         });
+        to_cache.push(CacheItem::new(thumb, filter));
     }
 
     // -------------------------------------------------------------------
@@ -290,14 +386,7 @@ pub async fn get_thumbnails_batch(
         if let Some(db) = db.as_mut() {
             let tx = db.transaction().map_err(|e| e.to_string())?;
             for item in &to_cache {
-                let _ = crate::cache::thumbnails::write_standard_row(
-                    &tx, &item.path, &item.media_type, 0, item.width, item.height,
-                    &item.data, &item.format, &item.resize_filter,
-                );
-                let _ = tx.execute(
-                    "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
-                    rusqlite::params![item.src_width, item.src_height, item.path],
-                );
+                item.write(&tx);
             }
 
             // Write ThumbHash + micro tier rows in the same transaction so
@@ -305,27 +394,14 @@ pub async fn get_thumbnails_batch(
             // placeholder/micro missing). `derived_extras` is index-aligned
             // with `to_cache`.
             for (item, extra) in to_cache.iter().zip(&derived_extras) {
-                if let Some(hash) = &extra.thumbhash {
-                    let _ = tx.execute(
-                        "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
-                        rusqlite::params![hash, item.path],
-                    );
-                }
-                if let Some(bytes) = &extra.micro_bytes {
-                    let _ = crate::cache::thumbnails::write_tier_row(
-                        &tx, ThumbTier::Micro, &item.path, &item.media_type, 0,
-                        extra.micro_size, extra.micro_size, bytes, "jpeg",
-                    );
-                }
+                store_derived_extras(&tx, &item.path, &item.media_type, extra, Overwrite::Yes);
             }
 
             let _ = tx.commit();
 
             // Extract video metadata outside the transaction
-            for item in &to_cache {
-                if item.media_type == "video" {
-                    populate_video_metadata(db.conn(), &item.path);
-                }
+            for item in to_cache.iter().filter(|i| i.is_video()) {
+                populate_video_metadata(db.conn(), &item.path);
             }
         }
     }
@@ -500,17 +576,17 @@ pub(crate) async fn dispatch_thumbnail_fit(
 /// paths that are missing them. Reads the standard thumbnail bytes from
 /// SQLite, decodes to RGBA, downsamples, and writes the micro row + thumbhash.
 async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
-    // Read standard-tier bytes from DB
+    // Read standard-tier bytes from DB — one batched query, not one per path.
     let items: Vec<(String, Vec<u8>, u32, u32, String)> = {
         let db = state.cache_db.lock().await;
         let Some(db) = db.as_ref() else { return };
-        paths
-            .iter()
-            .filter_map(|path| {
-                let row = db.get_thumbnail(path).ok()??;
-                Some((path.clone(), row.thumbnail, row.width, row.height, row.media_type))
-            })
-            .collect()
+        match db.get_thumbnail_blobs_batch(paths) {
+            Ok(items) => items,
+            Err(e) => {
+                log::warn!("micro derivation blob read failed: {e}");
+                return;
+            }
+        }
     };
 
     if items.is_empty() {
@@ -541,27 +617,7 @@ async fn derive_micro_for_cached(state: &AppState, paths: &[String]) {
     let Some(db) = db.as_mut() else { return };
     let Ok(txn) = db.transaction() else { return };
     for (path, media_type, extras) in &derived {
-        if let Some(hash) = &extras.thumbhash {
-            let _ = txn.execute(
-                "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2 AND thumbhash IS NULL",
-                rusqlite::params![hash, path],
-            );
-        }
-        if let Some(bytes) = &extras.micro_bytes {
-            let _ = txn.execute(
-                "INSERT OR IGNORE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    path,
-                    media_type,
-                    0u64,
-                    extras.micro_size,
-                    extras.micro_size,
-                    bytes,
-                    "jpeg"
-                ],
-            );
-        }
+        store_derived_extras(&txn, path, media_type, extras, Overwrite::No);
     }
     let _ = txn.commit();
     log::info!(
@@ -588,17 +644,9 @@ pub async fn regenerate_thumbnail_impl(
     {
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
-            for table in [
-                "thumbnails",
-                "thumbnails_micro",
-                "thumbnails_large",
-                "thumbnails_preview",
-                "thumbnails_justified",
-                "thumbnails_justified_mid",
-                "thumbnails_justified_high",
-            ] {
+            for tier in ThumbTier::ALL {
                 let _ = db.conn().execute(
-                    &format!("DELETE FROM {} WHERE path = ?1", table),
+                    &format!("DELETE FROM {} WHERE path = ?1", tier.table()),
                     rusqlite::params![path],
                 );
             }
@@ -699,12 +747,7 @@ pub async fn get_media_meta_impl(
 /// Extract video metadata via ffprobe and store it in the media_meta table.
 fn populate_video_metadata(conn: &rusqlite::Connection, path: &str) {
     match thumbnailer::probe_video_metadata(Path::new(path)) {
-        Ok((w, h, duration)) => {
-            let _ = conn.execute(
-                "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
-                rusqlite::params![w, h, duration, path],
-            );
-        }
+        Ok((w, h, duration)) => store_video_meta(conn, path, w, h, duration),
         Err(e) => {
             log::debug!("Video metadata extraction failed for {}: {}", path, e);
         }
@@ -789,32 +832,16 @@ pub async fn precache_thumbnails_impl(
     }
     let results = futures::future::join_all(handles).await;
 
-    let mut generated = 0usize;
     let mut failed = Vec::new();
     let mut to_cache = Vec::new();
 
     for (i, result) in results.into_iter().enumerate() {
         match result {
-            Ok(Ok(thumb)) => {
-                let fmt_str = thumb.format.as_cache_str();
-
-                to_cache.push((
-                    thumb.path,
-                    thumb.media_type,
-                    thumb.width,
-                    thumb.height,
-                    thumb.data,
-                    fmt_str.to_string(),
-                    thumb.src_width,
-                    thumb.src_height,
-                ));
-                generated += 1;
-            }
-            _ => {
-                failed.push(uncached[i].clone());
-            }
+            Ok(Ok(thumb)) => to_cache.push(CacheItem::new(thumb, filter)),
+            _ => failed.push(uncached[i].clone()),
         }
     }
+    let generated = to_cache.len();
 
     // Batch write to SQLite (single transaction)
     if !to_cache.is_empty() {
@@ -822,21 +849,13 @@ pub async fn precache_thumbnails_impl(
         if let Some(db) = db.as_mut() {
             let tx = db.transaction().map_err(|e| e.to_string())?;
             for item in &to_cache {
-                let _ = crate::cache::thumbnails::write_standard_row(
-                    &tx, &item.0, &item.1, 0, item.2, item.3, &item.4, &item.5, filter.as_str(),
-                );
-                let _ = tx.execute(
-                    "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
-                    rusqlite::params![item.6, item.7, item.0],
-                );
+                item.write(&tx);
             }
             let _ = tx.commit();
 
             // Extract video metadata outside the transaction
-            for item in &to_cache {
-                if item.1 == "video" {
-                    populate_video_metadata(db.conn(), &item.0);
-                }
+            for item in to_cache.iter().filter(|i| i.is_video()) {
+                populate_video_metadata(db.conn(), &item.path);
             }
         }
     }
@@ -845,7 +864,7 @@ pub async fn precache_thumbnails_impl(
     // previously cached paths that were missing them, so a precache pass over
     // the gallery leaves the cheap "s" tier fully warm.
     let mut micro_needed = micro_missing;
-    micro_needed.extend(to_cache.iter().map(|item| item.0.clone()));
+    micro_needed.extend(to_cache.iter().map(|item| item.path.clone()));
     if !micro_needed.is_empty() {
         derive_micro_for_cached(state, &micro_needed).await;
     }
@@ -1028,16 +1047,7 @@ pub async fn ensure_tier_thumbnails_impl(
 
     let target = tier.target_size();
     let filter = thumbnailer::filter_for_size(target);
-    // L/P tiers use lossy WebP — ~30 % smaller at equivalent quality,
-    // which matters a lot at 1024/1600 px. Micro falls back to JPEG.
-    let tier_format = match tier {
-        ThumbTier::Large
-        | ThumbTier::Preview
-        | ThumbTier::Justified
-        | ThumbTier::JustifiedMid
-        | ThumbTier::JustifiedHigh => ThumbFormat::Webp,
-        _ => ThumbFormat::Jpeg,
-    };
+    let tier_format = tier.format();
 
     // Generate on the shared thumb pool. `generate_for_path` decodes from
     // source, center-crops (for Micro/Standard it also squares), and
@@ -1047,10 +1057,7 @@ pub async fn ensure_tier_thumbnails_impl(
     // path so the gallery can show true proportions.
     let missing_clone = missing.clone();
     let pool = state.thumb_pool.clone();
-    let is_fit = matches!(
-        tier,
-        ThumbTier::Justified | ThumbTier::JustifiedMid | ThumbTier::JustifiedHigh
-    );
+    let is_fit = tier.is_fit();
     let (tx, rx) = tokio::sync::oneshot::channel();
     pool.spawn(move || {
         use rayon::prelude::*;
@@ -1251,19 +1258,9 @@ pub async fn generate_and_store_tier(
 
     let target = tier.target_size();
     let filter = thumbnailer::filter_for_size(target);
-    let tier_format = match tier {
-        ThumbTier::Large
-        | ThumbTier::Preview
-        | ThumbTier::Justified
-        | ThumbTier::JustifiedMid
-        | ThumbTier::JustifiedHigh => ThumbFormat::Webp,
-        _ => ThumbFormat::Jpeg,
-    };
+    let tier_format = tier.format();
 
-    let thumb = if matches!(
-        tier,
-        ThumbTier::Justified | ThumbTier::JustifiedMid | ThumbTier::JustifiedHigh
-    ) {
+    let thumb = if tier.is_fit() {
         dispatch_thumbnail_fit(&state.thumb_pool, path.to_string(), filter, tier_format, target)
             .await?
             .map_err(|e| format!("thumb gen: {e}"))?
@@ -1336,42 +1333,19 @@ pub async fn generate_and_store_tier(
     let db = db.as_mut().ok_or("No gallery open")?;
 
     if matches!(tier, ThumbTier::Standard) {
+        // One transaction so a reader never sees the standard row without its
+        // placeholder/micro derivations.
         let tx = db.transaction().map_err(|e| e.to_string())?;
         crate::cache::thumbnails::write_standard_row(
             &tx, path, &thumb.media_type, 0, thumb.width, thumb.height,
             &thumb.data, &fmt_str, filter.as_str(),
         )
         .map_err(|e| e.to_string())?;
-
-        // Source dimensions — matches the batch path's media_meta update.
-        let _ = tx.execute(
-            "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
-            rusqlite::params![thumb.src_width, thumb.src_height, path],
-        );
-
+        store_source_dims(&tx, path, thumb.src_width, thumb.src_height);
         if let Some(ref ex) = extras {
-            if let Some(hash) = &ex.thumbhash {
-                let _ = tx.execute(
-                    "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2",
-                    rusqlite::params![hash, path],
-                );
-            }
-            if let Some(micro) = &ex.micro_bytes {
-                let _ = crate::cache::thumbnails::write_tier_row(
-                    &tx, ThumbTier::Micro, path, &thumb.media_type, 0,
-                    ex.micro_size, ex.micro_size, micro, "jpeg",
-                );
-            }
+            store_derived_extras(&tx, path, &thumb.media_type, ex, Overwrite::Yes);
         }
-
         tx.commit().map_err(|e| e.to_string())?;
-
-        if let Some((w, h, duration)) = video_meta {
-            let _ = db.conn().execute(
-                "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
-                rusqlite::params![w, h, duration, path],
-            );
-        }
     } else {
         crate::cache::thumbnails::write_tier_row(
             db.conn(), tier, path, &thumb.media_type, 0,
@@ -1383,17 +1357,12 @@ pub async fn generate_and_store_tier(
         // tiers, so without this the source dimensions never reach media_meta
         // and the InfoPanel shows no dimensions for newly-added images until a
         // restart re-indexes. Idempotent: guarded by `width IS NULL`.
-        let _ = db.conn().execute(
-            "UPDATE media_meta SET width = ?1, height = ?2 WHERE path = ?3 AND width IS NULL",
-            rusqlite::params![thumb.src_width, thumb.src_height, path],
-        );
+        store_source_dims(db.conn(), path, thumb.src_width, thumb.src_height);
+    }
 
-        if let Some((w, h, duration)) = video_meta {
-            let _ = db.conn().execute(
-                "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
-                rusqlite::params![w, h, duration, path],
-            );
-        }
+    // ffprobe's numbers win over the decoded frame's, for either tier shape.
+    if let Some((w, h, duration)) = video_meta {
+        store_video_meta(db.conn(), path, w, h, duration);
     }
 
     // Enforce the tier budget here too, not just on the batch path. Serving a
@@ -1421,18 +1390,12 @@ async fn derive_micro_from_standard(
         db.get_thumbnail(path).ok().flatten()
     };
     let Some(row) = row else { return Ok(None) };
-    let (width, height, media_type, data) = (row.width, row.height, row.media_type, row.thumbnail);
 
     // Decode + downsample on the CPU pool — cheap (512px source), but still
     // not for the async threads.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state.thumb_pool.spawn(move || {
-        let _ = tx.send(derive_extras_from_bytes(&data, width, height));
-    });
-    let extras = rx
-        .await
-        .map_err(|_| "micro derivation task dropped".to_string())?;
-    let Some(micro) = extras.micro_bytes else {
+    let extras =
+        derive_standard_extras(&state.thumb_pool, row.thumbnail, row.width, row.height).await;
+    let Some(micro) = extras.micro_bytes.clone() else {
         // Undecodable standard bytes — let the caller regenerate from source.
         return Ok(None);
     };
@@ -1441,25 +1404,7 @@ async fn derive_micro_from_standard(
         let mut db = state.cache_db.lock().await;
         let db = db.as_mut().ok_or("No gallery open")?;
         let txn = db.transaction().map_err(|e| e.to_string())?;
-        if let Some(hash) = &extras.thumbhash {
-            let _ = txn.execute(
-                "UPDATE thumbnails SET thumbhash = ?1 WHERE path = ?2 AND thumbhash IS NULL",
-                rusqlite::params![hash, path],
-            );
-        }
-        let _ = txn.execute(
-            "INSERT OR IGNORE INTO thumbnails_micro (path, media_type, mtime, width, height, thumbnail, format)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                path,
-                media_type,
-                0u64,
-                extras.micro_size,
-                extras.micro_size,
-                micro,
-                "jpeg"
-            ],
-        );
+        store_derived_extras(&txn, path, &row.media_type, &extras, Overwrite::No);
         txn.commit().map_err(|e| e.to_string())?;
     }
 

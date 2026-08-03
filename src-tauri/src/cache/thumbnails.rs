@@ -58,6 +58,53 @@ pub enum ThumbTier {
 }
 
 impl ThumbTier {
+    /// Every tier, in storage order. The single source of truth for "which
+    /// thumbnail tables exist" — path-keyed maintenance (delete/rename/rebase/
+    /// prune) iterates this instead of repeating the table list, which used to
+    /// drift and leave orphaned rows in whichever tier a site had forgotten.
+    pub const ALL: [ThumbTier; 7] = [
+        Self::Standard,
+        Self::Micro,
+        Self::Large,
+        Self::Preview,
+        Self::Justified,
+        Self::JustifiedMid,
+        Self::JustifiedHigh,
+    ];
+
+    /// Human-readable tier name, for the per-file tier breakdown in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Micro => "Micro",
+            Self::Standard => "Standard",
+            Self::Large => "Large",
+            Self::Preview => "Preview",
+            Self::Justified => "Justified",
+            Self::JustifiedMid => "Justified Mid",
+            Self::JustifiedHigh => "Justified High",
+        }
+    }
+
+    /// Whether this tier stores an **aspect-preserving** (fit, non-cropping)
+    /// thumbnail. The justified tiers do; the square-cropped grid tiers don't.
+    pub fn is_fit(self) -> bool {
+        matches!(
+            self,
+            Self::Justified | Self::JustifiedMid | Self::JustifiedHigh
+        )
+    }
+
+    /// Encoded format this tier is stored in. The big tiers use lossy WebP —
+    /// ~30 % smaller at equivalent quality, which matters a lot at 1024–2560 px.
+    pub fn format(self) -> crate::pipeline::thumbnailer::ThumbFormat {
+        use crate::pipeline::thumbnailer::ThumbFormat;
+        match self {
+            Self::Large | Self::Preview => ThumbFormat::Webp,
+            _ if self.is_fit() => ThumbFormat::Webp,
+            _ => ThumbFormat::Jpeg,
+        }
+    }
+
     /// Map a URL-path segment ("s", "m", "l", "p") to a tier.
     pub fn from_segment(s: &str) -> Option<Self> {
         match s {
@@ -403,6 +450,42 @@ impl CacheDb {
         Ok(out)
     }
 
+    /// Bulk-read standard-tier blobs for `paths`, as
+    /// `(path, bytes, width, height, media_type)`. Paths without a cached
+    /// thumbnail are simply absent from the result.
+    ///
+    /// One IN-list query per 900 paths rather than a point query each: the
+    /// micro/thumbhash derivation runs over a whole batch of up to 128 paths
+    /// while holding the single writer connection, so the per-statement
+    /// overhead was paid with every other DB user queued behind it.
+    pub fn get_thumbnail_blobs_batch(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<(String, Vec<u8>, u32, u32, String)>, CacheError> {
+        let mut out = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(IN_CHUNK) {
+            let sql = format!(
+                "SELECT path, thumbnail, width, height, media_type
+                 FROM thumbnails WHERE path IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut stmt = self.conn().prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Get lightweight metadata about a cached thumbnail (no blob read).
     pub fn get_thumbnail_info(
         &self,
@@ -420,31 +503,13 @@ impl CacheDb {
 
     /// Delete all thumbnails (for full rebuild).
     pub fn clear_thumbnails(&self) -> Result<usize, CacheError> {
-        let mut count = self.conn().execute("DELETE FROM thumbnails", [])?;
-        count += self
-            .conn()
-            .execute("DELETE FROM thumbnails_micro", [])
-            .unwrap_or(0);
-        count += self
-            .conn()
-            .execute("DELETE FROM thumbnails_large", [])
-            .unwrap_or(0);
-        count += self
-            .conn()
-            .execute("DELETE FROM thumbnails_preview", [])
-            .unwrap_or(0);
-        count += self
-            .conn()
-            .execute("DELETE FROM thumbnails_justified", [])
-            .unwrap_or(0);
-        count += self
-            .conn()
-            .execute("DELETE FROM thumbnails_justified_mid", [])
-            .unwrap_or(0);
-        count += self
-            .conn()
-            .execute("DELETE FROM thumbnails_justified_high", [])
-            .unwrap_or(0);
+        let mut count = 0usize;
+        for tier in ThumbTier::ALL {
+            count += self
+                .conn()
+                .execute(&format!("DELETE FROM {}", tier.table()), [])
+                .unwrap_or(0);
+        }
         Ok(count)
     }
 
@@ -523,14 +588,7 @@ impl CacheDb {
         }
 
         // Other tiers — no resize_filter column
-        for (label, tier) in [
-            ("Micro", ThumbTier::Micro),
-            ("Large", ThumbTier::Large),
-            ("Preview", ThumbTier::Preview),
-            ("Justified", ThumbTier::Justified),
-            ("Justified Mid", ThumbTier::JustifiedMid),
-            ("Justified High", ThumbTier::JustifiedHigh),
-        ] {
+        for tier in ThumbTier::ALL.into_iter().filter(|t| *t != ThumbTier::Standard) {
             let sql = format!(
                 "SELECT width, height, LENGTH(thumbnail), format FROM {} WHERE path = ?1",
                 tier.table()
@@ -539,7 +597,7 @@ impl CacheDb {
             let mut rows = stmt.query(rusqlite::params![path])?;
             if let Some(row) = rows.next()? {
                 results.push((
-                    label.to_string(),
+                    tier.label().to_string(),
                     row.get(0)?,
                     row.get(1)?,
                     row.get(2)?,

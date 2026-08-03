@@ -1,25 +1,12 @@
-import { Show, createSignal, onMount, onCleanup } from "solid-js";
+import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
 import { getDebugInfo, getPerfSnapshot, type DebugInfo } from "../../lib/ipc";
 import {
   startMonitoring,
   stopMonitoring,
   setPerfSnapshotFetcher,
-  fps,
-  ipcBandwidthIn,
-  ipcBandwidthOut,
-  ipcCallRate,
-  ipcAvgLatency,
-  cacheMisses,
-  imageLoadLatency,
-  imageLoadRate,
-  inFlightImageLoads,
-  domNodes,
-  diskReadRate,
-  diskWriteRate,
-  visibleImages,
-  cachedImages,
-  jsHeapUsed,
+  metrics,
 } from "../../lib/perfMonitor";
+import { METRIC_ROWS } from "./metricRows";
 import { Sparkline } from "./Sparkline";
 
 type Tab = "hardware" | "performance";
@@ -61,26 +48,6 @@ export function DebugOverlay() {
   };
 
   // -------------------------------------------------------------------
-  // Helpers to read latest values (tick dependency forces reactivity)
-  // -------------------------------------------------------------------
-
-  const fmt = (n: number, decimals = 1) => {
-    void tick();
-    return n.toFixed(decimals);
-  };
-
-  const fmtInt = (n: number) => {
-    void tick();
-    return Math.round(n).toString();
-  };
-
-  const fmtBytes = (kb: number) => {
-    void tick();
-    if (kb < 1024) return `${kb.toFixed(1)} KB/s`;
-    return `${(kb / 1024).toFixed(2)} MB/s`;
-  };
-
-  // -------------------------------------------------------------------
   // Shared styles
   // -------------------------------------------------------------------
 
@@ -116,103 +83,24 @@ export function DebugOverlay() {
       {/* Performance tab */}
       <Show when={tab() === "performance"}>
         <div class="px-3 py-2 space-y-2 max-h-[70vh] overflow-y-auto">
-          <MetricRow
-            label="FPS"
-            value={() => fmtInt(fps.last)}
-            data={() => { void tick(); return fps.toArray(); }}
-            color="#4ade80"
-          />
-          <MetricRow
-            label="IPC In"
-            value={() => fmtBytes(ipcBandwidthIn.last)}
-            data={() => { void tick(); return ipcBandwidthIn.toArray(); }}
-            color="#60a5fa"
-          />
-          <MetricRow
-            label="IPC Out"
-            value={() => fmtBytes(ipcBandwidthOut.last)}
-            data={() => { void tick(); return ipcBandwidthOut.toArray(); }}
-            color="#a78bfa"
-          />
-          <MetricRow
-            label="IPC Calls"
-            value={() => `${fmtInt(ipcCallRate.last)}/s`}
-            data={() => { void tick(); return ipcCallRate.toArray(); }}
-            color="#fbbf24"
-          />
-          <MetricRow
-            label="IPC Latency"
-            value={() => `${fmt(ipcAvgLatency.last)} ms`}
-            data={() => { void tick(); return ipcAvgLatency.toArray(); }}
-            color="#f97316"
-          />
-          <MetricRow
-            label="Visible Imgs"
-            value={() => fmtInt(visibleImages.last)}
-            data={() => { void tick(); return visibleImages.toArray(); }}
-            color="#2dd4bf"
-          />
-          <MetricRow
-            label="Cached Imgs"
-            value={() => fmtInt(cachedImages.last)}
-            data={() => { void tick(); return cachedImages.toArray(); }}
-            color="#14b8a6"
-          />
-          <MetricRow
-            label="Cache Misses"
-            value={() => `${fmtInt(cacheMisses.last)}/s`}
-            data={() => { void tick(); return cacheMisses.toArray(); }}
-            color="#f43f5e"
-          />
-          <MetricRow
-            label="Img Load"
-            value={() => {
-              void tick();
-              const last = imageLoadLatency.last;
-              // No completions in the last window. Distinguish the two reasons:
-              // nothing was asked for, versus requests are outstanding and not
-              // landing — which is the stall this metric used to report as 0 ms.
-              if (!Number.isFinite(last)) {
-                const pending = inFlightImageLoads();
-                return pending > 0 ? `stalled (${pending} in flight)` : "idle";
-              }
-              return `${fmt(last)} ms`;
+          <For each={METRIC_ROWS}>
+            {(row) => {
+              const buffer = metrics[row.name];
+              // `tick()` is read inside each accessor so the whole block
+              // re-renders once a second; the ring buffers themselves aren't
+              // reactive.
+              return (
+                <Show when={!row.hideWhenEmpty || (tick(), buffer.count > 0)}>
+                  <MetricRow
+                    label={row.label}
+                    value={() => { void tick(); return row.format(buffer.last); }}
+                    data={() => { void tick(); return buffer.toArray(); }}
+                    color={row.color}
+                  />
+                </Show>
+              );
             }}
-            data={() => { void tick(); return imageLoadLatency.toArray(); }}
-            color="#a3e635"
-          />
-          <MetricRow
-            label="Img Load Rate"
-            value={() => `${fmtInt(imageLoadRate.last)}/s`}
-            data={() => { void tick(); return imageLoadRate.toArray(); }}
-            color="#84cc16"
-          />
-          <MetricRow
-            label="Disk Read"
-            value={() => fmtBytes(diskReadRate.last)}
-            data={() => { void tick(); return diskReadRate.toArray(); }}
-            color="#38bdf8"
-          />
-          <MetricRow
-            label="Disk Write"
-            value={() => fmtBytes(diskWriteRate.last)}
-            data={() => { void tick(); return diskWriteRate.toArray(); }}
-            color="#818cf8"
-          />
-          <MetricRow
-            label="DOM Nodes"
-            value={() => fmtInt(domNodes.last)}
-            data={() => { void tick(); return domNodes.toArray(); }}
-            color="#e879f9"
-          />
-          <Show when={jsHeapUsed.count > 0}>
-            <MetricRow
-              label="JS Heap"
-              value={() => `${fmt(jsHeapUsed.last)} MB`}
-              data={() => { void tick(); return jsHeapUsed.toArray(); }}
-              color="#fb923c"
-            />
-          </Show>
+          </For>
         </div>
       </Show>
 

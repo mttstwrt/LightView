@@ -195,6 +195,37 @@ export const jsHeapUsed = new RingBuffer(HISTORY_LEN);        // MB
 export const imageLoadLatency = new RingBuffer(HISTORY_LEN);  // ms (avg/sample)
 export const imageLoadRate = new RingBuffer(HISTORY_LEN);     // loads/sec
 
+/** Every metric history, by name. The registry is what `stopMonitoring` clears
+ *  and what the debug UIs enumerate, so adding a metric above and here is all
+ *  it takes — no third list to keep in sync. */
+export const metrics = {
+  fps,
+  ipcBandwidthIn,
+  ipcBandwidthOut,
+  ipcCallRate,
+  ipcAvgLatency,
+  cacheMisses,
+  imageLoadLatency,
+  imageLoadRate,
+  domNodes,
+  diskReadRate,
+  diskWriteRate,
+  visibleImages,
+  cachedImages,
+  jsHeapUsed,
+} as const;
+
+export type MetricName = keyof typeof metrics;
+
+/** A metric flattened for transport (the devtools window has no access to the
+ *  main window's ring buffers, so it receives snapshots instead). */
+export interface MetricEntry {
+  history: number[];
+  last: number;
+}
+
+export type MetricSnapshot = Record<MetricName, MetricEntry>;
+
 // -------------------------------------------------------------------------
 // FPS measurement (rAF-based, only runs when active)
 // -------------------------------------------------------------------------
@@ -359,18 +390,5 @@ export function stopMonitoring() {
   }
 
   // Clear histories so stale data doesn't show on next open
-  fps.clear();
-  ipcBandwidthIn.clear();
-  ipcBandwidthOut.clear();
-  ipcCallRate.clear();
-  ipcAvgLatency.clear();
-  cacheMisses.clear();
-  domNodes.clear();
-  diskReadRate.clear();
-  diskWriteRate.clear();
-  visibleImages.clear();
-  cachedImages.clear();
-  jsHeapUsed.clear();
-  imageLoadLatency.clear();
-  imageLoadRate.clear();
+  for (const buffer of Object.values(metrics)) buffer.clear();
 }
