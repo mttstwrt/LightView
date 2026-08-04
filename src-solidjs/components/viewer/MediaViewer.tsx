@@ -352,7 +352,17 @@ export function MediaViewer(props: MediaViewerProps) {
   let cloneRef: HTMLDivElement | undefined;
   const [cloneState, setCloneState] = createSignal<{ src: string; from: Rect } | null>(null);
   const [closing, setClosing] = createSignal(false);
+  // True from the moment the open transition commits until the clone lands.
+  // The real content is laid out at its full resting size the instant the
+  // viewer mounts, so without this the photo appears at final size *and* the
+  // clone flies over the top of it — two copies of the same image, and no
+  // sense of the thumbnail growing into place. `closing` does the mirror of
+  // this for the fly-back.
+  const [opening, setOpening] = createSignal(false);
   let closingNow = false;
+  /** The in-flight open animation, so a close arriving inside its 260ms can
+   *  stop it before animating the same clone element in the other direction. */
+  let openAnim: Animation | undefined;
 
   const mediaAspect = (): number | null => {
     const a = aspectByPath().get(currentPath());
@@ -373,8 +383,11 @@ export function MediaViewer(props: MediaViewerProps) {
     const aspect =
       aspectByPath().get(currentPath()) ??
       (cellImg.naturalWidth > 0 ? cellImg.naturalWidth / cellImg.naturalHeight : 1);
-    // Backdrop fades in from transparent underneath the flying clone.
+    // Backdrop fades in from transparent underneath the flying clone, and the
+    // real content stays hidden behind it until the clone lands — set here,
+    // before the first paint, so the photo never flashes at full size.
     setBackdropAlpha(0);
+    setOpening(true);
     setCloneState({ src, from });
     // Everything below has to wait a frame. `onMount` runs inside Solid's
     // effect phase, where signal writes are *queued* rather than applied — the
@@ -386,9 +399,18 @@ export function MediaViewer(props: MediaViewerProps) {
     // batch. The frame also gives the clone's <img> (already in cache — it is
     // the cell's own source) a chance to paint at the cell's rect before it
     // starts moving.
+    // Hand the content back and drop the clone in one update, so the swap
+    // happens within a single frame and neither is ever missing. Skipped once a
+    // close is under way: closing reuses this same clone element, so landing
+    // here would tear the clone down mid-fly-back.
+    const land = () => {
+      if (closingNow) return;
+      batch(() => { setOpening(false); setCloneState(null); });
+    };
+
     requestAnimationFrame(() => {
       setBackdropAlpha(1);
-      if (!cloneRef) { setCloneState(null); return; }
+      if (!cloneRef) { land(); return; }
       const anim = cloneRef.animate(
         [
           rectKeyframe(from),
@@ -396,8 +418,9 @@ export function MediaViewer(props: MediaViewerProps) {
         ],
         { duration: 260, easing: "cubic-bezier(0.2, 0, 0.2, 1)", fill: "forwards" },
       );
-      anim.onfinish = () => setCloneState(null);
-      anim.oncancel = () => setCloneState(null);
+      openAnim = anim;
+      anim.onfinish = land;
+      anim.oncancel = land;
     });
   });
 
@@ -409,6 +432,10 @@ export function MediaViewer(props: MediaViewerProps) {
     if (closingNow) return;
     if (prefersReducedMotion() || zoom() > 1) { props.onClose(); return; }
     closingNow = true;
+    // Closing within the open transition's 260ms would otherwise leave two
+    // animations running on the one clone element, the open one still pulling
+    // towards the viewport as this one flies back to the cell.
+    if (openAnim) { openAnim.cancel(); openAnim = undefined; }
     // Ask the grid to bring the (possibly navigated-to) item's cell into
     // view, then give it two frames to scroll + render the virtual slice.
     window.dispatchEvent(
@@ -1214,11 +1241,13 @@ export function MediaViewer(props: MediaViewerProps) {
       <div
         ref={trackRef}
         class="absolute inset-0 pointer-events-none"
-        // Hidden the instant the close clone takes over (the clone starts at
-        // the media's exact on-screen rect, so there's no visible seam). The
-        // clone-less fade fallback eases out instead.
+        // Hidden while either clone is in flight — on close the clone starts
+        // at the media's exact on-screen rect, on open it ends there, so in
+        // both directions the swap is seamless and the content is never drawn
+        // at full size alongside the clone. The clone-less close fallback eases
+        // out instead.
         style={{
-          opacity: closing() ? "0" : undefined,
+          opacity: opening() || closing() ? "0" : undefined,
           transition: closing() && !cloneState() ? "opacity 0.18s ease-out" : undefined,
         }}
       >
