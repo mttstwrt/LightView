@@ -43,7 +43,9 @@ const RENEW_MARGIN_DAYS: i64 = 30;
 /// have (e.g. the serverAuth EKU iOS requires): certs minted by older builds
 /// then regenerate on the next start instead of being served until expiry.
 /// 1 = KeyUsage(digitalSignature) + EKU(serverAuth).
-const CERT_SCHEMA: u32 = 1;
+/// 2 = also basicConstraints CA:TRUE + KeyUsage(keyCertSign), so the cert can
+///     be *installed* as a trust anchor instead of only clicked through.
+const CERT_SCHEMA: u32 = 2;
 
 /// Sidecar metadata so we can decide whether the persisted cert is still
 /// usable without pulling in an x509 parser.
@@ -179,6 +181,19 @@ fn generate(sans: &[String]) -> Result<(TlsMaterial, i64), String> {
         .extended_key_usages
         .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
 
+    // Self-signed *and* marked as a CA, so the same cert can be installed as a
+    // trust anchor rather than only clicked through. This matters most on iOS:
+    // Safari's click-through exception is dropped readily, and a standalone
+    // home-screen PWA has no chrome to re-render the interstitial — so the app
+    // opens from its cached shell and looks connected while every request
+    // fails. A cert installed via Settings → Profile Downloaded and enabled in
+    // Certificate Trust Settings has no such lifetime, but iOS only offers that
+    // full-trust toggle for certificates carrying basicConstraints CA:TRUE.
+    // Clients that don't install it are unaffected — an untrusted CA:TRUE
+    // self-signed cert falls back to the same interstitial as before.
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+
     let now = time::OffsetDateTime::now_utc();
     // Backdate slightly so clients with mild clock skew accept it immediately.
     params.not_before = now - time::Duration::hours(1);
@@ -245,12 +260,21 @@ pub fn load_or_generate(extra_sans: &[String]) -> Result<TlsMaterial, String> {
 
     let (material, not_after) = generate(&sans)?;
     persist(&dir, &material, &sans, not_after);
+
     log::info!(
         "Generated self-signed TLS certificate (SANs: {}) at {}",
         sans.join(", "),
         dir.display()
     );
     Ok(material)
+}
+
+/// The PEM of the certificate currently on disk, for clients that want to
+/// install it as a trust anchor instead of relying on a click-through
+/// exception. Returns `None` when TLS is off or persistence failed — the
+/// download route answers 404 in that case.
+pub fn persisted_cert_pem() -> Option<Vec<u8>> {
+    fs::read(tls_dir().join(CERT_FILE)).ok()
 }
 
 #[cfg(test)]

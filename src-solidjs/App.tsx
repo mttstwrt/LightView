@@ -30,6 +30,7 @@ import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { TrashPanel } from "./components/TrashPanel";
 import { TagManagerPanel } from "./components/TagManagerPanel";
 import { UploadButton } from "./components/upload/UploadButton";
+import { ConnectionBanner } from "./components/ConnectionBanner";
 import type { SortedItem, SortField } from "./lib/types";
 
 // ---------------------------------------------------------------------------
@@ -222,6 +223,11 @@ export function App() {
   const [tagManagerOpen, setTagManagerOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
+  // Web client: true once a boot round-trip has failed and nothing has
+  // succeeded since. Drives ConnectionBanner — the grid can still be fully
+  // painted from the IndexedDB snapshot, so without this the failure is
+  // invisible.
+  const [serverUnreachable, setServerUnreachable] = createSignal(false);
 
   // On mobile the settings panel is a full-screen page, so skip rendering the
   // gallery content behind it entirely.
@@ -327,9 +333,15 @@ export function App() {
       }
     });
 
-    // Single-round-trip boot: gallery info + default filter + sorted items
-    // (filter pre-applied server-side). The old path was three serial
-    // invokes — three network RTTs before the grid had any data.
+    await loadWebBootState();
+  });
+
+  // Single-round-trip boot: gallery info + default filter + sorted items
+  // (filter pre-applied server-side). The old path was three serial invokes —
+  // three network RTTs before the grid had any data. Also the Retry action on
+  // ConnectionBanner, hence the reachability flag: a failure here means the
+  // grid on screen (if any) came from the snapshot and is not live.
+  const loadWebBootState = async () => {
     try {
       const boot = await getBootState(sortField(), sortOrder(), groupBy(), subSortField(), subSortOrder());
       if (boot.gallery) {
@@ -342,10 +354,12 @@ export function App() {
           setDisplayPaths(boot.sorted.items.map((item) => item.path));
         }
       }
+      setServerUnreachable(false);
     } catch (e) {
       console.error("Failed to load current gallery:", e);
+      setServerUnreachable(true);
     }
-  });
+  };
 
   // Persist the grid for next boot (web only) — covers every path that
   // refreshes sortedItems (boot, uploads, fs-changes, filter edits). Debounced
@@ -588,6 +602,12 @@ export function App() {
           screen, so it's resizable before a gallery is opened). */}
       <Show when={isTauri() && !isMobile()}>
         <WindowResizeGrips />
+      </Show>
+
+      {/* Web only: the grid may be painted entirely from cache while the
+          server is unreachable. Say so, and offer the way back. */}
+      <Show when={isWeb() && serverUnreachable()}>
+        <ConnectionBanner onRetry={loadWebBootState} />
       </Show>
 
       <Show

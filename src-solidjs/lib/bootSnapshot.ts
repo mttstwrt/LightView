@@ -15,6 +15,13 @@ const DB_NAME = "lightview";
 const STORE = "boot-snapshot";
 const KEY = "current";
 
+/** How long a snapshot may stand in for live data. Beyond this the grid it
+ *  paints is more misleading than useful — a client that hasn't reached the
+ *  server in a month (a lapsed certificate exception, a host that moved) would
+ *  otherwise open to a confident-looking view of a gallery it can no longer
+ *  see. `savedAt` was recorded from the start but never read. */
+const MAX_AGE_MS = 30 * 24 * 3600 * 1000;
+
 export interface BootSnapshot {
   galleryPath: string;
   items: SortedItem[];
@@ -34,16 +41,23 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
-/** Read the last session's snapshot, or null when absent/unreadable. */
+/** Read the last session's snapshot, or null when absent, unreadable, or
+ *  older than `MAX_AGE_MS` (an expired snapshot is deleted on the way out). */
 export async function loadBootSnapshot(): Promise<BootSnapshot | null> {
   try {
     const db = await openDb();
-    return await new Promise((resolve) => {
+    const snap = await new Promise<BootSnapshot | null>((resolve) => {
       const tx = db.transaction(STORE, "readonly");
       const req = tx.objectStore(STORE).get(KEY);
       req.onsuccess = () => resolve((req.result as BootSnapshot) ?? null);
       req.onerror = () => resolve(null);
     });
+    if (!snap) return null;
+    if (Date.now() - (snap.savedAt ?? 0) > MAX_AGE_MS) {
+      db.transaction(STORE, "readwrite").objectStore(STORE).delete(KEY);
+      return null;
+    }
+    return snap;
   } catch {
     return null;
   }
