@@ -37,6 +37,20 @@ fn encode_b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+/// Encode format and resize filter the Standard tier is generated with.
+///
+/// Four entry points (`get_thumbnail`, `get_thumbnails_batch`,
+/// `precache_thumbnails_impl`, `regenerate_thumbnail_impl`) all write the same
+/// tier and must agree exactly: the format string is compared against the
+/// cached `format` column to decide hit-vs-regenerate, so a site that drifted
+/// would make every one of its lookups miss and regenerate forever.
+fn standard_tier_params() -> (ThumbFormat, ResizeFilter) {
+    (
+        ThumbFormat::Jpeg,
+        thumbnailer::filter_for_size(STANDARD_THUMB_SIZE),
+    )
+}
+
 /// Record a file's source dimensions, discovered while thumbnailing it.
 ///
 /// Guarded by `width IS NULL` so it only ever fills a gap: a freshly indexed
@@ -173,8 +187,7 @@ pub async fn get_thumbnail(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<Option<ThumbnailResult>, String> {
-    let format = ThumbFormat::Jpeg;
-    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
+    let (format, filter) = standard_tier_params();
     let thumb_size = STANDARD_THUMB_SIZE;
 
     // Check SQLite cache — return as-is if format matches, otherwise regenerate
@@ -251,10 +264,8 @@ pub async fn get_thumbnails_batch(
     paths: Vec<String>,
 ) -> Result<Vec<ThumbnailResult>, String> {
     state.touch_thumb_activity();
-    let format = ThumbFormat::Jpeg;
-    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
-    let thumb_w = STANDARD_THUMB_SIZE;
-    let thumb_h = STANDARD_THUMB_SIZE;
+    let (format, filter) = standard_tier_params();
+    let (thumb_w, thumb_h) = (STANDARD_THUMB_SIZE, STANDARD_THUMB_SIZE);
 
     let mut results = Vec::with_capacity(paths.len());
     let mut uncached_paths = Vec::new();
@@ -643,8 +654,7 @@ pub async fn regenerate_thumbnail_impl(
     state: &AppState,
     path: String,
 ) -> Result<ThumbnailResult, String> {
-    let format = ThumbFormat::Jpeg;
-    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
+    let (format, filter) = standard_tier_params();
     let thumb_size = STANDARD_THUMB_SIZE;
 
     // Remove from every tier so a re-render at any cell size pulls fresh bytes.
@@ -787,10 +797,8 @@ pub async fn precache_thumbnails_impl(
     state: &AppState,
     paths: Vec<String>,
 ) -> Result<PrecacheResult, String> {
-    let format = ThumbFormat::Jpeg;
-    let filter = thumbnailer::filter_for_size(STANDARD_THUMB_SIZE);
-    let thumb_w = STANDARD_THUMB_SIZE;
-    let thumb_h = STANDARD_THUMB_SIZE;
+    let (format, filter) = standard_tier_params();
+    let (thumb_w, thumb_h) = (STANDARD_THUMB_SIZE, STANDARD_THUMB_SIZE);
 
     // Filter to only paths that are uncached or have a format mismatch. Also
     // collect cached paths whose micro row is missing (galleries thumbnailed
