@@ -286,16 +286,16 @@ pub async fn get_thumbnails_batch(
 
         for path in &paths {
             match info.get(path) {
-                Some((w, h, fmt, has_micro)) if fmt == requested_fmt => {
+                Some(cached) if cached.format == requested_fmt => {
                     results.push(ThumbnailResult {
                         path: path.clone(),
-                        width: *w,
-                        height: *h,
+                        width: cached.width,
+                        height: cached.height,
                         media_type: String::new(),
-                        format: fmt.clone(),
+                        format: cached.format.clone(),
                     });
                     // Micro tier missing for this cached path — derive it below.
-                    if !has_micro {
+                    if !cached.has_micro {
                         micro_missing.push(path.clone());
                     }
                 }
@@ -815,8 +815,8 @@ pub async fn precache_thumbnails_impl(
         paths
             .into_iter()
             .filter(|p| match info.get(p) {
-                Some((_, _, fmt, has_micro)) if fmt == requested_fmt => {
-                    if !has_micro {
+                Some(cached) if cached.format == requested_fmt => {
+                    if !cached.has_micro {
                         micro_missing.push(p.clone());
                     }
                     false
@@ -940,13 +940,13 @@ pub async fn get_all_thumbnail_tiers(
     let tiers = db.get_all_tier_info(&path).map_err(|e| e.to_string())?;
     Ok(tiers
         .into_iter()
-        .map(|(tier, width, height, size_bytes, format, resize_filter)| ThumbnailTierInfo {
-            tier,
-            width,
-            height,
-            size_bytes,
-            format,
-            resize_filter,
+        .map(|t| ThumbnailTierInfo {
+            tier: t.label,
+            width: t.width,
+            height: t.height,
+            size_bytes: t.size_bytes,
+            format: t.format,
+            resize_filter: t.resize_filter,
         })
         .collect())
 }

@@ -18,6 +18,33 @@ fn placeholders(n: usize) -> String {
     s
 }
 
+/// What the grids need to know about a path's cached Standard-tier row
+/// without reading the blob: whether it is usable as-is, and whether its
+/// derived Micro row is present. Returned by [`CacheDb::get_thumbnail_info_batch`].
+pub struct StandardTierSummary {
+    pub width: u32,
+    pub height: u32,
+    /// Encoded format of the stored bytes. Compared against the requested
+    /// format — a mismatch means the row predates a format change and the
+    /// caller regenerates rather than serving it.
+    pub format: String,
+    /// Whether `thumbnails_micro` also has a row for this path. Carried here
+    /// so the batch check is one query instead of a second round-trip.
+    pub has_micro: bool,
+}
+
+/// One cached tier's stored size and shape, for the per-file tier breakdown
+/// in the UI. Returned by [`CacheDb::get_all_tier_info`].
+pub struct TierInfo {
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u64,
+    pub format: String,
+    /// Only the Standard tier records which resize filter produced it.
+    pub resize_filter: Option<String>,
+}
+
 /// A cached thumbnail record.
 pub struct CachedThumbnail {
     pub path: String,
@@ -414,14 +441,13 @@ impl CacheDb {
         )
     }
 
-    /// Bulk metadata lookup for the standard tier. Returns
-    /// `path → (width, height, format, has_micro_row)`; paths without a
-    /// cached thumbnail are absent from the map. One IN-list query per 900
-    /// paths instead of two point queries per path.
+    /// Bulk metadata lookup for the standard tier. Paths without a cached
+    /// thumbnail are absent from the map. One IN-list query per 900 paths
+    /// instead of two point queries per path.
     pub fn get_thumbnail_info_batch(
         &self,
         paths: &[String],
-    ) -> Result<HashMap<String, (u32, u32, String, bool)>, CacheError> {
+    ) -> Result<HashMap<String, StandardTierSummary>, CacheError> {
         let mut out = HashMap::with_capacity(paths.len());
         for chunk in paths.chunks(IN_CHUNK) {
             let sql = format!(
@@ -434,12 +460,12 @@ impl CacheDb {
             let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    (
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, u32>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, bool>(4)?,
-                    ),
+                    StandardTierSummary {
+                        width: row.get(1)?,
+                        height: row.get(2)?,
+                        format: row.get(3)?,
+                        has_micro: row.get(4)?,
+                    },
                 ))
             })?;
             for row in rows {
@@ -561,33 +587,30 @@ impl CacheDb {
     // methods above for that case.
     // -------------------------------------------------------------------
 
-    /// Get metadata for all cached thumbnail tiers for a given path.
-    /// Returns (tier_name, width, height, size_bytes, format, resize_filter_or_none) per tier.
-    pub fn get_all_tier_info(
-        &self,
-        path: &str,
-    ) -> Result<Vec<(String, u32, u32, u64, String, Option<String>)>, CacheError> {
+    /// Which tiers are cached for `path`, and how big each one is.
+    /// Tiers with no row are omitted. Standard comes first, then the rest in
+    /// [`ThumbTier::ALL`] order.
+    pub fn get_all_tier_info(&self, path: &str) -> Result<Vec<TierInfo>, CacheError> {
         let mut results = Vec::new();
 
-        // Standard tier — has resize_filter column
+        // Standard tier — the only one with a resize_filter column.
         {
             let mut stmt = self.conn().prepare_cached(
                 "SELECT width, height, LENGTH(thumbnail), format, resize_filter FROM thumbnails WHERE path = ?1",
             )?;
             let mut rows = stmt.query(rusqlite::params![path])?;
             if let Some(row) = rows.next()? {
-                results.push((
-                    "Standard".to_string(),
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    Some(row.get::<_, String>(4)?),
-                ));
+                results.push(TierInfo {
+                    label: ThumbTier::Standard.label().to_string(),
+                    width: row.get(0)?,
+                    height: row.get(1)?,
+                    size_bytes: row.get(2)?,
+                    format: row.get(3)?,
+                    resize_filter: Some(row.get::<_, String>(4)?),
+                });
             }
         }
 
-        // Other tiers — no resize_filter column
         for tier in ThumbTier::ALL.into_iter().filter(|t| *t != ThumbTier::Standard) {
             let sql = format!(
                 "SELECT width, height, LENGTH(thumbnail), format FROM {} WHERE path = ?1",
@@ -596,14 +619,14 @@ impl CacheDb {
             let mut stmt = self.conn().prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![path])?;
             if let Some(row) = rows.next()? {
-                results.push((
-                    tier.label().to_string(),
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    None,
-                ));
+                results.push(TierInfo {
+                    label: tier.label().to_string(),
+                    width: row.get(0)?,
+                    height: row.get(1)?,
+                    size_bytes: row.get(2)?,
+                    format: row.get(3)?,
+                    resize_filter: None,
+                });
             }
         }
 

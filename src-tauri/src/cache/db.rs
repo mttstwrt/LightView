@@ -472,6 +472,18 @@ fn run_migrations(conn: &rusqlite::Connection) -> Result<(), CacheError> {
         set_schema_version(conn, version)?;
     }
 
+    // Post-condition. The loop is driven by MIGRATIONS, so the only way to
+    // land short is a database stamped *ahead* of this build (opened by a
+    // newer LightView, then downgraded). Say so loudly: the tables a newer
+    // version added are still there, but this build's queries were written
+    // against an older shape, so anything odd afterwards starts here.
+    if version != SCHEMA_VERSION {
+        log::warn!(
+            "Cache schema is v{version}, but this build expects v{SCHEMA_VERSION} — \
+             the cache was likely written by a newer LightView"
+        );
+    }
+
     Ok(())
 }
 
