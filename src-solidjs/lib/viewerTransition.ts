@@ -19,6 +19,12 @@ export interface Rect {
  *  `findCellImage` — no store plumbing between the two components. */
 export const VIEWER_PATH_EVENT = "lightview:viewer-path";
 
+/** Asks the open viewer to close *through* its fly-back-to-cell transition
+ *  rather than vanishing. Dispatched by close paths that live outside the
+ *  component — the app-level Escape handler — which otherwise have no way to
+ *  reach `requestClose`. Same DOM-event plumbing as `VIEWER_PATH_EVENT`. */
+export const VIEWER_CLOSE_REQUEST_EVENT = "lightview:viewer-close-request";
+
 /** The grid cell's thumbnail <img> for a path, or null when the cell isn't
  *  currently rendered. Cells contain several stacked same-rect <img>s
  *  (underlay, main, hover overlays) — prefer the last one with decoded
@@ -42,19 +48,32 @@ export function prefersReducedMotion(): boolean {
 }
 
 /** The rect a media item of the given aspect ratio occupies when
- *  contain-fitted and centred in the viewport (the viewer's resting frame). */
-export function viewportContainRect(aspect: number): Rect {
+ *  contain-fitted and centred in the viewport (the viewer's resting frame).
+ *
+ *  `natural` is the item's source pixel size, when known. The viewer's media is
+ *  `object-contain` under `max-w-[100vw] max-h-[100vh]`, so it fills the
+ *  viewport only up to its own natural size — a photo smaller than the window
+ *  renders 1:1 rather than being blown up. Without that cap the open transition
+ *  inflates the clone past where the image will actually land (a 800×600 photo
+ *  in a 1280×900 window was flown out to 1200×900) and visibly snaps back the
+ *  moment the clone is torn down. */
+export function viewportContainRect(
+  aspect: number,
+  natural?: { width: number; height: number } | null,
+): Rect {
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const va = vw / vh;
+  const maxW = natural && natural.width > 0 ? Math.min(vw, natural.width) : vw;
+  const maxH = natural && natural.height > 0 ? Math.min(vh, natural.height) : vh;
+  const boxAspect = maxW / maxH;
   let w: number;
   let h: number;
-  if (aspect > va) {
-    w = vw;
-    h = vw / aspect;
+  if (aspect > boxAspect) {
+    w = maxW;
+    h = maxW / aspect;
   } else {
-    h = vh;
-    w = vh * aspect;
+    h = maxH;
+    w = maxH * aspect;
   }
   return { left: (vw - w) / 2, top: (vh - h) / 2, width: w, height: h };
 }

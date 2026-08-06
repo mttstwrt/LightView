@@ -8,9 +8,10 @@ import {
   viewportContainRect,
   rectKeyframe,
   VIEWER_PATH_EVENT,
+  VIEWER_CLOSE_REQUEST_EVENT,
   type Rect,
 } from "../../lib/viewerTransition";
-import { aspectByPath, sortedItems, rateItem } from "../../stores/galleryStore";
+import { aspectByPath, mediaMetaByPath, sortedItems, rateItem } from "../../stores/galleryStore";
 import { applyQueryAndRefresh } from "../../stores/filterStore";
 import { TitleBar } from "../topbar/TitleBar";
 import {
@@ -240,6 +241,13 @@ export function MediaViewer(props: MediaViewerProps) {
     setGridAspect(loaded ? cellImg!.naturalWidth / cellImg!.naturalHeight : null);
   };
 
+  /** Indexed source pixel size, when the backend has it. Caps the fitted rect
+   *  so an item smaller than the window isn't laid out as if it filled it. */
+  const naturalSize = (path: string) => {
+    const m = mediaMetaByPath().get(path);
+    return m && m.width && m.height ? { width: m.width, height: m.height } : null;
+  };
+
   /** The rect the full image will occupy once it loads. The placeholder is
    *  drawn into exactly this box so it has the photo's dimensions from the
    *  first frame and nothing shifts on reveal.
@@ -252,7 +260,7 @@ export function MediaViewer(props: MediaViewerProps) {
    *  map for the same reason. */
   const placeholderRect = (): Rect | null => {
     const a = aspectByPath().get(currentPath()) ?? gridAspect();
-    return a && a > 0 ? viewportContainRect(a) : null;
+    return a && a > 0 ? viewportContainRect(a, naturalSize(currentPath())) : null;
   };
   const placeholderBox = () => {
     const r = placeholderRect();
@@ -344,7 +352,17 @@ export function MediaViewer(props: MediaViewerProps) {
   let cloneRef: HTMLDivElement | undefined;
   const [cloneState, setCloneState] = createSignal<{ src: string; from: Rect } | null>(null);
   const [closing, setClosing] = createSignal(false);
+  // True from the moment the open transition commits until the clone lands.
+  // The real content is laid out at its full resting size the instant the
+  // viewer mounts, so without this the photo appears at final size *and* the
+  // clone flies over the top of it — two copies of the same image, and no
+  // sense of the thumbnail growing into place. `closing` does the mirror of
+  // this for the fly-back.
+  const [opening, setOpening] = createSignal(false);
   let closingNow = false;
+  /** The in-flight open animation, so a close arriving inside its 260ms can
+   *  stop it before animating the same clone element in the other direction. */
+  let openAnim: Animation | undefined;
 
   const mediaAspect = (): number | null => {
     const a = aspectByPath().get(currentPath());
@@ -365,26 +383,59 @@ export function MediaViewer(props: MediaViewerProps) {
     const aspect =
       aspectByPath().get(currentPath()) ??
       (cellImg.naturalWidth > 0 ? cellImg.naturalWidth / cellImg.naturalHeight : 1);
-    // Backdrop fades in from transparent underneath the flying clone.
+    // Backdrop fades in from transparent underneath the flying clone, and the
+    // real content stays hidden behind it until the clone lands — set here,
+    // before the first paint, so the photo never flashes at full size.
     setBackdropAlpha(0);
-    requestAnimationFrame(() => setBackdropAlpha(1));
+    setOpening(true);
     setCloneState({ src, from });
-    if (!cloneRef) { setCloneState(null); return; }
-    const anim = cloneRef.animate(
-      [rectKeyframe(from), rectKeyframe(viewportContainRect(aspect))],
-      { duration: 260, easing: "cubic-bezier(0.2, 0, 0.2, 1)", fill: "forwards" },
-    );
-    anim.onfinish = () => setCloneState(null);
-    anim.oncancel = () => setCloneState(null);
+    // Everything below has to wait a frame. `onMount` runs inside Solid's
+    // effect phase, where signal writes are *queued* rather than applied — the
+    // `<Show>` holding the clone (and with it `cloneRef`) is only committed
+    // once the current update batch flushes, after this callback returns. So
+    // reading `cloneRef` on the next line always found `undefined`, took the
+    // no-clone early-out, and silently skipped the open transition entirely;
+    // close worked only because it starts from a rAF callback, outside the
+    // batch. The frame also gives the clone's <img> (already in cache — it is
+    // the cell's own source) a chance to paint at the cell's rect before it
+    // starts moving.
+    // Hand the content back and drop the clone in one update, so the swap
+    // happens within a single frame and neither is ever missing. Skipped once a
+    // close is under way: closing reuses this same clone element, so landing
+    // here would tear the clone down mid-fly-back.
+    const land = () => {
+      if (closingNow) return;
+      batch(() => { setOpening(false); setCloneState(null); });
+    };
+
+    requestAnimationFrame(() => {
+      setBackdropAlpha(1);
+      if (!cloneRef) { land(); return; }
+      const anim = cloneRef.animate(
+        [
+          rectKeyframe(from),
+          rectKeyframe(viewportContainRect(aspect, naturalSize(currentPath()))),
+        ],
+        { duration: 260, easing: "cubic-bezier(0.2, 0, 0.2, 1)", fill: "forwards" },
+      );
+      openAnim = anim;
+      anim.onfinish = land;
+      anim.oncancel = land;
+    });
   });
 
-  /** Close with the fly-back-to-cell transition (or a fade fallback). All
-   *  in-viewer close paths route through here; App-level Escape still closes
-   *  instantly. */
+  /** Close with the fly-back-to-cell transition (or a fade fallback). Every
+   *  close path routes through here — in-viewer ones call it directly, and the
+   *  app-level Escape handler reaches it by dispatching
+   *  `VIEWER_CLOSE_REQUEST_EVENT`. */
   const requestClose = () => {
     if (closingNow) return;
     if (prefersReducedMotion() || zoom() > 1) { props.onClose(); return; }
     closingNow = true;
+    // Closing within the open transition's 260ms would otherwise leave two
+    // animations running on the one clone element, the open one still pulling
+    // towards the viewport as this one flies back to the cell.
+    if (openAnim) { openAnim.cancel(); openAnim = undefined; }
     // Ask the grid to bring the (possibly navigated-to) item's cell into
     // view, then give it two frames to scroll + render the virtual slice.
     window.dispatchEvent(
@@ -410,7 +461,7 @@ export function MediaViewer(props: MediaViewerProps) {
       if (mediaEl) from = mediaEl.getBoundingClientRect();
       else {
         const a = mediaAspect();
-        if (a) from = viewportContainRect(a);
+        if (a) from = viewportContainRect(a, naturalSize(path));
       }
       if (!from || from.width < 4) {
         setClosing(true);
@@ -439,6 +490,9 @@ export function MediaViewer(props: MediaViewerProps) {
       anim.oncancel = () => props.onClose();
     }));
   };
+
+  window.addEventListener(VIEWER_CLOSE_REQUEST_EVENT, requestClose);
+  onCleanup(() => window.removeEventListener(VIEWER_CLOSE_REQUEST_EVENT, requestClose));
 
   const handleBackdropClick = (e: MouseEvent) => {
     // A touch tap handles itself (toggles chrome); swallow the compatibility
@@ -1187,11 +1241,13 @@ export function MediaViewer(props: MediaViewerProps) {
       <div
         ref={trackRef}
         class="absolute inset-0 pointer-events-none"
-        // Hidden the instant the close clone takes over (the clone starts at
-        // the media's exact on-screen rect, so there's no visible seam). The
-        // clone-less fade fallback eases out instead.
+        // Hidden while either clone is in flight — on close the clone starts
+        // at the media's exact on-screen rect, on open it ends there, so in
+        // both directions the swap is seamless and the content is never drawn
+        // at full size alongside the clone. The clone-less close fallback eases
+        // out instead.
         style={{
-          opacity: closing() ? "0" : undefined,
+          opacity: opening() || closing() ? "0" : undefined,
           transition: closing() && !cloneState() ? "opacity 0.18s ease-out" : undefined,
         }}
       >

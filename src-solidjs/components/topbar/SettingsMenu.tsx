@@ -840,6 +840,15 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
               {/* Toggles */}
               <Toggle
+                label="Start at bottom"
+                checked={settings().display.start_at_bottom}
+                onChange={(v) => updateDisplay("start_at_bottom", v)}
+              />
+              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
+                Opens a gallery at the end of the grid and scrolls up. To change
+                which end is oldest, flip the sort direction instead.
+              </p>
+              <Toggle
                 label="GIF autoplay in grid"
                 checked={settings().display.gif_autoplay_grid}
                 onChange={(v) => updateDisplay("gif_autoplay_grid", v)}

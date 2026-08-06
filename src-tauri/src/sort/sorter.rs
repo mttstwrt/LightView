@@ -48,16 +48,25 @@ pub struct SortedItem {
 
 impl CacheDb {
     /// Build an ORDER BY expression for a single sort field + direction.
+    ///
+    /// Every column is qualified with the `m` alias of the query below. Sorting
+    /// reads only `media_meta`, but the query joins `thumbnails` for the inlined
+    /// ThumbHash — and that table has `path` and `media_type` columns of its
+    /// own, so the bare names made SQLite reject the whole statement with
+    /// "ambiguous column name". That broke sorting by Name or Media Type
+    /// outright, and any other sort that used one of them as its tiebreaker.
+    /// Qualifying all of them keeps the expression correct no matter which
+    /// columns a future join brings into scope.
     fn order_expr(field: &SortField, order: &str) -> String {
         match field {
-            SortField::Date => format!("date_taken {} NULLS LAST", order),
-            SortField::Size => format!("file_size {}", order),
-            SortField::Name => format!("path {}", order),
-            SortField::Rating => format!("rating {} NULLS LAST", order),
-            SortField::MediaType => format!("media_type {}", order),
-            SortField::LastViewed => format!("last_viewed {} NULLS LAST", order),
-            SortField::DateAdded => format!("date_added {} NULLS LAST", order),
-            SortField::LastRated => format!("last_rated {} NULLS LAST", order),
+            SortField::Date => format!("m.date_taken {} NULLS LAST", order),
+            SortField::Size => format!("m.file_size {}", order),
+            SortField::Name => format!("m.path {}", order),
+            SortField::Rating => format!("m.rating {} NULLS LAST", order),
+            SortField::MediaType => format!("m.media_type {}", order),
+            SortField::LastViewed => format!("m.last_viewed {} NULLS LAST", order),
+            SortField::DateAdded => format!("m.date_added {} NULLS LAST", order),
+            SortField::LastRated => format!("m.last_rated {} NULLS LAST", order),
         }
     }
 
@@ -203,4 +212,108 @@ fn map_sorted_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
         height: row.get(10)?,
         thumbhash: thumbhash.map(|h| base64::engine::general_purpose::STANDARD.encode(h)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_FIELDS: [SortField; 8] = [
+        SortField::Date,
+        SortField::Size,
+        SortField::Name,
+        SortField::Rating,
+        SortField::MediaType,
+        SortField::LastViewed,
+        SortField::DateAdded,
+        SortField::LastRated,
+    ];
+
+    /// A gallery with a thumbnail row present, so the query's LEFT JOIN really
+    /// pulls `thumbnails` (and its own `path`/`media_type` columns) into scope.
+    fn open_db() -> (tempfile::TempDir, CacheDb) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CacheDb::open(tmp.path()).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO media_meta (path, date_taken, file_size, media_type, rating) VALUES
+                     ('/g/c.jpg', 300, 30, 'image', 5),
+                     ('/g/a.mp4', 100, 10, 'video', 1),
+                     ('/g/b.jpg', 200, 20, 'image', 3);
+                 INSERT INTO thumbnails (path, media_type, mtime, width, height, thumbnail)
+                     VALUES ('/g/a.mp4', 'video', 1, 8, 8, x'00');",
+            )
+            .unwrap();
+        (tmp, db)
+    }
+
+    /// Every sort field has to survive the join to `thumbnails`. `path` and
+    /// `media_type` exist on both tables, so an unqualified ORDER BY made
+    /// SQLite reject the statement outright — sorting by Name or Media Type
+    /// failed with "ambiguous column name" rather than returning anything, as
+    /// did any sort using one of them as its tiebreaker.
+    #[test]
+    fn every_sort_field_builds_a_runnable_query() {
+        let (_tmp, db) = open_db();
+        let filter = vec!["/g/a.mp4".to_string(), "/g/b.jpg".to_string()];
+
+        for field in &ALL_FIELDS {
+            for order in [SortOrder::Asc, SortOrder::Desc] {
+                // Unfiltered, no sub-sort.
+                let all = db
+                    .get_sorted_items(field, &order, None, None, None)
+                    .unwrap_or_else(|e| panic!("{:?} {:?}: {}", field, order, e));
+                assert_eq!(all.len(), 3);
+
+                // Filtered — the other SQL branch.
+                let some = db
+                    .get_sorted_items(field, &order, None, None, Some(&filter))
+                    .unwrap_or_else(|e| panic!("{:?} {:?} filtered: {}", field, order, e));
+                assert_eq!(some.len(), 2);
+
+                // And behind every other field as a tiebreaker, since the
+                // sub-sort goes through the same expression builder.
+                for sub in &ALL_FIELDS {
+                    db.get_sorted_items(field, &order, Some(sub), Some(&SortOrder::Asc), None)
+                        .unwrap_or_else(|e| panic!("{:?} then {:?}: {}", field, sub, e));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn name_sort_orders_by_path() {
+        let (_tmp, db) = open_db();
+
+        let asc = db
+            .get_sorted_items(&SortField::Name, &SortOrder::Asc, None, None, None)
+            .expect("name asc");
+        let paths: Vec<&str> = asc.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["/g/a.mp4", "/g/b.jpg", "/g/c.jpg"]);
+
+        let desc = db
+            .get_sorted_items(&SortField::Name, &SortOrder::Desc, None, None, None)
+            .expect("name desc");
+        let paths: Vec<&str> = desc.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["/g/c.jpg", "/g/b.jpg", "/g/a.mp4"]);
+    }
+
+    /// The join still has to deliver the ThumbHash it was added for.
+    #[test]
+    fn the_thumbnail_join_still_supplies_thumbhashes() {
+        let (_tmp, db) = open_db();
+        db.conn()
+            .execute(
+                "UPDATE thumbnails SET thumbhash = x'0102' WHERE path = '/g/a.mp4'",
+                [],
+            )
+            .unwrap();
+
+        let items = db
+            .get_sorted_items(&SortField::Name, &SortOrder::Asc, None, None, None)
+            .expect("name asc");
+        assert_eq!(items[0].path, "/g/a.mp4");
+        assert!(items[0].thumbhash.is_some(), "joined thumbhash missing");
+        assert!(items[1].thumbhash.is_none(), "unrelated row got a thumbhash");
+    }
 }

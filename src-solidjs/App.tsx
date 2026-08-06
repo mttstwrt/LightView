@@ -6,6 +6,8 @@ import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
 import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
+import { createOpenAtBottom } from "./lib/openAtBottom";
+import { VIEWER_CLOSE_REQUEST_EVENT } from "./lib/viewerTransition";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
 import { openGallery, getBootState, getSortedItems, getRecentGalleries, removeRecentGallery, applyFilter, getGalleryDefaultFilter, type RecentGallery } from "./lib/ipc";
@@ -228,6 +230,13 @@ export function App() {
   // painted from the IndexedDB snapshot, so without this the failure is
   // invisible.
   const [serverUnreachable, setServerUnreachable] = createSignal(false);
+
+  // "Start at bottom" — open the grid at its end rather than its start.
+  createOpenAtBottom({
+    enabled: () => settings().display.start_at_bottom,
+    galleryKey: galleryPath,
+    contentHeight: galleryContentHeight,
+  });
 
   // On mobile the settings panel is a full-screen page, so skip rendering the
   // gallery content behind it entirely.
@@ -533,7 +542,10 @@ export function App() {
       e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
     if (viewerOpen()) {
       if (e.key === "Escape") {
-        closeViewer();
+        // Ask the viewer to close through its fly-back-to-cell transition; it
+        // calls closeViewer() itself once the animation lands (and falls back
+        // to closing outright when there's nothing to fly back to).
+        window.dispatchEvent(new Event(VIEWER_CLOSE_REQUEST_EVENT));
       } else if (e.key === "ArrowRight") {
         if (typingInInput) return;
         if (e.repeat && navPending) return;

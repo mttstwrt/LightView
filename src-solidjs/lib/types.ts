@@ -201,6 +201,10 @@ export interface AppSettings {
     /** Start playing a video automatically when you settle on it in the
      *  viewer (always muted, with a tap-to-unmute pill). Off = tap play. */
     video_autoplay_viewer: boolean;
+    /** Open a gallery scrolled to the *end* of the grid rather than the start,
+     *  so browsing runs bottom-to-top. Only changes where the view lands; the
+     *  sort order itself is unaffected (flip that in the sort menu). */
+    start_at_bottom: boolean;
   };
   performance: {
     preload_count: number;

@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     justified_high_detail: true,
     mobile_filter_sheet: "top",
     video_autoplay_viewer: true,
+    start_at_bottom: false,
   },
   performance: {
     preload_count: 3,
