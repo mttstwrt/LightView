@@ -1,21 +1,23 @@
-// ---------------------------------------------------------------------------
-// Thumbnail generation coalescer
-// ---------------------------------------------------------------------------
-//
-// Deduplicates concurrent on-miss thumbnail generation requests for the same
-// `(path, tier)` key. The first caller becomes the Generator; concurrent
-// callers for the same key become Waiters and resume once the Generator
-// signals completion. The actual result is persisted to SQLite, so waiters
-// only need a wake-up to re-read the cache.
-//
-// The generator's slot is held by an RAII guard: releasing (and waking
-// waiters) happens on Drop, so it also happens when the generating future is
-// *cancelled* — an HTTP request future is dropped whenever the browser aborts
-// the fetch, which the grids' virtual scrolling does constantly. The previous
-// explicit-release design leaked the key on cancellation, permanently hanging
-// every later request for that thumbnail (and, once a few piled up, the
-// browser's whole per-origin connection budget — the "server stops
-// responding" symptom).
+//! Deduplicates concurrent on-miss thumbnail generation for the same
+//! `(path, tier)`.
+//!
+//! The first caller becomes the generator; concurrent callers for the same key
+//! wait on a `Notify` and re-read the cache once woken, since the result is
+//! persisted to SQLite rather than passed between them.
+//!
+//! The generator's slot is held by an RAII guard, so releasing it — and waking
+//! the waiters — also happens when the generating future is *cancelled*. That
+//! is not a corner case: an HTTP request future is dropped whenever the browser
+//! aborts a fetch, which the grids' virtual scrolling does constantly. The
+//! previous explicit-release design leaked the key on cancellation, permanently
+//! hanging every later request for that thumbnail and, once a few piled up, the
+//! browser's whole per-origin connection budget. That was the "server stops
+//! responding until restart" symptom.
+//!
+//! Waiters must enrol in the wake queue before re-checking the cache, or they
+//! can miss a notify that races the generator's release; `thumb_serve` also
+//! bounds its retries, so a persistently failing source degrades to a miss
+//! rather than spinning.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

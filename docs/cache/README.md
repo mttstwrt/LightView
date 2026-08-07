@@ -150,9 +150,9 @@ Path-keyed (all swept together by `path_keyed_tables()`):
 - `tag_index` — `(path, namespace, tag)`. Rebuilt from companion files.
 - `index_state` — companion mtime per path, so re-indexing skips unchanged
   companions.
-- `file_hashes` — perceptual hashes for duplicate detection.
 - `gif_atlas` — pre-rendered GIF frame sprite sheets, keyed `(path, tier)`.
-- the seven `thumbnails*` tables — see
+- the seven `thumbnails*` tables, one of which (`thumbnails`) also
+  carries the `phash` column duplicate detection reads — see
   [`pipeline/`](../pipeline/README.md).
 
 Not path-keyed:

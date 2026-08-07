@@ -1,3 +1,13 @@
+//! Connection setup, the migration ladder, and the maintenance operations that
+//! span every table.
+//!
+//! Two rules here are load-bearing and easy to break silently. First,
+//! `SCHEMA_VERSION` is *derived* from `MIGRATIONS` rather than maintained
+//! alongside it — they drifted once, and the drift skipped migrations. Second,
+//! [`path_keyed_tables`] is the single source of truth for "which tables are
+//! keyed by a media path", so every operation that removes or relocates a file
+//! iterates it instead of listing tables itself.
+
 use std::path::Path;
 
 use crate::cache::thumbnails::ThumbTier;
@@ -11,7 +21,7 @@ use crate::cache::thumbnails::ThumbTier;
 /// `not_duplicates` is deliberately absent: its paths live in `path_a`/`path_b`,
 /// so callers handle it separately.
 pub fn path_keyed_tables() -> impl Iterator<Item = &'static str> {
-    ["media_meta", "tag_index", "index_state", "file_hashes", "gif_atlas"]
+    ["media_meta", "tag_index", "index_state", "gif_atlas"]
         .into_iter()
         .chain(ThumbTier::ALL.into_iter().map(|t| t.table()))
 }
@@ -82,13 +92,6 @@ const BASE_SCHEMA: &str = "
         PRIMARY KEY (namespace, tag)
     );
     CREATE INDEX IF NOT EXISTS idx_tag_counts_pop ON tag_counts(count DESC);
-
-    CREATE TABLE IF NOT EXISTS file_hashes (
-        path        TEXT PRIMARY KEY,
-        hash        TEXT NOT NULL,
-        mtime       INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_hash ON file_hashes(hash);
 
     CREATE TABLE IF NOT EXISTS index_state (
         path                TEXT PRIMARY KEY,
@@ -335,6 +338,17 @@ const MIGRATIONS: &[Migration] = &[
             UPDATE thumbnails_justified_high SET accessed_at = strftime('%s','now') WHERE accessed_at = 0;
             CREATE INDEX IF NOT EXISTS idx_jm_accessed ON thumbnails_justified_mid(accessed_at);
             CREATE INDEX IF NOT EXISTS idx_jh_accessed ON thumbnails_justified_high(accessed_at);
+        ",
+    },
+    // `file_hashes` was created by the base schema for duplicate detection and
+    // never written to: perceptual hashes ended up on `thumbnails.phash`
+    // instead, so they are discarded and recomputed with the thumbnail they
+    // describe. The empty table is harmless but its name is not — it reads as
+    // the home of dedup state, which is somewhere else entirely.
+    Migration {
+        version: 16,
+        sql: "
+            DROP TABLE IF EXISTS file_hashes;
         ",
     },
 ];
@@ -796,7 +810,6 @@ mod tests {
                 "INSERT INTO media_meta (path, file_size, media_type) VALUES ('/g/a.jpg', 1, 'image');
                  INSERT INTO tag_index (path, namespace, tag) VALUES ('/g/a.jpg', 'user', 'cat');
                  INSERT INTO index_state (path, companion_mtime) VALUES ('/g/a.jpg', 42);
-                 INSERT INTO file_hashes (path, hash, mtime) VALUES ('/g/a.jpg', 'abc', 1);
                  INSERT INTO gif_atlas (path, tier, mtime, frame_count, frame_w, frame_h, cols, delays, atlas)
                      VALUES ('/g/a.jpg', 'm', 1, 1, 8, 8, 1, '100', x'00');
                  INSERT INTO not_duplicates (path_a, path_b) VALUES ('/g/a.jpg', '/g/b.jpg');

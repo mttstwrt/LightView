@@ -1,3 +1,22 @@
+//! The thumbnail tier tables: the tier vocabulary, the read and write paths,
+//! and the disk budget for the two tiers that need one.
+//!
+//! [`ThumbTier::ALL`] is the source of truth for which thumbnail tables exist;
+//! `cache::db::path_keyed_tables` derives from it, so adding a variant there
+//! propagates a new tier to every maintenance sweep. Adding a tier still needs
+//! its `CREATE TABLE` migration — the array does not create tables, it only
+//! stops the rest of the codebase from forgetting one.
+//!
+//! Two families, and the split is not cosmetic: the square-cropped tiers back
+//! the fixed-cell grid and the aspect-preserving ("fit") tiers back the
+//! justified layout, and a fit tier cannot be derived from a square one because
+//! the crop already discarded the pixels. See
+//! `docs/decisions/0002-two-families-of-thumbnail-tiers.md`.
+//!
+//! Only the two zoom tiers are bounded, by bytes rather than rows, with
+//! eviction keyed on `accessed_at` — `docs/decisions/0004-byte-budgeted-lru-for-zoom-tiers.md`
+//! explains why each of those three choices is the way it is.
+
 use crate::cache::db::{CacheDb, CacheError};
 use std::collections::{HashMap, HashSet};
 
@@ -631,13 +650,6 @@ impl CacheDb {
         }
 
         Ok(results)
-    }
-
-    /// Check if a non-standard-tier thumbnail exists for this path.
-    pub fn tier_is_cached(&self, tier: ThumbTier, path: &str) -> Result<bool, CacheError> {
-        let mut stmt = self.conn().prepare_cached(tier.exists_sql())?;
-        let mut rows = stmt.query(rusqlite::params![path])?;
-        Ok(rows.next()?.is_some())
     }
 
     /// Which of `paths` already have a row in `tier`'s table. One IN-list

@@ -1,3 +1,15 @@
+//! EXIF extraction: capture time and GPS.
+//!
+//! Both are read from the metadata block alone — no image decode — which is
+//! what makes it affordable to run over a whole gallery during the backfill
+//! pass after gallery open.
+//!
+//! Two units to keep straight. Capture time is the camera's local wall clock:
+//! EXIF carries no timezone, so this returns a `NaiveDateTime` and the caller
+//! decides what to do about that. GPS is decimal degrees, WGS-84, converted
+//! from EXIF's degrees/minutes/seconds rationals and signed by the N/S and E/W
+//! reference tags — dropping those references silently mirrors half the planet.
+
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;

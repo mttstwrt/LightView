@@ -1,3 +1,13 @@
+//! `tag_counts`: per-`(namespace, tag)` frequencies, derived from
+//! [`crate::cache::index`].
+//!
+//! Maintained two ways on purpose. A full rebuild runs at gallery open, where
+//! one aggregate scan beats replaying every tag; individual edits then
+//! increment and decrement, because a rebuild per keystroke in the tag editor
+//! would scan the whole index to change one row. The autocomplete engine loads
+//! from here rather than from `tag_index`, so a tag's popularity is already
+//! summed by the time it is ranked.
+
 use crate::cache::db::{CacheDb, CacheError};
 
 /// A tag with its namespace and frequency count.
@@ -84,37 +94,6 @@ impl CacheDb {
                 namespace: namespace.to_string(),
                 tag: row.get(0)?,
                 count: row.get::<_, u32>(1)?,
-            })
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
-    }
-
-    /// Get the top N most popular tags, optionally filtered by namespace.
-    pub fn top_tags(
-        &self,
-        namespace: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<TagCount>, CacheError> {
-        let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match namespace {
-            Some(ns) => (
-                "SELECT namespace, tag, count FROM tag_counts WHERE namespace = ?1 ORDER BY count DESC LIMIT ?2",
-                vec![Box::new(ns.to_string()), Box::new(limit as u32)],
-            ),
-            None => (
-                "SELECT namespace, tag, count FROM tag_counts ORDER BY count DESC LIMIT ?1",
-                vec![Box::new(limit as u32)],
-            ),
-        };
-        let mut stmt = self.conn().prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok(TagCount {
-                namespace: row.get(0)?,
-                tag: row.get(1)?,
-                count: row.get::<_, u32>(2)?,
             })
         })?;
         let mut result = Vec::new();

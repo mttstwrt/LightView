@@ -1,3 +1,11 @@
+//! The tag index: `tag_index` (path, namespace, tag) and the `index_state`
+//! companion-mtime bookkeeping that lets re-indexing skip unchanged files.
+//!
+//! This table is pure derived state — it is rebuilt from companion files and
+//! can be dropped and regenerated at any time. Companion files are the record
+//! of intent; this is the shape that makes filtering a SQL query instead of a
+//! directory walk.
+
 use crate::cache::db::{CacheDb, CacheError};
 use crate::companion::schema::CompanionFile;
 
@@ -9,13 +17,13 @@ impl CacheDb {
         path: &str,
         companion: &CompanionFile,
     ) -> Result<(), CacheError> {
-        // Delete existing tags for this path
+        // Replace rather than merge: a companion is the whole truth for a
+        // path, so a tag removed there must disappear here too.
         self.conn().execute(
             "DELETE FROM tag_index WHERE path = ?1",
             rusqlite::params![path],
         )?;
 
-        // Insert all tags
         let mut stmt = self.conn().prepare_cached(
             "INSERT OR IGNORE INTO tag_index (path, namespace, tag) VALUES (?1, ?2, ?3)",
         )?;
@@ -24,9 +32,9 @@ impl CacheDb {
             stmt.execute(rusqlite::params![path, namespace, tag])?;
         }
 
-        // Update index_state with the current companion mtime
-        // (caller is responsible for passing the correct mtime)
-
+        // `index_state` is deliberately *not* stamped here. The caller knows
+        // the companion mtime it read, and stamping a different one would make
+        // the next open skip a file that had in fact changed.
         Ok(())
     }
 
@@ -80,21 +88,6 @@ impl CacheDb {
             "SELECT path FROM tag_index WHERE namespace = ?1 AND tag = ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![namespace, tag], |row| {
-            row.get::<_, String>(0)
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
-    }
-
-    /// Query paths matching ANY tag in a namespace.
-    pub fn query_namespace(&self, namespace: &str) -> Result<Vec<String>, CacheError> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT DISTINCT path FROM tag_index WHERE namespace = ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![namespace], |row| {
             row.get::<_, String>(0)
         })?;
         let mut result = Vec::new();

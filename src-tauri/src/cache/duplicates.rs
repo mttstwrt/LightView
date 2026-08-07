@@ -1,3 +1,17 @@
+//! Perceptual-hash duplicate detection.
+//!
+//! Hashes are computed from the *cached Standard thumbnail*, never from the
+//! original: those bytes are already decoded and already in the database, so
+//! hashing an entire gallery costs no source decodes. The hash lives in a
+//! `phash` column on the `thumbnails` table, which means it is discarded and
+//! recomputed along with the thumbnail it describes — exactly the lifetime it
+//! should have.
+//!
+//! Grouping is an all-pairs Hamming comparison, quadratic in the number of
+//! hashed files. That is acceptable at gallery scale and is why `threshold` is
+//! a parameter for precision rather than for cost: a tighter threshold is not
+//! cheaper. See `docs/duplicates/README.md`.
+
 use crate::cache::db::CacheDb;
 
 /// Compute a 64-bit difference hash (dHash) from raw RGBA pixel data.
@@ -24,7 +38,6 @@ pub fn dhash_rgba(rgba: &[u8], width: u32, height: u32) -> u64 {
         }
     }
 
-    // Build the 64-bit hash: for each row, compare adjacent columns.
     let mut hash: u64 = 0;
     for y in 0..8 {
         for x in 0..8 {
@@ -46,7 +59,8 @@ pub fn dhash_jpeg(jpeg_data: &[u8]) -> Option<u64> {
     let width = info.width as u32;
     let height = info.height as u32;
 
-    // Convert RGB to pseudo-RGBA for the shared dhash function
+    // Widen to RGBA so the shared dhash path can be used; the alpha byte is
+    // never read, so its value doesn't matter.
     let component_count = pixels.len() / (width * height) as usize;
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for chunk in pixels.chunks_exact(component_count) {
@@ -129,48 +143,6 @@ impl CacheDb {
         }
         tx.commit()?;
         Ok(fetched)
-    }
-
-    /// Compute and store the perceptual hash for all thumbnails that don't have one yet.
-    /// Returns the number of hashes computed.
-    pub fn compute_phashes(&self) -> Result<usize, rusqlite::Error> {
-        let mut read_stmt = self.conn().prepare(
-            "SELECT path, thumbnail, format, width, height FROM thumbnails WHERE phash IS NULL",
-        )?;
-
-        let rows: Vec<(String, Vec<u8>, String, u32, u32)> = read_stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let mut count = 0;
-        let tx = self.conn().unchecked_transaction()?;
-        {
-            let mut update_stmt =
-                tx.prepare_cached("UPDATE thumbnails SET phash = ?1 WHERE path = ?2")?;
-
-            for (path, data, format, width, height) in &rows {
-                let hash = match format.as_str() {
-                    "rgba" => Some(dhash_rgba(data, *width, *height)),
-                    "jpeg" => dhash_jpeg(data),
-                    _ => None,
-                };
-                if let Some(h) = hash {
-                    update_stmt.execute(rusqlite::params![h as i64, path])?;
-                    count += 1;
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(count)
     }
 
     /// Find groups of visually similar images based on perceptual hash.
