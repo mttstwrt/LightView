@@ -1,3 +1,9 @@
+// The in-window debug overlay: hardware info and live performance metrics.
+//
+// Rendering it starts the metric sampler, so the overlay costs nothing while
+// closed. Row definitions live in metricRows.ts, shared with DevtoolsApp so the
+// two views cannot drift apart.
+
 import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
 import { getDebugInfo, getPerfSnapshot, type DebugInfo } from "../../lib/ipc";
 import {

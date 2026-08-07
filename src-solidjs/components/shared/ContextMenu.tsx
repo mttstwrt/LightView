@@ -1,3 +1,16 @@
+// The right-click / long-press menu over grid cells and the viewer.
+//
+// The most capability-sensitive component in the app: it is where file
+// operations, plugin runs, and deletes are offered. Every one of those is
+// gated on `capabilities()` so the web client never shows an action the server
+// will refuse — but that gating is presentation. The enforcement is the
+// `/api/invoke` allowlist, which is why a component bug here cannot become a
+// security hole.
+//
+// Plugin actions come in two flavours that look alike and are not: a local run
+// (desktop, spawns a subprocess here) and an enqueued tagging job (web, claimed
+// by a paired worker). `taggingStore` decides which are available.
+
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { safeListen as listen, isWeb, hasTouch } from "../../lib/runtime";

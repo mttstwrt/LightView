@@ -1,3 +1,17 @@
+// The fixed-cell grid: square thumbnails in a uniform virtual scroller.
+//
+// Shares its machinery with JustifiedGrid — two nested render windows, a
+// resolution ladder, 404-driven generation, drain-time prioritization, and two
+// single-flight slots. docs/frontend/grid-loading.md describes that machine
+// once for both, and docs/decisions/0007-two-zone-render-window.md says why it
+// is shaped that way.
+//
+// What is specific to this file: tier selection maps cell size × DPR to s/m/l
+// with a 1.25× upscale tolerance, and the generation queue is a plain
+// Set<string> because every cell wants the same tier — the justified grid
+// needs a Map, since a cheap-rung cell there must regenerate whichever tier
+// actually 404'd.
+
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, hasTouch, isTauri, type UnlistenFn } from "../../lib/runtime";

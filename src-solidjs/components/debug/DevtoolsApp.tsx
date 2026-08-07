@@ -1,3 +1,9 @@
+// The same metrics as DebugOverlay, in a separate devtools window.
+//
+// A separate window cannot reach the main window's ring buffers, so it receives
+// flattened MetricSnapshot messages instead of reading the live buffers. Row
+// definitions are shared via metricRows.ts.
+
 import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
 import { safeListen as listen } from "../../lib/runtime";
 import { getDebugInfo, type DebugInfo } from "../../lib/ipc";

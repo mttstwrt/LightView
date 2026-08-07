@@ -1,3 +1,14 @@
+// The duplicate-detection panel: grouped near-identical images, with a
+// per-group choice of trashing the copies or merging them.
+//
+// The threshold presets map to Hamming distance over the perceptual hashes —
+// 0 is pixel-identical, higher is looser. A tighter threshold is not cheaper
+// (detection compares all pairs regardless), so the control is about precision
+// only.
+//
+// Both destructive actions sit behind `capabilities().delete`; merge is gated
+// too, because its final step is a trash.
+
 import { createSignal, Show, For, onCleanup } from "solid-js";
 import { findDuplicates, markNotDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
 import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
