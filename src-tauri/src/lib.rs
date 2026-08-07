@@ -1,3 +1,24 @@
+//! LightView's backend library: `AppState` and the modules it holds together.
+//!
+//! Everything the process knows lives in [`AppState`], which is `Clone` over
+//! shared `Arc`s so the HTTP server can hold its own handle and observe the
+//! same live gallery as the Tauri commands. That is what makes
+//! `lightview-headless` possible: the same state, minus the webview.
+//!
+//! The lock type on each field is a decision, not a default, and the two that
+//! matter most:
+//!
+//! * `cache_db` is a `tokio::Mutex`, not an `RwLock`, because
+//!   `rusqlite::Connection` is `Send` but not `Sync`. It serializes every write
+//!   in the process, so nothing expensive may run while it is held.
+//! * `thumb_protocol_db` is a `std::sync::RwLock` around an
+//!   `Arc<ThumbProtocolPool>` because its readers are synchronous and hold the
+//!   outer lock only long enough to clone the `Arc` — they must not serialize
+//!   on it.
+//!
+//! Per-field rationale is on the fields themselves. `docs/architecture.md` has
+//! the map of how the modules below fit together.
+
 pub mod companion;
 pub mod provider;
 pub mod cache;

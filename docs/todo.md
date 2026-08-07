@@ -32,10 +32,6 @@ change to the indexer. Until then the parser accepts a query the evaluator
 cannot honour, which is the worst of the available states. See
 [`query/`](query/README.md).
 
-## `get_recent_tags` does not persist
-
-Recent tags are in-memory only and do not survive a restart.
-
 ## `reindex_gallery` does not regenerate thumbnails
 
 Re-indexing rebuilds the media and tag indexes but does not kick off background

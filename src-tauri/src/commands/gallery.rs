@@ -1,3 +1,29 @@
+//! Opening, closing, and watching a gallery.
+//!
+//! `open_gallery_impl` is the one command with real orchestration, and its
+//! ordering is load-bearing at three points:
+//!
+//! 1. The root is canonicalized once here, so every later path-confinement
+//!    check compares against a stored value instead of canonicalizing per
+//!    request.
+//! 2. `adopt_gallery_root` runs **before** `populate_media_meta`. If the gallery
+//!    directory moved, the cached absolute paths must be rebased first;
+//!    otherwise the scan inserts bare rows under the new root that shadow the
+//!    relocated history, and the accumulated ratings, tags, and thumbnails are
+//!    orphaned in place.
+//! 3. The read-only connection pool opens after the rebase, so it never
+//!    observes mid-rebase state.
+//!
+//! Indexing companions, rebuilding tag counts, and starting the idle worker all
+//! happen *after* the command returns — the grid renders from `media_meta`
+//! alone, so there is no reason to make the user wait for them.
+//!
+//! The fs-watcher lives here too. `util::fs_watch` is only a transport; the
+//! policy — coalescing an event storm into one refresh, distinguishing the
+//! app's own `settings.toml` write from a hand edit, routing batches to both
+//! the desktop event and the web client's SSE broadcast — is all in
+//! `start_fs_watcher`.
+
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;

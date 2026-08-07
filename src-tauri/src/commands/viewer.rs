@@ -1,3 +1,14 @@
+//! Full-resolution viewing: transformed image renders for the viewer.
+//!
+//! Reads the original through the provider and decodes it at native
+//! resolution, so unlike the thumbnail path there is no tier to fall back on.
+//! Decoded output is capped at 50 megapixels (200 MB of RGBA) before
+//! downsampling — a bound on memory, not on quality, since nothing displays
+//! more than that.
+//!
+//! Uses the GPU pipeline for the transform when one initialized, CPU otherwise;
+//! the two must produce the same image, so a change to either belongs in both.
+
 use base64::Engine;
 use rayon::prelude::*;
 use serde::Deserialize;

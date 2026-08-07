@@ -1,3 +1,15 @@
+//! Installing, listing, and running plugins on the host.
+//!
+//! Desktop-only by design: running a plugin executes an arbitrary subprocess
+//! with the host's privileges, so none of these commands appear in the
+//! `/api/invoke` allowlist. A remote client that wants tagging done enqueues a
+//! job through `tagging/` instead, which routes it to a worker that opted in.
+//!
+//! Batch runs are cancellable through `AppState::plugin_cancelled`, checked
+//! between images — a plugin holds a model in memory for the length of a run,
+//! so the alternative to cooperative cancellation is killing the process and
+//! paying the model load again on the next attempt.
+
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

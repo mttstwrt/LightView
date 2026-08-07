@@ -1,3 +1,9 @@
+//! Sorting, grouping, and the scrollbar timeline.
+//!
+//! Takes the filtered path list from `commands::filter` and returns the ordered
+//! items plus their group headers in one round-trip, so the grid never renders
+//! a half-updated view.
+
 use crate::sort::grouper::{self, GroupBy, GroupHeader};
 use crate::sort::sorter::{SortField, SortOrder, SortedItem};
 use crate::sort::timeline::TimelineEntry;

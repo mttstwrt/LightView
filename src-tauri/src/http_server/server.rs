@@ -1,3 +1,23 @@
+//! Router assembly, binding, and the TLS handshake.
+//!
+//! The layering here *is* the security model, so the grouping is worth reading
+//! before adding a route. Three tiers:
+//!
+//! * **Protected** — media, thumbnails, `/api/*`. Behind
+//!   [`super::middleware::auth_layer`].
+//! * **Bootstrap** — `/pair/redeem`, `/auth/*`, `/cert`. These cannot sit
+//!   behind the auth layer or there would be no way past it the first time.
+//!   `/cert` is one step further out still: the point of downloading the
+//!   certificate is to fix a browser that cannot establish trust yet, which is
+//!   upstream of holding a cookie. It is public regardless — every TLS
+//!   handshake hands the same bytes to anyone who connects.
+//! * **Static** — the SPA. Outside auth because the shell must load before the
+//!   client can pair; it contains no gallery data.
+//!
+//! The upload body limit is applied to `/api/upload` alone rather than
+//! globally, so the other routes keep axum's small default and a hostile client
+//! cannot use any of them to buffer half a gigabyte.
+
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
@@ -82,20 +102,27 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
         remote_hits: remote_hits.clone(),
     };
 
-    // Permissive CORS — server is loopback-only today. When remote access
-    // lands this should be narrowed to the origin(s) we actually serve.
+    // Permissive CORS. This comment used to say "loopback-only today, narrow it
+    // when remote access lands" — remote access has landed, so here is the
+    // actual reasoning.
+    //
+    // Narrowing buys nothing on either instance. The loopback media server is
+    // fetched cross-origin by the webview itself, which is the whole point of
+    // its existence. The LAN server's protection is the `lv_device` cookie,
+    // and a cookie the browser will not send cross-site is not made safer by an
+    // origin allowlist; a same-origin SPA is unaffected either way. Meanwhile
+    // there is no fixed origin to name, since the server is reached by whatever
+    // LAN address or hostname the client happened to dial.
+    //
+    // What is load-bearing is `expose_headers`: the webview reads the
+    // `X-Gif-*` atlas metadata off the fetch Response, and custom response
+    // headers are invisible to JS cross-origin unless they are exposed.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
-        // The webview fetches this loopback server cross-origin, so custom
-        // response headers (the `X-Gif-*` atlas metadata) must be exposed or
-        // JS can't read them off the fetch Response.
         .expose_headers(Any);
 
-    // Data routes carry sensitive content and sit behind the auth layer.
-    // Static SPA assets do not — the app shell needs to load before the
-    // client can pair its device and attach the cookie to later requests.
     // Cap an upload request body. Generous enough for a batch of phone photos
     // or a short video, bounded so a hostile client can't exhaust memory/disk
     // in a single request (each file is buffered while being written).

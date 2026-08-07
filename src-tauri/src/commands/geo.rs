@@ -1,3 +1,14 @@
+//! Map view queries: GPS points and bounding-box lookups.
+//!
+//! Coordinates come from `media_meta.gps_lat/gps_lon`, backfilled from EXIF
+//! after gallery open, so the map never opens an image file. Filters compose
+//! with the map by compiling the active filter query to SQL and ANDing it with
+//! the bbox — the map is a filter term, not a separate mode.
+//!
+//! Decimal degrees, WGS-84. A box whose west bound exceeds its east bound
+//! crosses the anti-meridian and needs two longitude ranges ORed rather than
+//! one `BETWEEN`.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

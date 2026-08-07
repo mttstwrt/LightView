@@ -1,3 +1,28 @@
+//! The desktop binary: process setup, the `lightview://` protocol handler, and
+//! command registration.
+//!
+//! Three things happen here that happen nowhere else.
+//!
+//! **Environment before GTK.** `GDK_BACKEND` and `WEBKIT_DISABLE_DMABUF_RENDERER`
+//! are set before anything touches GTK, because WebKitGTK's Wayland and DMA-BUF
+//! paths crash on a range of drivers. They are read from `RenderConfig` rather
+//! than hard-coded so a user on working hardware can opt back in — and they are
+//! process-level rather than per-gallery settings precisely because they cannot
+//! take effect after init.
+//!
+//! **The `lightview://` protocol.** `thumb/<tier>/<path>` and
+//! `thumbhash/<path>` are answered here, off the GTK main thread — blocking it
+//! freezes the window. The bodies are `thumb_serve`, shared with the HTTP
+//! route, so the desktop and the web client coalesce, generate, and cache
+//! identically. Full-resolution media deliberately does *not* come through
+//! here: it goes over the loopback HTTP server, because WebKitGTK will not play
+//! `<video>` from a custom scheme and one streaming path for `<img>` and
+//! `<video>` beats two.
+//!
+//! **Command registration.** The `invoke_handler` list is the desktop's command
+//! surface. It is not the web's — that is the allowlist in
+//! `http_server::api`, and the two are intentionally different sets.
+
 use lightview_lib::AppState;
 use lightview_lib::cache::thumbnails::ThumbTier;
 use lightview_lib::commands;
@@ -314,7 +339,6 @@ fn main() {
 
             // Autocomplete commands
             commands::autocomplete::autocomplete_tags,
-            commands::autocomplete::get_recent_tags,
 
             // Sort commands
             commands::sort::get_sorted_items,

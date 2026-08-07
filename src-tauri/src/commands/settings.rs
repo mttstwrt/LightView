@@ -1,3 +1,18 @@
+//! Per-gallery settings, hardware reporting, and remote-access administration.
+//!
+//! Settings live in two places on purpose. Most are per-gallery, stored in
+//! `gallery_meta` and mirrored to a hand-editable `settings.toml` inside the
+//! gallery — the fs-watcher hot-reloads external edits to that file, comparing
+//! against `AppState::last_written_settings` so the app's own saves don't
+//! echo back as user edits. Process-level rendering preferences
+//! (`RenderConfig`) are separate because they are read before GTK/WebKit init
+//! and cannot take effect without a restart.
+//!
+//! The remote-access commands here — pairing codes, device lists, the gallery
+//! password — are deliberately **desktop-only**: they administer the boundary
+//! that `/api/invoke` enforces, so exposing them to a paired device would let
+//! it widen its own access.
+
 use serde::Serialize;
 use std::path::PathBuf;
 

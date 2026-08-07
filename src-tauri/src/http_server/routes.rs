@@ -1,3 +1,28 @@
+//! The data routes: media, thumbnails, GIF atlases, thumbhashes, uploads, and
+//! the SSE change stream.
+//!
+//! Every handler that resolves a filesystem path calls `path_in_gallery` first,
+//! and returns **404** when it fails — a 403 would confirm the existence of
+//! files outside the gallery. `/thumbhash` is the one exception, and only
+//! because it can read nothing but a blob already in the cache database.
+//!
+//! The thumbnail and GIF routes are thin: the real bodies are `thumb_serve` and
+//! `gif_serve`, shared with the desktop's custom protocol handler so both
+//! transports coalesce, generate, and cache identically.
+//!
+//! Two caching behaviours worth knowing. Thumbnails carry an ETag so a phone
+//! returning after `max-age` expiry revalidates its whole cached grid for a few
+//! hundred bytes each instead of refetching it. `/media` supports Range, since
+//! a multi-hundred-megabyte video must stream rather than be buffered — and
+//! `?fit=<edge>` serves an aspect-preserving backend resize of a native raster
+//! still, so the webview decodes a cell-sized image instead of the original.
+//!
+//! `/api/events` merges two broadcast channels: filesystem change batches and
+//! tagging job/worker updates. They are separate upstream because
+//! `fs_change_tx`'s subscriber count doubles as the "any web client connected?"
+//! signal for the idle backfill worker, and tagging traffic must not make the
+//! server think a user is present.
+
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},

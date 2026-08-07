@@ -1,3 +1,14 @@
+//! Host file operations: copy and move, with companions carried along.
+//!
+//! Desktop-only — absent from the `/api/invoke` allowlist, because these are
+//! the commands that can write anywhere on the host's filesystem.
+//!
+//! A move reports its results in two buckets, and the split is what the grid
+//! needs rather than a stylistic choice: files whose destination stays inside
+//! the gallery come back as old→new pairs so the frontend can re-key the
+//! existing cells and keep their loaded images, while files that left the
+//! gallery come back as removals.
+
 use std::path::Path;
 
 use serde::Serialize;

@@ -1,3 +1,5 @@
+//! Errors from reading file paths off the system clipboard.
+
 use std::path::PathBuf;
 
 #[derive(Debug)]

@@ -1,3 +1,23 @@
+//! Thumbnail generation commands, and the metadata that rides along with them.
+//!
+//! Four entry points write thumbnails, and they must agree on the Standard
+//! tier's `(format, resize_filter)` pair, because that format string is
+//! compared against the stored column to decide hit-versus-regenerate. If one
+//! site drifts, every lookup it makes misses and regenerates forever, at full
+//! decode cost, with no error anywhere — hence the single
+//! `standard_tier_params()`.
+//!
+//! The other rule this module exists to uphold: **do the expensive work before
+//! taking the cache lock.** Decode, encode, and `ffprobe` all run first; the
+//! writer mutex is taken only to commit. `generate_and_store_tier` spells this
+//! out for `ffprobe` specifically, because running a subprocess under the lock
+//! kept every other database user queued for hundreds of milliseconds per
+//! video.
+//!
+//! A Standard write is never alone: `store_derived_extras` commits the
+//! ThumbHash blob and the Micro row in the same transaction, so no reader can
+//! observe a Standard row without its placeholder.
+
 use base64::Engine;
 use serde::Serialize;
 use std::path::Path;

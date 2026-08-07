@@ -265,7 +265,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(autocomplete::autocomplete_tags_impl(app, a.query, a.namespace, a.limit).await)
         }
 
-        "get_recent_tags" => ok(autocomplete::get_recent_tags_impl(app).await),
 
         // --- Per-item metadata writes (allowed for paired devices) ---------
         "add_user_tag" => {

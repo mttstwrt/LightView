@@ -425,8 +425,6 @@ export const autocompleteTags = (
 ) =>
   invoke<TagSuggestion[]>("autocomplete_tags", { query, namespace, limit });
 
-export const getRecentTags = () =>
-  invoke<string[]>("get_recent_tags");
 
 // ---------------------------------------------------------------------------
 // Sort

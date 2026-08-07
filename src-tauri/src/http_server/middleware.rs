@@ -1,3 +1,21 @@
+//! Request-scoped policy: auth, cache headers, and the remote-hit counter.
+//!
+//! [`auth_layer`] is the authentication boundary — it decides whether a request
+//! carries a valid device cookie, and (when a gallery password is set) whether
+//! that device has proved it recently enough. It says nothing about *what* the
+//! device may then do; that is `api`'s allowlist.
+//!
+//! A failed password check answers 401 with `WWW-Authenticate: LV-Password`,
+//! which the frontend transport recognises, prompts for, and retries — so the
+//! challenge never surfaces to calling code. A 401 *without* that header means
+//! the cookie itself is bad, and the client redirects to pairing. The two cases
+//! must stay distinguishable or a password prompt and a re-pair become the same
+//! event to the client.
+//!
+//! [`track_remote_hits`] counts requests from non-loopback peers. That counter
+//! is the only dependable evidence that the port is actually reachable through
+//! the host firewall, which is what the settings UI reports.
+
 use axum::{
     extract::{ConnectInfo, State},
     http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},

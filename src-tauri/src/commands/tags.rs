@@ -1,3 +1,16 @@
+//! Reading and writing tags, ratings, and the other companion-backed metadata.
+//!
+//! Every write goes through `modify_companion`: read the sidecar (or start a
+//! fresh one), mutate, write atomically, then re-index. Sharing that helper is
+//! what keeps a hand edit, a batch edit, a plugin result, and a duplicate merge
+//! producing byte-identical files.
+//!
+//! Two stores must be updated together after any write — `tag_index` (so
+//! filters see the change) and `tag_counts` plus the autocomplete engine (so
+//! suggestions do). Updating only the first is invisible until someone types in
+//! the tag box, which is why the refresh is part of every write path here
+//! rather than left to the caller.
+
 use std::collections::BTreeSet;
 
 use serde::Serialize;
