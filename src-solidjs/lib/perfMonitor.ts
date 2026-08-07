@@ -165,12 +165,7 @@ export function recordImageLoad(durationMs: number) {
 // Image cache tracking (sampled each tick via getter)
 // -------------------------------------------------------------------------
 
-let _imageCounts: (() => { visible: number; cached: number }) | null = null;
 let _viewerCacheCount: (() => number) | null = null;
-
-export function setImageCountSource(fn: () => { visible: number; cached: number }) {
-  _imageCounts = fn;
-}
 
 export function setViewerCacheCountSource(fn: (() => number) | null) {
   _viewerCacheCount = fn;
@@ -189,8 +184,7 @@ export const cacheMisses = new RingBuffer(HISTORY_LEN);       // misses/sec
 export const domNodes = new RingBuffer(HISTORY_LEN);          // count
 export const diskReadRate = new RingBuffer(HISTORY_LEN);      // KB/s
 export const diskWriteRate = new RingBuffer(HISTORY_LEN);     // KB/s
-export const visibleImages = new RingBuffer(HISTORY_LEN);     // count
-export const cachedImages = new RingBuffer(HISTORY_LEN);      // count
+export const cachedImages = new RingBuffer(HISTORY_LEN);      // count (viewer cache)
 export const jsHeapUsed = new RingBuffer(HISTORY_LEN);        // MB
 export const imageLoadLatency = new RingBuffer(HISTORY_LEN);  // ms (avg/sample)
 export const imageLoadRate = new RingBuffer(HISTORY_LEN);     // loads/sec
@@ -210,7 +204,6 @@ export const metrics = {
   domNodes,
   diskReadRate,
   diskWriteRate,
-  visibleImages,
   cachedImages,
   jsHeapUsed,
 } as const;
@@ -315,11 +308,15 @@ async function sampleTick() {
     jsHeapUsed.push(perf.memory.usedJSHeapSize / (1024 * 1024));
   }
 
-  // Image cache counts (pulled fresh each tick)
-  if (_imageCounts) {
-    const counts = _imageCounts();
-    visibleImages.push(counts.visible);
-    cachedImages.push(counts.cached + (_viewerCacheCount?.() ?? 0));
+  // Decoded images the viewer is holding, pulled fresh each tick.
+  //
+  // There was a second source here for the grid's visible/cached counts,
+  // gated behind a setter nothing ever called — so `_imageCounts` was
+  // permanently null and this whole block never ran, silently dropping the
+  // viewer count too even though MediaViewer registers it on mount. The
+  // "Visible Imgs" row went with it: no source existed for that number.
+  if (_viewerCacheCount) {
+    cachedImages.push(_viewerCacheCount());
   }
 
   // Backend snapshot (disk IO)

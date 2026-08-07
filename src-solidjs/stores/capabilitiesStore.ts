@@ -1,3 +1,13 @@
+// What this client is allowed to do, as reported by the server.
+//
+// Purely a rendering input. The real enforcement is the `/api/invoke`
+// allowlist, so a component that ignores this store gets a 403 rather than
+// unauthorized access — which is why the optimistic desktop default is safe.
+//
+// The web default is the *paired-device baseline* rather than "nothing" or
+// "everything": assuming nothing makes the UI flash empty and then fill in;
+// assuming everything shows destructive actions that vanish a moment later.
+
 import { createSignal } from "solid-js";
 import { isTauri } from "../lib/runtime";
 import { getServerCapabilities, type ServerCapabilities } from "../lib/ipc";

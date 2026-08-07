@@ -1,3 +1,6 @@
+// Progress of a plugin run, for the activity indicator. Desktop only — remote
+// tagging jobs are `taggingStore`.
+
 import { createSignal } from "solid-js";
 
 export type PluginStatus = "running" | "done" | "error" | "cancelled";

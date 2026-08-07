@@ -38,6 +38,29 @@ Re-indexing rebuilds the media and tag indexes but does not kick off background
 thumbnail regeneration, so a re-index after a bulk external edit leaves stale
 thumbnails until something else asks for them.
 
+## Several backend commands have no consumer
+
+Each of these is a complete chain — a registered `#[tauri::command]`, a typed
+wrapper in `lib/ipc.ts`, and in some cases an `/api/invoke` arm — with no call
+site anywhere in the tree. They are listed together because the decision is the
+same for all of them and it is a product decision, not a cleanup: either wire up
+the UI or delete the chain end to end. Deleting only the client binding would
+be worse than leaving it, since it strands the backend half.
+
+| Command | What it would drive |
+|---|---|
+| `get_timeline_index` | The scrollbar's date markers. `CacheDb::compute_timeline` and `TimelineEntry` exist and work; nothing asks for them. |
+| `get_transformed_media` | Viewer rotate/exposure/colour. This one is the largest: it also strands `gpu_pipeline::transform_image`, its WGSL shader, and the `apply_cpu_transforms` fallback. |
+| `get_gallery_stats`, `clear_cache`, `reindex_gallery` | A cache-maintenance surface in settings. `rebuild_thumbnails` next to them *is* wired, so the gap is visible in one screen. |
+| `get_hardware_profile` | Showing the detected profile that already drives pool sizing. |
+| `get_cached_thumbnail_info`, `get_thumbnail` | Per-path thumbnail introspection; the batch forms are used. |
+| `get_thumbhashes`, `thumbhashUrl` | Superseded — the ThumbHash now rides inline on each sorted item. |
+| `close_gallery`, `get_gallery_info` | Superseded by `get_boot_state`, which returns gallery info with the first payload. |
+
+`apply_plugin_tags` looks like one of these and is not: `lightview-worker` calls
+it over HTTP, and its TS wrapper carries a comment saying it exists to document
+that contract.
+
 ## Absolute paths as primary keys
 
 Every path-keyed row stores an absolute path, which is why `rebase_root` and

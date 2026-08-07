@@ -1,3 +1,9 @@
+// Full-resolution viewer state: whether it is open, which item, info panel.
+//
+// Holds an *index* into `displayPaths` rather than a path, so paging with the
+// arrow keys is arithmetic and stays consistent with whatever the grid is
+// currently showing.
+
 import { createSignal } from "solid-js";
 import { recordView } from "../lib/ipc";
 import { displayPaths, setSortedItems } from "./galleryStore";

@@ -4,13 +4,13 @@
 // the commit is present for dev/desktop builds and for container builds that
 // pass VITE_GIT_SHA.
 
-export const APP_VERSION: string = __APP_VERSION__;
+const APP_VERSION: string = __APP_VERSION__;
 export const GIT_SHA: string = __GIT_SHA__;
-export const BUILD_TIME: string = __BUILD_TIME__;
+const BUILD_TIME: string = __BUILD_TIME__;
 
 /** Build time as a compact local string (e.g. "2026-07-23 14:20"), or "" if
  *  the stamp is missing/unparseable. */
-export function buildTimeLabel(): string {
+function buildTimeLabel(): string {
   if (!BUILD_TIME) return "";
   const d = new Date(BUILD_TIME);
   if (Number.isNaN(d.getTime())) return "";

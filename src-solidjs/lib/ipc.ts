@@ -1,3 +1,27 @@
+// The single boundary between the SPA and the backend.
+//
+// One typed function per backend command, and one place that knows which
+// transport is in use: Tauri's `invoke()` inside the desktop webview, or
+// `POST /api/invoke` in a browser. Nothing above this file branches on that,
+// which is what lets the same bundle ship to both.
+//
+// Two auth conditions are absorbed here rather than surfaced to callers:
+//
+//   * 401 with `WWW-Authenticate: LV-Password` — the gallery password is
+//     required again. The transport raises a challenge, waits for the modal,
+//     and retries the original request. Concurrent 401s share one pending
+//     promise, so a grid firing twenty requests produces one prompt instead of
+//     twenty stacked modals.
+//   * 401 without that header — the device cookie is missing or revoked. Emits
+//     NOT_PAIRED_EVENT so the router can redirect to /pair.
+//
+// A command the web client must not reach is not hidden here; it is simply
+// absent from the server's allowlist, and 403s if called. `capabilitiesStore`
+// tells components what to render, but it is not the enforcement.
+//
+// The types below mirror the Rust serde structs. When one side changes, the
+// other must too — `tsc --noEmit` is what catches it.
+
 import { invoke as _rawInvoke } from "@tauri-apps/api/core";
 import { isActive as isPerfActive, recordIpcCall } from "./perfMonitor";
 import {

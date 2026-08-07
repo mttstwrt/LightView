@@ -1,3 +1,5 @@
+// Scroll velocity, direction, and the decode gate — shared by both grids.
+
 import { createSignal, untrack, type Accessor } from "solid-js";
 import { isTauri } from "./runtime";
 import { ewmaImageLoadMs } from "./perfMonitor";

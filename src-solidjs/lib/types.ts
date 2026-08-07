@@ -52,17 +52,6 @@ export interface MediaInfo {
 // Gallery types
 // ---------------------------------------------------------------------------
 
-export interface GalleryMediaItem {
-  path: string;
-  name: string;
-  media_type: MediaType;
-  thumbnail_url: string | null;
-  size: number;
-  mtime: number;
-  date_taken?: number;
-  rating?: number;
-}
-
 export interface GalleryOpenResult {
   path: string;
   total_media: number;

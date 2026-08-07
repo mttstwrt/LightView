@@ -1,6 +1,11 @@
+// The open gallery: its items, the current sort/filter result, and selection.
+//
+// `sortedItems` is the full ordered list from the backend; `displayPaths` is
+// what the grid actually renders after filtering. They are separate signals so
+// changing the filter does not invalidate everything derived from the sort.
+
 import { createSignal, createMemo } from "solid-js";
 import type {
-  GalleryMediaItem,
   GroupHeader,
   SortedItem,
   TimelineEntry,
@@ -168,7 +173,7 @@ export function clearSelection() {
 }
 
 /** Enter multi-select mode (tap-to-toggle). */
-export function enterSelectionMode() {
+function enterSelectionMode() {
   setSelectionMode(true);
 }
 
@@ -188,10 +193,3 @@ export function selectAll(paths: string[]) {
   setSelectedPaths(new Set<string>(paths));
 }
 
-export function addToSelection(paths: string[]) {
-  setSelectedPaths((prev) => {
-    const next = new Set(prev);
-    for (const p of paths) next.add(p);
-    return next;
-  });
-}

@@ -1,3 +1,11 @@
+// Application settings, and the sort/group controls that travel with them.
+//
+// Settings have two homes and the split is deliberate: on the desktop they
+// persist per gallery through the backend (and are mirrored to a hand-editable
+// settings.toml the fs-watcher hot-reloads), while the web client keeps its own
+// copy in local storage. A phone and the desktop looking at the same gallery
+// should not fight over thumbnail size.
+
 import { createSignal } from "solid-js";
 import type { AppSettings, SortField, SortOrder, GroupBy } from "../lib/types";
 import { saveGallerySettings, loadGallerySettings } from "../lib/ipc";
@@ -131,9 +139,6 @@ export function loadWebSettings() {
 }
 
 /** Called when gallery is closed to stop backend persistence. */
-export function clearGallerySettingsSync() {
-  galleryOpen = false;
-}
 
 export { settings };
 
