@@ -1,3 +1,14 @@
+//! Locating and parsing a companion file.
+//!
+//! Reads try the requested [`CompanionLocation`] and then fall back to the
+//! other one, so a gallery whose preference changed keeps resolving its older
+//! sidecars without a migration pass. The fallback is a read affordance only —
+//! writes go where they are told, or the two locations would slowly diverge.
+//!
+//! [`crate::companion::migration::migrate`] runs on every parse, which is what
+//! makes adding a schema version a change to one function rather than an audit
+//! of every caller.
+
 use std::path::Path;
 
 use crate::companion::schema::{CompanionFile, COMPANION_EXTENSION, CURRENT_SCHEMA_VERSION};

@@ -1,3 +1,9 @@
+//! Group headers over a sorted item list.
+//!
+//! Pure and in-memory: takes the already-ordered items and returns
+//! `{label, start_index, count}` spans wherever the group key changes. It never
+//! sorts, so the grid can regroup without a round-trip to the database.
+
 use serde::{Deserialize, Serialize};
 
 use crate::sort::sorter::SortedItem;

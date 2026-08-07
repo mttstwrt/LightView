@@ -1,3 +1,21 @@
+//! Fuzzy tag suggestion from an in-memory copy of `tag_counts`.
+//!
+//! The whole tag vocabulary is held in RAM — roughly 300 KB at 5,000 unique
+//! tags — so there is no cache-eviction policy to reason about and a query is a
+//! linear scan with no I/O. It is loaded from `tag_counts` rather than
+//! `tag_index` so popularity is already summed by the time it is ranked.
+//!
+//! Ranking is four tiers: exact, prefix, substring, subsequence. Suggestions
+//! are deduplicated *across* namespaces, summing counts, because someone
+//! typing `beach` wants one suggestion rather than the same word once per
+//! namespace; narrowing is what the `user::beach` syntax is for.
+//!
+//! The subsequence tier compares **character** counts on both sides. Comparing
+//! a matched-character tally against `needle.len()` — a byte count — meant any
+//! needle containing a multi-byte character could never satisfy the branch, so
+//! fuzzy matching was silently dead for every non-ASCII query while the three
+//! higher tiers kept working.
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;

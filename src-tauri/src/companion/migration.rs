@@ -1,3 +1,9 @@
+//! Companion schema upgrades.
+//!
+//! Called unconditionally on every read, so introducing version 2 is a change
+//! to this one function rather than an audit of every call site. Only version 1
+//! exists, so today it is the identity.
+
 use crate::companion::schema::CompanionFile;
 
 /// Migrate a companion file from an older schema version to the current version.

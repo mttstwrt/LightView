@@ -8,7 +8,7 @@ use crate::cache::db::CacheDb;
 use crate::companion::schema::MediaType;
 use crate::pipeline::exif;
 use crate::provider::local::LocalProvider;
-use crate::provider::{FileEntry, ProviderType};
+use crate::provider::FileEntry;
 use crate::util::fs_watch::FsWatcher;
 use crate::AppState;
 use rayon::prelude::*;
@@ -17,7 +17,6 @@ use rayon::prelude::*;
 pub struct GalleryOpenResult {
     pub path: String,
     pub total_media: usize,
-    pub provider_type: ProviderType,
 }
 
 /// Populate the media_meta table from scanned file entries.
@@ -44,9 +43,6 @@ fn populate_media_meta(
             .map_err(|e| e.to_string())?;
 
         for entry in entries {
-            if entry.is_dir {
-                continue;
-            }
             let ext = Path::new(&entry.name)
                 .extension()
                 .and_then(|e| e.to_str())
@@ -68,11 +64,7 @@ fn populate_media_meta(
 
     // Prune stale entries — files in DB but no longer on disk
     {
-        let on_disk: HashSet<&str> = entries
-            .iter()
-            .filter(|e| !e.is_dir)
-            .map(|e| e.path.as_str())
-            .collect();
+        let on_disk: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
         let mut sel = tx
             .prepare_cached("SELECT path FROM media_meta")
@@ -397,7 +389,7 @@ fn infer_old_root(
 
     let mut candidate: Option<String> = None;
     let mut agreed = 0;
-    for entry in entries.iter().filter(|e| !e.is_dir) {
+    for entry in entries {
         // Keep the leading '/' so the prefix comes out without a trailing one.
         let Some(rel) = entry.path.strip_prefix(root) else {
             continue;
@@ -723,14 +715,8 @@ pub async fn open_gallery_impl(
     path: String,
     on_tags_indexed: impl FnOnce() + Send + 'static,
 ) -> Result<GalleryOpenResult, String> {
-    // Create the local provider
     let provider = Arc::new(LocalProvider::new(&path));
-
-    // Register it
-    {
-        let mut reg = state.providers.write().await;
-        reg.register(path.clone(), provider.clone());
-    }
+    *state.provider.write().await = Some(provider.clone());
 
     // Open (or create) the cache database
     let cache_db = CacheDb::open(std::path::Path::new(&path))
@@ -870,7 +856,6 @@ pub async fn open_gallery_impl(
     Ok(GalleryOpenResult {
         path,
         total_media: media_count,
-        provider_type: ProviderType::Local,
     })
 }
 
@@ -912,10 +897,8 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
         current.clone()
     };
 
-    if let Some(path) = gallery_path {
-        // Remove provider
-        let mut reg = state.providers.write().await;
-        reg.remove(&path);
+    if gallery_path.is_some() {
+        *state.provider.write().await = None;
     }
 
     // Close protocol handler DB FIRST — the read-only connections block
@@ -962,32 +945,30 @@ pub async fn get_gallery_info_impl(
     state: &AppState,
 ) -> Result<Option<GalleryOpenResult>, String> {
     let current = state.current_gallery.read().await;
-    match current.as_ref() {
-        Some(path) => {
-            let reg = state.providers.read().await;
-            match reg.get(path) {
-                Some(_provider) => {
-                    // Use the media_meta table for count — it was populated
-                    // from the recursive scan during open_gallery.
-                    let db = state.cache_db.lock().await;
-                    let media_count = if let Some(db) = db.as_ref() {
-                        db.conn()
-                            .query_row("SELECT COUNT(*) FROM media_meta", [], |r| r.get::<_, usize>(0))
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    Ok(Some(GalleryOpenResult {
-                        path: path.clone(),
-                        total_media: media_count,
-                        provider_type: _provider.provider_type(),
-                    }))
-                }
-                None => Ok(None),
-            }
-        }
-        None => Ok(None),
+    let Some(path) = current.as_ref() else {
+        return Ok(None);
+    };
+    if state.provider.read().await.is_none() {
+        return Ok(None);
     }
+
+    // Counted from media_meta rather than by re-scanning: the table was
+    // populated from the recursive scan during open_gallery, and a re-scan here
+    // would stat the whole tree on every info request.
+    let db = state.cache_db.lock().await;
+    let media_count = db
+        .as_ref()
+        .and_then(|db| {
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM media_meta", [], |r| r.get::<_, usize>(0))
+                .ok()
+        })
+        .unwrap_or(0);
+
+    Ok(Some(GalleryOpenResult {
+        path: path.clone(),
+        total_media: media_count,
+    }))
 }
 
 /// Everything the web client needs to render its first frame, in one

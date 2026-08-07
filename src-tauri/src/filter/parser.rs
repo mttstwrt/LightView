@@ -1,3 +1,16 @@
+//! Tokenizer and recursive-descent parser for the filter language.
+//!
+//! Precedence is the conventional one: `OR` binds loosest, then `AND`, then
+//! `NOT`, with parentheses to override. Terms are matched by prefix against a
+//! fixed set of forms, and **order matters** — `rating>=` is tried before a
+//! bare tag, so `rating:general` (a real tag emitted by the WD taggers) falls
+//! through to the tag branch instead of being mistaken for a rating filter.
+//!
+//! Dates accept a year, a year-month, or a full date and expand to the
+//! inclusive range they name: `date=2024` is all of 2024. Four-digit years are
+//! required rather than inferred, because guessing the century for `24-01-01`
+//! silently produces the wrong range.
+
 use chrono::NaiveDate;
 
 use crate::companion::schema::MediaType;

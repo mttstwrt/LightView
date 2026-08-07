@@ -76,9 +76,18 @@ Filtering therefore runs entirely in SQLite over the index, and never opens a
 companion file. That is what makes it usable on a large gallery, and it is also
 the constraint that shapes the language: **a field is filterable only if it is
 indexed in `media_meta`.** Colour label is the standing exception — it lives
-only in the companion, so `ColorLabel` compiles to a tautology and the term is
-silently ignored. Making it work means adding a `color_label` column and
-indexing it at scan time; see [`todo.md`](../todo.md).
+only in the companion, so `ColorLabel` compiles to a tautology, and the term
+widens the result set instead of narrowing it. Making it work means adding a
+`color_label` column and indexing it at scan time; see
+[`todo.md`](../todo.md).
+
+There was once a second, in-memory evaluator that walked companion files
+directly, and it was the only thing that could have honoured a colour label.
+Nothing ever called it. Keeping a parallel implementation of the language's
+semantics meant any divergence between the two was silent — and they had
+already diverged on exactly this term — so it was deleted rather than wired up.
+Evaluating a filter by opening every sidecar is the cost the tag index exists to
+remove.
 
 ## Sorting and grouping
 

@@ -64,10 +64,12 @@ sidecar next to each media file. That file, not the database, is the record of
 user intent — tags, ratings, notes. The cache indexes it for query speed and
 can always be rebuilt from it.
 
-**`provider/`** is the file-access seam: a `FileProvider` trait plus a
-`ProviderRegistry` that maps a gallery root to the provider serving it.
-`LocalProvider` is the only implementation, and the trait is small enough that
-it has no page of its own — read `provider/mod.rs`.
+**`provider/`** reads the gallery's files: a recursive scan at open, and
+whole-file reads for the viewer. It was a `FileProvider` trait plus a registry,
+sized for the SMB/SFTP/S3 backends that were never written; it is now the one
+concrete struct, since an interface with a single implementation and five
+unreachable methods bought nothing. Re-introducing the trait is the right move
+on the second backend, not the first hypothetical one.
 
 **[`remote/`](remote/README.md)** (`http_server/`) is the axum server: static
 SPA assets, media and thumbnail routes, an SSE change stream, device pairing,
@@ -90,9 +92,9 @@ folds several copies' metadata onto one survivor before trashing the rest.
 Its output sizes the thumbnail thread pool and decides whether the GPU pipeline
 is worth initializing — it is read, never written, after startup.
 
-**`util/`** holds `paths` (the exe-relative data directory), `hash`, and
-`fs_watch` (the notify-based watcher whose batches drive both the desktop's
-`gallery:fs-changed` event and the web client's SSE stream).
+**`util/`** holds `paths` (the exe-relative data directory) and `fs_watch` (a
+thin non-blocking wrapper over `notify`; the coalescing that turns an event
+storm into one refresh is policy, and lives in `commands/gallery.rs`).
 
 **[`frontend/`](frontend/README.md)** is the SPA. `lib/ipc.ts` is the only
 module that knows whether it is talking to Tauri or to HTTP; everything above
@@ -103,7 +105,7 @@ it is transport-agnostic.
 `open_gallery` is the one command with real orchestration, and its ordering is
 load-bearing:
 
-1. Register the directory with the `ProviderRegistry` and canonicalize the root
+1. Construct the `LocalProvider` for the directory and canonicalize the root
    once — every later path-confinement check compares against that value rather
    than canonicalizing the root per request.
 2. Open `<gallery>/.lightview/cache.db`, run migrations, then **rebase the
@@ -145,10 +147,10 @@ an eviction pass, rather than written through per request.
 
 The rule is that the domain modules do not know about their callers:
 
-- `cache/`, `companion/`, `filter/`, `sort/`, `autocomplete/`, `hardware/`, and
-  `util/` know nothing about Tauri, axum, or `AppState`. They are ordinary
-  libraries taking a connection or a struct.
-- `pipeline/`, `provider/`, `plugin/`, and `tagging/` sit one level up: they
+- `cache/`, `companion/`, `filter/`, `sort/`, `autocomplete/`, `hardware/`,
+  `provider/`, and `util/` know nothing about Tauri, axum, or `AppState`. They
+  are ordinary libraries taking a connection or a struct.
+- `pipeline/`, `plugin/`, and `tagging/` sit one level up: they
   take `AppState` or pieces of it, but no HTTP or IPC types.
 - `commands/` and `http_server/` are the two adapters at the top. **Neither may
   contain logic the other needs.** The convention that enforces this is the

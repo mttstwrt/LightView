@@ -23,7 +23,7 @@ use cache::coalescer::ThumbGenCoalescer;
 use cache::db::CacheDb;
 use autocomplete::engine::AutocompleteEngine;
 use hardware::HardwareProfile;
-use provider::ProviderRegistry;
+use provider::local::LocalProvider;
 use util::fs_watch::FsWatcher;
 
 /// Maximum number of recent galleries to remember.
@@ -146,8 +146,10 @@ impl ThumbProtocolPool {
 /// `AppState` clone and observe the same live gallery as the Tauri commands.
 #[derive(Clone)]
 pub struct AppState {
-    /// Active file provider registry (local, SMB, SFTP, S3)
-    pub providers: Arc<RwLock<ProviderRegistry>>,
+    /// File access for the open gallery. `None` when no gallery is open;
+    /// set by `open_gallery` and cleared by `close_gallery`, so it tracks
+    /// `current_gallery` exactly.
+    pub provider: Arc<RwLock<Option<Arc<LocalProvider>>>>,
 
     /// SQLite cache database (thumbnails, tag index, media meta)
     /// Uses Mutex (not RwLock) because rusqlite::Connection is Send but not Sync.
@@ -359,7 +361,7 @@ impl AppState {
         let recent_galleries = load_recent_galleries();
 
         Self {
-            providers: Arc::new(RwLock::new(ProviderRegistry::new())),
+            provider: Arc::new(RwLock::new(None)),
             cache_db: Arc::new(Mutex::new(None)),
             autocomplete: Arc::new(AutocompleteEngine::new()),
             hardware: Arc::new(hardware),

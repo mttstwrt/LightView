@@ -1,3 +1,11 @@
+//! One-shot hardware detection: storage class, CPU, RAM, GPU.
+//!
+//! Read once at startup and never updated. Its output sizes the bounded
+//! thumbnail thread pool and decides whether initializing the GPU pipeline is
+//! worth the cost, so it runs before any of that exists — which is also why it
+//! is best-effort throughout: every probe degrades to a conservative default
+//! rather than failing startup.
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]

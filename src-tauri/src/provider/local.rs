@@ -1,12 +1,13 @@
-use async_trait::async_trait;
+//! Local-filesystem access for an open gallery.
+
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
-use crate::companion::reader;
-use crate::companion::schema::{CompanionFile, MediaType, COMPANION_EXTENSION};
-use crate::provider::{FileEntry, FileProvider, ProviderError, ProviderType};
+use crate::companion::schema::MediaType;
+use crate::provider::{FileEntry, ProviderError};
 
-/// File provider for the local filesystem.
+/// Rooted at the open gallery directory. Paths handed to it may be absolute
+/// (the common case — every cached path is) or relative to that root.
 pub struct LocalProvider {
     root: PathBuf,
 }
@@ -24,19 +25,23 @@ impl LocalProvider {
         }
     }
 
-    /// Recursively discover all media files under `path`, skipping hidden
-    /// directories and `.lightview` metadata folders.
+    /// Recursively discover the media files under `path`.
+    ///
+    /// Skips every dot-directory, which covers `.lightview` (our own cache and
+    /// companion storage) along with the usual `.git`/`.Trash` noise, and skips
+    /// anything whose extension is not a known media type — so the result is
+    /// exactly the set `media_meta` should contain.
+    ///
+    /// Runs once per gallery open and is the gating step before the grid can
+    /// render, so it does the minimum per entry: one `metadata()` call, no
+    /// canonicalization, no companion reads.
     pub fn list_dir_recursive(&self, path: &str) -> Result<Vec<FileEntry>, ProviderError> {
         let dir = self.resolve(path);
         let mut entries = Vec::new();
 
         for entry in walkdir::WalkDir::new(&dir)
             .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                // Skip hidden dirs and .lightview metadata
-                !name.starts_with('.')
-            })
+            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
         {
             let entry = match entry {
                 Ok(e) => e,
@@ -49,12 +54,10 @@ impl LocalProvider {
 
             let name = entry.file_name().to_string_lossy().to_string();
 
-            // Skip companion files
             if name.ends_with(crate::companion::schema::COMPANION_EXTENSION) {
                 continue;
             }
 
-            // Skip non-media files
             let ext = entry.path()
                 .extension()
                 .and_then(|e| e.to_str())
@@ -78,167 +81,30 @@ impl LocalProvider {
             entries.push(FileEntry {
                 name,
                 path: entry.path().to_string_lossy().to_string(),
-                is_dir: false,
                 size: metadata.len(),
                 mtime,
-                mime_type: Some(mime_from_ext(ext)),
             });
         }
 
         entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         Ok(entries)
     }
-}
 
-#[async_trait]
-impl FileProvider for LocalProvider {
-    async fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, ProviderError> {
-        let dir = self.resolve(path);
-        let mut entries = Vec::new();
-
-        let read_dir = std::fs::read_dir(&dir).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ProviderError::NotFound(dir.display().to_string())
-            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                ProviderError::PermissionDenied(dir.display().to_string())
-            } else {
-                ProviderError::Io(e)
-            }
-        })?;
-
-        for entry in read_dir {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip hidden files and companion files
-            if name.starts_with('.') || name.ends_with(COMPANION_EXTENSION) {
-                continue;
-            }
-
-            let metadata = entry.metadata()?;
-            let is_dir = metadata.is_dir();
-
-            // Skip non-media files (unless directory)
-            if !is_dir {
-                let ext = Path::new(&name)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                if MediaType::from_extension(ext).is_none() {
-                    continue;
-                }
-            }
-
-            let mtime = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            let mime_type = if is_dir {
-                None
-            } else {
-                Some(mime_from_ext(
-                    Path::new(&name)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or(""),
-                ))
-            };
-
-            entries.push(FileEntry {
-                name,
-                path: entry.path().to_string_lossy().to_string(),
-                is_dir,
-                size: metadata.len(),
-                mtime,
-                mime_type,
-            });
-        }
-
-        // Sort: directories first, then by name
-        entries.sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-
-        Ok(entries)
-    }
-
-    async fn read_file(&self, path: &str) -> Result<Bytes, ProviderError> {
+    /// Read a whole file into memory.
+    ///
+    /// Deliberately `std::fs::read` rather than a memory map: the caller wants
+    /// every byte (it is about to decode the image), so a map would only add a
+    /// copy out of the mapped pages. The thumbnail path, which often touches
+    /// only part of a stream, does map — see `pipeline::thumbnailer`.
+    pub fn read_file(&self, path: &str) -> Result<Bytes, ProviderError> {
         let full = self.resolve(path);
-        // Read directly into a Vec (single allocation, no mmap+copy double-buffer).
-        let data = std::fs::read(&full).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ProviderError::NotFound(full.display().to_string())
-            } else {
-                ProviderError::Io(e)
+        let data = std::fs::read(&full).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => ProviderError::NotFound(full.display().to_string()),
+            std::io::ErrorKind::PermissionDenied => {
+                ProviderError::PermissionDenied(full.display().to_string())
             }
+            _ => ProviderError::Io(e),
         })?;
         Ok(Bytes::from(data))
     }
-
-    async fn read_companion(
-        &self,
-        media_path: &str,
-    ) -> Result<Option<CompanionFile>, ProviderError> {
-        let full = self.resolve(media_path);
-        match reader::read_companion_optional(&full) {
-            Ok(c) => Ok(c),
-            Err(e) => Err(ProviderError::Parse(e.to_string())),
-        }
-    }
-
-    async fn write_companion(
-        &self,
-        media_path: &str,
-        data: &CompanionFile,
-    ) -> Result<(), ProviderError> {
-        let full = self.resolve(media_path);
-        let mut data = data.clone();
-        crate::companion::writer::write_companion(&full, &mut data)
-            .map_err(|e| ProviderError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        Ok(())
-    }
-
-    async fn exists(&self, path: &str) -> Result<bool, ProviderError> {
-        Ok(self.resolve(path).exists())
-    }
-
-    async fn mtime(&self, path: &str) -> Result<u64, ProviderError> {
-        let full = self.resolve(path);
-        let metadata = std::fs::metadata(&full)?;
-        Ok(metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0))
-    }
-
-    fn provider_type(&self) -> ProviderType {
-        ProviderType::Local
-    }
-}
-
-fn mime_from_ext(ext: &str) -> String {
-    match ext.to_lowercase().as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "tiff" | "tif" => "image/tiff",
-        "heic" | "heif" => "image/heif",
-        "avif" => "image/avif",
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "avi" => "video/x-msvideo",
-        "mkv" => "video/x-matroska",
-        "webm" => "video/webm",
-        _ => "application/octet-stream",
-    }
-    .to_string()
 }

@@ -1,3 +1,10 @@
+//! The scrollbar's date index: one entry per month boundary.
+//!
+//! Row indices, not item indices, because the scrollbar positions against rows
+//! — which means the result is only valid for the `items_per_row` that asked
+//! for it. That is why the layout passes it in rather than this caching a
+//! single index.
+
 use serde::Serialize;
 
 use crate::cache::db::{CacheDb, CacheError};

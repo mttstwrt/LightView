@@ -66,7 +66,6 @@ export interface GalleryMediaItem {
 export interface GalleryOpenResult {
   path: string;
   total_media: number;
-  provider_type: string;
 }
 
 // ---------------------------------------------------------------------------

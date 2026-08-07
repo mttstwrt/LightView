@@ -1,3 +1,15 @@
+//! Sort fields and the `SELECT ... ORDER BY` that serves the grid.
+//!
+//! One query returns everything the grid needs for first paint, including the
+//! ~25-byte ThumbHash blob joined from `thumbnails`. Inlining that is what lets
+//! the remote web client paint a recognisable blurry grid before any thumbnail
+//! request goes out, instead of a round-trip per cell.
+//!
+//! A filtered path list is bound as a single JSON parameter and expanded with
+//! `json_each`, not spliced into a generated `IN (?, ?, …)`. One prepared
+//! statement then serves every filter size, so the statement cache stays warm
+//! instead of being invalidated by each new result count.
+
 use serde::{Deserialize, Serialize};
 
 use crate::cache::db::{CacheDb, CacheError};

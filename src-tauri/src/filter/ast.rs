@@ -1,3 +1,16 @@
+//! The filter expression tree, and the vocabularies its leaves draw on.
+//!
+//! Serializable in both directions: the frontend can hand back a tree it built
+//! itself (the filter bar's structured controls) rather than round-tripping
+//! through query text. That is why the enums carry serde attributes and why
+//! [`FilterExpr`] is internally tagged.
+//!
+//! Units are fixed here and assumed everywhere downstream: date bounds are
+//! inclusive Unix seconds, `Width`/`Height` are pixels, `FileSize` is bytes,
+//! and geo coordinates are decimal degrees WGS-84 — with `west > east` meaning
+//! the box crosses the anti-meridian, which is the one case a naive `BETWEEN`
+//! gets wrong.
+
 use serde::{Deserialize, Serialize};
 
 use crate::companion::schema::MediaType;

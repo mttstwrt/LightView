@@ -1,3 +1,25 @@
+//! Running an external plugin as a subprocess.
+//!
+//! [`manifest`] is the `manifest.json` a plugin directory must contain;
+//! [`runner`] spawns the process and speaks the NDJSON protocol over its
+//! stdin/stdout. Process isolation is the point — a plugin that segfaults,
+//! wedges, or allocates without bound costs the host one child, and brings its
+//! own interpreter and native dependencies with it.
+//!
+//! Plugins **must stream**: consume requests as they arrive and emit each
+//! result as soon as it is ready, never read stdin to EOF first. A remote host
+//! keeps a bounded number of downloaded files on disk and fetches more only as
+//! results come back, so an EOF-buffering plugin deadlocks any job past that
+//! bound. `LIGHTVIEW_JOB_TOTAL` exists for plugins that legitimately need the
+//! count up front.
+//!
+//! Scope, stated plainly: there is one verb. `action` is plumbed but never
+//! varies from `"tag"`, and capabilities in the manifest are advisory — there
+//! is no sandbox, so a plugin runs with the host's privileges. That is why
+//! plugin execution is absent from the remote `/api/invoke` allowlist. See
+//! `docs/plugins/README.md` and
+//! `docs/decisions/0006-plugins-are-ndjson-subprocesses.md`.
+
 pub mod manifest;
 pub mod runner;
 

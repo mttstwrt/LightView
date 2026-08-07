@@ -62,20 +62,14 @@ pub async fn get_transformed_media(
     /// 50 MP × 4 bytes/pixel = 200 MB of RGBA — a safe upper bound.
     const MAX_PIXELS: u64 = 50_000_000;
 
-    let gallery_path = state
-        .current_gallery
+    let provider = state
+        .provider
         .read()
         .await
         .clone()
         .ok_or("No gallery open")?;
 
-    let reg = state.providers.read().await;
-    let provider = reg.get(&gallery_path).ok_or("Provider not found")?;
-
-    let data = provider
-        .read_file(&path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let data = provider.read_file(&path).map_err(|e| e.to_string())?;
 
     // Decode image to RGBA (HEIC uses libheif, others use image crate)
     let ext = std::path::Path::new(&path)

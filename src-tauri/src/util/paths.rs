@@ -1,3 +1,11 @@
+//! Where LightView keeps process-level state.
+//!
+//! Exe-relative (`<exe_dir>/data/`), not the platform's user-data directory, so
+//! a portable install carries its plugins, TLS material, and recent-gallery
+//! list with it. Per-*gallery* state does not live here at all — it lives in
+//! the gallery's own `.lightview/` directory, which is what lets a gallery move
+//! between machines intact.
+
 use std::path::PathBuf;
 
 /// Return the portable `data/` directory next to the running executable.
