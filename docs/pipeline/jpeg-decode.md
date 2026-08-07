@@ -1,4 +1,6 @@
-# Faster JPEG decode — options and recommendation
+# JPEG decode performance
+
+[← docs index](../README.md) · [pipeline](README.md)
 
 **Status:** research / recommendation. Nothing here is built yet.
 **Audience:** maintainers deciding whether to speed up thumbnail decode.

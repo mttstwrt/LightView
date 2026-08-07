@@ -1,5 +1,14 @@
 # The two grids
 
+[← docs index](../README.md) · [frontend](README.md)
+
+`GalleryGrid` (fixed square cells) and `JustifiedGrid` (aspect-preserving rows)
+are the two views of a gallery. They solve the same problem — stream thumbnails
+into a virtual scroller without burying the main thread — and they have
+converged on the same architecture without yet being one component. The
+two-window shape at the centre of it is
+[decision 0007](../decisions/0007-two-zone-render-window.md).
+
 `GalleryGrid` (fixed square cells) and `JustifiedGrid` (aspect-preserving rows)
 are the two views of a gallery. They solve the same problem — stream thumbnails
 into a virtual scroller without burying the main thread — and they have
@@ -28,8 +37,8 @@ Both grids run the same seven-part machine:
    windows, never at enqueue time — by the time a batch drains, the scroll may
    be elsewhere entirely.
 6. **Two single-flight slots.** `inFlightFetch` for the visible drain,
-   `inFlightWarm` for speculation. See [`invariants.md`](invariants.md) for why
-   one slot was a session-killing bug.
+   `inFlightWarm` for speculation. See the invariants in
+   [`frontend/`](README.md) for why one slot was a session-killing bug.
 7. **Eviction.** Paths far outside the rendered range have their `thumbMap`
    entry dropped, releasing the decoded bitmap.
 
@@ -90,7 +99,7 @@ Steps 1–2 are mechanical. Step 3 is where the real reduction is, and it is als
 where the grids' policies genuinely differ, so it needs the differences kept as
 parameters rather than flattened.
 
-**Verify it in a browser, not just with `tsc`.** `docs/wiki/build-and-verify.md`
+**Verify it in a browser, not just with `tsc`.** [`build-and-verify.md`](../build-and-verify.md)
 describes driving the real SPA against `lightview-headless` with Playwright;
 these are exactly the code paths a type check cannot cover.
 

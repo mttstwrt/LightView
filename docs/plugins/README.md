@@ -1,4 +1,24 @@
-# Plugin extensibility — current state and a path forward
+# Plugins
+
+[← docs index](../README.md) · [architecture](../architecture.md)
+
+**Responsible for:** the plugin manifest format, spawning a plugin as a
+subprocess, and the NDJSON protocol spoken over its stdin/stdout
+(`plugin/manifest.rs`, `plugin/runner.rs`, `commands/plugins.rs`).
+
+**Not responsible for:** deciding *where* a plugin runs. That is
+[`tagging/`](../remote/worker-tagging.md), which routes a job either to the
+server's own in-process executor or to a paired `lightview-worker`. It is also
+not responsible for writing results: `apply_plugin_output` hands tags to
+[`companion/`](../companion/README.md), which owns the file format.
+
+**Depends on:** `companion/` and `util::paths` for the plugin directory.
+**Depended on by:** `tagging/`, `commands/plugins.rs`, and `lightview-worker`.
+
+The protocol shape — a subprocess and a line of JSON, rather than an embedded
+runtime — is [decision 0006](../decisions/0006-plugins-are-ndjson-subprocesses.md).
+The rest of this page is the honest inventory of what that protocol can express
+today and what a real extension host would need.
 
 **Status:** design discussion / roadmap. Nothing here is built yet.
 **Audience:** maintainers deciding how far to take LightView's plugin system.

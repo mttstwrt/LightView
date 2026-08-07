@@ -153,7 +153,7 @@ export interface ThumbnailResult {
   format: string;
 }
 
-/** LOD tier for thumbnails; see docs/thumbnailStreamingResearch.md and
+/** LOD tier for thumbnails; see docs/pipeline/README.md and
  *  `ThumbTier` in src-tauri/src/cache/thumbnails.rs. */
 export type ThumbTier = "s" | "m" | "l" | "p" | "j" | "jm" | "jh";
 
@@ -493,7 +493,7 @@ export const applyPluginTags = (entries: PluginTagWrite[]) =>
 
 // ---------------------------------------------------------------------------
 // Remote tagging jobs (web-triggered, executed by a paired lightview-worker;
-// see docs/workerTagging.md and stores/taggingStore.ts)
+// see docs/remote/worker-tagging.md and stores/taggingStore.ts)
 // ---------------------------------------------------------------------------
 
 export type TaggingJobState = "queued" | "running" | "done" | "failed" | "cancelled";

@@ -89,7 +89,7 @@ function pickTier(cellPx: number): ThumbTier {
   // Match the decoded image to the *rendered* pixel size (cell × DPR), on
   // desktop too. Serving a far larger tier than the cell shows forces the
   // webview to decode + downscale a big bitmap per cell — see
-  // docs/thumbnailStreamingResearch.md. DPR is capped so a 4×-DPR phone doesn't
+  // docs/pipeline/README.md. DPR is capped so a 4×-DPR phone doesn't
   // always punt to the largest tier.
   const dpr =
     typeof window !== "undefined"

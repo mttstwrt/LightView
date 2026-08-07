@@ -6,7 +6,7 @@
 //! locally installed plugin (the same `data/plugins/` layout as the desktop
 //! app), and pushes tags back via `apply_plugin_tags`. The server never
 //! executes anything the worker sends — only tag data flows back.
-//! Design: `docs/workerTagging.md`.
+//! Design: `docs/remote/worker-tagging.md`.
 //!
 //! Usage:
 //!   lightview-worker pair --server https://<host>:<port> [--pin <code>] [--name <name>] [--yes] [--trust-new]

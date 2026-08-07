@@ -12,11 +12,11 @@
 - **Rust Linting:** `cargo clippy --all-targets --all-features` (clean of errors; ~60 style warnings remain)
 - **Frontend Types:** `npx tsc --noEmit`
 - **Note:** There is no `npm run lint` script.
-- **`cargo fmt --check` currently FAILS** on ~70 files — the tree has never been rustfmt-formatted. Do not run `cargo fmt` inside an unrelated change, and avoid `cargo clippy --fix` (its let-chain rewrites need a reformat you can't scope). See `docs/wiki/build-and-verify.md`.
+- **`cargo fmt --check` currently FAILS** on ~70 files — the tree has never been rustfmt-formatted. Do not run `cargo fmt` inside an unrelated change, and avoid `cargo clippy --fix` (its let-chain rewrites need a reformat you can't scope). See [`docs/build-and-verify.md`](docs/build-and-verify.md).
 - **Build prerequisites:** `cargo check` fails in a build script without GTK/WebKitGTK and `libheif >= 1.21` (Ubuntu 24.04 ships 1.17 — needs a source build), and the `lightview` binary additionally needs `dist/` to exist (`npm run build`). Same doc.
 
 ## Deeper Reference
-`docs/wiki/` — subsystem maps and cross-module invariants. Start at `docs/wiki/README.md`; read `docs/wiki/invariants.md` before changing the cache, thumbnail pipeline, or remote API.
+[`docs/`](docs/README.md) — subsystem maps and cross-module invariants. Start at [`docs/architecture.md`](docs/architecture.md); each subsystem README states the invariants its callers must uphold, so read the one covering whatever you are about to change.
 
 ## Core Architecture
 - **Boundary:** Frontend calls Rust via `src-solidjs/lib/ipc.ts` (canonical IPC).

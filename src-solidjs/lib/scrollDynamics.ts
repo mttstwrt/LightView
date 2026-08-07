@@ -15,7 +15,7 @@ import { ewmaImageLoadMs } from "./perfMonitor";
 // buries the thread and scrolling chokes. Real browsers (the web client)
 // decode async off-thread, so the gate never engages there — new cells load
 // while the scroll is still moving, which is what keeps the virtual-scroll
-// buffer useful on touch flings (docs/scrollLoadingRedesign.md).
+// buffer useful on touch flings (docs/decisions/0007-two-zone-render-window.md).
 // ---------------------------------------------------------------------------
 
 // Decode-work rate above which the gate engages, in decoded pixels per second
@@ -197,7 +197,7 @@ export function createScrollDynamics(opts: {
     // would take the `velocity() > VELOCITY_FAST` fling branch — warming a
     // *projected* landing zone instead of generating thumbnails for the viewport
     // the fling actually landed on. That left hard flicks with blank/late cells
-    // until the next 500ms poll or a manual scroll (docs/scrollLoadingRedesign).
+    // until the next 500ms poll or a manual scroll (docs/decisions/0007-two-zone-render-window.md).
     vel = 0;
     if (untrack(decodeGate)) setDecodeGate(false);
     if (settleDebounce) clearTimeout(settleDebounce);

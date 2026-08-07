@@ -1,4 +1,6 @@
-# Worker-based remote tagging — design
+# Worker-based remote tagging
+
+[← docs index](../README.md) · [remote](README.md)
 
 **Status:** implemented (2026-07-07; server-local execution, job pinning and
 the plugin streaming contract added 2026-07-08).
@@ -214,7 +216,7 @@ The downloader's files-on-disk bound (64) is released only as results land, so
 than the bound** — the plugin waits for EOF, EOF waits for the downloader,
 the downloader waits for results. (This is exactly how the original ML
 taggers failed: they read the whole request list up front to size their GPU
-instance pool.) The rules, also documented in `docs/pluginExtensibility.md`
+instance pool.) The rules, also documented in [`plugins/`](../plugins/README.md)
 and `plugin/runner.rs`:
 
 - Plugins **must consume requests as they arrive and emit each result as soon

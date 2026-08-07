@@ -138,7 +138,7 @@ export function inFlightImageLoads(): number {
 
 // Always-on EWMA of image load latency, independent of the overlay's `_active`
 // gate: the grids size their look-ahead buffer by velocity × this latency
-// (docs/scrollLoadingRedesign.md Phase 5), which must work during normal use.
+// (docs/decisions/0007-two-zone-render-window.md), which must work during normal use.
 // One multiply-add per fresh load; α=0.2 ≈ the last ~10 loads dominate, so a
 // network change re-converges within a screenful of cells.
 const IMAGE_LOAD_EWMA_ALPHA = 0.2;

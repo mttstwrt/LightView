@@ -6,12 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LightView is a fast, plugin-extensible local media gallery built with **Tauri 2** (Rust backend) and **SolidJS** (TypeScript frontend). It opens a folder of images/videos, generates thumbnails, indexes metadata/tags into SQLite, and presents a browsable grid with filtering, sorting, and a full-resolution viewer.
 
-**Deeper reference: [`docs/wiki/`](docs/wiki/README.md)** — this file is the
-orientation; the wiki carries the subsystem maps and the rules a change must
-not break. Read [`invariants.md`](docs/wiki/invariants.md) before touching the
-cache, the thumbnail pipeline, or the remote API, and
-[`build-and-verify.md`](docs/wiki/build-and-verify.md) if `cargo check` fails
-before it reaches your code (missing system libraries, or an absent `dist/`).
+**Deeper reference: [`docs/`](docs/README.md)** — this file is the orientation;
+`docs/` carries the subsystem maps and the rules a change must not break. Start
+at [`docs/architecture.md`](docs/architecture.md), then the subsystem README for
+whatever you are touching — each one ends its header with the invariants callers
+must uphold. Read [`docs/build-and-verify.md`](docs/build-and-verify.md) if
+`cargo check` fails before it reaches your code (missing system libraries, or an
+absent `dist/`).
 
 ## Build & Dev Commands
 
@@ -137,7 +138,7 @@ on a small box or in a test.
 
 ### Remote tagging worker (test the job queue end-to-end, no ML needed)
 
-`lightview-worker` (feature-gated bin; see `docs/workerTagging.md`) runs tagger
+`lightview-worker` (feature-gated bin; see [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md)) runs tagger
 plugins on a capable machine against a headless server. The dependency-free
 `plugins/example-auto-tagger` exercises the whole loop:
 
@@ -174,7 +175,7 @@ forever. Mitigations, all three needed: `pending` is keyed on the temp file
 name rather than the full path; the worker fails the job after 20 min with no
 result; and the server tracks `progressed_at` separately from `updated_at` and
 fails a job that goes 30 min without its counts moving. Grep the worker log for
-`plugin result for unknown path`. Full contract in `docs/workerTagging.md`.
+`plugin result for unknown path`. Full contract in [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md).
 
 Notes: the *server itself* also runs jobs when plugins are installed in **its**
 `data_dir()/plugins` (same `target/debug/data/plugins/` when server and worker
@@ -182,7 +183,7 @@ share an exe dir) — it registers as worker `local-server` / "Server (<host>)"
 with `local: true`, so no `lightview-worker` is needed for a server-local run.
 Pass `"workerId": "<id>"` to `enqueue_tagging_job` to pin a job to a specific
 worker when several offer the same plugin. Plugins must stream results (never
-buffer stdin to EOF) — see `docs/workerTagging.md`.
+buffer stdin to EOF) — see [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md).
 
 ## Architecture
 
@@ -209,8 +210,8 @@ buffer stdin to EOF) — see `docs/workerTagging.md`.
 | `filter/` | Query language for filtering media: `ast` → `parser` → `evaluator` |
 | `sort/` | Sorting + grouping: `sorter`, `grouper`, `timeline` |
 | `autocomplete/` | In-memory tag autocomplete engine |
-| `plugin/` | External plugin system: `manifest` (JSON) + `runner`. Spawns a plugin subprocess and exchanges NDJSON over stdin/stdout. Currently implements a single verb — image → tags — so in practice it's an auto-tagger runner, not a general extension host. See `docs/pluginExtensibility.md`. |
-| `tagging/` | Remote-tagging job queue + worker registry (in-memory). Web clients enqueue jobs over `/api/invoke` (optionally pinned to one worker); a paired `lightview-worker` (bin, feature `worker`) claims them, runs the plugin on its own machine, and pushes tags back via `apply_plugin_tags`. `tagging/local.rs` is the in-process executor: the server registers itself as worker `local-server` and runs its own installed plugins directly (opt-in by installing plugins server-side). Job/worker changes stream to web clients as `tagging-job`/`tagging-workers` SSE events. See `docs/workerTagging.md`. |
+| `plugin/` | External plugin system: `manifest` (JSON) + `runner`. Spawns a plugin subprocess and exchanges NDJSON over stdin/stdout. Currently implements a single verb — image → tags — so in practice it's an auto-tagger runner, not a general extension host. See [`docs/plugins/`](docs/plugins/README.md). |
+| `tagging/` | Remote-tagging job queue + worker registry (in-memory). Web clients enqueue jobs over `/api/invoke` (optionally pinned to one worker); a paired `lightview-worker` (bin, feature `worker`) claims them, runs the plugin on its own machine, and pushes tags back via `apply_plugin_tags`. `tagging/local.rs` is the in-process executor: the server registers itself as worker `local-server` and runs its own installed plugins directly (opt-in by installing plugins server-side). Job/worker changes stream to web clients as `tagging-job`/`tagging-workers` SSE events. See [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md). |
 | `hardware/` | Hardware detection (storage type, CPU, RAM, GPU) — drives adaptive performance tuning |
 | `util/` | Helpers: `paths` (data dir), `hash`, `fs_watch` |
 
@@ -232,7 +233,7 @@ buffer stdin to EOF) — see `docs/workerTagging.md`.
 - **Thumbnail pipeline**: Hardware-adaptive — detects NVMe/SSD, discrete GPU, CPU cores. Uses a bounded `rayon::ThreadPool` (`thumb_pool`). Optional GPU path via `wgpu` (feature `gpu`) for fused crop+resize.
 - **Dependencies in dev builds**: `[profile.dev.package."*"] opt-level = 2` — image codecs, SIMD resize, and SQLite are unusably slow at opt-level 0.
 - **Video thumbnails need ffmpeg**: `pipeline/video.rs` shells out to `ffmpeg`/`ffprobe`; without them every clip falls back to a grey placeholder (checked once per process, so a missing binary doesn't cost two failed spawns per file). ffmpeg does the downscale in its filter graph at *exact* pixel dimensions, so the raw output length is known up front — a 4K clip crosses the pipe at ~1.8 MB instead of ~33 MB. Those dimensions come from the probe with the container's **display-matrix rotation applied**: phone clips are landscape on disk and portrait on screen, ffmpeg autorotates ahead of our scale filter, and a mismatch here is what makes `.MOV` thumbnails come back sideways or fail outright. Every invocation is timeout-bounded — a wedged subprocess would otherwise hold a `thumb_pool` thread forever.
-- **Plugin system**: Plugins are directories with a `manifest.json`. Execution is CLI-based: the host spawns the plugin as a subprocess and streams NDJSON image paths in / tag results out (`plugin/runner.rs`). The host only implements the `tag` verb today, so every plugin is effectively an auto-tagger keyed by `tag_prefix`. Example: `plugins/wd-tagger/` (ML image tagger). Roadmap for true extensibility: `docs/pluginExtensibility.md`.
+- **Plugin system**: Plugins are directories with a `manifest.json`. Execution is CLI-based: the host spawns the plugin as a subprocess and streams NDJSON image paths in / tag results out (`plugin/runner.rs`). The host only implements the `tag` verb today, so every plugin is effectively an auto-tagger keyed by `tag_prefix`. Example: `plugins/wd-tagger/` (ML image tagger). Roadmap for true extensibility: [`docs/plugins/`](docs/plugins/README.md).
 
 ### Cargo features
 

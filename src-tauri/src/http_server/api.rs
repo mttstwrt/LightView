@@ -407,7 +407,7 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
         // device. Web clients enqueue/cancel/observe; a paired lightview-worker
         // announces, claims, and reports progress, pushing the actual tag
         // writes through apply_plugin_tags above. Same metadata-write tier.
-        // See docs/workerTagging.md.
+        // See docs/remote/worker-tagging.md.
         "worker_announce" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]

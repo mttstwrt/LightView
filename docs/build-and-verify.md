@@ -1,4 +1,6 @@
-# Getting a compiling checkout, and verifying without a display
+# Build and verify
+
+[← docs index](README.md)
 
 ## System libraries
 
