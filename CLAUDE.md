@@ -6,6 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LightView is a fast, plugin-extensible local media gallery built with **Tauri 2** (Rust backend) and **SolidJS** (TypeScript frontend). It opens a folder of images/videos, generates thumbnails, indexes metadata/tags into SQLite, and presents a browsable grid with filtering, sorting, and a full-resolution viewer.
 
+**Deeper reference: [`docs/wiki/`](docs/wiki/README.md)** — this file is the
+orientation; the wiki carries the subsystem maps and the rules a change must
+not break. Read [`invariants.md`](docs/wiki/invariants.md) before touching the
+cache, the thumbnail pipeline, or the remote API, and
+[`build-and-verify.md`](docs/wiki/build-and-verify.md) if `cargo check` fails
+before it reaches your code (missing system libraries, or an absent `dist/`).
+
 ## Build & Dev Commands
 
 ```bash

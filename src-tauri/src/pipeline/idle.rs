@@ -12,7 +12,7 @@
 //! frontend batch commands). Both signals are re-checked between small work
 //! units, so the worker yields within one batch of a user showing up.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use crate::cache::thumbnails::ThumbTier;
@@ -39,6 +39,10 @@ const PHASH_BATCH: usize = 64;
 /// items warm early on a large cold backlog.
 const PREWARM_TIERS: [ThumbTier; 2] = [ThumbTier::Standard, ThumbTier::Justified];
 
+/// Paths whose generation failed, grouped by tier. See the field comment in
+/// [`start_idle_worker`] for why it isn't a flat set of pairs.
+type FailedPaths = HashMap<ThumbTier, HashSet<String>>;
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -63,9 +67,12 @@ pub fn start_idle_worker(state: &AppState) {
 
     tauri::async_runtime::spawn(async move {
         log::info!("Idle backfill worker started (gen {my_gen})");
-        // Path+tier pairs that failed generation once — skip them instead of
-        // retrying (and re-logging) forever. Reset on restart.
-        let mut failed: HashSet<(String, ThumbTier)> = HashSet::new();
+        // Paths that failed generation once, per tier — skipped instead of
+        // retried (and re-logged) forever. Reset on restart. Keyed tier-first
+        // so the candidate filter below can probe with a borrowed `&str`; a
+        // flat `HashSet<(String, ThumbTier)>` forced a String clone per
+        // candidate on every poll just to ask the question.
+        let mut failed: FailedPaths = HashMap::new();
         // Round-robin position so a long backlog in one tier doesn't starve
         // the other — each work cycle takes one batch from the next tier
         // with pending work.
@@ -110,8 +117,9 @@ pub fn start_idle_worker(state: &AppState) {
 async fn backfill_thumbnails(
     state: &AppState,
     tier: ThumbTier,
-    failed: &mut HashSet<(String, ThumbTier)>,
+    failed: &mut FailedPaths,
 ) -> bool {
+    let failed_here = failed.entry(tier).or_default();
     let batch: Vec<String> = {
         let db = state.cache_db.lock().await;
         let Some(db) = db.as_ref() else { return false };
@@ -134,11 +142,11 @@ async fn backfill_thumbnails(
         };
         // Over-fetch by the failed count so a backlog of known failures
         // doesn't mask fresh work forever.
-        let limit = THUMB_BATCH + failed.len();
+        let limit = THUMB_BATCH + failed_here.len();
         match stmt.query_map([limit], |row| row.get::<_, String>(0)) {
             Ok(rows) => rows
                 .filter_map(|r| r.ok())
-                .filter(|p| !failed.contains(&(p.clone(), tier)))
+                .filter(|p| !failed_here.contains(p.as_str()))
                 .take(THUMB_BATCH)
                 .collect(),
             Err(e) => {
@@ -160,7 +168,7 @@ async fn backfill_thumbnails(
             ThumbOutcome::Hit { .. } => {}
             ThumbOutcome::Miss => {
                 log::debug!("Idle worker: thumbnail generation failed for {path} ({tier:?})");
-                failed.insert((path, tier));
+                failed_here.insert(path);
             }
             ThumbOutcome::NoGallery => return false,
         }

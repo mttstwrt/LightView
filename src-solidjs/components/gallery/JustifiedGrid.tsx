@@ -1,10 +1,11 @@
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, isMobile, isTauri, type UnlistenFn } from "../../lib/runtime";
+import { isMobile, isTauri } from "../../lib/runtime";
 import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
-import { ensureTierThumbnails, thumbUrl, mediaUrl, THUMB_REGENERATED_EVENT, type ThumbTier } from "../../lib/ipc";
+import { ensureTierThumbnails, thumbUrl, mediaUrl, type ThumbTier } from "../../lib/ipc";
+import { onThumbRegenerated } from "../../lib/thumbRegeneration";
 import type { MediaMeta } from "../../stores/galleryStore";
 import { createThumbProgress } from "../../lib/thumbProgress";
 import { recordCacheMiss } from "../../lib/perfMonitor";
@@ -524,28 +525,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   };
 
   // Regeneration / one-shot invalidation listener.
-  const handleRegenerated = (p: string) => {
+  onThumbRegenerated((p) => {
     bumpVersion(p);
     if (assignedRung.has(p)) {
       assignedRung.set(p, "full");
       setThumbMap(p, thumbSrcFor(p));
     }
-  };
-  let unlistenRegenerated: UnlistenFn | undefined;
-  onMount(() => {
-    listen<{ path: string }>("thumb:regenerated", (event) => {
-      handleRegenerated(event.payload.path);
-    }).then((fn) => { unlistenRegenerated = fn; });
-    // Web stand-in for the Tauri event (dispatched by ContextMenu after the
-    // regenerate invoke resolves; `listen` above is a no-op off-desktop).
-    const domRegen = (e: Event) => {
-      const p = (e as CustomEvent<{ path: string }>).detail?.path;
-      if (p) handleRegenerated(p);
-    };
-    window.addEventListener(THUMB_REGENERATED_EVENT, domRegen);
-    onCleanup(() => window.removeEventListener(THUMB_REGENERATED_EVENT, domRegen));
   });
-  onCleanup(() => unlistenRegenerated?.());
 
   // Off-DOM decode-then-swap (shared helper) for cells that already show an
   // image — zoom tier changes and cheap-rung upgrades. Swaps are dropped if

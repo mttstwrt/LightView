@@ -28,8 +28,27 @@ pub enum CacheError {
 // Schema migrations
 // ---------------------------------------------------------------------------
 
-/// Current schema version. Bump this when adding a new migration.
-const SCHEMA_VERSION: u32 = 14;
+/// Current schema version — the highest version in [`MIGRATIONS`].
+///
+/// Derived rather than hand-maintained: the two drifted once already (the
+/// constant sat at 14 while a v15 migration existed), and the only consumer is
+/// [`detect_legacy_version`], where a too-high value silently *skips*
+/// migrations for the database it is applied to. A `const fn` keeps them
+/// welded together at compile time.
+const SCHEMA_VERSION: u32 = latest_migration_version();
+
+const fn latest_migration_version() -> u32 {
+    // Base schema is v1; every entry in MIGRATIONS moves it forward from there.
+    let mut latest = 1;
+    let mut i = 0;
+    while i < MIGRATIONS.len() {
+        if MIGRATIONS[i].version > latest {
+            latest = MIGRATIONS[i].version;
+        }
+        i += 1;
+    }
+    latest
+}
 
 /// Base tables created on a fresh database (version 0 → 1).
 const BASE_SCHEMA: &str = "
@@ -341,126 +360,63 @@ fn set_schema_version(conn: &rusqlite::Connection, version: u32) -> Result<(), C
     Ok(())
 }
 
-/// Detect if this is a pre-versioned database by checking for tables
-/// that only exist after the base schema was applied.
+fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![name],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    conn.execute(&format!("SELECT {column} FROM {table} LIMIT 0"), [])
+        .is_ok()
+}
+
+/// Highest version [`detect_legacy_version`] can recognize. Everything past it
+/// is applied by re-running migrations, which is safe because they are
+/// idempotent (`CREATE TABLE IF NOT EXISTS`, duplicate-column-tolerant
+/// `ALTER`). Extending the ladder is therefore optional — but returning a
+/// version *higher* than what was actually verified is not: the migration loop
+/// skips everything at or below the returned number, so an over-estimate
+/// silently leaves tables uncreated. This is what the old `SCHEMA_VERSION`
+/// return did once the constant outran the ladder's last check.
+const MAX_DETECTABLE_VERSION: u32 = 10;
+
+/// Best-effort version stamp for a database created before the migration
+/// system existed (`gallery_meta.schema_version` absent). Walks the schema
+/// features in version order and returns the last one fully present.
+///
+/// Only reachable for caches predating the versioning scheme; every database
+/// written since is stamped. Under-reporting is harmless (migrations re-run
+/// idempotently) — see [`MAX_DETECTABLE_VERSION`].
 fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
-    // If media_meta doesn't exist, this is a completely fresh DB.
-    let has_media_meta: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_meta'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
+    // (version introduced by the feature, is the feature present?)
+    let ladder = [
+        (1, has_table(conn, "media_meta")),
+        (2, has_column(conn, "thumbnails", "format")),
+        (3, has_column(conn, "media_meta", "last_viewed")),
+        (4, has_column(conn, "media_meta", "last_rated")),
+        (5, has_column(conn, "thumbnails", "thumbhash")),
+        (6, has_table(conn, "thumbnails_micro")),
+        (7, has_column(conn, "media_meta", "gps_lat")),
+        (8, has_table(conn, "not_duplicates")),
+        (9, has_table(conn, "remote_devices")),
+        (MAX_DETECTABLE_VERSION, has_table(conn, "gif_atlas")),
+    ];
 
-    if !has_media_meta {
-        return 0;
+    let mut version = 0;
+    for (introduced_in, present) in ladder {
+        // The first gap ends the walk: schema features land in order, so a
+        // missing one means everything after it is missing too.
+        if !present {
+            break;
+        }
+        version = introduced_in;
     }
-
-    // media_meta exists — check if the v2 thumbnail columns are present.
-    let has_thumb_format = conn
-        .execute("SELECT format FROM thumbnails LIMIT 0", [])
-        .is_ok();
-
-    if !has_thumb_format {
-        return 1; // base schema only
-    }
-
-    // v2 columns exist — check for v3 columns.
-    let has_last_viewed = conn
-        .execute("SELECT last_viewed FROM media_meta LIMIT 0", [])
-        .is_ok();
-
-    if !has_last_viewed {
-        return 2;
-    }
-
-    // v3 columns exist — check for v4 columns.
-    let has_last_rated = conn
-        .execute("SELECT last_rated FROM media_meta LIMIT 0", [])
-        .is_ok();
-
-    if !has_last_rated {
-        return 3;
-    }
-
-    // v4 columns exist — check for v5 (thumbhash).
-    let has_thumbhash = conn
-        .execute("SELECT thumbhash FROM thumbnails LIMIT 0", [])
-        .is_ok();
-
-    if !has_thumbhash {
-        return 4;
-    }
-
-    // v5 present — check for v6 (tier tables).
-    let has_micro_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thumbnails_micro'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
-
-    if !has_micro_table {
-        return 5;
-    }
-
-    // v6 present — check for v7 (GPS columns).
-    let has_gps = conn
-        .execute("SELECT gps_lat FROM media_meta LIMIT 0", [])
-        .is_ok();
-
-    if !has_gps {
-        return 6;
-    }
-
-    // v7 present — check for v8 (not_duplicates table).
-    let has_not_duplicates: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='not_duplicates'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
-
-    if !has_not_duplicates {
-        return 7;
-    }
-
-    // v8 present — check for v9 (remote_devices table).
-    let has_remote_devices: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='remote_devices'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
-
-    if !has_remote_devices {
-        return 8;
-    }
-
-    // v9 present — check for v10 (gif_atlas table).
-    let has_gif_atlas: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gif_atlas'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
-
-    if !has_gif_atlas {
-        return 9;
-    }
-
-    // Everything present — fully up to date.
-    SCHEMA_VERSION
+    version
 }
 
 /// Run all pending migrations to bring the database up to `SCHEMA_VERSION`.
@@ -514,6 +470,18 @@ fn run_migrations(conn: &rusqlite::Connection) -> Result<(), CacheError> {
 
         version = migration.version;
         set_schema_version(conn, version)?;
+    }
+
+    // Post-condition. The loop is driven by MIGRATIONS, so the only way to
+    // land short is a database stamped *ahead* of this build (opened by a
+    // newer LightView, then downgraded). Say so loudly: the tables a newer
+    // version added are still there, but this build's queries were written
+    // against an older shape, so anything odd afterwards starts here.
+    if version != SCHEMA_VERSION {
+        log::warn!(
+            "Cache schema is v{version}, but this build expects v{SCHEMA_VERSION} — \
+             the cache was likely written by a newer LightView"
+        );
     }
 
     Ok(())
@@ -676,6 +644,56 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = CacheDb::open(tmp.path()).unwrap();
         (tmp, db)
+    }
+
+    /// A freshly opened database must land on the newest migration, and the
+    /// migration list must be strictly increasing — an out-of-order or
+    /// duplicated version would be silently skipped by the `<= version`
+    /// guard in `run_migrations`.
+    #[test]
+    fn fresh_db_reaches_the_latest_migration() {
+        let (_tmp, db) = open_db();
+        assert_eq!(get_schema_version(db.conn()), SCHEMA_VERSION);
+
+        let mut prev = 1;
+        for migration in MIGRATIONS {
+            assert!(
+                migration.version > prev,
+                "migration v{} is not after v{prev}",
+                migration.version
+            );
+            prev = migration.version;
+        }
+        assert_eq!(SCHEMA_VERSION, prev, "SCHEMA_VERSION must track MIGRATIONS");
+    }
+
+    /// The legacy ladder must never claim a version it did not verify: the
+    /// migration loop skips everything at or below what it returns, so an
+    /// over-estimate leaves tables uncreated. A fully-migrated database still
+    /// reports only the last feature the ladder actually knows about.
+    #[test]
+    fn legacy_detection_never_over_reports() {
+        let (_tmp, db) = open_db();
+        assert_eq!(detect_legacy_version(db.conn()), MAX_DETECTABLE_VERSION);
+        assert!(MAX_DETECTABLE_VERSION <= SCHEMA_VERSION);
+
+        // An empty database has none of the ladder's features.
+        let blank = rusqlite::Connection::open_in_memory().unwrap();
+        assert_eq!(detect_legacy_version(&blank), 0);
+    }
+
+    /// Re-running every migration over an already-current database must be a
+    /// no-op, since that is exactly what an under-reporting legacy detection
+    /// (or a crash mid-migration) causes.
+    #[test]
+    fn migrations_are_idempotent() {
+        let (_tmp, db) = open_db();
+        set_schema_version(db.conn(), 1).unwrap();
+        run_migrations(db.conn()).expect("re-running migrations must succeed");
+        assert_eq!(get_schema_version(db.conn()), SCHEMA_VERSION);
+        for tier in ThumbTier::ALL {
+            assert!(has_table(db.conn(), tier.table()), "{} missing", tier.table());
+        }
     }
 
     #[test]

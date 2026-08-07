@@ -5,7 +5,8 @@ import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
-import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, THUMB_REGENERATED_EVENT, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
+import { ensureTierThumbnails, getThumbnailsBatch, precacheThumbnails, thumbUrl, type ThumbTier, type ThumbnailResult } from "../../lib/ipc";
+import { onThumbRegenerated } from "../../lib/thumbRegeneration";
 import { createThumbProgress } from "../../lib/thumbProgress";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
@@ -231,30 +232,13 @@ export function GalleryGrid(props: GalleryGridProps) {
   // Listen for one-shot regeneration. Unlike thumb:streamed there is no
   // in-flight batch to gate on — just bump the URL version so WebKit's
   // image cache fetches the fresh bytes from the protocol handler.
-  const handleRegenerated = (path: string) => {
+  onThumbRegenerated((path) => {
     bumpVersion(path);
     if (assignedRung.has(path)) {
       assignedRung.set(path, tier());
       setThumbMap(path, thumbSrcFor(path, tier()));
     }
-  };
-  let unlistenRegenerated: UnlistenFn | undefined;
-  onMount(() => {
-    listen<ThumbnailResult>("thumb:regenerated", (event) => {
-      handleRegenerated(event.payload.path);
-    }).then((fn) => {
-      unlistenRegenerated = fn;
-    });
-    // Web stand-in for the Tauri event (dispatched by ContextMenu after the
-    // regenerate invoke resolves; `listen` above is a no-op off-desktop).
-    const domRegen = (e: Event) => {
-      const path = (e as CustomEvent<{ path: string }>).detail?.path;
-      if (path) handleRegenerated(path);
-    };
-    window.addEventListener(THUMB_REGENERATED_EVENT, domRegen);
-    onCleanup(() => window.removeEventListener(THUMB_REGENERATED_EVENT, domRegen));
   });
-  onCleanup(() => unlistenRegenerated?.());
 
   // -----------------------------------------------------------------------
   // Grid geometry — derived from container width, thumb size, gap

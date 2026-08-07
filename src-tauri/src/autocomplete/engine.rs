@@ -155,14 +155,19 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
     let mut hay_chars = haystack.chars();
     let mut matched = 0;
     for nc in needle.chars() {
-        while let Some(hc) = hay_chars.next() {
+        for hc in hay_chars.by_ref() {
             if hc == nc {
                 matched += 1;
                 break;
             }
         }
     }
-    if matched == needle.len() {
+    // Compare against the *character* count, not `needle.len()` (bytes). Any
+    // needle with a multi-byte character has more bytes than chars, so the
+    // byte comparison could never hold and subsequence matching silently did
+    // nothing for non-ASCII queries — e.g. typing "café" never fuzzy-matched
+    // "cafeteria café" even though prefix/substring matching still worked.
+    if matched == needle.chars().count() {
         Some(50)
     } else {
         None
@@ -199,5 +204,26 @@ mod tests {
     fn test_fuzzy_subsequence() {
         let score = fuzzy_score("vacation", "vcn").unwrap();
         assert!(score > 0 && score < 100);
+    }
+
+    /// Subsequence matching counted matched *characters* but compared against
+    /// the needle's *byte* length, so any multi-byte character made the test
+    /// unsatisfiable and non-ASCII queries silently lost fuzzy matching.
+    #[test]
+    fn subsequence_matching_handles_multibyte_needles() {
+        assert_eq!(fuzzy_score("crème brûlée", "cèbû"), Some(50));
+        assert_eq!(fuzzy_score("sommerurlaub", "smürl"), None);
+    }
+
+    /// The exact/prefix/substring rungs must keep out-ranking the subsequence
+    /// rung for non-ASCII input too — the byte/char mix-up was invisible
+    /// precisely because these three paths never depended on it.
+    #[test]
+    fn non_ascii_keeps_its_ranking_order() {
+        let exact = fuzzy_score("café", "café").unwrap();
+        let prefix = fuzzy_score("café au lait", "café").unwrap();
+        let substring = fuzzy_score("le café noir", "café").unwrap();
+        let subseq = fuzzy_score("cheap fée", "café").unwrap();
+        assert!(exact > prefix && prefix > substring && substring > subseq);
     }
 }

@@ -620,27 +620,27 @@ pub async fn events(
     use tokio::sync::broadcast::error::RecvError;
 
     let rx = state.app.fs_change_tx.subscribe();
+    // No retry loop here (unlike the tagging stream below): every arm yields
+    // something, because a dropped fs batch still has to reach the client as a
+    // refetch ping.
     let fs_stream = futures::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(change) => {
-                    // json_data only fails if the value isn't serializable;
-                    // FsChangeEvent always is, so fall back to a refetch ping.
-                    let event = Event::default()
-                        .event("fs-changed")
-                        .json_data(&change)
-                        .unwrap_or_else(|_| Event::default().event("fs-changed").data("{}"));
-                    return Some((Ok(event), rx));
-                }
-                // Receiver fell behind and dropped messages: tell the client to
-                // refetch everything rather than trying to reconstruct the gap.
-                Err(RecvError::Lagged(_)) => {
-                    let event = Event::default().event("fs-changed").data("{}");
-                    return Some((Ok(event), rx));
-                }
-                // Sender dropped (app shutting down): end the stream.
-                Err(RecvError::Closed) => return None,
+        match rx.recv().await {
+            Ok(change) => {
+                // json_data only fails if the value isn't serializable;
+                // FsChangeEvent always is, so fall back to a refetch ping.
+                let event = Event::default()
+                    .event("fs-changed")
+                    .json_data(&change)
+                    .unwrap_or_else(|_| Event::default().event("fs-changed").data("{}"));
+                Some((Ok(event), rx))
             }
+            // Receiver fell behind and dropped messages: tell the client to
+            // refetch everything rather than trying to reconstruct the gap.
+            Err(RecvError::Lagged(_)) => {
+                Some((Ok(Event::default().event("fs-changed").data("{}")), rx))
+            }
+            // Sender dropped (app shutting down): end the stream.
+            Err(RecvError::Closed) => None,
         }
     });
 
