@@ -233,6 +233,12 @@ and `plugin/runner.rs`:
   run (model downloads), so it warns as soon as the bound is full with no
   results and only fails the job after **20 min** of total silence
   (`NO_RESULT_STALL_SECS`). Left unbounded, that state is a permanent hang.
+  **This bound is not yet watertight** — see
+  [`../todo.md`](../todo.md). The worker's silence timer is refreshed before a
+  result is matched against `pending`, so unmatched results (case 2 below) keep
+  it alive forever; and the server's `JOB_NO_PROGRESS_SECS` deadline is only
+  evaluated inside `reap()`, which `update_job` does not call, so a heartbeating
+  worker on a wedged job never reaches it either.
 
 ### Disk slots are released by matching results, not by count
 
