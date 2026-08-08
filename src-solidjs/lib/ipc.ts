@@ -31,9 +31,7 @@ import {
 } from "./runtime";
 import type {
   GalleryOpenResult,
-  GalleryStats,
   GroupBy,
-  HardwareProfile,
   MemoryStatus,
   PluginInfo,
   PluginRunResult,
@@ -41,7 +39,6 @@ import type {
   SortOrder,
   SortedResult,
   TagSuggestion,
-  TimelineEntry,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -137,9 +134,6 @@ export const openGallery = (path: string) =>
 
 export const closeGallery = () => invoke<void>("close_gallery");
 
-export const getGalleryInfo = () =>
-  invoke<GalleryOpenResult | null>("get_gallery_info");
-
 /** Everything the web client's first frame needs, in one round-trip:
  *  gallery info + default filter + sorted items (filter pre-applied
  *  server-side). Replaces three serial invokes on boot. */
@@ -192,16 +186,6 @@ export function thumbUrl(path: string, tier: ThumbTier = "m"): string {
   // Web client: same-origin HTTP route served by the axum server. Cookie auth.
   const rel = path.startsWith("/") ? path.slice(1) : path;
   return `/thumb/${tier}/${encodeMediaPath(rel)}`;
-}
-
-/** Build a protocol URL for the decoded ThumbHash placeholder of a path.
- *  Returns a ~32x32 PNG generated on-the-fly from the ~25-byte hash. */
-export function thumbhashUrl(path: string): string {
-  if (isTauri()) {
-    return `lightview://thumbhash/${encodeURIComponent(path)}`;
-  }
-  const rel = path.startsWith("/") ? path.slice(1) : path;
-  return `/thumbhash/${encodeMediaPath(rel)}`;
 }
 
 /** Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).
@@ -280,17 +264,6 @@ export function gifAtlasUrl(path: string, tier: ThumbTier = "m"): string {
   return `${_mediaServerUrl}/gif-atlas/${tier}/${encodeMediaPath(rel)}`;
 }
 
-export interface ThumbHashResult {
-  path: string;
-  /** Base64-encoded hash bytes, or null if not yet generated. */
-  hash: string | null;
-}
-
-/** Bulk fetch of ThumbHash placeholders for a list of paths. Missing paths
- *  return `{ hash: null }`; caller can fall back to the skeleton texture. */
-export const getThumbhashes = (paths: string[]) =>
-  invoke<ThumbHashResult[]>("get_thumbhashes", { paths });
-
 /** Outcome of a tier warm-up. `generated` counts newly cached thumbnails; the
  *  caller should refetch the tier URL (with a new cache-buster) after this
  *  resolves. `evicted` lists paths the backend dropped to stay inside the
@@ -306,9 +279,6 @@ export interface EnsureTierResult {
  *  source image at the tier's target size. */
 export const ensureTierThumbnails = (paths: string[], tier: ThumbTier) =>
   invoke<EnsureTierResult>("ensure_tier_thumbnails", { paths, tier });
-
-export const getThumbnail = (path: string) =>
-  invoke<ThumbnailResult | null>("get_thumbnail", { path });
 
 export const getThumbnailsBatch = (paths: string[]) =>
   invoke<ThumbnailResult[]>("get_thumbnails_batch", { paths });
@@ -470,9 +440,6 @@ export const getSortedItems = (
     subSortField,
     subSortOrder,
   });
-
-export const getTimelineIndex = (itemsPerRow: number) =>
-  invoke<TimelineEntry[]>("get_timeline_index", { itemsPerRow });
 
 // ---------------------------------------------------------------------------
 // Plugins
@@ -723,9 +690,6 @@ export const markNotDuplicates = (paths: string[]) =>
 // Settings / Maintenance
 // ---------------------------------------------------------------------------
 
-export const getHardwareProfile = () =>
-  invoke<HardwareProfile>("get_hardware_profile");
-
 export const getMemoryStatus = () =>
   invoke<MemoryStatus>("get_memory_status");
 
@@ -884,11 +848,6 @@ export const rebuildThumbnails = () => invoke<number>("rebuild_thumbnails");
 export const regenerateThumbnail = (path: string) =>
   invoke<void>("regenerate_thumbnail", { path });
 
-export const clearCache = () => invoke<void>("clear_cache");
-
-export const getGalleryStats = () =>
-  invoke<GalleryStats>("get_gallery_stats");
-
 export const saveGallerySettings = (settingsJson: string) =>
   invoke<void>("save_gallery_settings", { settingsJson });
 
@@ -951,17 +910,6 @@ export const getDebugInfo = () =>
 // Thumbnail Info
 // ---------------------------------------------------------------------------
 
-export interface CachedThumbnailInfo {
-  width: number;
-  height: number;
-  size_bytes: number;
-  format: string;
-  resize_filter: string;
-}
-
-export const getCachedThumbnailInfo = (path: string) =>
-  invoke<CachedThumbnailInfo | null>("get_cached_thumbnail_info", { path });
-
 export interface ThumbnailTierInfo {
   tier: string;
   width: number;
@@ -977,16 +925,6 @@ export const getAllThumbnailTiers = (path: string) =>
 // ---------------------------------------------------------------------------
 // Viewer (GPU-accelerated transforms)
 // ---------------------------------------------------------------------------
-
-export interface ImageTransform {
-  rotation_degrees?: number;
-  exposure?: number;
-  saturation?: number;
-  contrast?: number;
-}
-
-export const getTransformedMedia = (path: string, transform: ImageTransform) =>
-  invoke<string>("get_transformed_media", { path, transform });
 
 export const recordView = (path: string) =>
   invoke<void>("record_view", { path });

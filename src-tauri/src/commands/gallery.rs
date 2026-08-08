@@ -959,14 +959,6 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
-/// Get information about the currently open gallery.
-#[tauri::command]
-pub async fn get_gallery_info(
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<GalleryOpenResult>, String> {
-    get_gallery_info_impl(&state).await
-}
-
 pub async fn get_gallery_info_impl(
     state: &AppState,
 ) -> Result<Option<GalleryOpenResult>, String> {

@@ -559,48 +559,6 @@ impl CacheDb {
     }
 
     // -------------------------------------------------------------------
-    // ThumbHash (P1) — ~25-byte placeholder blob on the `thumbnails` row.
-    // -------------------------------------------------------------------
-
-    /// Fetch a single thumbhash blob by path. None if not cached yet.
-    pub fn get_thumbhash(&self, path: &str) -> Result<Option<Vec<u8>>, CacheError> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")?;
-        let mut rows = stmt.query(rusqlite::params![path])?;
-        match rows.next()? {
-            Some(row) => {
-                let blob: Option<Vec<u8>> = row.get(0)?;
-                Ok(blob)
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Bulk-fetch thumbhashes for a list of paths. Returned in the same
-    /// order as `paths`; missing/null entries become `None`.
-    pub fn get_thumbhashes(&self, paths: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
-        let mut map: HashMap<String, Vec<u8>> = HashMap::new();
-        for chunk in paths.chunks(IN_CHUNK) {
-            let sql = format!(
-                "SELECT path, thumbhash FROM thumbnails WHERE path IN ({})",
-                placeholders(chunk.len())
-            );
-            let mut stmt = self.conn().prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
-            })?;
-            for row in rows {
-                let (path, hash) = row?;
-                if let Some(hash) = hash {
-                    map.insert(path, hash);
-                }
-            }
-        }
-        Ok(paths.iter().map(|p| map.remove(p)).collect())
-    }
-
-    // -------------------------------------------------------------------
     // Tiered thumbnails (P2/P3/P5) — micro / large / preview tables.
     // The Standard tier still lives in `thumbnails`; use the original
     // methods above for that case.

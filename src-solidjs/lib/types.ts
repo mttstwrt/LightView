@@ -120,12 +120,6 @@ export interface SortedItem {
 // Timeline types
 // ---------------------------------------------------------------------------
 
-export interface TimelineEntry {
-  row_index: number;
-  date: number;
-  label: string;
-}
-
 // ---------------------------------------------------------------------------
 // Autocomplete types
 // ---------------------------------------------------------------------------
@@ -140,14 +134,6 @@ export interface TagSuggestion {
 // ---------------------------------------------------------------------------
 // Hardware types
 // ---------------------------------------------------------------------------
-
-export interface HardwareProfile {
-  storage_type: string;
-  filesystem: string;
-  supports_reflink: boolean;
-  cpu_cores: number;
-  total_ram_mb: number;
-}
 
 export interface MemoryStatus {
   total_ram_mb: number;
@@ -233,11 +219,4 @@ export interface PluginRunResult {
   tags_added: string[];
   success: boolean;
   error: string | null;
-}
-
-export interface GalleryStats {
-  total_media: number;
-  index_size_bytes: number;
-  cache_size_bytes: number;
-  unique_tags: number;
 }

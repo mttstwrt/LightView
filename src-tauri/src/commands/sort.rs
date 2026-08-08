@@ -1,4 +1,4 @@
-//! Sorting, grouping, and the scrollbar timeline.
+//! Sorting and grouping.
 //!
 //! Takes the filtered path list from `commands::filter` and returns the ordered
 //! items plus their group headers in one round-trip, so the grid never renders
@@ -6,7 +6,6 @@
 
 use crate::sort::grouper::{self, GroupBy, GroupHeader};
 use crate::sort::sorter::{SortField, SortOrder, SortedItem};
-use crate::sort::timeline::TimelineEntry;
 use crate::AppState;
 use serde::Serialize;
 
@@ -64,24 +63,4 @@ pub async fn get_sorted_items_impl(
     let groups = grouper::compute_groups(&items, &group_by);
 
     Ok(SortedResult { items, groups })
-}
-
-/// Get the timeline index for scrollbar date indicators.
-#[tauri::command]
-pub async fn get_timeline_index(
-    state: tauri::State<'_, AppState>,
-    items_per_row: usize,
-) -> Result<Vec<TimelineEntry>, String> {
-    get_timeline_index_impl(&state, items_per_row).await
-}
-
-pub async fn get_timeline_index_impl(
-    state: &AppState,
-    items_per_row: usize,
-) -> Result<Vec<TimelineEntry>, String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-
-    db.compute_timeline(items_per_row)
-        .map_err(|e| e.to_string())
 }

@@ -299,18 +299,14 @@ fn main() {
             // Gallery commands
             commands::gallery::open_gallery,
             commands::gallery::close_gallery,
-            commands::gallery::get_gallery_info,
             commands::gallery::get_boot_state,
 
             // Media commands
-            commands::media::get_thumbnail,
             commands::media::get_thumbnails_batch,
             commands::media::get_media_meta,
             commands::media::regenerate_thumbnail,
-            commands::media::get_cached_thumbnail_info,
             commands::media::get_all_thumbnail_tiers,
             commands::media::precache_thumbnails,
-            commands::media::get_thumbhashes,
             commands::media::ensure_tier_thumbnails,
 
             // Tag commands
@@ -342,7 +338,6 @@ fn main() {
 
             // Sort commands
             commands::sort::get_sorted_items,
-            commands::sort::get_timeline_index,
 
             // Plugin commands
             commands::plugins::list_plugins,
@@ -353,7 +348,6 @@ fn main() {
             commands::plugins::apply_plugin_tags,
 
             // Viewer commands (GPU-accelerated transforms)
-            commands::viewer::get_transformed_media,
             commands::viewer::record_view,
 
             // File operations (copy/move)
@@ -374,7 +368,6 @@ fn main() {
             commands::duplicates::merge_duplicates,
 
             // Settings / maintenance commands
-            commands::settings::get_hardware_profile,
             commands::settings::get_memory_status,
             commands::settings::get_media_server_url,
             commands::settings::enable_remote_access,
@@ -394,8 +387,6 @@ fn main() {
             commands::settings::set_remote_delete_config,
             commands::settings::reindex_gallery,
             commands::settings::rebuild_thumbnails,
-            commands::settings::clear_cache,
-            commands::settings::get_gallery_stats,
             commands::settings::get_debug_info,
             commands::settings::get_perf_snapshot,
             commands::settings::save_gallery_settings,

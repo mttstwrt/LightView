@@ -18,7 +18,6 @@
 //! ThumbHash blob and the Micro row in the same transaction, so no reader can
 //! observe a Standard row without its placeholder.
 
-use base64::Engine;
 use serde::Serialize;
 use std::path::Path;
 use tauri::Emitter;
@@ -53,9 +52,6 @@ pub struct MediaMeta {
     pub gps_lon: Option<f64>,
 }
 
-fn encode_b64(data: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(data)
-}
 
 /// Encode format and resize filter the Standard tier is generated with.
 ///
@@ -197,79 +193,6 @@ fn store_derived_extras(
                     ],
                 );
             }
-        }
-    }
-}
-
-/// Get a single thumbnail. Checks the SQLite cache, then generates on-demand.
-#[tauri::command]
-pub async fn get_thumbnail(
-    state: tauri::State<'_, AppState>,
-    path: String,
-) -> Result<Option<ThumbnailResult>, String> {
-    let (format, filter) = standard_tier_params();
-    let thumb_size = STANDARD_THUMB_SIZE;
-
-    // Check SQLite cache — return as-is if format matches, otherwise regenerate
-    let requested_fmt = format.as_cache_str();
-    {
-        let db = state.cache_db.lock().await;
-        let db = db.as_ref().ok_or("No gallery open")?;
-
-        if let Ok(Some(cached)) = db.get_thumbnail(&path) {
-            if cached.format == requested_fmt {
-                return Ok(Some(ThumbnailResult {
-                    path: cached.path,
-                    width: cached.width,
-                    height: cached.height,
-                    media_type: cached.media_type,
-                    format: cached.format,
-                }));
-            }
-            // Format mismatch — fall through to regenerate
-        }
-    }
-    // Lock released — generate without holding the mutex
-
-    // Generate thumbnail using tier-derived format and dimensions
-    let result = dispatch_thumbnail(&state.thumb_pool, path.clone(), filter, format, thumb_size, thumb_size).await?;
-
-    match result {
-        Ok(thumb) => {
-            let fmt_str = thumb.format.as_cache_str();
-
-            // Cache in SQLite in the generated format
-            let db = state.cache_db.lock().await;
-            if let Some(db) = db.as_ref() {
-                let _ = db.upsert_thumbnail(
-                    &thumb.path,
-                    &thumb.media_type,
-                    0,
-                    thumb.width,
-                    thumb.height,
-                    &thumb.data,
-                    fmt_str,
-                    filter.as_str(),
-                );
-                store_source_dims(db.conn(), &thumb.path, thumb.src_width, thumb.src_height);
-
-                // Extract and store video metadata (duration, dimensions, codec)
-                if thumb.media_type == "video" {
-                    populate_video_metadata(db.conn(), &thumb.path);
-                }
-            }
-
-            Ok(Some(ThumbnailResult {
-                path: thumb.path.clone(),
-                width: thumb.width,
-                height: thumb.height,
-                media_type: thumb.media_type.clone(),
-                format: fmt_str.to_string(),
-            }))
-        }
-        Err(e) => {
-            log::warn!("Thumbnail generation failed for {}: {}", path, e);
-            Ok(None)
         }
     }
 }
@@ -908,37 +831,6 @@ pub async fn precache_thumbnails_impl(
 }
 
 #[derive(Debug, Serialize)]
-pub struct CachedThumbnailInfo {
-    pub width: u32,
-    pub height: u32,
-    pub size_bytes: u64,
-    pub format: String,
-    pub resize_filter: String,
-}
-
-/// Get metadata about the cached thumbnail for a specific file (without reading the blob).
-#[tauri::command]
-pub async fn get_cached_thumbnail_info(
-    state: tauri::State<'_, AppState>,
-    path: String,
-) -> Result<Option<CachedThumbnailInfo>, String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-
-    match db.get_thumbnail_info(&path) {
-        Ok(Some((width, height, size_bytes, format, resize_filter))) => Ok(Some(CachedThumbnailInfo {
-            width,
-            height,
-            size_bytes,
-            format,
-            resize_filter,
-        })),
-        Ok(None) => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-#[derive(Debug, Serialize)]
 pub struct ThumbnailTierInfo {
     pub tier: String,
     pub width: u32,
@@ -969,48 +861,6 @@ pub async fn get_all_thumbnail_tiers(
             resize_filter: t.resize_filter,
         })
         .collect())
-}
-
-/// Entry returned by `get_thumbhashes` — one per requested path.
-/// `hash` is the base64-encoded ThumbHash blob (~32 chars for ~25 bytes),
-/// or None if no hash has been computed yet. The frontend decodes these
-/// into tiny bitmaps and uses them as skeleton placeholders until the
-/// real thumbnail streams in.
-#[derive(Debug, Clone, Serialize)]
-pub struct ThumbHashResult {
-    pub path: String,
-    pub hash: Option<String>,
-}
-
-/// Bulk-fetch ThumbHash placeholders for a list of paths. Returned in the
-/// same order as the input — missing entries become `{ path, hash: null }`.
-/// This is a pure-metadata command (~25 bytes per hash); the frontend
-/// decodes each hash into a 32x32 bitmap locally.
-#[tauri::command]
-pub async fn get_thumbhashes(
-    state: tauri::State<'_, AppState>,
-    paths: Vec<String>,
-) -> Result<Vec<ThumbHashResult>, String> {
-    get_thumbhashes_impl(&state, paths).await
-}
-
-pub async fn get_thumbhashes_impl(
-    state: &AppState,
-    paths: Vec<String>,
-) -> Result<Vec<ThumbHashResult>, String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-
-    let blobs = db.get_thumbhashes(&paths).map_err(|e| e.to_string())?;
-    let out = paths
-        .into_iter()
-        .zip(blobs.into_iter())
-        .map(|(path, blob)| ThumbHashResult {
-            path,
-            hash: blob.map(|b| encode_b64(&b)),
-        })
-        .collect();
-    Ok(out)
 }
 
 /// Lazily generate high-resolution tier thumbnails (L/P). This is the

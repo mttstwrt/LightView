@@ -11,7 +11,7 @@ another.
 
 **Responsible for:** the filter query language (tokenizer, parser, AST, SQL
 compilation), the sort field vocabulary and its `ORDER BY` construction, group
-headers, the scrollbar timeline index, and in-memory tag autocomplete.
+headers, and in-memory tag autocomplete.
 
 **Not responsible for:** executing SQL — `filter/evaluator.rs` produces a
 `WHERE` fragment plus bound parameters and hands them back;
@@ -21,8 +21,8 @@ by whoever wrote a tag.
 
 **Public interface:** `filter::parser::parse_filter`,
 `filter::evaluator::to_sql`, `filter::ast::FilterExpr`,
-`CacheDb::get_sorted_items`, `CacheDb::compute_timeline`,
-`sort::grouper::compute_groups`, and `AutocompleteEngine::{refresh, query}`.
+`CacheDb::get_sorted_items`, `sort::grouper::compute_groups`, and
+`AutocompleteEngine::{refresh, query}`.
 
 **Depends on:** [`cache/`](../cache/README.md) (the `media_meta`, `tag_index`,
 and `tag_counts` tables) and [`companion/`](../companion/README.md) (the
@@ -114,11 +114,13 @@ the group key changes. It never re-sorts, so a grouping that disagrees with the
 sort field produces fragmented headers rather than a reordered list — grouping
 describes the order, it does not impose one.
 
-`compute_timeline` is the same idea for the scrollbar: walk the dates
-descending, emit an entry at each month boundary, and convert the item position
-to a row index using the caller's `items_per_row`. The row index is therefore
-only valid for the layout that asked for it, which is why it takes that
-parameter rather than caching a single index.
+The scrollbar's date markers are *not* computed here. There was a
+`compute_timeline` that emitted an entry per month boundary and converted item
+positions to row indices, but the frontend had independently grown its own
+version in `App.tsx` over `sortedItems` — which it already holds, which also
+covers name and size indicators, and which needs no `items_per_row` round-trip.
+The backend one was deleted rather than kept as a second answer to the same
+question.
 
 ## Autocomplete
 

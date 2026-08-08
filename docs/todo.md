@@ -38,55 +38,34 @@ Re-indexing rebuilds the media and tag indexes but does not kick off background
 thumbnail regeneration, so a re-index after a bulk external edit leaves stale
 thumbnails until something else asks for them.
 
-## Several backend commands have no consumer
+## `close_gallery` is never called
 
-Each of these is a complete chain — a registered `#[tauri::command]`, a typed
-wrapper in `lib/ipc.ts`, and in some cases an `/api/invoke` arm — with no call
-site anywhere in the tree. Deleting only the client binding would be worse than
-leaving it, since it strands the backend half; each chain has to go, or get
-wired up, end to end.
+The frontend switches galleries by calling `open_gallery` again. That is mostly
+fine — `start_fs_watcher` retires the previous watcher itself, and the old
+`CacheDb` and connection pool are dropped when replaced. The one thing only
+`close_gallery` does is drop the read-only pool *and then* checkpoint the WAL,
+so switching galleries leaves the previous gallery's WAL to SQLite's own
+auto-checkpoint. Minor, but the fix is to call the command on switch, not to
+delete it.
 
-They are not all the same kind of thing, and the kind determines the answer.
+`reindex_gallery` has no caller either; see the entry above, which is the
+larger of its two problems.
 
-### Superseded — a better path already exists
+## Memory-pressure polling 403s on the web client
 
-Deleting these loses no capability. Each was replaced by something that does the
-same job and is what the app actually calls.
+`lib/memoryPressure.ts` polls `get_memory_status`, which is not in the
+`/api/invoke` allowlist and never has been. The poll is wrapped in a bare
+`try/catch`, so every cycle fails silently and the viewer cache's
+pressure-based eviction never engages in a browser — only on the desktop.
 
-| Command | Replaced by |
-|---|---|
-| `get_timeline_index` | The scrollbar indicators are computed client-side in `App.tsx` from `sortedItems`, which the frontend already holds. That version also does name and size indicators, not just dates, and needs no `items_per_row` round-trip. `CacheDb::compute_timeline`, `TimelineEntry`, and the unused `timeline` signal in `galleryStore` all belong to the old design. |
-| `get_hardware_profile` | `get_debug_info` returns the same facts (storage type, cores, RAM, thumbnail threads, GPU active) already shaped for display, and is what `DebugOverlay` and `DevtoolsApp` call. |
-| `get_thumbhashes`, `thumbhashUrl` | The ThumbHash now rides inline on every `SortedItem`, which is the whole point of the `LEFT JOIN thumbnails` in `get_sorted_items` — one payload instead of a second round-trip. |
-| `get_gallery_info` | `get_boot_state`, which returns gallery info with the first payload rather than as its own call. |
-| `get_cached_thumbnail_info` | `get_all_thumbnail_tiers`, sitting next to it and returning per-tier rows instead of only the Standard one. `InfoPanel` uses the richer form. |
-| `get_thumbnail` | `get_thumbnails_batch` for the grid, and the 404-driven serve path for everything else. The singular form predates both. |
+Adding it to the allowlist is the wrong fix: the command reports the *server's*
+RAM, and sizing a phone's image cache from the host's free memory is
+meaningless. The web client should either use its own signal
+(`performance.memory`, `navigator.deviceMemory`) or not poll at all. Either way
+the empty `catch` should stop hiding it.
 
-### Never finished — the capability is unreachable
-
-| Command | State |
-|---|---|
-| `get_transformed_media` | Viewer rotate/exposure/colour. The largest of these by far: it is the only caller of `gpu_pipeline::transform_image` (~170 lines) and its 66-line WGSL shader, plus `apply_cpu_transforms` and roughly a third of `commands/viewer.rs`. No UI exposes any of it. |
-| `get_gallery_stats`, `clear_cache` | A cache-maintenance surface in settings. `rebuild_thumbnails` next to them *is* wired, so the gap sits inside one screen. `get_gallery_stats` also reports `index_size_bytes` as a row count times 100, which would need fixing before it is shown to anyone. |
-
-### Orphaned by omission
-
-`close_gallery` is never called because the frontend switches galleries by
-calling `open_gallery` again. That is mostly fine — `start_fs_watcher` retires
-the previous watcher itself, and the old `CacheDb` and connection pool are
-dropped when replaced. The one thing only `close_gallery` does is drop the
-read-only pool *and then* checkpoint the WAL, so switching galleries leaves the
-previous gallery's WAL to SQLite's own auto-checkpoint. Minor, but it is the
-reason the command should be called on switch rather than deleted.
-
-`reindex_gallery` is listed separately above: it has a second problem beyond
-having no caller.
-
-### Not one of these
-
-`apply_plugin_tags` looks like one and is not: `lightview-worker` calls it over
-HTTP, and its TS wrapper carries a comment saying it exists to document that
-contract.
+Found by driving the SPA against `lightview-headless`; it is invisible from
+`tsc` and from the Rust tests.
 
 ## Absolute paths as primary keys
 

@@ -8,7 +8,6 @@ import { createSignal, createMemo } from "solid-js";
 import type {
   GroupHeader,
   SortedItem,
-  TimelineEntry,
 } from "../lib/types";
 import { loadPref, savePref } from "../lib/clientPrefs";
 import { setRating as setRatingIpc } from "../lib/ipc";
@@ -80,7 +79,6 @@ const mediaMetaByPath = createMemo(() => {
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 
 // Timeline data for scrollbar
-const [timeline, setTimeline] = createSignal<TimelineEntry[]>([]);
 
 // Selected items (multi-select)
 const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
@@ -124,7 +122,6 @@ export {
   aspectByPath,
   mediaMetaByPath,
   groups, setGroups,
-  timeline, setTimeline,
   selectedPaths, setSelectedPaths,
   selectionMode,
   viewMode, setViewMode,

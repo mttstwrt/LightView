@@ -4,7 +4,6 @@
 //!   query it builds joins `thumbnails` for the inlined ThumbHash, which is why
 //!   every column is qualified with the `m.` alias.
 //! - [`grouper`] — group headers, computed in memory over the sorted list.
-//! - [`timeline`] — the month-boundary index the scrollbar's date markers use.
 //!
 //! Grouping never reorders. It walks the sorted items and emits a header
 //! wherever the group key changes, so a grouping that disagrees with the sort
@@ -13,4 +12,3 @@
 
 pub mod sorter;
 pub mod grouper;
-pub mod timeline;

@@ -89,7 +89,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
     };
 
     match command {
-        "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
 
         // Single-round-trip boot: gallery info + default filter + sorted
         // items. The phone client's whole first paint hangs on this.
@@ -151,16 +150,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             .await)
         }
 
-        "get_timeline_index" => {
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct A {
-                items_per_row: usize,
-            }
-            let a: A = parse(args)?;
-            ok(sort::get_timeline_index_impl(app, a.items_per_row).await)
-        }
-
         "apply_filter" => {
             #[derive(Deserialize)]
             struct A {
@@ -213,15 +202,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             }
             let a: A = parse(args)?;
             ok(media::ensure_tier_thumbnails_impl(app, a.paths, a.tier).await)
-        }
-
-        "get_thumbhashes" => {
-            #[derive(Deserialize)]
-            struct A {
-                paths: Vec<String>,
-            }
-            let a: A = parse(args)?;
-            ok(media::get_thumbhashes_impl(app, a.paths).await)
         }
 
         "get_tags" => {
