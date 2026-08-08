@@ -1,3 +1,10 @@
+//! Applying a filter query and returning the matching paths.
+//!
+//! Parse, compile to SQL, run. The result is a path list rather than full
+//! rows because sorting is a separate command that takes the list as an
+//! argument — keeping them apart means changing the sort does not re-run the
+//! filter.
+
 use crate::filter::evaluator;
 use crate::filter::parser;
 use crate::AppState;

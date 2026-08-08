@@ -1,3 +1,5 @@
+// Progress of a batch thumbnail generation, for the activity indicator.
+
 import { createSignal } from "solid-js";
 
 export type ThumbGenStatus = "generating" | "done" | "error";

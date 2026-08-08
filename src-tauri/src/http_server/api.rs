@@ -89,7 +89,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
     };
 
     match command {
-        "get_gallery_info" => ok(gallery::get_gallery_info_impl(app).await),
 
         // Single-round-trip boot: gallery info + default filter + sorted
         // items. The phone client's whole first paint hangs on this.
@@ -151,16 +150,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             .await)
         }
 
-        "get_timeline_index" => {
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct A {
-                items_per_row: usize,
-            }
-            let a: A = parse(args)?;
-            ok(sort::get_timeline_index_impl(app, a.items_per_row).await)
-        }
-
         "apply_filter" => {
             #[derive(Deserialize)]
             struct A {
@@ -215,15 +204,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(media::ensure_tier_thumbnails_impl(app, a.paths, a.tier).await)
         }
 
-        "get_thumbhashes" => {
-            #[derive(Deserialize)]
-            struct A {
-                paths: Vec<String>,
-            }
-            let a: A = parse(args)?;
-            ok(media::get_thumbhashes_impl(app, a.paths).await)
-        }
-
         "get_tags" => {
             #[derive(Deserialize)]
             struct A {
@@ -265,7 +245,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(autocomplete::autocomplete_tags_impl(app, a.query, a.namespace, a.limit).await)
         }
 
-        "get_recent_tags" => ok(autocomplete::get_recent_tags_impl(app).await),
 
         // --- Per-item metadata writes (allowed for paired devices) ---------
         "add_user_tag" => {
@@ -341,6 +320,29 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(tags::set_rating_batch_impl(app, a.paths, a.rating).await)
         }
 
+        // Colour label sits in the same tier as rating: it rewrites one field
+        // in a companion sidecar the client can already read, and touches
+        // nothing on the host. `null` clears it.
+        "set_color_label" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+                label: Option<String>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::set_color_label_impl(app, a.path, a.label).await)
+        }
+
+        "set_color_label_batch" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+                label: Option<String>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::set_color_label_batch_impl(app, a.paths, a.label).await)
+        }
+
         // --- Gallery-wide tag management -----------------------------------
         // Still the metadata-write tier — these only rewrite the `user` tag
         // list inside companion sidecars, exactly like add/remove_user_tag —
@@ -407,7 +409,7 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
         // device. Web clients enqueue/cancel/observe; a paired lightview-worker
         // announces, claims, and reports progress, pushing the actual tag
         // writes through apply_plugin_tags above. Same metadata-write tier.
-        // See docs/workerTagging.md.
+        // See docs/remote/worker-tagging.md.
         "worker_announce" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]

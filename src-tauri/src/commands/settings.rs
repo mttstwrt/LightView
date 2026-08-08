@@ -1,7 +1,22 @@
+//! Per-gallery settings, hardware reporting, and remote-access administration.
+//!
+//! Settings live in two places on purpose. Most are per-gallery, stored in
+//! `gallery_meta` and mirrored to a hand-editable `settings.toml` inside the
+//! gallery — the fs-watcher hot-reloads external edits to that file, comparing
+//! against `AppState::last_written_settings` so the app's own saves don't
+//! echo back as user edits. Process-level rendering preferences
+//! (`RenderConfig`) are separate because they are read before GTK/WebKit init
+//! and cannot take effect without a restart.
+//!
+//! The remote-access commands here — pairing codes, device lists, the gallery
+//! password — are deliberately **desktop-only**: they administer the boundary
+//! that `/api/invoke` enforces, so exposing them to a paired device would let
+//! it widen its own access.
+
 use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::hardware::{HardwareProfile, MemoryStatus};
+use crate::hardware::MemoryStatus;
 use crate::http_server::devices::{self, DeviceRow, PairingKind, DEFAULT_INACTIVITY_SECS};
 use crate::http_server::tls::detect_lan_ip;
 use crate::http_server::uploads::{self, UploadConfig, UploadScheme};
@@ -25,22 +40,6 @@ pub struct DebugInfo {
     pub gpu_resize_active: bool,
     pub gdk_backend: String,
     pub webkit_disable_dmabuf: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GalleryStats {
-    pub total_media: u64,
-    pub index_size_bytes: u64,
-    pub cache_size_bytes: u64,
-    pub unique_tags: u64,
-}
-
-/// Get the detected hardware profile.
-#[tauri::command]
-pub async fn get_hardware_profile(
-    state: tauri::State<'_, AppState>,
-) -> Result<HardwareProfile, String> {
-    Ok((*state.hardware).clone())
 }
 
 /// Get current memory status (available + total RAM) for pressure-aware caching.
@@ -591,57 +590,6 @@ pub async fn rebuild_thumbnails(
     Ok(cleared as u64)
 }
 
-/// Clear the entire cache database.
-#[tauri::command]
-pub async fn clear_cache(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let gallery_path = state
-        .current_gallery
-        .read()
-        .await
-        .clone()
-        .ok_or("No gallery open")?;
-
-    let cache_path = std::path::Path::new(&gallery_path)
-        .join(".lightview")
-        .join("cache.db");
-
-    // Close the DB
-    {
-        let mut db = state.cache_db.lock().await;
-        *db = None;
-    }
-
-    // Delete the cache file
-    if cache_path.exists() {
-        std::fs::remove_file(&cache_path).map_err(|e| e.to_string())?;
-    }
-
-    // Delete BC7 atlas files left behind by old builds (the atlas itself
-    // was removed; these can linger in galleries opened before that).
-    let lightview_dir = std::path::Path::new(&gallery_path).join(".lightview");
-    let atlas_bin = lightview_dir.join("thumb_atlas.bin");
-    let atlas_idx = lightview_dir.join("thumb_atlas.idx");
-    if atlas_bin.exists() {
-        let _ = std::fs::remove_file(&atlas_bin);
-    }
-    if atlas_idx.exists() {
-        let _ = std::fs::remove_file(&atlas_idx);
-    }
-
-    // Reopen fresh
-    let new_db = crate::cache::db::CacheDb::open(std::path::Path::new(&gallery_path))
-        .map_err(|e| e.to_string())?;
-    {
-        let mut db = state.cache_db.lock().await;
-        *db = Some(new_db);
-    }
-
-    Ok(())
-}
-
-/// Get debug information about which hardware optimizations are active.
 #[tauri::command]
 pub async fn get_debug_info(
     state: tauri::State<'_, AppState>,
@@ -828,47 +776,6 @@ pub async fn get_gallery_default_filter(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<DefaultFilter>, String> {
     get_gallery_default_filter_impl(&state).await
-}
-
-/// Get gallery statistics.
-#[tauri::command]
-pub async fn get_gallery_stats(
-    state: tauri::State<'_, AppState>,
-) -> Result<GalleryStats, String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-
-    let total_media: u64 = db
-        .conn()
-        .query_row("SELECT COUNT(*) FROM media_meta", [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-
-    let unique_tags: u64 = db
-        .conn()
-        .query_row("SELECT COUNT(*) FROM tag_counts", [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-
-    // Estimate cache size from thumbnail count * avg size
-    let cache_size: u64 = db
-        .conn()
-        .query_row(
-            "SELECT COALESCE(SUM(LENGTH(thumbnail)), 0) FROM thumbnails",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-
-    let index_size: u64 = db
-        .conn()
-        .query_row("SELECT COUNT(*) FROM tag_index", [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-
-    Ok(GalleryStats {
-        total_media,
-        index_size_bytes: index_size * 100, // rough estimate per row
-        cache_size_bytes: cache_size,
-        unique_tags,
-    })
 }
 
 /// Lightweight performance snapshot for the debug overlay.

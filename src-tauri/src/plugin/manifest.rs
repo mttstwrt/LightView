@@ -1,3 +1,14 @@
+//! The `manifest.json` a plugin directory declares itself with.
+//!
+//! `tag_prefix` is mandatory and is the plugin's namespace in every companion
+//! file it writes, so renaming it orphans that plugin's previous output rather
+//! than replacing it.
+//!
+//! `ExecutionConfig::Wasm` parses but is rejected at run time. It is a
+//! placeholder for the sandboxing story, not a half-built feature — and the
+//! `capabilities` list is advisory for the same reason: nothing enforces it
+//! yet.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

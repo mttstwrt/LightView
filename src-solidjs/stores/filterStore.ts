@@ -1,3 +1,10 @@
+// The active filter: the query text, the rating control, and autocomplete state.
+//
+// The rating filter is kept separate from the query string and appended at
+// apply time, because it is a discrete control rather than something the user
+// typed — round-tripping it through the text would mean parsing the query back
+// out to know where the slider should sit.
+
 import { createSignal } from "solid-js";
 import type { TagSuggestion } from "../lib/types";
 import { applyFilter, getSortedItems } from "../lib/ipc";

@@ -1,3 +1,12 @@
+//! Server configuration: bind address, auth mode, TLS, static root.
+//!
+//! Two constructors, and they are the only two shapes that exist:
+//! [`HttpConfig::local_only`] for the desktop's loopback media server and
+//! [`HttpConfig::remote`] for the LAN interface. Loopback stays plain HTTP
+//! because the desktop webview will not accept a self-signed certificate and
+//! `127.0.0.1` already counts as a secure context; remote is always HTTPS
+//! because browsers gate the async clipboard and friends behind one.
+
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 

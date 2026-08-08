@@ -376,7 +376,7 @@ async fn drive_plugin(
                         break Outcome::Failed(format!(
                             "plugin '{}' returned no result for {}s while holding {pending_now} \
                              downloaded file(s) — the job cannot progress. Plugins must stream \
-                             results and answer every request (see docs/pluginExtensibility.md).",
+                             results and answer every request (see docs/plugins/README.md).",
                             job.plugin_name,
                             idle.as_secs(),
                         ));

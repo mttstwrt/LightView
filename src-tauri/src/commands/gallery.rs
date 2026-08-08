@@ -1,3 +1,29 @@
+//! Opening, closing, and watching a gallery.
+//!
+//! `open_gallery_impl` is the one command with real orchestration, and its
+//! ordering is load-bearing at three points:
+//!
+//! 1. The root is canonicalized once here, so every later path-confinement
+//!    check compares against a stored value instead of canonicalizing per
+//!    request.
+//! 2. `adopt_gallery_root` runs **before** `populate_media_meta`. If the gallery
+//!    directory moved, the cached absolute paths must be rebased first;
+//!    otherwise the scan inserts bare rows under the new root that shadow the
+//!    relocated history, and the accumulated ratings, tags, and thumbnails are
+//!    orphaned in place.
+//! 3. The read-only connection pool opens after the rebase, so it never
+//!    observes mid-rebase state.
+//!
+//! Indexing companions, rebuilding tag counts, and starting the idle worker all
+//! happen *after* the command returns — the grid renders from `media_meta`
+//! alone, so there is no reason to make the user wait for them.
+//!
+//! The fs-watcher lives here too. `util::fs_watch` is only a transport; the
+//! policy — coalescing an event storm into one refresh, distinguishing the
+//! app's own `settings.toml` write from a hand edit, routing batches to both
+//! the desktop event and the web client's SSE broadcast — is all in
+//! `start_fs_watcher`.
+
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -8,7 +34,7 @@ use crate::cache::db::CacheDb;
 use crate::companion::schema::MediaType;
 use crate::pipeline::exif;
 use crate::provider::local::LocalProvider;
-use crate::provider::{FileEntry, ProviderType};
+use crate::provider::FileEntry;
 use crate::util::fs_watch::FsWatcher;
 use crate::AppState;
 use rayon::prelude::*;
@@ -17,7 +43,6 @@ use rayon::prelude::*;
 pub struct GalleryOpenResult {
     pub path: String,
     pub total_media: usize,
-    pub provider_type: ProviderType,
 }
 
 /// Populate the media_meta table from scanned file entries.
@@ -44,9 +69,6 @@ fn populate_media_meta(
             .map_err(|e| e.to_string())?;
 
         for entry in entries {
-            if entry.is_dir {
-                continue;
-            }
             let ext = Path::new(&entry.name)
                 .extension()
                 .and_then(|e| e.to_str())
@@ -68,11 +90,7 @@ fn populate_media_meta(
 
     // Prune stale entries — files in DB but no longer on disk
     {
-        let on_disk: HashSet<&str> = entries
-            .iter()
-            .filter(|e| !e.is_dir)
-            .map(|e| e.path.as_str())
-            .collect();
+        let on_disk: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
         let mut sel = tx
             .prepare_cached("SELECT path FROM media_meta")
@@ -240,7 +258,7 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
             }
         };
         let mut rating_stmt = match tx.prepare_cached(
-            "UPDATE media_meta SET rating = ?2, last_rated = ?3 WHERE path = ?1",
+            "UPDATE media_meta SET rating = ?2, last_rated = ?3, color_label = ?4 WHERE path = ?1",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -299,17 +317,29 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
                         let _ =
                             ins_stmt.execute(rusqlite::params![media_path_str, namespace, tag]);
                     }
-                    // Mirror the companion's rating into media_meta. The row is
-                    // keyed by absolute path, so after a gallery move/copy it
-                    // starts NULL even though the companion holds a rating.
+                    // Mirror the companion's rating and colour label into
+                    // media_meta. The row is keyed by absolute path, so after a
+                    // gallery move/copy it starts NULL even though the companion
+                    // holds both — and neither is filterable or sortable until
+                    // it is a column here.
                     let core = companion.meta.core.as_ref();
                     let rating = core.and_then(|c| c.rating);
                     let last_rated = core
                         .and_then(|c| c.date_rated.as_deref())
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|d| d.timestamp());
-                    let _ = rating_stmt
-                        .execute(rusqlite::params![media_path_str, rating, last_rated]);
+                    // Lowercased on the way in so `color:Red` and `color:red`
+                    // are one query; the companion keeps whatever it was given.
+                    let color_label = core
+                        .and_then(|c| c.color_label.as_deref())
+                        .map(|l| l.trim().to_lowercase())
+                        .filter(|l| !l.is_empty());
+                    let _ = rating_stmt.execute(rusqlite::params![
+                        media_path_str,
+                        rating,
+                        last_rated,
+                        color_label
+                    ]);
                     let _ = state_stmt.execute(rusqlite::params![media_path_str, companion_mtime]);
                     indexed += 1;
                 }
@@ -397,7 +427,7 @@ fn infer_old_root(
 
     let mut candidate: Option<String> = None;
     let mut agreed = 0;
-    for entry in entries.iter().filter(|e| !e.is_dir) {
+    for entry in entries {
         // Keep the leading '/' so the prefix comes out without a trailing one.
         let Some(rel) = entry.path.strip_prefix(root) else {
             continue;
@@ -723,14 +753,8 @@ pub async fn open_gallery_impl(
     path: String,
     on_tags_indexed: impl FnOnce() + Send + 'static,
 ) -> Result<GalleryOpenResult, String> {
-    // Create the local provider
     let provider = Arc::new(LocalProvider::new(&path));
-
-    // Register it
-    {
-        let mut reg = state.providers.write().await;
-        reg.register(path.clone(), provider.clone());
-    }
+    *state.provider.write().await = Some(provider.clone());
 
     // Open (or create) the cache database
     let cache_db = CacheDb::open(std::path::Path::new(&path))
@@ -870,7 +894,6 @@ pub async fn open_gallery_impl(
     Ok(GalleryOpenResult {
         path,
         total_media: media_count,
-        provider_type: ProviderType::Local,
     })
 }
 
@@ -899,23 +922,70 @@ pub async fn open_gallery(
 /// Close the current gallery and release resources.
 #[tauri::command]
 pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    close_gallery_impl(&state).await
+}
+
+/// Release everything tied to the open gallery, in an order that matters.
+///
+/// Also the process's shutdown path: the desktop calls it on exit and
+/// `lightview-headless` calls it on SIGTERM/SIGINT, because nothing else
+/// flushes the buffered tier-access marks (see below).
+///
+/// What an abrupt kill would and would not cost, since that decides what this
+/// function has to do:
+///
+/// * **Companion files are already safe.** Writes go to a temp file in the
+///   target directory and are renamed into place, so a reader never sees a
+///   partial one. If we die between writing a companion and re-indexing it,
+///   `index_state` still holds the old mtime and the next gallery open
+///   re-indexes that file. Nothing to do here.
+/// * **The WAL is already safe.** SQLite recovers it on the next open. The
+///   checkpoint below is tidiness — a smaller `-wal` beside the database — not
+///   correctness.
+/// * **Buffered tier-access marks are not safe.** The thumbnail serve path
+///   reads through a read-only pool and cannot write, so "this row was served"
+///   accumulates in `AppState::pending_tier_accesses` and is only landed by
+///   `enforce_tier_budget`, which runs when a capped tier is *written*. Exit
+///   without flushing and the zoom thumbnails you were just looking at go back
+///   to the eviction pass looking maximally cold. That is the one real loss,
+///   and the reason this function flushes before it closes anything.
+pub async fn close_gallery_impl(state: &AppState) -> Result<(), String> {
     // Stop filesystem watcher first
-    stop_fs_watcher(&state);
+    stop_fs_watcher(state);
 
     // Retire the idle backfill worker (it exits at its next generation check).
     state
         .idle_generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    // Land the buffered access marks while the writer is still open. Ordering:
+    // this must happen before the connection is dropped, and it deliberately
+    // does *not* evict — shutdown is the wrong moment to spend seconds in a
+    // DELETE, and the next write will enforce the budget anyway.
+    {
+        let db = state.cache_db.lock().await;
+        if let Some(db) = db.as_ref() {
+            for tier in crate::cache::thumbnails::ThumbTier::ALL {
+                if !crate::cache::thumbnails::is_lru_capped(tier) {
+                    continue;
+                }
+                let touched = state.take_tier_accesses(tier);
+                if let Err(e) =
+                    crate::cache::thumbnails::touch_accessed(db.conn(), tier, &touched)
+                {
+                    log::warn!("{} tier access flush on close failed: {e}", tier.as_segment());
+                }
+            }
+        }
+    }
+
     let gallery_path = {
         let current = state.current_gallery.read().await;
         current.clone()
     };
 
-    if let Some(path) = gallery_path {
-        // Remove provider
-        let mut reg = state.providers.write().await;
-        reg.remove(&path);
+    if gallery_path.is_some() {
+        *state.provider.write().await = None;
     }
 
     // Close protocol handler DB FIRST — the read-only connections block
@@ -950,44 +1020,34 @@ pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
-/// Get information about the currently open gallery.
-#[tauri::command]
-pub async fn get_gallery_info(
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<GalleryOpenResult>, String> {
-    get_gallery_info_impl(&state).await
-}
-
 pub async fn get_gallery_info_impl(
     state: &AppState,
 ) -> Result<Option<GalleryOpenResult>, String> {
     let current = state.current_gallery.read().await;
-    match current.as_ref() {
-        Some(path) => {
-            let reg = state.providers.read().await;
-            match reg.get(path) {
-                Some(_provider) => {
-                    // Use the media_meta table for count — it was populated
-                    // from the recursive scan during open_gallery.
-                    let db = state.cache_db.lock().await;
-                    let media_count = if let Some(db) = db.as_ref() {
-                        db.conn()
-                            .query_row("SELECT COUNT(*) FROM media_meta", [], |r| r.get::<_, usize>(0))
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    Ok(Some(GalleryOpenResult {
-                        path: path.clone(),
-                        total_media: media_count,
-                        provider_type: _provider.provider_type(),
-                    }))
-                }
-                None => Ok(None),
-            }
-        }
-        None => Ok(None),
+    let Some(path) = current.as_ref() else {
+        return Ok(None);
+    };
+    if state.provider.read().await.is_none() {
+        return Ok(None);
     }
+
+    // Counted from media_meta rather than by re-scanning: the table was
+    // populated from the recursive scan during open_gallery, and a re-scan here
+    // would stat the whole tree on every info request.
+    let db = state.cache_db.lock().await;
+    let media_count = db
+        .as_ref()
+        .and_then(|db| {
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM media_meta", [], |r| r.get::<_, usize>(0))
+                .ok()
+        })
+        .unwrap_or(0);
+
+    Ok(Some(GalleryOpenResult {
+        path: path.clone(),
+        total_media: media_count,
+    }))
 }
 
 /// Everything the web client needs to render its first frame, in one

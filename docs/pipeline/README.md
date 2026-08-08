@@ -1,5 +1,58 @@
 # The thumbnail pipeline
 
+[← docs index](../README.md) · [architecture](../architecture.md)
+
+The most intricate subsystem in the codebase, and the one most changes touch.
+Seven cached resolutions, four generation entry points, two serving transports,
+and a disk budget — this page is the map.
+
+**Responsible for:** decoding a source file, producing thumbnail bytes at a
+requested tier, and getting them into the cache. That covers the CPU
+decode/resize path, the optional `wgpu` path, `ffmpeg` frame extraction and
+probing for video, HEIC transcode, EXIF extraction, and the idle worker that
+backfills the queue when nobody is looking.
+
+**Not responsible for:** storage (that is [`cache/`](../cache/README.md)),
+deciding *which* tier a cell wants (that is
+[`frontend/`](../frontend/README.md)), or transport. `thumb_serve.rs` and
+`gif_serve.rs` sit above this module and are shared by the desktop protocol
+handler and the HTTP route.
+
+**Public interface:** `pipeline::thumbnailer` (the generate functions),
+`pipeline::video` (`probe`, frame extraction), `pipeline::exif`,
+`pipeline::heic_cache`, `pipeline::idle::spawn`, and — under the `gpu` feature
+— `pipeline::gpu_pipeline::GpuPipeline`.
+
+**Depends on:** [`cache/`](../cache/README.md) for the tier definitions and the
+write path, `provider/` for file access, `hardware/` for pool sizing, and the
+external `ffmpeg`/`ffprobe` binaries at runtime.
+
+**Depended on by:** `commands/media.rs`, `thumb_serve.rs`, and the idle worker.
+
+**Invariants callers must uphold** — each of these has a silent failure mode:
+
+- *The Standard tier's format string is a cache key.* Four entry points write
+  it and each compares the requested format against the stored `format` column
+  to decide hit-versus-regenerate. If one site drifts, every one of its lookups
+  misses and regenerates forever, at full decode cost, with no error anywhere.
+  They share `commands::media::standard_tier_params()`; keep it that way.
+- *Every Standard generation must also produce its derivations.* A Standard row
+  implies a ThumbHash blob and a Micro row, written in one transaction
+  (`store_derived_extras`) so no reader observes a Standard row without its
+  placeholder. A path with a Standard row but no Micro row makes the grid's
+  cheap rung fall through to a full source decode per 128px thumbnail.
+- *Placeholder thumbnails must not write source dimensions.* `store_source_dims`
+  refuses `0×0`: a placeholder carries no source size, and writing zeros both
+  fills the `width IS NULL` gap that guards the column and hands the justified
+  grid a degenerate aspect ratio.
+- *Video dimensions come from the probe with rotation applied.* Phone clips are
+  landscape on disk and portrait on screen; `ffmpeg` autorotates ahead of our
+  scale filter, so the dimensions handed to the filter graph must be the
+  display-matrix-corrected ones. A mismatch is what makes `.MOV` thumbnails
+  come back sideways or fail outright.
+- *Every `ffmpeg`/`ffprobe` invocation is timeout-bounded.* A wedged subprocess
+  would otherwise hold a `thumb_pool` thread for the life of the process.
+
 The most intricate subsystem in the codebase, and the one most changes touch.
 Seven cached resolutions, four generation entry points, two serving transports,
 and a disk budget — this page is the map.
@@ -140,7 +193,7 @@ warmed, rather than whatever the table scan happened upon.
 
 ## Where the frontend picks a tier
 
-The grids own this; see [`grid-loading.md`](grid-loading.md). Briefly:
+The grids own this; see [`frontend/grid-loading.md`](../frontend/grid-loading.md). Briefly:
 `GalleryGrid` maps cell size × DPR to `s`/`m`/`l` with a 1.25× upscale
 tolerance; `JustifiedGrid` maps a hysteretic zoom level to `j`/`jm`/`jh`, and
 at mid/high detail may bypass the tiers entirely for small native-format

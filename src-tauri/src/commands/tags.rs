@@ -1,3 +1,16 @@
+//! Reading and writing tags, ratings, and the other companion-backed metadata.
+//!
+//! Every write goes through `modify_companion`: read the sidecar (or start a
+//! fresh one), mutate, write atomically, then re-index. Sharing that helper is
+//! what keeps a hand edit, a batch edit, a plugin result, and a duplicate merge
+//! producing byte-identical files.
+//!
+//! Two stores must be updated together after any write — `tag_index` (so
+//! filters see the change) and `tag_counts` plus the autocomplete engine (so
+//! suggestions do). Updating only the first is invisible until someone types in
+//! the tag box, which is why the refresh is part of every write path here
+//! rather than left to the caller.
+
 use std::collections::BTreeSet;
 
 use serde::Serialize;
@@ -541,18 +554,63 @@ pub async fn set_rating_impl(
     single(set_rating_batch_impl(state, vec![path], rating).await)
 }
 
-/// Set the color label for a media file.
+/// Set the colour label on a batch of files. `None` clears it.
+///
+/// Writes the companion (the record of intent) and then mirrors the value into
+/// `media_meta.color_label`, exactly as [`set_rating_batch_impl`] does — the
+/// filter compiles to SQL over that column and never opens a sidecar, so
+/// skipping the mirror would leave `color:red` unable to see the label the user
+/// just set.
+pub async fn set_color_label_batch_impl(
+    state: &AppState,
+    paths: Vec<String>,
+    label: Option<String>,
+) -> Result<u64, String> {
+    let mut count = 0u64;
+    for path in &paths {
+        match modify_companion(path, |c| {
+            let core = c.meta.core.get_or_insert_with(CoreMeta::default);
+            core.color_label = label.clone();
+        }) {
+            Ok(_) => {
+                count += 1;
+                let db = state.cache_db.lock().await;
+                if let Some(db) = db.as_ref() {
+                    let _ = db.update_color_label(path, label.as_deref());
+                }
+            }
+            Err(e) => log::warn!("Failed to set colour label on {}: {}", path, e),
+        }
+    }
+    Ok(count)
+}
+
+/// Set the colour label for a media file. `None` clears it.
 #[tauri::command]
 pub async fn set_color_label(
-    _state: tauri::State<'_, AppState>,
+    state: tauri::State<'_, AppState>,
     path: String,
     label: Option<String>,
 ) -> Result<(), String> {
-    modify_companion(&path, |c| {
-        let core = c.meta.core.get_or_insert_with(CoreMeta::default);
-        core.color_label = label;
-    })?;
-    Ok(())
+    set_color_label_impl(&state, path, label).await
+}
+
+pub async fn set_color_label_impl(
+    state: &AppState,
+    path: String,
+    label: Option<String>,
+) -> Result<(), String> {
+    single(set_color_label_batch_impl(state, vec![path], label).await)
+}
+
+/// Set the colour label on every path in `paths` (multi-select).
+#[tauri::command]
+pub async fn set_color_label_batch(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    label: Option<String>,
+) -> Result<u64, String> {
+    set_color_label_batch_impl(&state, paths, label).await
 }
 
 /// Set notes for a media file.

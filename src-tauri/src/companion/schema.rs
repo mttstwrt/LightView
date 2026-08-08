@@ -1,3 +1,13 @@
+//! The companion file's on-disk shape.
+//!
+//! Every field here is a wire format: it is written to the user's gallery and
+//! read back by other LightView installations, so changing a name or a type is
+//! a breaking change that needs a [`crate::companion::migration`] entry and a
+//! `CURRENT_SCHEMA_VERSION` bump.
+//!
+//! `Location` is decimal degrees, WGS-84, with altitude in metres above sea
+//! level when present.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

@@ -369,7 +369,7 @@ installed, listed, run on a single file, or run as a cancellable batch.
 > commands, or other UI, and the built-in grid / justified / map views are native, not
 > plugins. A design for broadening this into real extensibility (more plugin verbs,
 > per-gallery enablement, and a sandboxed view surface) lives in
-> [`docs/pluginExtensibility.md`](docs/pluginExtensibility.md).
+> [`docs/plugins/`](docs/plugins/README.md).
 
 **Remote tagging (headless servers):** a server too weak for ML taggers never runs
 plugins itself. Instead, run `lightview-worker` on a capable machine: it pairs with the
@@ -377,7 +377,7 @@ server like any device, and the web UI's *Run Plugin* / *Tag All Untagged* actio
 enqueue jobs that the worker claims — pulling image bytes over HTTPS, running the
 plugin locally, and pushing tags back. Progress streams live to every connected web
 client. The server never executes code on a remote device's behalf. See
-[`docs/workerTagging.md`](docs/workerTagging.md).
+[`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md).
 
 ### Remote web access
 

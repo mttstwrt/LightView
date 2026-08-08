@@ -1,3 +1,19 @@
+// The full-resolution viewer: the overlay that opens over the grid.
+//
+// Owns pan/zoom, paging, the open/close flight animation, and the decoded-image
+// cache. Two things here are subtler than they look.
+//
+// The open transition measures the grid cell's on-screen rect and animates the
+// viewer from it, so the image appears to grow out of the thumbnail. That
+// requires the viewer's own content to stay hidden until the flight lands —
+// otherwise the full-resolution image pops in behind the animating clone.
+//
+// The image cache (lib/viewerCache.ts) is bounded by estimated decoded bytes
+// and by live memory pressure, not by entry count. A full-resolution decode is
+// one to two orders of magnitude larger than a thumbnail and varies with the
+// source, so a fixed count is either wasteful or useless depending on the
+// gallery. It reports its size to perfMonitor.
+
 import { Show, For, createSignal, createEffect, on, onMount, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { isWeb, hasTouch, isTauri, isMobile } from "../../lib/runtime";

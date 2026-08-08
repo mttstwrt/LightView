@@ -1,3 +1,17 @@
+//! Duplicate detection and the metadata-preserving merge.
+//!
+//! `find_duplicates_impl` computes any missing perceptual hashes before
+//! grouping, so opening the panel on a cold gallery makes progress rather than
+//! returning nothing.
+//!
+//! `merge_duplicates` takes a *fully resolved* plan: the dialog decides every
+//! conflict, and this side applies it. That split is deliberate — conflict
+//! resolution is a UI question with no correct default, and putting it here
+//! would mean guessing. The merge writes the keeper's companion and optionally
+//! its mtime, then trashes the discards through the ordinary capability-gated
+//! trash path; it never rewrites image bytes. See `docs/duplicates/README.md`
+//! for why EXIF is out of scope and GPS is the exception.
+
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -300,6 +314,9 @@ pub async fn merge_duplicates_impl(
         if let Some(db) = db.as_ref() {
             let _ = db.reindex_tags_for_file(&plan.keeper, &companion);
             let _ = db.update_rating(&plan.keeper, rating);
+            // Same reason as the rating: the merge wrote the companion, and the
+            // filter reads the column.
+            let _ = db.update_color_label(&plan.keeper, plan.color_label.as_deref());
             if let Ok(counts) = db.query_all_tag_counts() {
                 state.autocomplete.refresh(counts).await;
             }

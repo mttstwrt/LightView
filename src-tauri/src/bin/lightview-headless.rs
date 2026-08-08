@@ -26,7 +26,7 @@ use std::process::ExitCode;
 
 use lightview_lib::AppState;
 use lightview_lib::cache::db::CacheDb;
-use lightview_lib::commands::gallery::open_gallery_impl;
+use lightview_lib::commands::gallery::{close_gallery_impl, open_gallery_impl};
 use lightview_lib::http_server::devices::{self, PairingKind};
 use lightview_lib::http_server::{self, HttpConfig};
 
@@ -136,12 +136,58 @@ async fn serve(path: PathBuf, port: u16, tls_sans: Vec<String>) -> ExitCode {
 
     log::info!("Pair a device with:  lightview-headless pair {path_str}");
 
-    // Park on the server task — it only resolves if axum::serve returns/errors.
-    if let Err(e) = server.handle.await {
-        log::error!("server task ended unexpectedly: {e}");
-        return ExitCode::FAILURE;
+    // Park until either the server task ends (it only does so on error) or the
+    // container/user asks us to stop. `docker stop` sends SIGTERM and then
+    // SIGKILLs after its grace period, so the handler has to be quick — which
+    // `close_gallery_impl` is: it flushes the buffered tier-access marks and
+    // checkpoints, but deliberately does not evict.
+    let exit = tokio::select! {
+        joined = server.handle => match joined {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                log::error!("server task ended unexpectedly: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        signal = shutdown_signal() => {
+            log::info!("{signal} received — closing gallery");
+            ExitCode::SUCCESS
+        }
+    };
+
+    if let Err(e) = close_gallery_impl(&state).await {
+        log::warn!("close on shutdown failed: {e}");
     }
-    ExitCode::SUCCESS
+    exit
+}
+
+/// Resolve when the process is asked to stop, naming whichever signal arrived.
+///
+/// SIGTERM is the one that matters — it is what `docker stop` and systemd send.
+/// SIGINT is here so a foreground run in a terminal takes the same path rather
+/// than dying with the marks unflushed.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
 }
 
 /// Mint a one-time pairing PIN for the gallery and print it. The PIN is stored

@@ -1,12 +1,16 @@
+// The open gallery: its items, the current sort/filter result, and selection.
+//
+// `sortedItems` is the full ordered list from the backend; `displayPaths` is
+// what the grid actually renders after filtering. They are separate signals so
+// changing the filter does not invalidate everything derived from the sort.
+
 import { createSignal, createMemo } from "solid-js";
 import type {
-  GalleryMediaItem,
   GroupHeader,
   SortedItem,
-  TimelineEntry,
 } from "../lib/types";
 import { loadPref, savePref } from "../lib/clientPrefs";
-import { setRating as setRatingIpc } from "../lib/ipc";
+import { setRating as setRatingIpc, setColorLabel as setColorLabelIpc } from "../lib/ipc";
 
 // ---------------------------------------------------------------------------
 // Gallery state
@@ -71,11 +75,20 @@ const mediaMetaByPath = createMemo(() => {
   return map;
 });
 
+/** Path → colour label, for the cell marker and the context menu's tick. A
+ *  memo rather than a scan per lookup: both callers ask once per rendered cell. */
+const colorLabelByPath = createMemo(() => {
+  const map = new Map<string, string>();
+  for (const item of sortedItems()) {
+    if (item.color_label) map.set(item.path, item.color_label);
+  }
+  return map;
+});
+
 // Group headers for the current sort/group
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 
 // Timeline data for scrollbar
-const [timeline, setTimeline] = createSignal<TimelineEntry[]>([]);
 
 // Selected items (multi-select)
 const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
@@ -118,8 +131,8 @@ export {
   durationByPath,
   aspectByPath,
   mediaMetaByPath,
+  colorLabelByPath,
   groups, setGroups,
-  timeline, setTimeline,
   selectedPaths, setSelectedPaths,
   selectionMode,
   viewMode, setViewMode,
@@ -147,6 +160,16 @@ export async function rateItem(path: string, rating: number) {
   );
 }
 
+/** Set a colour label and keep `sortedItems` in step, so a `color:` filter and
+ *  the cell marker update without a refetch — the same reason `rateItem`
+ *  exists rather than calling the IPC wrapper directly. */
+export async function setItemColorLabel(path: string, label: string | null) {
+  await setColorLabelIpc(path, label);
+  setSortedItems((items) =>
+    items.map((it) => (it.path === path ? { ...it, color_label: label } : it)),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Selection helpers
 // ---------------------------------------------------------------------------
@@ -168,7 +191,7 @@ export function clearSelection() {
 }
 
 /** Enter multi-select mode (tap-to-toggle). */
-export function enterSelectionMode() {
+function enterSelectionMode() {
   setSelectionMode(true);
 }
 
@@ -188,10 +211,3 @@ export function selectAll(paths: string[]) {
   setSelectedPaths(new Set<string>(paths));
 }
 
-export function addToSelection(paths: string[]) {
-  setSelectedPaths((prev) => {
-    const next = new Set(prev);
-    for (const p of paths) next.add(p);
-    return next;
-  });
-}

@@ -1,3 +1,10 @@
+// Sort field, direction, sub-sort, and grouping.
+//
+// Changing any of them re-runs the filter *and* the sort together rather than
+// re-sorting what is on screen: the backend returns the ordered list, so a
+// client-side re-sort would have to reimplement the tiebreakers and would drift
+// from them.
+
 import { createSignal, Show, For, onCleanup } from "solid-js";
 import { isMobile } from "../../lib/runtime";
 import { sortField, setSortField, sortOrder, setSortOrder, subSortField, setSubSortField, subSortOrder, setSubSortOrder, groupBy } from "../../stores/settingsStore";

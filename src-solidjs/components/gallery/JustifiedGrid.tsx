@@ -1,3 +1,22 @@
+// The justified grid: aspect-preserving rows, zoomable.
+//
+// Shares the loading machine with GalleryGrid (see
+// docs/frontend/grid-loading.md); what differs is policy.
+//
+// Tier selection follows a hysteretic zoom level rather than a pixel size, so
+// small layout changes do not thrash between tiers. At mid and high detail it
+// can bypass the thumbnail tiers entirely: a native-format still that is
+// neither too large in bytes nor far bigger than the cell is served as a
+// backend resize of the original (`GET /media?fit=`), which is sharper and
+// costs no cache storage. The requested edge is quantized to 256px buckets so
+// the URL stays cache-stable.
+//
+// Served-original cells are deliberately never warmed ahead of the viewport.
+// Each is an on-demand source decode inside the request, landing on the same
+// bounded pool as the visible cells; measured, warming them made things worse,
+// because a look-ahead only pays off if it wins the race and it cannot when
+// each decode takes seconds.
+
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { isMobile, isTauri } from "../../lib/runtime";

@@ -1,10 +1,68 @@
-# The cache database
+# The cache
+
+[← docs index](../README.md) · [architecture](../architecture.md)
 
 One SQLite file per gallery, at `<gallery>/.lightview/cache.db`. It is a
 *cache* in the sense that it can be deleted and rebuilt, but it also holds
 state that exists nowhere else until a companion file is written — ratings,
 view history, dedup decisions, device pairings — so "just delete it" is not
-free.
+free. Why per-gallery rather than one global index is
+[decision 0001](../decisions/0001-one-cache-per-gallery.md).
+
+**Responsible for:** the schema and its migrations; the connection strategy
+(one writer, a read-only pool); every SQL statement in the process; the tier
+tables and their byte budget; keeping the stored absolute paths valid when the
+gallery directory moves.
+
+**Not responsible for:** deciding *what* to store. It does not generate
+thumbnails ([`pipeline/`](../pipeline/README.md)), parse filters
+([`query/`](../query/README.md)), or read companion files
+([`companion/`](../companion/README.md)) — it stores what those hand it. It
+also owns no policy about when to write: callers decide, and callers are
+responsible for not holding the writer lock while they do something slow.
+
+**Public interface:** `CacheDb` (the writer), `ThumbProtocolPool` (declared in
+`lib.rs`, read-only), `cache::thumbnails::ThumbTier` and its `ALL`, and the
+per-area helper modules `index`, `counts`, `duplicates`, `gif_atlas`, and
+`coalescer`.
+
+**Depends on:** `rusqlite` (bundled SQLite) and nothing else in the tree except
+the `MediaType` vocabulary from `companion/`.
+
+**Depended on by:** effectively everything —
+[`pipeline/`](../pipeline/README.md), [`query/`](../query/README.md),
+[`remote/`](../remote/README.md), [`duplicates/`](../duplicates/README.md), and
+every command handler.
+
+## Invariants callers must uphold
+
+**Never hold the writer lock across an expensive non-DB operation.** The
+pattern throughout `commands/media.rs` is: do the work (decode, encode,
+`ffprobe`), *then* take the lock and commit. `generate_and_store_tier` spells
+this out for `ffprobe` specifically — running a subprocess under the lock kept
+every other DB user queued for hundreds of milliseconds per video.
+
+**The thumbnail read path cannot write.** It goes through
+`AppState::thumb_protocol_db`, a pool of read-only connections. That is why LRU
+access marks are buffered in `AppState::pending_tier_accesses` instead of
+written through, and why `enforce_tier_budget` must drain them via
+`take_tier_accesses` *immediately before* the eviction pass. Reordering those
+two steps makes eviction drop exactly the rows the user is looking at.
+
+**Every path-keyed table must be swept together.** `cache::db::path_keyed_tables()`
+is the single source of truth, derived from `ThumbTier::ALL`. Any operation
+that removes or relocates a file — trash, fs-watch removal, stale-row pruning
+in `populate_media_meta`, `rebase_root` — iterates it. When a site spells the
+list out itself, the failure mode is a multi-megabyte blob keyed to a path that
+no longer exists and can never be reached again.
+`remove_media_rows_clears_every_path_keyed_table` guards this. `not_duplicates`
+is deliberately outside the list: its paths live in `path_a`/`path_b`, so
+callers handle it separately.
+
+**Adding a tier is a schema change *and* a maintenance change.** Add the
+variant to `ThumbTier`, add it to `ThumbTier::ALL`, and add its `CREATE TABLE`
+migration. `ALL` then propagates it to `path_keyed_tables()`,
+`clear_thumbnails`, `get_all_tier_info`, and the per-file delete.
 
 ## Connections
 
@@ -23,7 +81,11 @@ serializes them; the pool hands each request one of N (2–6, from
 `available_parallelism`) so grid reads fan out.
 
 The pool's connections **block WAL checkpointing**, which is why
-`close_gallery` drops them *before* checkpointing the writer.
+`close_gallery_impl` drops them *before* checkpointing the writer. That function
+is also the process's shutdown path — the desktop runs it on exit and
+`lightview-headless` on SIGTERM — because it is the only place the buffered
+tier-access marks get landed. See
+[`architecture.md`](../architecture.md#shutdown).
 
 ### PRAGMA choices
 
@@ -53,33 +115,29 @@ To add a migration:
 3. Statements are executed one at a time, split on `;`, so a partially-applied
    migration does not abort the rest of the batch.
 4. If it adds a thumbnail tier, also add the `ThumbTier` variant and put it in
-   `ThumbTier::ALL` — see [`invariants.md`](invariants.md).
+   `ThumbTier::ALL` — see the invariants at the top of this page.
 
 `SCHEMA_VERSION` needs no edit; it follows.
 
-### Legacy detection, and why it must under-report
+### A database with no version stamp
 
-`detect_legacy_version` only runs when `gallery_meta.schema_version` is absent —
-a database created before the versioning scheme existed. It walks schema
-features in version order and returns the last one fully present.
+`run_migrations` treats "no `schema_version` in `gallery_meta`" as version 0 and
+handles it in one branch: apply `BASE_SCHEMA` (every statement is
+`IF NOT EXISTS`, so it is a no-op on a populated database), claim v1, and let
+the loop re-run every migration.
 
-The asymmetry to understand: `run_migrations` **skips every migration at or
-below the version returned**. So
+There used to be a ten-rung `detect_legacy_version` ladder that probed for
+schema features and *guessed* an unstamped database's version. Guessing is all
+downside: the loop skips everything at or below the version it is handed, so an
+over-estimate silently leaves tables uncreated — the exact failure
+[decision 0003](../decisions/0003-derive-schema-version-from-migrations.md)
+records. Under-estimating costs one idempotent re-run. The ladder was deleted
+once its premise was confirmed dead: versioning has been in place since v1 of
+the schema, so no unstamped database exists.
 
-- under-reporting is harmless — migrations re-run, and they are idempotent;
-- over-reporting silently leaves tables uncreated.
-
-That is precisely the bug the old code had. The ladder's last actual check is
-`gif_atlas` (v10), but it returned the `SCHEMA_VERSION` constant, so once that
-constant moved past 10 an unstamped database would be stamped 14/15 without
-ever creating the justified-tier tables. The ladder now returns
-`MAX_DETECTABLE_VERSION` (10), and `legacy_detection_never_over_reports`
-guards it. **Extending the ladder is optional; raising its return value beyond
-what it verifies is not.**
-
-`run_migrations` also warns if the final version does not equal
-`SCHEMA_VERSION`. The only way to land short is a database stamped ahead of
-this build — opened by a newer LightView, then downgraded.
+`run_migrations` still warns if the final version does not equal
+`SCHEMA_VERSION`. The only way to land short is a database stamped ahead of this
+build — opened by a newer LightView, then downgraded.
 
 ## Tables
 
@@ -92,10 +150,10 @@ Path-keyed (all swept together by `path_keyed_tables()`):
 - `tag_index` — `(path, namespace, tag)`. Rebuilt from companion files.
 - `index_state` — companion mtime per path, so re-indexing skips unchanged
   companions.
-- `file_hashes` — perceptual hashes for duplicate detection.
 - `gif_atlas` — pre-rendered GIF frame sprite sheets, keyed `(path, tier)`.
-- the seven `thumbnails*` tables — see
-  [`thumbnail-pipeline.md`](thumbnail-pipeline.md).
+- the seven `thumbnails*` tables, one of which (`thumbnails`) also
+  carries the `phash` column duplicate detection reads — see
+  [`pipeline/`](../pipeline/README.md).
 
 Not path-keyed:
 

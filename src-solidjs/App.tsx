@@ -1,3 +1,22 @@
+// The application shell: which view is on screen, and the boot sequence.
+//
+// Boot differs by runtime, and the difference is the interesting part. The
+// desktop opens a gallery and waits. The web client is several round-trips
+// from anything renderable, so it paints from the IndexedDB snapshot first,
+// then replaces it with `getBootState()` — one call returning gallery info,
+// the default filter, and the sorted items with that filter already applied,
+// because three serial invokes over a phone's connection is most of the
+// perceived boot time.
+//
+// When that call fails but the snapshot painted anyway, the app looks
+// connected while every write and uncached thumbnail silently fails. That is
+// what `serverUnreachable` and ConnectionBanner exist for; see
+// docs/frontend/README.md.
+//
+// Everything below the shell reads stores rather than props. This file wires
+// the pieces together and owns the keyboard map, the paste/drop handlers, and
+// the Tauri event subscriptions — not gallery logic.
+
 import { Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";

@@ -1,3 +1,13 @@
+//! Connection setup, the migration list, and the maintenance operations that
+//! span every table.
+//!
+//! Two rules here are load-bearing and easy to break silently. First,
+//! `SCHEMA_VERSION` is *derived* from `MIGRATIONS` rather than maintained
+//! alongside it — they drifted once, and the drift skipped migrations. Second,
+//! [`path_keyed_tables`] is the single source of truth for "which tables are
+//! keyed by a media path", so every operation that removes or relocates a file
+//! iterates it instead of listing tables itself.
+
 use std::path::Path;
 
 use crate::cache::thumbnails::ThumbTier;
@@ -11,7 +21,7 @@ use crate::cache::thumbnails::ThumbTier;
 /// `not_duplicates` is deliberately absent: its paths live in `path_a`/`path_b`,
 /// so callers handle it separately.
 pub fn path_keyed_tables() -> impl Iterator<Item = &'static str> {
-    ["media_meta", "tag_index", "index_state", "file_hashes", "gif_atlas"]
+    ["media_meta", "tag_index", "index_state", "gif_atlas"]
         .into_iter()
         .chain(ThumbTier::ALL.into_iter().map(|t| t.table()))
 }
@@ -31,10 +41,10 @@ pub enum CacheError {
 /// Current schema version — the highest version in [`MIGRATIONS`].
 ///
 /// Derived rather than hand-maintained: the two drifted once already (the
-/// constant sat at 14 while a v15 migration existed), and the only consumer is
-/// [`detect_legacy_version`], where a too-high value silently *skips*
-/// migrations for the database it is applied to. A `const fn` keeps them
-/// welded together at compile time.
+/// constant sat at 14 while a v15 migration existed), and the consumer at the
+/// time used it as "this database is fully up to date" — which silently
+/// *skipped* migrations. A `const fn` keeps them welded together at compile
+/// time.
 const SCHEMA_VERSION: u32 = latest_migration_version();
 
 const fn latest_migration_version() -> u32 {
@@ -82,13 +92,6 @@ const BASE_SCHEMA: &str = "
         PRIMARY KEY (namespace, tag)
     );
     CREATE INDEX IF NOT EXISTS idx_tag_counts_pop ON tag_counts(count DESC);
-
-    CREATE TABLE IF NOT EXISTS file_hashes (
-        path        TEXT PRIMARY KEY,
-        hash        TEXT NOT NULL,
-        mtime       INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_hash ON file_hashes(hash);
 
     CREATE TABLE IF NOT EXISTS index_state (
         path                TEXT PRIMARY KEY,
@@ -337,6 +340,30 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_jh_accessed ON thumbnails_justified_high(accessed_at);
         ",
     },
+    // `file_hashes` was created by the base schema for duplicate detection and
+    // never written to: perceptual hashes ended up on `thumbnails.phash`
+    // instead, so they are discarded and recomputed with the thumbnail they
+    // describe. The empty table is harmless but its name is not — it reads as
+    // the home of dedup state, which is somewhere else entirely.
+    Migration {
+        version: 16,
+        sql: "
+            DROP TABLE IF EXISTS file_hashes;
+        ",
+    },
+    // Colour label mirrored out of the companion, for the same reason `rating`
+    // is: filtering runs entirely in SQLite over `media_meta` and never opens a
+    // sidecar, so a field that is not a column here cannot be filtered on. The
+    // partial index skips the overwhelming majority of rows, which have no
+    // label.
+    Migration {
+        version: 17,
+        sql: "
+            ALTER TABLE media_meta ADD COLUMN color_label TEXT;
+            CREATE INDEX IF NOT EXISTS idx_meta_color ON media_meta(color_label)
+                WHERE color_label IS NOT NULL;
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.
@@ -360,6 +387,9 @@ fn set_schema_version(conn: &rusqlite::Connection, version: u32) -> Result<(), C
     Ok(())
 }
 
+/// Only the migration tests need this now — the version-0 branch no longer
+/// probes the schema, it just applies the idempotent base and re-runs.
+#[cfg(test)]
 fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -370,70 +400,25 @@ fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
         > 0
 }
 
-fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
-    conn.execute(&format!("SELECT {column} FROM {table} LIMIT 0"), [])
-        .is_ok()
-}
-
-/// Highest version [`detect_legacy_version`] can recognize. Everything past it
-/// is applied by re-running migrations, which is safe because they are
-/// idempotent (`CREATE TABLE IF NOT EXISTS`, duplicate-column-tolerant
-/// `ALTER`). Extending the ladder is therefore optional — but returning a
-/// version *higher* than what was actually verified is not: the migration loop
-/// skips everything at or below the returned number, so an over-estimate
-/// silently leaves tables uncreated. This is what the old `SCHEMA_VERSION`
-/// return did once the constant outran the ladder's last check.
-const MAX_DETECTABLE_VERSION: u32 = 10;
-
-/// Best-effort version stamp for a database created before the migration
-/// system existed (`gallery_meta.schema_version` absent). Walks the schema
-/// features in version order and returns the last one fully present.
-///
-/// Only reachable for caches predating the versioning scheme; every database
-/// written since is stamped. Under-reporting is harmless (migrations re-run
-/// idempotently) — see [`MAX_DETECTABLE_VERSION`].
-fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
-    // (version introduced by the feature, is the feature present?)
-    let ladder = [
-        (1, has_table(conn, "media_meta")),
-        (2, has_column(conn, "thumbnails", "format")),
-        (3, has_column(conn, "media_meta", "last_viewed")),
-        (4, has_column(conn, "media_meta", "last_rated")),
-        (5, has_column(conn, "thumbnails", "thumbhash")),
-        (6, has_table(conn, "thumbnails_micro")),
-        (7, has_column(conn, "media_meta", "gps_lat")),
-        (8, has_table(conn, "not_duplicates")),
-        (9, has_table(conn, "remote_devices")),
-        (MAX_DETECTABLE_VERSION, has_table(conn, "gif_atlas")),
-    ];
-
-    let mut version = 0;
-    for (introduced_in, present) in ladder {
-        // The first gap ends the walk: schema features land in order, so a
-        // missing one means everything after it is missing too.
-        if !present {
-            break;
-        }
-        version = introduced_in;
-    }
-    version
-}
-
 /// Run all pending migrations to bring the database up to `SCHEMA_VERSION`.
 fn run_migrations(conn: &rusqlite::Connection) -> Result<(), CacheError> {
     let mut version = get_schema_version(conn);
 
-    // Handle databases created before the migration system existed.
+    // No stamp: either a brand-new file, or one predating the versioning
+    // scheme. Both are handled the same way — apply the base schema (every
+    // statement is `IF NOT EXISTS`, so it is a no-op on a populated database),
+    // claim v1, and let the loop below re-run every migration.
+    //
+    // This replaced a ten-rung feature-detection ladder that tried to *guess*
+    // an unstamped database's version. Guessing is all downside here: the loop
+    // skips everything at or below the version it is handed, so an
+    // over-estimate silently leaves tables uncreated — which is exactly the bug
+    // decision 0003 was written about. Under-estimating costs one idempotent
+    // re-run of migrations that mostly do nothing, once, on a database that
+    // almost certainly does not exist.
     if version == 0 {
-        let detected = detect_legacy_version(conn);
-        if detected == 0 {
-            // Fresh database — create all base tables.
-            conn.execute_batch(BASE_SCHEMA)?;
-            version = 1;
-        } else {
-            // Existing database without a version stamp.
-            version = detected;
-        }
+        conn.execute_batch(BASE_SCHEMA)?;
+        version = 1;
         set_schema_version(conn, version)?;
     }
 
@@ -667,21 +652,6 @@ mod tests {
         assert_eq!(SCHEMA_VERSION, prev, "SCHEMA_VERSION must track MIGRATIONS");
     }
 
-    /// The legacy ladder must never claim a version it did not verify: the
-    /// migration loop skips everything at or below what it returns, so an
-    /// over-estimate leaves tables uncreated. A fully-migrated database still
-    /// reports only the last feature the ladder actually knows about.
-    #[test]
-    fn legacy_detection_never_over_reports() {
-        let (_tmp, db) = open_db();
-        assert_eq!(detect_legacy_version(db.conn()), MAX_DETECTABLE_VERSION);
-        assert!(MAX_DETECTABLE_VERSION <= SCHEMA_VERSION);
-
-        // An empty database has none of the ladder's features.
-        let blank = rusqlite::Connection::open_in_memory().unwrap();
-        assert_eq!(detect_legacy_version(&blank), 0);
-    }
-
     /// Re-running every migration over an already-current database must be a
     /// no-op, since that is exactly what an under-reporting legacy detection
     /// (or a crash mid-migration) causes.
@@ -796,7 +766,6 @@ mod tests {
                 "INSERT INTO media_meta (path, file_size, media_type) VALUES ('/g/a.jpg', 1, 'image');
                  INSERT INTO tag_index (path, namespace, tag) VALUES ('/g/a.jpg', 'user', 'cat');
                  INSERT INTO index_state (path, companion_mtime) VALUES ('/g/a.jpg', 42);
-                 INSERT INTO file_hashes (path, hash, mtime) VALUES ('/g/a.jpg', 'abc', 1);
                  INSERT INTO gif_atlas (path, tier, mtime, frame_count, frame_w, frame_h, cols, delays, atlas)
                      VALUES ('/g/a.jpg', 'm', 1, 1, 8, 8, 1, '100', x'00');
                  INSERT INTO not_duplicates (path_a, path_b) VALUES ('/g/a.jpg', '/g/b.jpg');

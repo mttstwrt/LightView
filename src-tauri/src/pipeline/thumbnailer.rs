@@ -1,3 +1,25 @@
+//! Decode, resize, encode: the CPU thumbnail path.
+//!
+//! Thumbnail generation is **decode-bound**, not resize- or encode-bound —
+//! roughly 80% of the time for a 4000×3000 JPEG is the decode, and the resize
+//! filter choice moves the total by under a millisecond. Every optimization
+//! here is therefore about decoding fewer pixels, not about resizing faster:
+//!
+//! * JPEG goes through `jpeg-decoder` specifically for its DCT-scaled decode,
+//!   which produces a 1/2, 1/4, or 1/8 image directly from the entropy stream.
+//!   A faster per-pixel decoder that lacks scaling is a net *loss* on camera
+//!   JPEGs, because it would decode sixteen times the pixels.
+//! * HEIC prefers an embedded thumbnail handle over decoding the full image.
+//! * Micro is derived from cached Standard bytes rather than from the original;
+//!   the derivation is in `commands::media`, but this is where the primitives
+//!   for it live.
+//!
+//! `docs/pipeline/jpeg-decode.md` has the measurements and the options that
+//! were rejected.
+//!
+//! Source files are memory-mapped rather than read into a buffer, so a decoder
+//! that only touches part of the stream only faults in that part.
+
 use fast_image_resize as fir;
 use fir::images::{Image, ImageRef};
 use image::GenericImageView;
@@ -132,7 +154,6 @@ fn generate_jpeg_thumbnail_inner(path: &Path, filter: ResizeFilter, format: Thum
     let mmap = mmap_file(path)?;
     let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&mmap[..]));
 
-    // Read header to get source dimensions
     decoder
         .read_info()
         .map_err(|e| ThumbError::Decode(e.to_string()))?;
@@ -164,7 +185,8 @@ fn generate_jpeg_thumbnail_inner(path: &Path, filter: ResizeFilter, format: Thum
         return Err(ThumbError::Decode("Zero decoded dimensions".to_string()));
     }
 
-    // Convert to RGB if needed (jpeg-decoder may return L8, RGB, or CMYK)
+    // jpeg-decoder returns whatever the file's colour model is — L8, RGB24,
+    // or CMYK32 — so every branch has to be handled, not just the common one.
     let rgb_buf = match decoded_info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => {
             let expected = (dw as usize) * (dh as usize) * 3;

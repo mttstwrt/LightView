@@ -1,3 +1,24 @@
+//! LightView's backend library: `AppState` and the modules it holds together.
+//!
+//! Everything the process knows lives in [`AppState`], which is `Clone` over
+//! shared `Arc`s so the HTTP server can hold its own handle and observe the
+//! same live gallery as the Tauri commands. That is what makes
+//! `lightview-headless` possible: the same state, minus the webview.
+//!
+//! The lock type on each field is a decision, not a default, and the two that
+//! matter most:
+//!
+//! * `cache_db` is a `tokio::Mutex`, not an `RwLock`, because
+//!   `rusqlite::Connection` is `Send` but not `Sync`. It serializes every write
+//!   in the process, so nothing expensive may run while it is held.
+//! * `thumb_protocol_db` is a `std::sync::RwLock` around an
+//!   `Arc<ThumbProtocolPool>` because its readers are synchronous and hold the
+//!   outer lock only long enough to clone the `Arc` — they must not serialize
+//!   on it.
+//!
+//! Per-field rationale is on the fields themselves. `docs/architecture.md` has
+//! the map of how the modules below fit together.
+
 pub mod companion;
 pub mod provider;
 pub mod cache;
@@ -23,7 +44,7 @@ use cache::coalescer::ThumbGenCoalescer;
 use cache::db::CacheDb;
 use autocomplete::engine::AutocompleteEngine;
 use hardware::HardwareProfile;
-use provider::ProviderRegistry;
+use provider::local::LocalProvider;
 use util::fs_watch::FsWatcher;
 
 /// Maximum number of recent galleries to remember.
@@ -146,8 +167,10 @@ impl ThumbProtocolPool {
 /// `AppState` clone and observe the same live gallery as the Tauri commands.
 #[derive(Clone)]
 pub struct AppState {
-    /// Active file provider registry (local, SMB, SFTP, S3)
-    pub providers: Arc<RwLock<ProviderRegistry>>,
+    /// File access for the open gallery. `None` when no gallery is open;
+    /// set by `open_gallery` and cleared by `close_gallery`, so it tracks
+    /// `current_gallery` exactly.
+    pub provider: Arc<RwLock<Option<Arc<LocalProvider>>>>,
 
     /// SQLite cache database (thumbnails, tag index, media meta)
     /// Uses Mutex (not RwLock) because rusqlite::Connection is Send but not Sync.
@@ -359,7 +382,7 @@ impl AppState {
         let recent_galleries = load_recent_galleries();
 
         Self {
-            providers: Arc::new(RwLock::new(ProviderRegistry::new())),
+            provider: Arc::new(RwLock::new(None)),
             cache_db: Arc::new(Mutex::new(None)),
             autocomplete: Arc::new(AutocompleteEngine::new()),
             hardware: Arc::new(hardware),

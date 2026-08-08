@@ -1,3 +1,17 @@
+// The fixed-cell grid: square thumbnails in a uniform virtual scroller.
+//
+// Shares its machinery with JustifiedGrid — two nested render windows, a
+// resolution ladder, 404-driven generation, drain-time prioritization, and two
+// single-flight slots. docs/frontend/grid-loading.md describes that machine
+// once for both, and docs/decisions/0007-two-zone-render-window.md says why it
+// is shaped that way.
+//
+// What is specific to this file: tier selection maps cell size × DPR to s/m/l
+// with a 1.25× upscale tolerance, and the generation queue is a plain
+// Set<string> because every cell wants the same tier — the justified grid
+// needs a Map, since a cheap-rung cell there must regenerate whichever tier
+// actually 404'd.
+
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { safeListen as listen, hasTouch, isTauri, type UnlistenFn } from "../../lib/runtime";
@@ -89,7 +103,7 @@ function pickTier(cellPx: number): ThumbTier {
   // Match the decoded image to the *rendered* pixel size (cell × DPR), on
   // desktop too. Serving a far larger tier than the cell shows forces the
   // webview to decode + downscale a big bitmap per cell — see
-  // docs/thumbnailStreamingResearch.md. DPR is capped so a 4×-DPR phone doesn't
+  // docs/pipeline/README.md. DPR is capped so a 4×-DPR phone doesn't
   // always punt to the largest tier.
   const dpr =
     typeof window !== "undefined"

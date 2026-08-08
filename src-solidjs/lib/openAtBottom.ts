@@ -1,3 +1,5 @@
+// "Start at bottom": land a freshly opened gallery at the end of the grid.
+
 import { createEffect, on, onCleanup } from "solid-js";
 
 // "Start at bottom": land a freshly opened gallery at the end of the grid

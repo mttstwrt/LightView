@@ -1,3 +1,28 @@
+//! The desktop binary: process setup, the `lightview://` protocol handler, and
+//! command registration.
+//!
+//! Three things happen here that happen nowhere else.
+//!
+//! **Environment before GTK.** `GDK_BACKEND` and `WEBKIT_DISABLE_DMABUF_RENDERER`
+//! are set before anything touches GTK, because WebKitGTK's Wayland and DMA-BUF
+//! paths crash on a range of drivers. They are read from `RenderConfig` rather
+//! than hard-coded so a user on working hardware can opt back in — and they are
+//! process-level rather than per-gallery settings precisely because they cannot
+//! take effect after init.
+//!
+//! **The `lightview://` protocol.** `thumb/<tier>/<path>` and
+//! `thumbhash/<path>` are answered here, off the GTK main thread — blocking it
+//! freezes the window. The bodies are `thumb_serve`, shared with the HTTP
+//! route, so the desktop and the web client coalesce, generate, and cache
+//! identically. Full-resolution media deliberately does *not* come through
+//! here: it goes over the loopback HTTP server, because WebKitGTK will not play
+//! `<video>` from a custom scheme and one streaming path for `<img>` and
+//! `<video>` beats two.
+//!
+//! **Command registration.** The `invoke_handler` list is the desktop's command
+//! surface. It is not the web's — that is the allowlist in
+//! `http_server::api`, and the two are intentionally different sets.
+
 use lightview_lib::AppState;
 use lightview_lib::cache::thumbnails::ThumbTier;
 use lightview_lib::commands;
@@ -274,18 +299,14 @@ fn main() {
             // Gallery commands
             commands::gallery::open_gallery,
             commands::gallery::close_gallery,
-            commands::gallery::get_gallery_info,
             commands::gallery::get_boot_state,
 
             // Media commands
-            commands::media::get_thumbnail,
             commands::media::get_thumbnails_batch,
             commands::media::get_media_meta,
             commands::media::regenerate_thumbnail,
-            commands::media::get_cached_thumbnail_info,
             commands::media::get_all_thumbnail_tiers,
             commands::media::precache_thumbnails,
-            commands::media::get_thumbhashes,
             commands::media::ensure_tier_thumbnails,
 
             // Tag commands
@@ -294,6 +315,7 @@ fn main() {
             commands::tags::remove_user_tag,
             commands::tags::set_rating,
             commands::tags::set_color_label,
+            commands::tags::set_color_label_batch,
             commands::tags::set_notes,
             commands::tags::add_user_tag_batch,
             commands::tags::remove_user_tag_batch,
@@ -314,11 +336,9 @@ fn main() {
 
             // Autocomplete commands
             commands::autocomplete::autocomplete_tags,
-            commands::autocomplete::get_recent_tags,
 
             // Sort commands
             commands::sort::get_sorted_items,
-            commands::sort::get_timeline_index,
 
             // Plugin commands
             commands::plugins::list_plugins,
@@ -329,7 +349,6 @@ fn main() {
             commands::plugins::apply_plugin_tags,
 
             // Viewer commands (GPU-accelerated transforms)
-            commands::viewer::get_transformed_media,
             commands::viewer::record_view,
 
             // File operations (copy/move)
@@ -350,7 +369,6 @@ fn main() {
             commands::duplicates::merge_duplicates,
 
             // Settings / maintenance commands
-            commands::settings::get_hardware_profile,
             commands::settings::get_memory_status,
             commands::settings::get_media_server_url,
             commands::settings::enable_remote_access,
@@ -370,8 +388,6 @@ fn main() {
             commands::settings::set_remote_delete_config,
             commands::settings::reindex_gallery,
             commands::settings::rebuild_thumbnails,
-            commands::settings::clear_cache,
-            commands::settings::get_gallery_stats,
             commands::settings::get_debug_info,
             commands::settings::get_perf_snapshot,
             commands::settings::save_gallery_settings,
@@ -383,6 +399,26 @@ fn main() {
             commands::settings::set_render_config,
             commands::settings::open_with,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Closing the window used to take the process straight down. That
+            // was *nearly* fine — companion writes are atomic and the WAL
+            // recovers on the next open — but the buffered tier-access marks
+            // died with it, so the zoom thumbnails the user had just been
+            // looking at came back cold to the next eviction pass. See
+            // `close_gallery_impl` for the full accounting.
+            //
+            // `block_on` is correct here rather than a spawn: this is the last
+            // thing the process does, and the flush has to finish before the
+            // runtime goes away.
+            if let tauri::RunEvent::Exit = event {
+                let state = app_handle.state::<AppState>();
+                if let Err(e) = tauri::async_runtime::block_on(
+                    commands::gallery::close_gallery_impl(&state),
+                ) {
+                    log::warn!("close on exit failed: {e}");
+                }
+            }
+        });
 }

@@ -1,3 +1,16 @@
+//! A thin, non-blocking wrapper over `notify` for the open gallery.
+//!
+//! Deliberately only a transport. `poll_events` drains whatever the watcher
+//! thread has queued and returns immediately, and the caller
+//! (`commands::gallery::start_fs_watcher`) polls it on a timer and decides what
+//! a burst of events means. That split matters because the interesting logic is
+//! all policy: a single user action — a copy, an export, an unzip — produces a
+//! storm of notify events, and the consumer coalesces them into one refresh
+//! rather than re-indexing per event.
+//!
+//! Only changes made *after* the watcher starts are seen; a restart re-indexes
+//! from scratch.
+
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::mpsc;

@@ -1,3 +1,14 @@
+//! Atomically replacing a companion file.
+//!
+//! Serialize to a uniquely-named temp file **in the target directory**, then
+//! rename over the destination. Same directory means same filesystem, which is
+//! what makes the rename atomic: a concurrent reader sees either the old file
+//! or the new one, never a partial write. That matters because batch tagging
+//! writes companions while the indexer may be walking the same tree.
+//!
+//! `modified` is stamped here rather than by the caller, so every write carries
+//! an accurate timestamp regardless of which path produced it.
+
 use std::path::Path;
 
 use crate::companion::reader::{companion_path, CompanionLocation};

@@ -1,117 +1,29 @@
-use crate::companion::schema::CompanionFile;
-use crate::filter::ast::{CompareOp, FilterExpr, TagNamespace};
+//! Compiling a [`FilterExpr`] into SQL.
+//!
+//! There is one evaluation path, and it is this one: the AST becomes a `WHERE`
+//! fragment against `media_meta m` plus a vector of bound parameters, and
+//! SQLite does the work. There used to be a second, in-memory evaluator that
+//! walked companion files; nothing ever called it, and keeping a parallel
+//! implementation of the language's semantics around meant any divergence
+//! between them was silent. It was deleted rather than wired up — evaluating a
+//! filter by opening every sidecar is precisely the cost the tag index exists
+//! to remove.
+//!
+//! The consequence to keep in mind when extending the language: **a term is
+//! expressible only if the value it tests is indexed.** Tags come from
+//! `tag_index` via `EXISTS`; everything else is a column on `media_meta`. A
+//! field that lives only in the companion cannot be filtered on without first
+//! being mirrored into a column — which is what `color_label` had to do.
+//!
+//! Literals are pushed onto `params` and referenced positionally, never
+//! interpolated — filter strings come from the user, and on the web client
+//! from the network.
 
-/// Evaluate a filter expression against a single companion file (in-memory path).
-/// Returns true if the companion file matches the filter.
-pub fn evaluate(expr: &FilterExpr, companion: &CompanionFile) -> bool {
-    match expr {
-        FilterExpr::Tag { namespace, value } => match namespace {
-            TagNamespace::Any => companion
-                .all_tags()
-                .iter()
-                .any(|(_, t)| t == value),
-            _ => {
-                let ns_str = namespace
-                    .to_db_namespace()
-                    .unwrap_or_default();
-                companion
-                    .tags_in_namespace(&ns_str)
-                    .iter()
-                    .any(|t| t == value)
-            }
-        },
+use crate::filter::ast::FilterExpr;
 
-        FilterExpr::And { left, right } => {
-            evaluate(left, companion) && evaluate(right, companion)
-        }
-
-        FilterExpr::Or { left, right } => {
-            evaluate(left, companion) || evaluate(right, companion)
-        }
-
-        FilterExpr::Not { expr } => !evaluate(expr, companion),
-
-        FilterExpr::Rating { op, value } => {
-            let rating = companion
-                .meta
-                .core
-                .as_ref()
-                .and_then(|c| c.rating)
-                .unwrap_or(0);
-            match op {
-                CompareOp::Gte => rating >= *value,
-                CompareOp::Lte => rating <= *value,
-                CompareOp::Eq => rating == *value,
-            }
-        }
-
-        FilterExpr::MediaType { value } => companion.media_type == *value,
-
-        FilterExpr::HasNamespace { namespace } => {
-            let ns_str = namespace
-                .to_db_namespace()
-                .unwrap_or_default();
-            !companion.tags_in_namespace(&ns_str).is_empty()
-        }
-
-        FilterExpr::ColorLabel { value } => companion
-            .meta
-            .core
-            .as_ref()
-            .and_then(|c| c.color_label.as_ref())
-            .map_or(false, |l| l == value),
-
-        FilterExpr::GeoBbox { south, west, north, east } => {
-            let loc = match companion
-                .meta
-                .core
-                .as_ref()
-                .and_then(|c| c.location)
-            {
-                Some(l) => l,
-                None => return false,
-            };
-            point_in_bbox(loc.lat, loc.lon, *south, *west, *north, *east)
-        }
-
-        FilterExpr::HasGeo { present } => {
-            let has = companion
-                .meta
-                .core
-                .as_ref()
-                .and_then(|c| c.location)
-                .is_some();
-            has == *present
-        }
-
-        // Date columns (date_taken/date_added/last_viewed) and numeric columns
-        // (width/height/file_size) live in media_meta, not in the companion
-        // file, so the in-memory path can't evaluate them. Treat as a no-op
-        // pass-through; these filters run through `to_sql` (the production path
-        // — `evaluate` is only used in tests).
-        FilterExpr::DateRange { .. } | FilterExpr::Numeric { .. } => true,
-    }
-}
-
-/// Test a point against a bbox. When `west > east` the box wraps across the
-/// anti-meridian, so we OR two longitude ranges instead of using a single
-/// BETWEEN.
-fn point_in_bbox(lat: f64, lon: f64, south: f64, west: f64, north: f64, east: f64) -> bool {
-    if lat < south || lat > north {
-        return false;
-    }
-    if west <= east {
-        lon >= west && lon <= east
-    } else {
-        lon >= west || lon <= east
-    }
-}
-
-/// Build a SQL WHERE clause from a FilterExpr for use with the tag_index
-/// and media_meta tables. Returns (sql_fragment, params).
-///
-/// This is used for large galleries where in-memory evaluation is too slow.
-/// The caller must join tag_index and media_meta as needed.
+/// Build the `WHERE` fragment for `expr`, appending its bound values to
+/// `params`. The caller supplies `media_meta` under the alias `m`; tag terms
+/// bring in `tag_index` themselves via a correlated `EXISTS`.
 pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
     match expr {
         FilterExpr::Tag { namespace, value } => {
@@ -181,12 +93,18 @@ pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
         }
 
         FilterExpr::ColorLabel { value } => {
-            // Color label is stored in companion file, not in media_meta.
-            // For SQL path, we'd need an additional index column.
-            // For now, fall back to a placeholder that always matches.
-            // TODO: Add color_label column to media_meta for SQL filtering.
-            let _ = value;
-            "1 = 1".to_string()
+            // `color:none` asks for the *absence* of a label, which is a
+            // different predicate rather than a label that happens to be
+            // spelled "none" — and is the form worth having, since "which of
+            // these did I never triage?" is the question a colour workflow
+            // actually asks.
+            if value.eq_ignore_ascii_case("none") {
+                return "m.color_label IS NULL".to_string();
+            }
+            // Stored lowercase by every write path, so the comparison is exact
+            // rather than `COLLATE NOCASE` — which would not use the index.
+            params.push(value.trim().to_lowercase());
+            format!("m.color_label = ?{}", params.len())
         }
 
         FilterExpr::GeoBbox { south, west, north, east } => {
@@ -258,7 +176,6 @@ pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::companion::schema::{CompanionFile, MediaType as MT};
     use crate::filter::parser::parse_filter;
 
     #[test]
@@ -289,6 +206,29 @@ mod tests {
         assert_eq!(params, vec![(5 * 1024 * 1024).to_string()]);
     }
 
+    /// The colour term compiles to a real predicate against the indexed
+    /// column. It used to be `1 = 1`, which silently *widened* a filter that
+    /// the user wrote to narrow it.
+    #[test]
+    fn test_to_sql_color_label() {
+        let expr = parse_filter("color:Red").unwrap();
+        let mut params = Vec::new();
+        assert_eq!(to_sql(&expr, &mut params), "m.color_label = ?1");
+        // Normalized on the way in, matching what every write path stores.
+        assert_eq!(params, vec!["red".to_string()]);
+    }
+
+    /// `color:none` is absence, not a label spelled "none" — and it binds no
+    /// parameter, so the surrounding expression's numbering must still line up.
+    #[test]
+    fn test_to_sql_color_label_none() {
+        let expr = parse_filter("color:none AND rating>=4").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert_eq!(sql, "(m.color_label IS NULL AND m.rating >= ?1)");
+        assert_eq!(params, vec!["4".to_string()]);
+    }
+
     #[test]
     fn test_to_sql_date_range_field_and_open_end() {
         // viewed>=2024-01-01 → single lower bound against last_viewed.
@@ -297,112 +237,5 @@ mod tests {
         let sql = to_sql(&expr, &mut params);
         assert_eq!(sql, "(m.last_viewed IS NOT NULL AND m.last_viewed >= ?1)");
         assert_eq!(params.len(), 1);
-    }
-
-    fn make_companion(user_tags: &[&str]) -> CompanionFile {
-        let mut c = CompanionFile::new("test.jpg", MT::Image);
-        c.tags.user = user_tags.iter().map(|s| s.to_string()).collect();
-        c
-    }
-
-    #[test]
-    fn test_eval_simple_tag() {
-        let c = make_companion(&["vacation", "family"]);
-        let expr = parse_filter("user::vacation").unwrap();
-        assert!(evaluate(&expr, &c));
-
-        let expr2 = parse_filter("user::work").unwrap();
-        assert!(!evaluate(&expr2, &c));
-    }
-
-    #[test]
-    fn test_eval_and() {
-        let c = make_companion(&["vacation", "family"]);
-        let expr = parse_filter("user::vacation AND user::family").unwrap();
-        assert!(evaluate(&expr, &c));
-
-        let expr2 = parse_filter("user::vacation AND user::work").unwrap();
-        assert!(!evaluate(&expr2, &c));
-    }
-
-    #[test]
-    fn test_eval_not() {
-        let c = make_companion(&["vacation"]);
-        let expr = parse_filter("NOT user::work").unwrap();
-        assert!(evaluate(&expr, &c));
-    }
-
-    #[test]
-    fn test_eval_media_type() {
-        let c = make_companion(&[]);
-        let expr = parse_filter("type:image").unwrap();
-        assert!(evaluate(&expr, &c));
-
-        let expr2 = parse_filter("type:video").unwrap();
-        assert!(!evaluate(&expr2, &c));
-    }
-
-    #[test]
-    fn test_eval_bare_tag_cross_namespace() {
-        use crate::companion::schema::PluginTagEntry;
-        use std::collections::HashMap;
-
-        // Image with only a plugin tag "example"
-        let mut c = CompanionFile::new("a.jpg", MT::Image);
-        c.tags.plugins.insert(
-            "tagger".to_string(),
-            PluginTagEntry {
-                version: "1.0.0".to_string(),
-                tags: vec!["example".to_string()],
-                extra: HashMap::new(),
-            },
-        );
-
-        // Bare "example" should match across namespaces
-        let expr = parse_filter("example").unwrap();
-        assert!(evaluate(&expr, &c));
-
-        // "user::example" should NOT match (it's a plugin tag, not user)
-        let expr2 = parse_filter("user::example").unwrap();
-        assert!(!evaluate(&expr2, &c));
-
-        // "plugin.tagger::example" should match
-        let expr3 = parse_filter("plugin.tagger::example").unwrap();
-        assert!(evaluate(&expr3, &c));
-    }
-
-    #[test]
-    fn test_eval_bare_namespace() {
-        let c = make_companion(&["vacation"]);
-        // "user" should match (image has user tags)
-        let expr = parse_filter("user").unwrap();
-        assert!(evaluate(&expr, &c));
-
-        // "auto" should NOT match (no auto tags)
-        let expr2 = parse_filter("auto").unwrap();
-        assert!(!evaluate(&expr2, &c));
-    }
-
-    #[test]
-    fn test_eval_example_and_user() {
-        // "example AND user" should find images that have "example" in any
-        // namespace AND have at least one user tag.
-        let c = make_companion(&["example"]);
-        let expr = parse_filter("example AND user").unwrap();
-        assert!(evaluate(&expr, &c));
-
-        // Image with plugin tag "example" but no user tags → should NOT match
-        use crate::companion::schema::PluginTagEntry;
-        use std::collections::HashMap;
-        let mut c2 = CompanionFile::new("b.jpg", MT::Image);
-        c2.tags.plugins.insert(
-            "tagger".to_string(),
-            PluginTagEntry {
-                version: "1.0.0".to_string(),
-                tags: vec!["example".to_string()],
-                extra: HashMap::new(),
-            },
-        );
-        assert!(!evaluate(&expr, &c2));
     }
 }

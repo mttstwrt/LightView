@@ -52,21 +52,9 @@ export interface MediaInfo {
 // Gallery types
 // ---------------------------------------------------------------------------
 
-export interface GalleryMediaItem {
-  path: string;
-  name: string;
-  media_type: MediaType;
-  thumbnail_url: string | null;
-  size: number;
-  mtime: number;
-  date_taken?: number;
-  rating?: number;
-}
-
 export interface GalleryOpenResult {
   path: string;
   total_media: number;
-  provider_type: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +104,8 @@ export interface SortedItem {
   file_size: number;
   media_type: string;
   rating: number | null;
+  /** Colour label, lowercase, or null. One of `COLOR_LABELS`. */
+  color_label: string | null;
   last_viewed: number | null;
   date_added: number | null;
   last_rated: number | null;
@@ -132,12 +122,6 @@ export interface SortedItem {
 // Timeline types
 // ---------------------------------------------------------------------------
 
-export interface TimelineEntry {
-  row_index: number;
-  date: number;
-  label: string;
-}
-
 // ---------------------------------------------------------------------------
 // Autocomplete types
 // ---------------------------------------------------------------------------
@@ -152,14 +136,6 @@ export interface TagSuggestion {
 // ---------------------------------------------------------------------------
 // Hardware types
 // ---------------------------------------------------------------------------
-
-export interface HardwareProfile {
-  storage_type: string;
-  filesystem: string;
-  supports_reflink: boolean;
-  cpu_cores: number;
-  total_ram_mb: number;
-}
 
 export interface MemoryStatus {
   total_ram_mb: number;
@@ -245,11 +221,4 @@ export interface PluginRunResult {
   tags_added: string[];
   success: boolean;
   error: string | null;
-}
-
-export interface GalleryStats {
-  total_media: number;
-  index_size_bytes: number;
-  cache_size_bytes: number;
-  unique_tags: number;
 }

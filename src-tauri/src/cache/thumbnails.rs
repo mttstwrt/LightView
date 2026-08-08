@@ -1,3 +1,22 @@
+//! The thumbnail tier tables: the tier vocabulary, the read and write paths,
+//! and the disk budget for the two tiers that need one.
+//!
+//! [`ThumbTier::ALL`] is the source of truth for which thumbnail tables exist;
+//! `cache::db::path_keyed_tables` derives from it, so adding a variant there
+//! propagates a new tier to every maintenance sweep. Adding a tier still needs
+//! its `CREATE TABLE` migration — the array does not create tables, it only
+//! stops the rest of the codebase from forgetting one.
+//!
+//! Two families, and the split is not cosmetic: the square-cropped tiers back
+//! the fixed-cell grid and the aspect-preserving ("fit") tiers back the
+//! justified layout, and a fit tier cannot be derived from a square one because
+//! the crop already discarded the pixels. See
+//! `docs/decisions/0002-two-families-of-thumbnail-tiers.md`.
+//!
+//! Only the two zoom tiers are bounded, by bytes rather than rows, with
+//! eviction keyed on `accessed_at` — `docs/decisions/0004-byte-budgeted-lru-for-zoom-tiers.md`
+//! explains why each of those three choices is the way it is.
+
 use crate::cache::db::{CacheDb, CacheError};
 use std::collections::{HashMap, HashSet};
 
@@ -59,7 +78,7 @@ pub struct CachedThumbnail {
 
 /// LOD tier for a thumbnail. Determines which SQL table a thumbnail is
 /// read from / written to. Frontend picks the tier from the current
-/// gallery cell size; see docs/thumbnailStreamingResearch.md.
+/// gallery cell size; see docs/pipeline/README.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThumbTier {
     /// 128x128 — dense grid (cellSize <= 160). `thumbnails_micro`.
@@ -540,48 +559,6 @@ impl CacheDb {
     }
 
     // -------------------------------------------------------------------
-    // ThumbHash (P1) — ~25-byte placeholder blob on the `thumbnails` row.
-    // -------------------------------------------------------------------
-
-    /// Fetch a single thumbhash blob by path. None if not cached yet.
-    pub fn get_thumbhash(&self, path: &str) -> Result<Option<Vec<u8>>, CacheError> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached("SELECT thumbhash FROM thumbnails WHERE path = ?1")?;
-        let mut rows = stmt.query(rusqlite::params![path])?;
-        match rows.next()? {
-            Some(row) => {
-                let blob: Option<Vec<u8>> = row.get(0)?;
-                Ok(blob)
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Bulk-fetch thumbhashes for a list of paths. Returned in the same
-    /// order as `paths`; missing/null entries become `None`.
-    pub fn get_thumbhashes(&self, paths: &[String]) -> Result<Vec<Option<Vec<u8>>>, CacheError> {
-        let mut map: HashMap<String, Vec<u8>> = HashMap::new();
-        for chunk in paths.chunks(IN_CHUNK) {
-            let sql = format!(
-                "SELECT path, thumbhash FROM thumbnails WHERE path IN ({})",
-                placeholders(chunk.len())
-            );
-            let mut stmt = self.conn().prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
-            })?;
-            for row in rows {
-                let (path, hash) = row?;
-                if let Some(hash) = hash {
-                    map.insert(path, hash);
-                }
-            }
-        }
-        Ok(paths.iter().map(|p| map.remove(p)).collect())
-    }
-
-    // -------------------------------------------------------------------
     // Tiered thumbnails (P2/P3/P5) — micro / large / preview tables.
     // The Standard tier still lives in `thumbnails`; use the original
     // methods above for that case.
@@ -631,13 +608,6 @@ impl CacheDb {
         }
 
         Ok(results)
-    }
-
-    /// Check if a non-standard-tier thumbnail exists for this path.
-    pub fn tier_is_cached(&self, tier: ThumbTier, path: &str) -> Result<bool, CacheError> {
-        let mut stmt = self.conn().prepare_cached(tier.exists_sql())?;
-        let mut rows = stmt.query(rusqlite::params![path])?;
-        Ok(rows.next()?.is_some())
     }
 
     /// Which of `paths` already have a row in `tier`'s table. One IN-list

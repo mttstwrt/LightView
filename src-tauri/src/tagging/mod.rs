@@ -8,7 +8,7 @@
 //! registry when plugins are installed server-side and runs them directly on
 //! the local files. No plugin ever executes in this process *on behalf of a
 //! remote device*; remote devices only ever submit plugin names and tag data.
-//! See `docs/workerTagging.md`.
+//! See `docs/remote/worker-tagging.md`.
 //!
 //! Everything is in-memory: tag writes are idempotent and filter-target jobs
 //! resolve their path list at *claim* time (`NOT has::plugin.<prefix>` skips

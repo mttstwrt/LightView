@@ -1,3 +1,27 @@
+// The single boundary between the SPA and the backend.
+//
+// One typed function per backend command, and one place that knows which
+// transport is in use: Tauri's `invoke()` inside the desktop webview, or
+// `POST /api/invoke` in a browser. Nothing above this file branches on that,
+// which is what lets the same bundle ship to both.
+//
+// Two auth conditions are absorbed here rather than surfaced to callers:
+//
+//   * 401 with `WWW-Authenticate: LV-Password` — the gallery password is
+//     required again. The transport raises a challenge, waits for the modal,
+//     and retries the original request. Concurrent 401s share one pending
+//     promise, so a grid firing twenty requests produces one prompt instead of
+//     twenty stacked modals.
+//   * 401 without that header — the device cookie is missing or revoked. Emits
+//     NOT_PAIRED_EVENT so the router can redirect to /pair.
+//
+// A command the web client must not reach is not hidden here; it is simply
+// absent from the server's allowlist, and 403s if called. `capabilitiesStore`
+// tells components what to render, but it is not the enforcement.
+//
+// The types below mirror the Rust serde structs. When one side changes, the
+// other must too — `tsc --noEmit` is what catches it.
+
 import { invoke as _rawInvoke } from "@tauri-apps/api/core";
 import { isActive as isPerfActive, recordIpcCall } from "./perfMonitor";
 import {
@@ -7,9 +31,7 @@ import {
 } from "./runtime";
 import type {
   GalleryOpenResult,
-  GalleryStats,
   GroupBy,
-  HardwareProfile,
   MemoryStatus,
   PluginInfo,
   PluginRunResult,
@@ -17,7 +39,6 @@ import type {
   SortOrder,
   SortedResult,
   TagSuggestion,
-  TimelineEntry,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -113,9 +134,6 @@ export const openGallery = (path: string) =>
 
 export const closeGallery = () => invoke<void>("close_gallery");
 
-export const getGalleryInfo = () =>
-  invoke<GalleryOpenResult | null>("get_gallery_info");
-
 /** Everything the web client's first frame needs, in one round-trip:
  *  gallery info + default filter + sorted items (filter pre-applied
  *  server-side). Replaces three serial invokes on boot. */
@@ -153,7 +171,7 @@ export interface ThumbnailResult {
   format: string;
 }
 
-/** LOD tier for thumbnails; see docs/thumbnailStreamingResearch.md and
+/** LOD tier for thumbnails; see docs/pipeline/README.md and
  *  `ThumbTier` in src-tauri/src/cache/thumbnails.rs. */
 export type ThumbTier = "s" | "m" | "l" | "p" | "j" | "jm" | "jh";
 
@@ -168,16 +186,6 @@ export function thumbUrl(path: string, tier: ThumbTier = "m"): string {
   // Web client: same-origin HTTP route served by the axum server. Cookie auth.
   const rel = path.startsWith("/") ? path.slice(1) : path;
   return `/thumb/${tier}/${encodeMediaPath(rel)}`;
-}
-
-/** Build a protocol URL for the decoded ThumbHash placeholder of a path.
- *  Returns a ~32x32 PNG generated on-the-fly from the ~25-byte hash. */
-export function thumbhashUrl(path: string): string {
-  if (isTauri()) {
-    return `lightview://thumbhash/${encodeURIComponent(path)}`;
-  }
-  const rel = path.startsWith("/") ? path.slice(1) : path;
-  return `/thumbhash/${encodeMediaPath(rel)}`;
 }
 
 /** Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).
@@ -256,17 +264,6 @@ export function gifAtlasUrl(path: string, tier: ThumbTier = "m"): string {
   return `${_mediaServerUrl}/gif-atlas/${tier}/${encodeMediaPath(rel)}`;
 }
 
-export interface ThumbHashResult {
-  path: string;
-  /** Base64-encoded hash bytes, or null if not yet generated. */
-  hash: string | null;
-}
-
-/** Bulk fetch of ThumbHash placeholders for a list of paths. Missing paths
- *  return `{ hash: null }`; caller can fall back to the skeleton texture. */
-export const getThumbhashes = (paths: string[]) =>
-  invoke<ThumbHashResult[]>("get_thumbhashes", { paths });
-
 /** Outcome of a tier warm-up. `generated` counts newly cached thumbnails; the
  *  caller should refetch the tier URL (with a new cache-buster) after this
  *  resolves. `evicted` lists paths the backend dropped to stay inside the
@@ -282,9 +279,6 @@ export interface EnsureTierResult {
  *  source image at the tier's target size. */
 export const ensureTierThumbnails = (paths: string[], tier: ThumbTier) =>
   invoke<EnsureTierResult>("ensure_tier_thumbnails", { paths, tier });
-
-export const getThumbnail = (path: string) =>
-  invoke<ThumbnailResult | null>("get_thumbnail", { path });
 
 export const getThumbnailsBatch = (paths: string[]) =>
   invoke<ThumbnailResult[]>("get_thumbnails_batch", { paths });
@@ -326,8 +320,27 @@ export const removeUserTag = (path: string, tag: string) =>
 export const setRating = (path: string, rating: number) =>
   invoke<void>("set_rating", { path, rating });
 
+/** The colour labels the UI offers. Free-form on disk and in the filter, but
+ *  these five are what the swatches draw and what `color:<name>` expects —
+ *  matching the Lightroom/Bridge vocabulary users already have muscle memory
+ *  for. Stored and queried lowercase. */
+export const COLOR_LABELS = ["red", "yellow", "green", "blue", "purple"] as const;
+export type ColorLabel = (typeof COLOR_LABELS)[number];
+
+/** Hex per label, for the swatches and the cell corner marker. */
+export const COLOR_LABEL_HEX: Record<ColorLabel, string> = {
+  red: "#ef4444",
+  yellow: "#eab308",
+  green: "#22c55e",
+  blue: "#3b82f6",
+  purple: "#a855f7",
+};
+
 export const setColorLabel = (path: string, label: string | null) =>
   invoke<void>("set_color_label", { path, label });
+
+export const setColorLabelBatch = (paths: string[], label: string | null) =>
+  invoke<number>("set_color_label_batch", { paths, label });
 
 export const setNotes = (path: string, notes: string | null) =>
   invoke<void>("set_notes", { path, notes });
@@ -425,8 +438,6 @@ export const autocompleteTags = (
 ) =>
   invoke<TagSuggestion[]>("autocomplete_tags", { query, namespace, limit });
 
-export const getRecentTags = () =>
-  invoke<string[]>("get_recent_tags");
 
 // ---------------------------------------------------------------------------
 // Sort
@@ -448,9 +459,6 @@ export const getSortedItems = (
     subSortField,
     subSortOrder,
   });
-
-export const getTimelineIndex = (itemsPerRow: number) =>
-  invoke<TimelineEntry[]>("get_timeline_index", { itemsPerRow });
 
 // ---------------------------------------------------------------------------
 // Plugins
@@ -493,7 +501,7 @@ export const applyPluginTags = (entries: PluginTagWrite[]) =>
 
 // ---------------------------------------------------------------------------
 // Remote tagging jobs (web-triggered, executed by a paired lightview-worker;
-// see docs/workerTagging.md and stores/taggingStore.ts)
+// see docs/remote/worker-tagging.md and stores/taggingStore.ts)
 // ---------------------------------------------------------------------------
 
 export type TaggingJobState = "queued" | "running" | "done" | "failed" | "cancelled";
@@ -701,9 +709,6 @@ export const markNotDuplicates = (paths: string[]) =>
 // Settings / Maintenance
 // ---------------------------------------------------------------------------
 
-export const getHardwareProfile = () =>
-  invoke<HardwareProfile>("get_hardware_profile");
-
 export const getMemoryStatus = () =>
   invoke<MemoryStatus>("get_memory_status");
 
@@ -862,11 +867,6 @@ export const rebuildThumbnails = () => invoke<number>("rebuild_thumbnails");
 export const regenerateThumbnail = (path: string) =>
   invoke<void>("regenerate_thumbnail", { path });
 
-export const clearCache = () => invoke<void>("clear_cache");
-
-export const getGalleryStats = () =>
-  invoke<GalleryStats>("get_gallery_stats");
-
 export const saveGallerySettings = (settingsJson: string) =>
   invoke<void>("save_gallery_settings", { settingsJson });
 
@@ -929,17 +929,6 @@ export const getDebugInfo = () =>
 // Thumbnail Info
 // ---------------------------------------------------------------------------
 
-export interface CachedThumbnailInfo {
-  width: number;
-  height: number;
-  size_bytes: number;
-  format: string;
-  resize_filter: string;
-}
-
-export const getCachedThumbnailInfo = (path: string) =>
-  invoke<CachedThumbnailInfo | null>("get_cached_thumbnail_info", { path });
-
 export interface ThumbnailTierInfo {
   tier: string;
   width: number;
@@ -955,16 +944,6 @@ export const getAllThumbnailTiers = (path: string) =>
 // ---------------------------------------------------------------------------
 // Viewer (GPU-accelerated transforms)
 // ---------------------------------------------------------------------------
-
-export interface ImageTransform {
-  rotation_degrees?: number;
-  exposure?: number;
-  saturation?: number;
-  contrast?: number;
-}
-
-export const getTransformedMedia = (path: string, transform: ImageTransform) =>
-  invoke<string>("get_transformed_media", { path, transform });
 
 export const recordView = (path: string) =>
   invoke<void>("record_view", { path });

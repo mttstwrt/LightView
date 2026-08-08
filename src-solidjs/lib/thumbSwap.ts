@@ -7,7 +7,7 @@
 // skeleton flash. A 404 (cold tier) leaves the old image up and reports a miss
 // so the caller can queue generation. Extracted from JustifiedGrid's zoom-swap
 // logic; used by both grids for the cheap-rung → target-tier upgrade
-// (docs/scrollLoadingRedesign.md, Phase 2).
+// (docs/decisions/0007-two-zone-render-window.md).
 //
 // In-flight decodes are tracked per path so they can be cancelled when a cell
 // is evicted or the gallery resets — otherwise each abandoned upgrade keeps an

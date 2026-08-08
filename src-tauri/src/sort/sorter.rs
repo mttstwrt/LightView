@@ -1,3 +1,15 @@
+//! Sort fields and the `SELECT ... ORDER BY` that serves the grid.
+//!
+//! One query returns everything the grid needs for first paint, including the
+//! ~25-byte ThumbHash blob joined from `thumbnails`. Inlining that is what lets
+//! the remote web client paint a recognisable blurry grid before any thumbnail
+//! request goes out, instead of a round-trip per cell.
+//!
+//! A filtered path list is bound as a single JSON parameter and expanded with
+//! `json_each`, not spliced into a generated `IN (?, ?, …)`. One prepared
+//! statement then serves every filter size, so the statement cache stays warm
+//! instead of being invalidated by each new result count.
+
 use serde::{Deserialize, Serialize};
 
 use crate::cache::db::{CacheDb, CacheError};
@@ -30,6 +42,10 @@ pub struct SortedItem {
     pub file_size: i64,
     pub media_type: String,
     pub rating: Option<u8>,
+    /// Colour label, lowercased. Rides along here for the same reason `rating`
+    /// does — the grid draws it per cell, so a per-item round-trip would be one
+    /// request per visible thumbnail.
+    pub color_label: Option<String>,
     pub last_viewed: Option<i64>,
     pub date_added: Option<i64>,
     pub last_rated: Option<i64>,
@@ -97,7 +113,7 @@ impl CacheDb {
             order_clause.push_str(&Self::order_expr(sub_field, sub_order));
         }
 
-        let cols = "m.path, m.date_taken, m.file_size, m.media_type, m.rating, m.last_viewed, m.date_added, m.last_rated, m.duration, m.width, m.height, t.thumbhash";
+        let cols = "m.path, m.date_taken, m.file_size, m.media_type, m.rating, m.color_label, m.last_viewed, m.date_added, m.last_rated, m.duration, m.width, m.height, t.thumbhash";
         let sql = if filter_paths.is_some() {
             format!(
                 "SELECT {} FROM media_meta m
@@ -133,6 +149,21 @@ impl CacheDb {
 
     /// Update only the rating for a file in the cache.
     /// Also sets `last_rated` to the current timestamp.
+    /// Mirror a companion's colour label into the index.
+    ///
+    /// Unlike [`Self::update_rating`] there is no companion timestamp to carry
+    /// across — a label is a flag, not an event — so this is a single column
+    /// write. Values are stored lowercase so `color:Red` and `color:red` are
+    /// the same query.
+    pub fn update_color_label(&self, path: &str, label: Option<&str>) -> Result<(), CacheError> {
+        let normalized = label.map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty());
+        self.conn().execute(
+            "UPDATE media_meta SET color_label = ?1 WHERE path = ?2",
+            rusqlite::params![normalized, path],
+        )?;
+        Ok(())
+    }
+
     pub fn update_rating(&self, path: &str, rating: Option<u8>) -> Result<(), CacheError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -195,21 +226,25 @@ impl CacheDb {
     }
 }
 
+/// Positional, so it must stay in step with `cols` in `get_sorted_items` —
+/// inserting a column there without shifting every index below silently moves
+/// every field one place along.
 fn map_sorted_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
     use base64::Engine;
-    let thumbhash: Option<Vec<u8>> = row.get(11)?;
+    let thumbhash: Option<Vec<u8>> = row.get(12)?;
     Ok(SortedItem {
         path: row.get(0)?,
         date_taken: row.get(1)?,
         file_size: row.get(2)?,
         media_type: row.get(3)?,
         rating: row.get(4)?,
-        last_viewed: row.get(5)?,
-        date_added: row.get(6)?,
-        last_rated: row.get(7)?,
-        duration: row.get(8)?,
-        width: row.get(9)?,
-        height: row.get(10)?,
+        color_label: row.get(5)?,
+        last_viewed: row.get(6)?,
+        date_added: row.get(7)?,
+        last_rated: row.get(8)?,
+        duration: row.get(9)?,
+        width: row.get(10)?,
+        height: row.get(11)?,
         thumbhash: thumbhash.map(|h| base64::engine::general_purpose::STANDARD.encode(h)),
     })
 }
