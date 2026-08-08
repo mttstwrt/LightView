@@ -175,7 +175,16 @@ forever. Mitigations, all three needed: `pending` is keyed on the temp file
 name rather than the full path; the worker fails the job after 20 min with no
 result; and the server tracks `progressed_at` separately from `updated_at` and
 fails a job that goes 30 min without its counts moving. Grep the worker log for
-`plugin result for unknown path`. Full contract in [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md).
+`plugin result for unknown path`. **First check the installed plugin is
+current** — taggers predating `1eaa7ed` read stdin to EOF before loading their
+model, which deadlocks past 64 by construction and is the common cause; the
+tell is that no VRAM is ever allocated. Nothing updates a plugin copied into
+`data_dir()/plugins`, so a rebuilt worker can still be running a year-old
+script. Neither timeout is watertight either — the
+worker's silence timer is refreshed by results it could not match, and the
+server's no-progress deadline is only checked in `reap()`, which the heartbeat
+path never calls; see [`docs/todo.md`](docs/todo.md). Full contract in
+[`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md).
 
 Notes: the *server itself* also runs jobs when plugins are installed in **its**
 `data_dir()/plugins` (same `target/debug/data/plugins/` when server and worker

@@ -214,7 +214,42 @@ side effect of "making plugins better."
 
 ---
 
-## 6. Suggested first step
+## 6. Chosen direction
+
+The tracks above are the analysis; this is what was actually decided, recorded
+here so the next reader does not re-litigate it. Open items are tracked in
+[`../todo.md`](../todo.md).
+
+**Per-gallery enablement first (Track A), extended to cover the built-in
+views.** Enabling a view and generating its thumbnails become the same setting,
+so a gallery browsed only in the justified layout stops paying for square
+tiers. This is the whole near-term answer to "the square grid costs gigabytes I
+don't need" and it requires no plugin machinery.
+
+**Plugin UI is host-rendered and declarative, not an iframe.** Plugins describe
+panels, forms and actions as JSON in the manifest — `settings_schema` made real
+— and the host renders them in Solid. Track C's sandboxed iframe remains the
+fallback for displays a schema cannot express, but it is not the default
+mechanism: it is a versioned message protocol and a plugin lifecycle to
+maintain forever, and the motivating case (naming recognised faces) does not
+need one. That case needs a *host* surface for naming and merging
+plugin-emitted clusters, which any grouping plugin can feed.
+
+**New views are built native; a view-module API waits for a second consumer.**
+The infinite-canvas view lands as core code alongside the grid, justified and
+map views. Extracting a view API from one implementation would freeze a guess;
+extract it when the canvas has shipped and something else wants the same
+contract. Section 3 above still holds — the core views do not get routed
+through whatever that API turns out to be.
+
+**Native `.so`/`.dll` view plugins are rejected.** Layout runs in a webview, and
+the LAN web client cannot load a host dynamic library at all, so a dylib view
+would exist on the desktop only. Handing the host layout results over IPC
+instead keeps the browser working but puts a round trip inside the scroll loop.
+A cargo feature per view was also rejected: it gives up runtime availability and
+multiplies the single Docker image the project ships.
+
+## 7. Suggested first step
 
 If we pursue this, start with **Track A**, because it is self-contained, low-risk, and
 immediately useful, and it forces the "available vs. enabled" split that every later track
