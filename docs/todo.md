@@ -48,14 +48,40 @@ naming arbitrary filesystem paths for a worker to download. Widen the
 `type:image AND NOT has::plugin.<prefix>` and would keep excluding videos even
 after the backend stops doing so.
 
-One thing to settle before enabling it rather than after: `?fit=` only applies
-to `jpg`/`png`/`webp` (`is_fit_resizable`), so a video downloads whole, and the
-worker's disk bound is a count of 64 files, not a byte budget — 64 videos is
-plausibly tens of gigabytes across the wire and onto the worker's disk. The
-alternative is extracting frames server-side and sending those as images, which
-is cheap on the wire and reuses `pipeline/video.rs`, but puts decode work back
-on the weak machine the remote worker exists to spare. Worth deciding
-deliberately; the count-based bound is not safe for video either way.
+**The server extracts the frames, and how many is adjustable.** Shipping whole
+videos was the alternative and is rejected: `?fit=` only applies to
+`jpg`/`png`/`webp` (`is_fit_resizable`), so a video would transfer whole, and
+the worker's disk bound is a count of 64 files rather than a byte budget —
+64 videos is plausibly tens of gigabytes on the wire and on disk. Frames are
+images, which makes that bound safe again and costs a few hundred KB per clip.
+Sampling a handful of frames is cheap enough that the weak-server argument does
+not apply; decoding every frame would be a different matter.
+
+`pipeline/video.rs` already has the parts: `probe()` for duration (cached),
+`-ss` seeking in `run_frame`, scaling inside the filter graph, display-matrix
+rotation, and timeouts on every invocation. `extract_frame` needs to take a
+timestamp instead of choosing one. Mirror the sampling the plugins do today —
+`VIDEO_FRAME_SAMPLES = 5`, evenly spaced across 5%–95% of duration — as the
+default for the adjustable count, so behaviour does not change silently on the
+day this lands.
+
+Merging is mostly free, and one part is not. The plugins aggregate frames by
+taking an element-wise maximum of the score vectors and thresholding once, and
+because `max(s) > T` exactly when some `s > T`, a plain union of per-frame tag
+sets reproduces today's general and character tags precisely. `rating:` is the
+exception: it is an argmax over the rating scores, so a union would yield up to
+five ratings where there is currently one. The per-frame `rating_scores` ride
+along in the result `meta` already, so the host can reproduce the argmax over
+the per-frame maxima — but it has to be done deliberately.
+
+The payoff beyond fixing video is that plugins stop knowing what a video is.
+`is_video`, `predict_video`, `get_video_duration`, the plugin-side
+`extract_frame` and the ffmpeg dependency itself all leave every plugin, which
+is worth having before the taggers move to their own repository. That argues
+for converging the desktop path onto the same host-side extraction rather than
+keeping plugin-side sampling for local runs and server-side sampling for remote
+ones — two policies that would quietly disagree per plugin. The frame edge
+should come from the same manifest-declared input size as still images.
 
 ## Nothing updates an installed plugin, and a stale one deadlocks silently
 
