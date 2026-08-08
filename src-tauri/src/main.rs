@@ -398,6 +398,26 @@ fn main() {
             commands::settings::set_render_config,
             commands::settings::open_with,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Closing the window used to take the process straight down. That
+            // was *nearly* fine — companion writes are atomic and the WAL
+            // recovers on the next open — but the buffered tier-access marks
+            // died with it, so the zoom thumbnails the user had just been
+            // looking at came back cold to the next eviction pass. See
+            // `close_gallery_impl` for the full accounting.
+            //
+            // `block_on` is correct here rather than a spawn: this is the last
+            // thing the process does, and the flush has to finish before the
+            // runtime goes away.
+            if let tauri::RunEvent::Exit = event {
+                let state = app_handle.state::<AppState>();
+                if let Err(e) = tauri::async_runtime::block_on(
+                    commands::gallery::close_gallery_impl(&state),
+                ) {
+                    log::warn!("close on exit failed: {e}");
+                }
+            }
+        });
 }

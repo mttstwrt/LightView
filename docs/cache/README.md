@@ -81,7 +81,11 @@ serializes them; the pool hands each request one of N (2–6, from
 `available_parallelism`) so grid reads fan out.
 
 The pool's connections **block WAL checkpointing**, which is why
-`close_gallery` drops them *before* checkpointing the writer.
+`close_gallery_impl` drops them *before* checkpointing the writer. That function
+is also the process's shutdown path — the desktop runs it on exit and
+`lightview-headless` on SIGTERM — because it is the only place the buffered
+tier-access marks get landed. See
+[`architecture.md`](../architecture.md#shutdown).
 
 ### PRAGMA choices
 
@@ -115,29 +119,25 @@ To add a migration:
 
 `SCHEMA_VERSION` needs no edit; it follows.
 
-### Legacy detection, and why it must under-report
+### A database with no version stamp
 
-`detect_legacy_version` only runs when `gallery_meta.schema_version` is absent —
-a database created before the versioning scheme existed. It walks schema
-features in version order and returns the last one fully present.
+`run_migrations` treats "no `schema_version` in `gallery_meta`" as version 0 and
+handles it in one branch: apply `BASE_SCHEMA` (every statement is
+`IF NOT EXISTS`, so it is a no-op on a populated database), claim v1, and let
+the loop re-run every migration.
 
-The asymmetry to understand: `run_migrations` **skips every migration at or
-below the version returned**. So
+There used to be a ten-rung `detect_legacy_version` ladder that probed for
+schema features and *guessed* an unstamped database's version. Guessing is all
+downside: the loop skips everything at or below the version it is handed, so an
+over-estimate silently leaves tables uncreated — the exact failure
+[decision 0003](../decisions/0003-derive-schema-version-from-migrations.md)
+records. Under-estimating costs one idempotent re-run. The ladder was deleted
+once its premise was confirmed dead: versioning has been in place since v1 of
+the schema, so no unstamped database exists.
 
-- under-reporting is harmless — migrations re-run, and they are idempotent;
-- over-reporting silently leaves tables uncreated.
-
-That is precisely the bug the old code had. The ladder's last actual check is
-`gif_atlas` (v10), but it returned the `SCHEMA_VERSION` constant, so once that
-constant moved past 10 an unstamped database would be stamped 14/15 without
-ever creating the justified-tier tables. The ladder now returns
-`MAX_DETECTABLE_VERSION` (10), and `legacy_detection_never_over_reports`
-guards it. **Extending the ladder is optional; raising its return value beyond
-what it verifies is not.**
-
-`run_migrations` also warns if the final version does not equal
-`SCHEMA_VERSION`. The only way to land short is a database stamped ahead of
-this build — opened by a newer LightView, then downgraded.
+`run_migrations` still warns if the final version does not equal
+`SCHEMA_VERSION`. The only way to land short is a database stamped ahead of this
+build — opened by a newer LightView, then downgraded.
 
 ## Tables
 

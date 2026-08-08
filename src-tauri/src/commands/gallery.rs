@@ -910,13 +910,62 @@ pub async fn open_gallery(
 /// Close the current gallery and release resources.
 #[tauri::command]
 pub async fn close_gallery(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    close_gallery_impl(&state).await
+}
+
+/// Release everything tied to the open gallery, in an order that matters.
+///
+/// Also the process's shutdown path: the desktop calls it on exit and
+/// `lightview-headless` calls it on SIGTERM/SIGINT, because nothing else
+/// flushes the buffered tier-access marks (see below).
+///
+/// What an abrupt kill would and would not cost, since that decides what this
+/// function has to do:
+///
+/// * **Companion files are already safe.** Writes go to a temp file in the
+///   target directory and are renamed into place, so a reader never sees a
+///   partial one. If we die between writing a companion and re-indexing it,
+///   `index_state` still holds the old mtime and the next gallery open
+///   re-indexes that file. Nothing to do here.
+/// * **The WAL is already safe.** SQLite recovers it on the next open. The
+///   checkpoint below is tidiness — a smaller `-wal` beside the database — not
+///   correctness.
+/// * **Buffered tier-access marks are not safe.** The thumbnail serve path
+///   reads through a read-only pool and cannot write, so "this row was served"
+///   accumulates in `AppState::pending_tier_accesses` and is only landed by
+///   `enforce_tier_budget`, which runs when a capped tier is *written*. Exit
+///   without flushing and the zoom thumbnails you were just looking at go back
+///   to the eviction pass looking maximally cold. That is the one real loss,
+///   and the reason this function flushes before it closes anything.
+pub async fn close_gallery_impl(state: &AppState) -> Result<(), String> {
     // Stop filesystem watcher first
-    stop_fs_watcher(&state);
+    stop_fs_watcher(state);
 
     // Retire the idle backfill worker (it exits at its next generation check).
     state
         .idle_generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    // Land the buffered access marks while the writer is still open. Ordering:
+    // this must happen before the connection is dropped, and it deliberately
+    // does *not* evict — shutdown is the wrong moment to spend seconds in a
+    // DELETE, and the next write will enforce the budget anyway.
+    {
+        let db = state.cache_db.lock().await;
+        if let Some(db) = db.as_ref() {
+            for tier in crate::cache::thumbnails::ThumbTier::ALL {
+                if !crate::cache::thumbnails::is_lru_capped(tier) {
+                    continue;
+                }
+                let touched = state.take_tier_accesses(tier);
+                if let Err(e) =
+                    crate::cache::thumbnails::touch_accessed(db.conn(), tier, &touched)
+                {
+                    log::warn!("{} tier access flush on close failed: {e}", tier.as_segment());
+                }
+            }
+        }
+    }
 
     let gallery_path = {
         let current = state.current_gallery.read().await;

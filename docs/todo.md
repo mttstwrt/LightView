@@ -38,19 +38,6 @@ Re-indexing rebuilds the media and tag indexes but does not kick off background
 thumbnail regeneration, so a re-index after a bulk external edit leaves stale
 thumbnails until something else asks for them.
 
-## `close_gallery` is never called
-
-The frontend switches galleries by calling `open_gallery` again. That is mostly
-fine — `start_fs_watcher` retires the previous watcher itself, and the old
-`CacheDb` and connection pool are dropped when replaced. The one thing only
-`close_gallery` does is drop the read-only pool *and then* checkpoint the WAL,
-so switching galleries leaves the previous gallery's WAL to SQLite's own
-auto-checkpoint. Minor, but the fix is to call the command on switch, not to
-delete it.
-
-`reindex_gallery` has no caller either; see the entry above, which is the
-larger of its two problems.
-
 ## Memory-pressure polling 403s on the web client
 
 `lib/memoryPressure.ts` polls `get_memory_status`, which is not in the
@@ -75,15 +62,6 @@ mechanism, but it is a migration touching every table and every query, and the
 current machinery works and is tested. Recorded as a structural observation, not
 a recommendation — see
 [decision 0001](decisions/0001-one-cache-per-gallery.md).
-
-## `detect_legacy_version` is probably dead
-
-It only runs for databases with no `schema_version` stamp, and versioning has
-been in place since v1 of the schema. The ladder is now cheap and correct so
-there is no cost to keeping it, but if it could be established that no such
-database exists in the wild, deleting it would remove the whole class of
-over-reporting bug that [decision 0003](decisions/0003-derive-schema-version-from-migrations.md)
-was written about.
 
 ## Smaller items
 

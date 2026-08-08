@@ -184,6 +184,32 @@ landing-zone warms, the idle backfill — lands on that same pool, which is why
 the frontend gates speculation behind "nothing visible is outstanding". There
 is no second pool to escape to.
 
+## Shutdown
+
+Both binaries run `commands::gallery::close_gallery_impl` on the way out — the
+desktop from Tauri's `RunEvent::Exit`, `lightview-headless` from a SIGTERM or
+SIGINT handler (SIGTERM being what `docker stop` sends).
+
+It is worth knowing what that does and does not buy, because most of the
+obvious answers are already handled elsewhere:
+
+- **Companion files need nothing.** Writes go to a temp file in the target
+  directory and are renamed into place, so no reader sees a partial one. Dying
+  between writing a companion and re-indexing it is also safe: `index_state`
+  still holds the old mtime, so the next gallery open re-indexes that file.
+- **The WAL needs nothing.** SQLite recovers it on the next open. The checkpoint
+  is tidiness, not correctness.
+- **Buffered tier-access marks do need it.** The thumbnail serve path holds a
+  read-only connection and cannot write, so "this row was served" accumulates in
+  `AppState::pending_tier_accesses` and is otherwise landed only by
+  `enforce_tier_budget`, which runs when a capped tier is written. Exiting
+  without flushing sends the zoom thumbnails you were just looking at back to
+  the next eviction pass looking maximally cold.
+
+The shutdown path deliberately flushes without evicting: exit is the wrong
+moment to spend seconds in a `DELETE`, and the next write enforces the budget
+anyway.
+
 ## Build shapes
 
 Three binaries come out of `src-tauri/`:

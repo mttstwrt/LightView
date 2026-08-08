@@ -1,4 +1,4 @@
-//! Connection setup, the migration ladder, and the maintenance operations that
+//! Connection setup, the migration list, and the maintenance operations that
 //! span every table.
 //!
 //! Two rules here are load-bearing and easy to break silently. First,
@@ -41,10 +41,10 @@ pub enum CacheError {
 /// Current schema version — the highest version in [`MIGRATIONS`].
 ///
 /// Derived rather than hand-maintained: the two drifted once already (the
-/// constant sat at 14 while a v15 migration existed), and the only consumer is
-/// [`detect_legacy_version`], where a too-high value silently *skips*
-/// migrations for the database it is applied to. A `const fn` keeps them
-/// welded together at compile time.
+/// constant sat at 14 while a v15 migration existed), and the consumer at the
+/// time used it as "this database is fully up to date" — which silently
+/// *skipped* migrations. A `const fn` keeps them welded together at compile
+/// time.
 const SCHEMA_VERSION: u32 = latest_migration_version();
 
 const fn latest_migration_version() -> u32 {
@@ -374,6 +374,9 @@ fn set_schema_version(conn: &rusqlite::Connection, version: u32) -> Result<(), C
     Ok(())
 }
 
+/// Only the migration tests need this now — the version-0 branch no longer
+/// probes the schema, it just applies the idempotent base and re-runs.
+#[cfg(test)]
 fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -384,70 +387,25 @@ fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
         > 0
 }
 
-fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
-    conn.execute(&format!("SELECT {column} FROM {table} LIMIT 0"), [])
-        .is_ok()
-}
-
-/// Highest version [`detect_legacy_version`] can recognize. Everything past it
-/// is applied by re-running migrations, which is safe because they are
-/// idempotent (`CREATE TABLE IF NOT EXISTS`, duplicate-column-tolerant
-/// `ALTER`). Extending the ladder is therefore optional — but returning a
-/// version *higher* than what was actually verified is not: the migration loop
-/// skips everything at or below the returned number, so an over-estimate
-/// silently leaves tables uncreated. This is what the old `SCHEMA_VERSION`
-/// return did once the constant outran the ladder's last check.
-const MAX_DETECTABLE_VERSION: u32 = 10;
-
-/// Best-effort version stamp for a database created before the migration
-/// system existed (`gallery_meta.schema_version` absent). Walks the schema
-/// features in version order and returns the last one fully present.
-///
-/// Only reachable for caches predating the versioning scheme; every database
-/// written since is stamped. Under-reporting is harmless (migrations re-run
-/// idempotently) — see [`MAX_DETECTABLE_VERSION`].
-fn detect_legacy_version(conn: &rusqlite::Connection) -> u32 {
-    // (version introduced by the feature, is the feature present?)
-    let ladder = [
-        (1, has_table(conn, "media_meta")),
-        (2, has_column(conn, "thumbnails", "format")),
-        (3, has_column(conn, "media_meta", "last_viewed")),
-        (4, has_column(conn, "media_meta", "last_rated")),
-        (5, has_column(conn, "thumbnails", "thumbhash")),
-        (6, has_table(conn, "thumbnails_micro")),
-        (7, has_column(conn, "media_meta", "gps_lat")),
-        (8, has_table(conn, "not_duplicates")),
-        (9, has_table(conn, "remote_devices")),
-        (MAX_DETECTABLE_VERSION, has_table(conn, "gif_atlas")),
-    ];
-
-    let mut version = 0;
-    for (introduced_in, present) in ladder {
-        // The first gap ends the walk: schema features land in order, so a
-        // missing one means everything after it is missing too.
-        if !present {
-            break;
-        }
-        version = introduced_in;
-    }
-    version
-}
-
 /// Run all pending migrations to bring the database up to `SCHEMA_VERSION`.
 fn run_migrations(conn: &rusqlite::Connection) -> Result<(), CacheError> {
     let mut version = get_schema_version(conn);
 
-    // Handle databases created before the migration system existed.
+    // No stamp: either a brand-new file, or one predating the versioning
+    // scheme. Both are handled the same way — apply the base schema (every
+    // statement is `IF NOT EXISTS`, so it is a no-op on a populated database),
+    // claim v1, and let the loop below re-run every migration.
+    //
+    // This replaced a ten-rung feature-detection ladder that tried to *guess*
+    // an unstamped database's version. Guessing is all downside here: the loop
+    // skips everything at or below the version it is handed, so an
+    // over-estimate silently leaves tables uncreated — which is exactly the bug
+    // decision 0003 was written about. Under-estimating costs one idempotent
+    // re-run of migrations that mostly do nothing, once, on a database that
+    // almost certainly does not exist.
     if version == 0 {
-        let detected = detect_legacy_version(conn);
-        if detected == 0 {
-            // Fresh database — create all base tables.
-            conn.execute_batch(BASE_SCHEMA)?;
-            version = 1;
-        } else {
-            // Existing database without a version stamp.
-            version = detected;
-        }
+        conn.execute_batch(BASE_SCHEMA)?;
+        version = 1;
         set_schema_version(conn, version)?;
     }
 
@@ -679,21 +637,6 @@ mod tests {
             prev = migration.version;
         }
         assert_eq!(SCHEMA_VERSION, prev, "SCHEMA_VERSION must track MIGRATIONS");
-    }
-
-    /// The legacy ladder must never claim a version it did not verify: the
-    /// migration loop skips everything at or below what it returns, so an
-    /// over-estimate leaves tables uncreated. A fully-migrated database still
-    /// reports only the last feature the ladder actually knows about.
-    #[test]
-    fn legacy_detection_never_over_reports() {
-        let (_tmp, db) = open_db();
-        assert_eq!(detect_legacy_version(db.conn()), MAX_DETECTABLE_VERSION);
-        assert!(MAX_DETECTABLE_VERSION <= SCHEMA_VERSION);
-
-        // An empty database has none of the ladder's features.
-        let blank = rusqlite::Connection::open_in_memory().unwrap();
-        assert_eq!(detect_legacy_version(&blank), 0);
     }
 
     /// Re-running every migration over an already-current database must be a
