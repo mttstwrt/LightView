@@ -1,7 +1,7 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show } from "solid-js";
 import { settings } from "../../stores/settingsStore";
-import { selectionMode } from "../../stores/galleryStore";
-import { mediaUrl, gifAtlasUrl, type ThumbTier } from "../../lib/ipc";
+import { selectionMode, colorLabelByPath } from "../../stores/galleryStore";
+import { mediaUrl, gifAtlasUrl, COLOR_LABEL_HEX, type ColorLabel, type ThumbTier } from "../../lib/ipc";
 import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
 import { LONG_PRESS_MS, TAP_SLOP_PX, suppressNextClick } from "../../lib/touch";
@@ -132,6 +132,9 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
     const dot = name.lastIndexOf(".");
     return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
   };
+
+  const colorLabel = () =>
+    (colorLabelByPath().get(props.path) as ColorLabel | undefined) ?? null;
 
   const isVideo = () => VIDEO_EXTS.has(ext());
 
@@ -551,6 +554,24 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       >
         <Show when={props.selected}>&#10003;</Show>
       </div>
+
+      {/* Colour label — a dot in the corner opposite the selection check, so a
+          labelled cell reads at a glance without opening the menu. Read from
+          the store rather than threaded through props, like `selectionMode`
+          above: both grids render this component and neither has to know. */}
+      <span
+        class="absolute top-1.5 right-1.5 w-3 h-3 rounded-full"
+        style={{
+          "background-color": colorLabel() ? COLOR_LABEL_HEX[colorLabel()!] : "transparent",
+          display: colorLabel() ? undefined : "none",
+          // A white ring plus a dark shadow, matching the selection check. A
+          // thin dark ring alone was not enough: a green dot on a green photo
+          // disappeared into it, which is precisely the case the marker exists
+          // for.
+          border: "1.5px solid rgba(255, 255, 255, 0.9)",
+          "box-shadow": "0 0 0 1px rgba(0, 0, 0, 0.45)",
+        }}
+      />
 
       {/* Media badge — always present, toggled via display */}
       <span

@@ -14,8 +14,8 @@
 import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { safeListen as listen, isWeb, hasTouch } from "../../lib/runtime";
-import { rateItem } from "../../stores/galleryStore";
-import { addUserTag, removeUserTag, regenerateThumbnail, addUserTagBatch, setRatingBatch, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, enqueueTaggingJob, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
+import { rateItem, setItemColorLabel, colorLabelByPath } from "../../stores/galleryStore";
+import { addUserTag, removeUserTag, regenerateThumbnail, addUserTagBatch, setRatingBatch, setColorLabelBatch, COLOR_LABELS, COLOR_LABEL_HEX, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, enqueueTaggingJob, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
 import type { MovedFile } from "../../lib/ipc";
 import { isVideoPath } from "../../lib/mediaExts";
 import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
@@ -42,7 +42,7 @@ interface ContextMenuProps {
   hideViewOption?: boolean;
 }
 
-type SubMenu = "tag" | "rating" | "openWith" | "plugins" | null;
+type SubMenu = "tag" | "rating" | "color" | "openWith" | "plugins" | null;
 
 export function ContextMenu(props: ContextMenuProps) {
   const [subMenu, setSubMenu] = createSignal<SubMenu>(null);
@@ -143,6 +143,25 @@ export function ContextMenu(props: ContextMenuProps) {
       props.onClose();
     } catch (err) {
       console.error("Failed to set rating:", err);
+    }
+  };
+
+  const currentColorLabel = () =>
+    props.state ? colorLabelByPath().get(props.state.path) ?? null : null;
+
+  const handleSetColorLabel = async (label: string | null) => {
+    if (!props.state) return;
+    try {
+      if (isBatchContext()) {
+        await setColorLabelBatch(batchPaths(), label);
+      } else {
+        // setItemColorLabel keeps sortedItems in sync, not just the DB — so a
+        // `color:` filter re-evaluates without a refetch.
+        await setItemColorLabel(props.state.path, label);
+      }
+      props.onClose();
+    } catch (err) {
+      console.error("Failed to set colour label:", err);
     }
   };
 
@@ -405,6 +424,10 @@ export function ContextMenu(props: ContextMenuProps) {
                 label={isBatchContext() ? `Rate ${props.selectedPaths!.size} Items` : "Set Rating"}
                 onClick={() => setSubMenu("rating")}
               />
+              <MenuItem
+                label={isBatchContext() ? `Label ${props.selectedPaths!.size} Items` : "Colour Label"}
+                onClick={() => setSubMenu("color")}
+              />
             </Show>
             <Divider />
             <Show when={capabilities().metadataWrite && !isBatchContext()}>
@@ -489,6 +512,34 @@ export function ContextMenu(props: ContextMenuProps) {
               )}
             </For>
             <MenuItem label="Clear Rating" onClick={() => handleSetRating(0)} />
+            <Divider />
+            <MenuItem label="Back" onClick={() => setSubMenu(null)} />
+          </Show>
+
+          {/* Colour label sub-menu */}
+          <Show when={subMenu() === "color"}>
+            <div class="px-3 py-2 text-neutral-500">Colour Label</div>
+            <For each={COLOR_LABELS}>
+              {(name) => (
+                <button
+                  type="button"
+                  class="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-neutral-800"
+                  onClick={() => handleSetColorLabel(name)}
+                >
+                  <span
+                    class="w-3 h-3 rounded-full shrink-0"
+                    style={{ "background-color": COLOR_LABEL_HEX[name] }}
+                  />
+                  <span class="capitalize">{name}</span>
+                  {/* Only meaningful for a single item; a mixed selection has
+                      no one current value to tick. */}
+                  <Show when={!isBatchContext() && currentColorLabel() === name}>
+                    <span class="ml-auto text-neutral-400">✓</span>
+                  </Show>
+                </button>
+              )}
+            </For>
+            <MenuItem label="Clear Label" onClick={() => handleSetColorLabel(null)} />
             <Divider />
             <MenuItem label="Back" onClick={() => setSubMenu(null)} />
           </Show>

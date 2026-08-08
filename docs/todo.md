@@ -23,15 +23,6 @@ small policy differences that make a naive merge unsafe.
 differences and proposes a four-step extraction ordered smallest-risk-first.
 Each step needs browser verification, not just `tsc`.
 
-## Colour-label filtering is silently inert
-
-`color_label` lives only in the companion file, so `FilterExpr::ColorLabel`
-compiles to a tautology and the term is ignored rather than rejected. Fixing it
-means indexing the column into `media_meta` at scan time — a migration plus a
-change to the indexer. Until then the parser accepts a query the evaluator
-cannot honour, which is the worst of the available states. See
-[`query/`](query/README.md).
-
 ## `reindex_gallery` does not regenerate thumbnails
 
 Re-indexing rebuilds the media and tag indexes but does not kick off background

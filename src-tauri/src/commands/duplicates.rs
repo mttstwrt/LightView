@@ -314,6 +314,9 @@ pub async fn merge_duplicates_impl(
         if let Some(db) = db.as_ref() {
             let _ = db.reindex_tags_for_file(&plan.keeper, &companion);
             let _ = db.update_rating(&plan.keeper, rating);
+            // Same reason as the rating: the merge wrote the companion, and the
+            // filter reads the column.
+            let _ = db.update_color_label(&plan.keeper, plan.color_label.as_deref());
             if let Ok(counts) = db.query_all_tag_counts() {
                 state.autocomplete.refresh(counts).await;
             }

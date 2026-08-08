@@ -11,8 +11,9 @@
 //!
 //! The consequence to keep in mind when extending the language: **a term is
 //! expressible only if the value it tests is indexed.** Tags come from
-//! `tag_index` via `EXISTS`; everything else is a column on `media_meta`.
-//! `ColorLabel` is the one term that has no column, and it is inert.
+//! `tag_index` via `EXISTS`; everything else is a column on `media_meta`. A
+//! field that lives only in the companion cannot be filtered on without first
+//! being mirrored into a column — which is what `color_label` had to do.
 //!
 //! Literals are pushed onto `params` and referenced positionally, never
 //! interpolated — filter strings come from the user, and on the web client
@@ -92,19 +93,18 @@ pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
         }
 
         FilterExpr::ColorLabel { value } => {
-            // Inert, and deliberately so rather than an error: `color_label`
-            // lives only in the companion file, and this compiler's whole
-            // premise is that a filter runs in SQLite over `media_meta` without
-            // opening a single sidecar. Honouring the term means indexing the
-            // column at scan time — a migration plus an indexer change, tracked
-            // in docs/todo.md — not reading companions from here.
-            //
-            // The parser still accepts `color:red`, so the term widens the
-            // result set instead of narrowing it. That is the wrong behaviour;
-            // it is written down here and in the docs so it is a known gap
-            // rather than a mystery.
-            let _ = value;
-            "1 = 1".to_string()
+            // `color:none` asks for the *absence* of a label, which is a
+            // different predicate rather than a label that happens to be
+            // spelled "none" — and is the form worth having, since "which of
+            // these did I never triage?" is the question a colour workflow
+            // actually asks.
+            if value.eq_ignore_ascii_case("none") {
+                return "m.color_label IS NULL".to_string();
+            }
+            // Stored lowercase by every write path, so the comparison is exact
+            // rather than `COLLATE NOCASE` — which would not use the index.
+            params.push(value.trim().to_lowercase());
+            format!("m.color_label = ?{}", params.len())
         }
 
         FilterExpr::GeoBbox { south, west, north, east } => {
@@ -204,6 +204,29 @@ mod tests {
         let sql = to_sql(&expr, &mut params);
         assert_eq!(sql, "(m.file_size IS NOT NULL AND m.file_size <= ?1)");
         assert_eq!(params, vec![(5 * 1024 * 1024).to_string()]);
+    }
+
+    /// The colour term compiles to a real predicate against the indexed
+    /// column. It used to be `1 = 1`, which silently *widened* a filter that
+    /// the user wrote to narrow it.
+    #[test]
+    fn test_to_sql_color_label() {
+        let expr = parse_filter("color:Red").unwrap();
+        let mut params = Vec::new();
+        assert_eq!(to_sql(&expr, &mut params), "m.color_label = ?1");
+        // Normalized on the way in, matching what every write path stores.
+        assert_eq!(params, vec!["red".to_string()]);
+    }
+
+    /// `color:none` is absence, not a label spelled "none" — and it binds no
+    /// parameter, so the surrounding expression's numbering must still line up.
+    #[test]
+    fn test_to_sql_color_label_none() {
+        let expr = parse_filter("color:none AND rating>=4").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert_eq!(sql, "(m.color_label IS NULL AND m.rating >= ?1)");
+        assert_eq!(params, vec!["4".to_string()]);
     }
 
     #[test]

@@ -10,7 +10,7 @@ import type {
   SortedItem,
 } from "../lib/types";
 import { loadPref, savePref } from "../lib/clientPrefs";
-import { setRating as setRatingIpc } from "../lib/ipc";
+import { setRating as setRatingIpc, setColorLabel as setColorLabelIpc } from "../lib/ipc";
 
 // ---------------------------------------------------------------------------
 // Gallery state
@@ -75,6 +75,16 @@ const mediaMetaByPath = createMemo(() => {
   return map;
 });
 
+/** Path → colour label, for the cell marker and the context menu's tick. A
+ *  memo rather than a scan per lookup: both callers ask once per rendered cell. */
+const colorLabelByPath = createMemo(() => {
+  const map = new Map<string, string>();
+  for (const item of sortedItems()) {
+    if (item.color_label) map.set(item.path, item.color_label);
+  }
+  return map;
+});
+
 // Group headers for the current sort/group
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 
@@ -121,6 +131,7 @@ export {
   durationByPath,
   aspectByPath,
   mediaMetaByPath,
+  colorLabelByPath,
   groups, setGroups,
   selectedPaths, setSelectedPaths,
   selectionMode,
@@ -146,6 +157,16 @@ export async function rateItem(path: string, rating: number) {
   );
   window.dispatchEvent(
     new CustomEvent("lightview:rating-changed", { detail: { path, rating } }),
+  );
+}
+
+/** Set a colour label and keep `sortedItems` in step, so a `color:` filter and
+ *  the cell marker update without a refetch — the same reason `rateItem`
+ *  exists rather than calling the IPC wrapper directly. */
+export async function setItemColorLabel(path: string, label: string | null) {
+  await setColorLabelIpc(path, label);
+  setSortedItems((items) =>
+    items.map((it) => (it.path === path ? { ...it, color_label: label } : it)),
   );
 }
 

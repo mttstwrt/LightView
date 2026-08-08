@@ -320,6 +320,29 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(tags::set_rating_batch_impl(app, a.paths, a.rating).await)
         }
 
+        // Colour label sits in the same tier as rating: it rewrites one field
+        // in a companion sidecar the client can already read, and touches
+        // nothing on the host. `null` clears it.
+        "set_color_label" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+                label: Option<String>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::set_color_label_impl(app, a.path, a.label).await)
+        }
+
+        "set_color_label_batch" => {
+            #[derive(Deserialize)]
+            struct A {
+                paths: Vec<String>,
+                label: Option<String>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::set_color_label_batch_impl(app, a.paths, a.label).await)
+        }
+
         // --- Gallery-wide tag management -----------------------------------
         // Still the metadata-write tier — these only rewrite the `user` tag
         // list inside companion sidecars, exactly like add/remove_user_tag —

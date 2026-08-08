@@ -258,7 +258,7 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
             }
         };
         let mut rating_stmt = match tx.prepare_cached(
-            "UPDATE media_meta SET rating = ?2, last_rated = ?3 WHERE path = ?1",
+            "UPDATE media_meta SET rating = ?2, last_rated = ?3, color_label = ?4 WHERE path = ?1",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -317,17 +317,29 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
                         let _ =
                             ins_stmt.execute(rusqlite::params![media_path_str, namespace, tag]);
                     }
-                    // Mirror the companion's rating into media_meta. The row is
-                    // keyed by absolute path, so after a gallery move/copy it
-                    // starts NULL even though the companion holds a rating.
+                    // Mirror the companion's rating and colour label into
+                    // media_meta. The row is keyed by absolute path, so after a
+                    // gallery move/copy it starts NULL even though the companion
+                    // holds both — and neither is filterable or sortable until
+                    // it is a column here.
                     let core = companion.meta.core.as_ref();
                     let rating = core.and_then(|c| c.rating);
                     let last_rated = core
                         .and_then(|c| c.date_rated.as_deref())
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|d| d.timestamp());
-                    let _ = rating_stmt
-                        .execute(rusqlite::params![media_path_str, rating, last_rated]);
+                    // Lowercased on the way in so `color:Red` and `color:red`
+                    // are one query; the companion keeps whatever it was given.
+                    let color_label = core
+                        .and_then(|c| c.color_label.as_deref())
+                        .map(|l| l.trim().to_lowercase())
+                        .filter(|l| !l.is_empty());
+                    let _ = rating_stmt.execute(rusqlite::params![
+                        media_path_str,
+                        rating,
+                        last_rated,
+                        color_label
+                    ]);
                     let _ = state_stmt.execute(rusqlite::params![media_path_str, companion_mtime]);
                     indexed += 1;
                 }

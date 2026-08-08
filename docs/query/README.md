@@ -48,6 +48,7 @@ rating>=4                                   rating comparison
 type:video                                  media type
 has::user                                   namespace is non-empty
 has:geo                                     has GPS coordinates
+color:red  color:none                       colour label (or the absence of one)
 date>=2024-01-01  date=2024  added<=2024-06 dates: taken / added / viewed
 width>=1920  height<=1080                   pixel dimensions
 size>=10mb  size<=500kb                     file size (b/kb/mb/gb)
@@ -75,19 +76,29 @@ over `tag_index`; everything else is a column comparison on `media_meta`.
 Filtering therefore runs entirely in SQLite over the index, and never opens a
 companion file. That is what makes it usable on a large gallery, and it is also
 the constraint that shapes the language: **a field is filterable only if it is
-indexed in `media_meta`.** Colour label is the standing exception — it lives
-only in the companion, so `ColorLabel` compiles to a tautology, and the term
-widens the result set instead of narrowing it. Making it work means adding a
-`color_label` column and indexing it at scan time; see
-[`todo.md`](../todo.md).
+indexed in `media_meta`.**
+
+Colour label is the worked example. It lives in the companion at
+`meta.core.color_label`, and for a long time `color:red` compiled to `1 = 1` —
+so a term the user wrote to *narrow* a search silently widened it. Fixing it was
+not a change to the evaluator but a change to what is indexed: a `color_label`
+column (schema v17, with a partial index, since most rows have none) plus a
+mirror in every path that writes the field. Values are lowercased on the way
+into the column so `color:Red` and `color:red` are one query and the comparison
+can use the index; the companion keeps whatever spelling it was given, because
+it is the record of intent rather than the query surface.
+
+`color:none` is the absence of a label rather than a label spelled "none" — it
+compiles to `IS NULL` and binds no parameter. "Which of these have I not triaged
+yet?" is the question a colour workflow actually asks.
 
 There was once a second, in-memory evaluator that walked companion files
-directly, and it was the only thing that could have honoured a colour label.
-Nothing ever called it. Keeping a parallel implementation of the language's
-semantics meant any divergence between the two was silent — and they had
-already diverged on exactly this term — so it was deleted rather than wired up.
-Evaluating a filter by opening every sidecar is the cost the tag index exists to
-remove.
+directly, and it was the only thing that could have honoured a colour label
+before the column existed. Nothing ever called it. Keeping a parallel
+implementation of the language's semantics meant any divergence was silent — and
+they had already diverged on exactly this term — so it was deleted rather than
+wired up. Evaluating a filter by opening every sidecar is the cost the tag index
+exists to remove.
 
 ## Sorting and grouping
 

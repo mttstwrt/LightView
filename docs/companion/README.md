@@ -58,6 +58,14 @@ That namespacing is what the filter language's `user::`, `auto::`, and
 `color_label`, `notes`, `media` (dimensions, duration, codec), and `location`
 (decimal degrees, WGS-84, optional altitude in metres).
 
+Two of those — `rating` and `color_label` — are also **mirrored into
+`media_meta`** columns, because filtering and sorting run in SQLite and never
+open a sidecar. The companion stays the source of truth: the mirror is written
+by every path that sets the field, and rebuilt from the companion by the
+indexing pass at gallery open, so deleting the cache loses nothing. Adding a
+third filterable `meta.core` field means adding a column and a mirror in the
+same places — see [`query/`](../query/README.md).
+
 ## Where the file lives
 
 `CompanionLocation` has two variants: `Alongside` (next to the media file) and

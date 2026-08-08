@@ -351,6 +351,19 @@ const MIGRATIONS: &[Migration] = &[
             DROP TABLE IF EXISTS file_hashes;
         ",
     },
+    // Colour label mirrored out of the companion, for the same reason `rating`
+    // is: filtering runs entirely in SQLite over `media_meta` and never opens a
+    // sidecar, so a field that is not a column here cannot be filtered on. The
+    // partial index skips the overwhelming majority of rows, which have no
+    // label.
+    Migration {
+        version: 17,
+        sql: "
+            ALTER TABLE media_meta ADD COLUMN color_label TEXT;
+            CREATE INDEX IF NOT EXISTS idx_meta_color ON media_meta(color_label)
+                WHERE color_label IS NOT NULL;
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.

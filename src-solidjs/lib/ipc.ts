@@ -320,8 +320,27 @@ export const removeUserTag = (path: string, tag: string) =>
 export const setRating = (path: string, rating: number) =>
   invoke<void>("set_rating", { path, rating });
 
+/** The colour labels the UI offers. Free-form on disk and in the filter, but
+ *  these five are what the swatches draw and what `color:<name>` expects —
+ *  matching the Lightroom/Bridge vocabulary users already have muscle memory
+ *  for. Stored and queried lowercase. */
+export const COLOR_LABELS = ["red", "yellow", "green", "blue", "purple"] as const;
+export type ColorLabel = (typeof COLOR_LABELS)[number];
+
+/** Hex per label, for the swatches and the cell corner marker. */
+export const COLOR_LABEL_HEX: Record<ColorLabel, string> = {
+  red: "#ef4444",
+  yellow: "#eab308",
+  green: "#22c55e",
+  blue: "#3b82f6",
+  purple: "#a855f7",
+};
+
 export const setColorLabel = (path: string, label: string | null) =>
   invoke<void>("set_color_label", { path, label });
+
+export const setColorLabelBatch = (paths: string[], label: string | null) =>
+  invoke<number>("set_color_label_batch", { paths, label });
 
 export const setNotes = (path: string, notes: string | null) =>
   invoke<void>("set_notes", { path, notes });

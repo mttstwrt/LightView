@@ -104,6 +104,8 @@ export interface SortedItem {
   file_size: number;
   media_type: string;
   rating: number | null;
+  /** Colour label, lowercase, or null. One of `COLOR_LABELS`. */
+  color_label: string | null;
   last_viewed: number | null;
   date_added: number | null;
   last_rated: number | null;
