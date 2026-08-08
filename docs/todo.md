@@ -21,6 +21,42 @@ servers stop colliding. Keep accepting a bare `lv_device` as a fallback and
 re-issue it under the new name on the next request, so no already-paired device
 has to pair again. See [`remote/`](remote/README.md).
 
+## Videos are dropped from every remote tagging job
+
+Sending mp4s to a remote worker produces no tags and no worker log line,
+because the job is never offered to a worker at all. `resolve_target`
+(`tagging/mod.rs`) intersects the candidate list with
+`SELECT path FROM media_meta WHERE media_type = 'image'`, and it does so for
+*both* target kinds — so explicitly selecting videos and right-clicking to tag
+them drops them just as surely as a filter would. When every candidate is a
+video the resolved list is empty, and the claim loop treats empty as "nothing
+left to tag" and marks the job **Done**. The UI therefore reports a job that
+succeeded, which is why this reads as silence rather than as an error.
+
+This never worked remotely: the filter arrived in `1eaa7ed`, the commit that
+introduced the worker. The desktop path (`commands/plugins.rs`) has no
+equivalent restriction, so native frame-splitting still works — which is what
+makes it look like a regression. The plugin side has been ready all along
+(`is_video` → `predict_video`).
+
+The intersection itself must stay. It is doing two jobs, and only one of them
+is wrong: it also confines a remote-supplied path list to files actually
+indexed in this gallery, which is the only thing stopping a paired device from
+naming arbitrary filesystem paths for a worker to download. Widen the
+`media_type` predicate; do not drop the join. The second half is
+`SettingsMenu.tsx`, where "Tag All Untagged" hardcodes
+`type:image AND NOT has::plugin.<prefix>` and would keep excluding videos even
+after the backend stops doing so.
+
+One thing to settle before enabling it rather than after: `?fit=` only applies
+to `jpg`/`png`/`webp` (`is_fit_resizable`), so a video downloads whole, and the
+worker's disk bound is a count of 64 files, not a byte budget — 64 videos is
+plausibly tens of gigabytes across the wire and onto the worker's disk. The
+alternative is extracting frames server-side and sending those as images, which
+is cheap on the wire and reuses `pipeline/video.rs`, but puts decode work back
+on the weak machine the remote worker exists to spare. Worth deciding
+deliberately; the count-based bound is not safe for video either way.
+
 ## Nothing updates an installed plugin, and a stale one deadlocks silently
 
 Plugins are *copied* into a worker's `data_dir()/plugins`, and nothing
