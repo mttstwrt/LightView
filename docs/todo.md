@@ -50,6 +50,57 @@ at `log::debug!` (`plugin/runner.rs`), so at the default level the one channel
 that would have explained this — the plugin saying nothing at all — is
 invisible. It should surface at info, or at least be replayed when a job fails.
 
+## Move the real plugins to their own repository
+
+`plugins/` should keep only `example-auto-tagger`; the three ML taggers (`wd`,
+`camie`, `pixai`) move out. They are 11 tracked files and ~200 KB, so this is
+not about size — it is that they are personal tools on their own release
+cadence, pinned to model repositories and CUDA stacks the gallery knows nothing
+about, and every one of them is a working demonstration of a protocol the host
+should be able to change without editing three Python scripts in the same
+commit.
+
+`example-auto-tagger` stays because it is load-bearing: dependency-free
+`python3`, and the thing the headless recipe in `CLAUDE.md`, the testing
+section of [`remote/worker-tagging.md`](remote/worker-tagging.md) and the
+`verify` skill all drive to exercise the job queue without ML.
+
+Two things make this more than a `git mv`:
+
+**The install path stops existing.** Today a plugin is installed by copying
+`../plugins/<name>` out of the checkout. With no local copy, that instruction
+has no source, so the install/update mechanism described above stops being a
+nice-to-have and becomes the only way to get a plugin onto a worker. These two
+items should land together or the split will strand every worker on whatever it
+last copied — which is exactly the failure that has already cost a debugging
+session.
+
+**The three taggers share a virtualenv that is not in the repo.** Each manifest
+runs `{plugin_dir}/../.venv/bin/python`, a sibling of the plugin directory in
+the *install* root, so they must be installed into a common parent and
+something must build that venv from their three `requirements.txt` files. An
+installer that treats plugins as independent directories will produce three
+plugins that all fail to spawn.
+
+Whether the new repository is a submodule or fully independent is open. A
+submodule keeps a single clone working and lets CI reach the taggers, at the
+cost of re-coupling the two repositories' histories; independent is cleaner and
+forces the install path to be real, which is the point. Independent looks
+right, given that nothing in the build or the tests reads the ML plugins today.
+
+References to fix in the same change: the plugin-system note in `CLAUDE.md` and
+the `plugins/` line in `README.md` (both name `wd-tagger` as *the* example), the
+inventory at `README.md`'s directory listing, and the worker's own error
+message, which tells the user to install "the repo's plugins/wd-tagger"
+(`bin/lightview-worker/main.rs`) — a string that becomes a lie the moment this
+lands.
+
+While the two repositories are being separated, give the protocol a version the
+manifest can declare. Today a plugin states its own version but nothing about
+which host contract it was written against, which is why a script that predates
+the streaming requirement installs cleanly and then deadlocks. Across a repo
+boundary that drift stops being a mistake and becomes the normal case.
+
 ## Two ways a tagging job can still hang forever
 
 Distinct from the stale-plugin deadlock above, which the 20-minute fail-out does
