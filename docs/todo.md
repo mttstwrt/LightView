@@ -386,41 +386,75 @@ A single decode worker is fine in practice — the browser parallelizes
 `createImageBitmap` — but a small pool would remove the JS orchestration
 bottleneck under burst load.
 
-### D3. The settings panel is a junk drawer
+### D3. Commands and settings are the same drawer, on both surfaces
 
 `SettingsMenu.tsx` is 1,705 lines rendering thirteen `Section`s, and it has
 stopped distinguishing between things you *do* and things you *set*. Three of
 those sections are a heading plus a single button — Tags → "Manage Tags…",
 Deduplication → "Find Duplicates…", Trash → "View Trash…" — each spending a
-section header on one verb. On mobile the panel is a full-screen page, so the
-cost of scrolling past configuration to reach a button you press daily is paid
-in full.
+section header on one verb. On mobile the panel is a full-screen page, so
+scrolling past configuration to reach a button pressed daily costs the whole
+screen.
 
-The split to make is by *frequency of use*, not by subject:
+The mobile chrome has drifted the same way and has less room to absorb it. Four
+things float over an edge-to-edge grid today: search (top-left), select and the
+gear (top-right), and the web client's upload FAB (bottom-right). The FAB is
+the tell — it carries three separate hide conditions (`viewerOpen`, mobile
+selection mode, mobile selection non-empty) because it is one button competing
+for the bottom edge with the selection bar and the video player's controls. A
+fifth floating button is not available, so any answer that adds chrome per
+action is already ruled out on the surface that needs it most.
 
-- **Used repeatedly, and really actions rather than settings:** manage tags,
-  find duplicates, view trash, run a plugin, open a folder, enqueue a remote
-  tagging job.
-- **Set once and rarely revisited:** display (thumbnail size, gaps, background,
-  autoplay), enabled views, default filter, thumbnails, storage, remote access
-  and pairing, connection.
+**One command list, three presentations.** Declare the actions once as data —
+label, icon, an availability predicate (`capabilities()`, `isWeb()`,
+desktop-only), and a handler — and render that same list three ways:
 
-Worth deciding rather than assuming: whether the first list belongs in a second
-*section* of this panel, or does not belong in a settings menu at all. Tag
-management, the duplicate finder and the trash are top-level features of the
-app that ended up under a gear icon because there was nowhere else to put them,
-and a settings panel is the wrong shape for something reached every session.
-The second section may turn out to be a toolbar.
+- **Desktop:** a toolbar.
+- **Mobile:** a sheet, opened from one button, reusing the sheet the filter and
+  sort controls already use.
+- **Settings panel:** not at all. It keeps only configuration, which is what
+  makes it shrink.
 
-Two smaller things to fix in the same pass, both symptoms of the same drift:
+Nothing about the phone's button count changes, because the actions button
+takes the upload FAB's place rather than adding to it — upload becomes the
+first entry in the list instead of its own control, which also deletes those
+three hide conditions. After that, adding a seventh action costs no chrome at
+all.
 
-- **The `order` scheme has run out.** `Section` takes an `order` prop so visual
-  position can be set independently of source order, but four values now
-  collide — three sections at `1`, two each at `2`, `3` and `4` — and ties fall
-  back to source order. The decoupling the prop exists for is gone, silently,
-  and the layout is once again a function of where the JSX happens to sit.
-- **"Gallery" is not a `Section`.** It is a bare `<div style={{ order: 8 }}>`
-  with a border, so the one pattern the panel has already has an exception.
+**On a phone, frequency should map to reachability**, which is the same split
+this item is about expressed as geometry rather than as section order. The
+bottom-right FAB position is the thumb zone: that is where the actions belong.
+The gear stays in the top-right corner, deliberately harder to reach, because
+settings is rare. Search and select keep their corners. That hierarchy is
+already half-built by accident; this makes it the rule.
+
+The commands worth listing: manage tags, find duplicates, view trash, upload,
+run a plugin, open a folder. Anything scoped to a *selection* stays out —
+`SelectionBar` and `ContextMenu` already own that, and moving selection actions
+into a global list would break the one thing the mobile chrome currently gets
+right.
+
+**Why the `order` prop decayed, and what replaces it.** It was a deliberate
+attempt to float the most-used sections to the top, and it stopped being
+respected as sections were added — four values now collide (three at `1`, two
+each at `2`, `3` and `4`), so ties fall back to source order and the decoupling
+the prop exists for is silently gone. The mechanism is what failed, not the
+intent: a magic number per call site, spread over 1,705 lines, cannot be kept
+consistent because nobody ever sees the thirteen numbers together. The same
+fix serves both halves — one ordered list in one place, where position *is* the
+order and adding a fourteenth entry means looking at the other thirteen.
+
+Also fix in the same pass: **"Gallery" is not a `Section`** but a bare
+`<div style={{ order: 8 }}>` with a border, so the one pattern the panel has
+already has an exception.
+
+Still open, and worth deciding before writing code: where the desktop toolbar
+lives, given the top bar already carries filter, sort, the item count, the view
+switcher and the gear — a second row, icons appended to that row, or a rail.
+And whether the mobile gear folds into the actions sheet as a final "Settings"
+entry, which would take the phone down to three floating buttons at the cost of
+a second tap. Once those are settled this has enough shape to graduate out of
+this file into a `frontend/` page.
 
 ---
 
