@@ -56,6 +56,29 @@ even triggers the import. Every other view sits on machinery the main bundle
 carries regardless — splitting them would save single-digit kilobytes. Split the
 next view that brings its own renderer; measure first.
 
+### Reading the build output
+
+The chunk names mislead, and it is worth knowing why before chasing one. There
+are two HTML entries — `index.html` and `devtools.html` — so Rollup hoists what
+they share into a common chunk and names it after one member, which is neither
+stable nor descriptive. Two artifacts that look alarming and are not:
+
+- **`Sparkline-*.css`, ~53 kB.** This is the whole Tailwind stylesheet, not
+  anything to do with the sparkline. `styles/global.css` is imported by both
+  `index.tsx` and `devtools.tsx`, so it attaches to the shared chunk and inherits
+  its name. It belongs on the critical path and is 9.5 kB gzipped.
+- **`Sparkline-*.js`, ~37 kB, `modulepreload`ed from `index.html`.** The shared
+  chunk itself: the Solid DOM runtime and `lib/ipc.ts` (34 kB of source on its
+  own), both of which the main entry needs immediately. Lazy-loading
+  `DebugOverlay` — the only genuinely optional thing in it — was measured at
+  6.9 kB raw / **2.3 kB gzipped** off first load, and renames the chunk to
+  `ipc-*`. Not taken: a lazy boundary is not worth 2 kB, and the name is
+  cosmetic. Recorded so the measurement is not repeated.
+
+`solid-devtools` is a devDependency and its Vite plugin compiles out of
+production builds; the shipped bundle contains no instrumentation. Checked, for
+the same reason.
+
 ## The IPC boundary
 
 `lib/ipc.ts` exports one typed function per backend command. Internally it picks
