@@ -366,6 +366,11 @@ files into were considered and set aside for that reason.
 **D1 before D2**, and the order matters more than it looks: the decode worker
 pool lives in exactly the fetch loops D1 is extracting, so doing it first means
 writing and verifying it twice, in two copies that already differ in small ways.
+D1 also goes first because [C2](#c2-the-infinite-scrolling-canvas) waits on it.
+
+**D3 shares nothing with either** — a different file, no common code — and is
+listed last only so the D1→D2 chain stays intact. Take it whenever; it is the
+one item in this group a user would notice.
 
 ### D1. ~250–300 duplicated lines between the two grids
 
@@ -380,6 +385,42 @@ Each step needs browser verification, not just `tsc`.
 A single decode worker is fine in practice — the browser parallelizes
 `createImageBitmap` — but a small pool would remove the JS orchestration
 bottleneck under burst load.
+
+### D3. The settings panel is a junk drawer
+
+`SettingsMenu.tsx` is 1,705 lines rendering thirteen `Section`s, and it has
+stopped distinguishing between things you *do* and things you *set*. Three of
+those sections are a heading plus a single button — Tags → "Manage Tags…",
+Deduplication → "Find Duplicates…", Trash → "View Trash…" — each spending a
+section header on one verb. On mobile the panel is a full-screen page, so the
+cost of scrolling past configuration to reach a button you press daily is paid
+in full.
+
+The split to make is by *frequency of use*, not by subject:
+
+- **Used repeatedly, and really actions rather than settings:** manage tags,
+  find duplicates, view trash, run a plugin, open a folder, enqueue a remote
+  tagging job.
+- **Set once and rarely revisited:** display (thumbnail size, gaps, background,
+  autoplay), enabled views, default filter, thumbnails, storage, remote access
+  and pairing, connection.
+
+Worth deciding rather than assuming: whether the first list belongs in a second
+*section* of this panel, or does not belong in a settings menu at all. Tag
+management, the duplicate finder and the trash are top-level features of the
+app that ended up under a gear icon because there was nowhere else to put them,
+and a settings panel is the wrong shape for something reached every session.
+The second section may turn out to be a toolbar.
+
+Two smaller things to fix in the same pass, both symptoms of the same drift:
+
+- **The `order` scheme has run out.** `Section` takes an `order` prop so visual
+  position can be set independently of source order, but four values now
+  collide — three sections at `1`, two each at `2`, `3` and `4` — and ties fall
+  back to source order. The decoupling the prop exists for is gone, silently,
+  and the layout is once again a function of where the JSX happens to sit.
+- **"Gallery" is not a `Section`.** It is a bare `<div style={{ order: 8 }}>`
+  with a border, so the one pattern the panel has already has an exception.
 
 ---
 
