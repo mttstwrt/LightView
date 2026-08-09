@@ -11,12 +11,23 @@
 //!   lightview-headless serve <gallery-path> [--port <port>] [--tls-san <host>]
 //!                            [--web-root <dir>]
 //!   lightview-headless pair  <gallery-path>
+//!   lightview-headless views <gallery-path> [<list>]
 //!
 //! `serve` opens the gallery and listens on 0.0.0.0 with per-device cookie auth,
 //! serving the SPA compiled into this binary (`--web-root` overrides it with a
 //! directory, for development against a live Vite build). `pair` mints a single
 //! 6-digit PIN, prints it, and exits — redeem it at
-//! `https://<host>:<port>/pair` on the device.
+//! `https://<host>:<port>/pair` on the device. `views` shows or sets which
+//! layouts the gallery offers, which also decides the thumbnail tiers the idle
+//! worker pre-warms.
+//!
+//! `pair` and `views` are the admin surface of a headless deployment: they are
+//! per-gallery host settings that the desktop app exposes as UI and that a
+//! paired browser is deliberately not allowed to change, so with no desktop
+//! there has to be some way to reach them. Both write to the gallery's own
+//! `cache.db` from a second process, which WAL makes safe against a running
+//! `serve`. Other host settings — the gallery password, uploads, remote delete
+//! — have no equivalent yet; see `docs/todo.md`.
 //!
 //! `--tls-san` names an address the cert must cover that this process can't
 //! detect on its own. In Docker that's mandatory: detection sees the container's
@@ -32,6 +43,7 @@ use lightview_lib::cache::db::CacheDb;
 use lightview_lib::commands::gallery::{close_gallery_impl, open_gallery_impl};
 use lightview_lib::http_server::devices::{self, PairingKind};
 use lightview_lib::http_server::{self, HttpConfig};
+use lightview_lib::views::View;
 
 /// Default LAN port. Fixed (not OS-assigned) so the origin stays stable across
 /// restarts — browsers scope the `lv_device` pairing cookie to host:port, so a
@@ -56,6 +68,14 @@ async fn main() -> ExitCode {
             Some(path) => pair(Path::new(path)),
             None => {
                 eprintln!("error: `pair` requires a gallery path\n");
+                usage();
+                ExitCode::from(2)
+            }
+        },
+        Some("views") => match args.get(2) {
+            Some(path) => views(Path::new(path), args.get(3).map(String::as_str)),
+            None => {
+                eprintln!("error: `views` requires a gallery path\n");
                 usage();
                 ExitCode::from(2)
             }
@@ -195,32 +215,120 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
-/// Mint a one-time pairing PIN for the gallery and print it. The PIN is stored
-/// in the gallery's `.lightview/cache.db`, so the running `serve` process (which
-/// shares that db) will accept it at `/pair/redeem`.
-fn pair(path: &Path) -> ExitCode {
-    // Refuse to invent a gallery: opening a path with no cache would silently
-    // create a fresh cache.db and mint a PIN the running server never sees
-    // (its migration log lines are the tell). The path must be exactly what
-    // the server is serving — its startup log says `Opening gallery: <path>`
-    // — and the server must have opened it at least once.
+/// Open the cache of a gallery a running server is already serving.
+///
+/// Refuses to *create* one. Opening a path with no cache would silently make a
+/// fresh `cache.db` that the running server never looks at, and the command
+/// would then appear to succeed while changing nothing (the migration log lines
+/// are the only tell). The path must be exactly what the server is serving —
+/// its startup log says `Opening gallery: <path>` — and the server must have
+/// opened it at least once.
+///
+/// Writing from a second process is safe: the cache runs in WAL mode, so this
+/// does not block the server's readers and the server sees the row immediately.
+fn open_existing_cache(path: &Path, command: &str) -> Option<CacheDb> {
     let db_file = path.join(".lightview").join("cache.db");
     if !db_file.is_file() {
         eprintln!("error: no gallery cache at {}", db_file.display());
         eprintln!(
-            "`pair` must be given the same path the running server is serving \
-             (check its `Opening gallery:` log line — inside Docker that's the \
-             container-side path, e.g. /gallery), and the server must have been \
-             started against it at least once."
+            "`{command}` must be given the same path the running server is \
+             serving (check its `Opening gallery:` log line — inside Docker \
+             that's the container-side path, e.g. /gallery), and the server \
+             must have been started against it at least once."
         );
-        return ExitCode::FAILURE;
+        return None;
     }
-    let db = match CacheDb::open(path) {
-        Ok(db) => db,
+    match CacheDb::open(path) {
+        Ok(db) => Some(db),
         Err(e) => {
             eprintln!("error: cannot open gallery cache at {}: {e}", path.display());
-            return ExitCode::FAILURE;
+            None
         }
+    }
+}
+
+/// Show or set the gallery's enabled views.
+///
+/// The desktop app has a toggle for this in Settings; a headless deployment has
+/// no desktop app, and the setting is host configuration rather than something
+/// a paired browser may change, so without this subcommand the only way to
+/// reach it was editing `gallery_meta` in SQLite by hand.
+///
+/// It matters most exactly where there is no GUI: the setting exists so a
+/// gallery browsed only in the justified layout stops pre-generating square
+/// thumbnails it will never show, which on a large library is gigabytes on the
+/// weak box a headless server usually runs on.
+fn views(path: &Path, spec: Option<&str>) -> ExitCode {
+    let Some(db) = open_existing_cache(path, "views") else {
+        return ExitCode::FAILURE;
+    };
+
+    let Some(spec) = spec else {
+        let enabled = lightview_lib::views::enabled(db.conn());
+        println!("Enabled:   {}", join_views(&enabled));
+        println!("Available: {}", join_views(&View::ALL));
+        return ExitCode::SUCCESS;
+    };
+
+    let mut parsed: Vec<View> = Vec::new();
+    for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match View::parse(name) {
+            // Silently accepting a duplicate would print a list that differs
+            // from the argument, which reads like the command misunderstood.
+            Some(v) if parsed.contains(&v) => {
+                eprintln!("error: view listed twice: {name}");
+                return ExitCode::from(2);
+            }
+            Some(v) => parsed.push(v),
+            None => {
+                eprintln!("error: unknown view: {name}");
+                eprintln!("valid views: {}", join_views(&View::ALL));
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // Rejected at the edge rather than in `views::set_enabled`, which stays
+    // mechanism. The desktop UI refuses the same thing by disabling the last
+    // toggle; both are input validation, and neither is policy the store needs
+    // to know about. A gallery with no views leaves the switcher empty with no
+    // way back to a working state.
+    if parsed.is_empty() {
+        eprintln!("error: at least one view must stay enabled");
+        eprintln!("valid views: {}", join_views(&View::ALL));
+        return ExitCode::from(2);
+    }
+
+    match lightview_lib::views::set_enabled(db.conn(), &parsed) {
+        Ok(()) => {
+            println!("Enabled: {}", join_views(&parsed));
+            println!(
+                "Thumbnails already generated for a disabled view are kept, so \
+                 re-enabling one costs nothing."
+            );
+            println!(
+                "A running server picks this up within a few seconds; browsers \
+                 already open need a reload."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: failed to save enabled views: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn join_views(views: &[View]) -> String {
+    views.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// Mint a one-time pairing PIN for the gallery and print it. The PIN is stored
+/// in the gallery's `.lightview/cache.db`, so the running `serve` process (which
+/// shares that db) will accept it at `/pair/redeem`.
+fn pair(path: &Path) -> ExitCode {
+    let Some(db) = open_existing_cache(path, "pair") else {
+        return ExitCode::FAILURE;
     };
     match devices::create_pairing(db.conn(), PairingKind::Pin) {
         Ok(pin) => {
@@ -301,10 +409,16 @@ fn usage() {
          USAGE:\n  \
          lightview-headless serve <gallery-path> [--port <port>] [--tls-san <host>]\n                              \
          [--web-root <dir>]\n  \
-         lightview-headless pair  <gallery-path>\n\n\
+         lightview-headless pair  <gallery-path>\n  \
+         lightview-headless views <gallery-path> [<list>]\n\n\
          COMMANDS:\n  \
          serve   Open a gallery and serve it over the LAN (default port {DEFAULT_PORT}).\n  \
-         pair    Mint a one-time 6-digit pairing PIN for the gallery and exit.\n\n\
+         pair    Mint a one-time 6-digit pairing PIN for the gallery and exit.\n  \
+         views   Show the gallery's enabled views, or set them from a\n          \
+         comma-separated <list> (grid, justified, map). A disabled view\n          \
+         stops pre-generating its thumbnails; ones already cached are kept.\n          \
+         `pair` and `views` both act on a gallery a server is already\n          \
+         serving, and need the same path that server was given.\n\n\
          OPTIONS:\n  \
          --web-root <dir>  Serve the web app from this directory instead of the copy\n                    \
          compiled into the binary. For development against a live Vite build.\n  \

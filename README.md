@@ -122,13 +122,31 @@ lightview-headless serve /path/to/gallery --port 9000
 
 # Mint a one-time 6-digit pairing PIN for a device, then exit
 lightview-headless pair /path/to/gallery
+
+# Show which layouts this gallery offers, then turn the square grid off
+lightview-headless views /path/to/gallery
+lightview-headless views /path/to/gallery justified,map
 ```
 
 | Command | Purpose |
 |---|---|
 | `serve <gallery-path> [--port <n>]` | Open the gallery and serve it on `0.0.0.0:<port>` (default `8787`) with per-device cookie auth |
 | `pair <gallery-path>` | Create a single-use PIN (stored in the gallery's `cache.db`) and print it; redeem it at `http://<host>:<port>/pair` on the device |
+| `views <gallery-path> [<list>]` | Show the enabled views, or set them from a comma-separated list of `grid`, `justified`, `map` |
 | `-h` / `--help` | Usage |
+
+`pair` and `views` act on a gallery a server is already serving, and must be
+given the same path that server was given (inside Docker, the container-side
+path). Both write to the gallery's own `cache.db`, which is safe while `serve`
+is running.
+
+**Disabling a view stops it pre-generating thumbnails.** That is the point of
+`views` on a headless box: a gallery browsed only in the justified layout would
+otherwise keep building square-cropped thumbnails nobody renders, which on a
+large library is gigabytes of work on the weakest machine you own. Thumbnails
+already cached for a disabled view are kept, so re-enabling one costs nothing.
+A running server picks the change up within seconds; browsers already open need
+a reload.
 
 The port is fixed (not OS-assigned) on purpose: the pairing cookie is scoped to
 `host:port`, so a stable origin means devices don't have to re-pair after a restart.

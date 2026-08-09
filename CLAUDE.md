@@ -72,6 +72,13 @@ COOKIE=$(curl -sk -D- -o/dev/null -X POST https://localhost:8799/pair/redeem \
 # Now hit auth-gated routes. Example: watch the SSE change stream, then add a file
 curl -skN --cookie "$COOKIE" https://localhost:8799/api/events &  # streams `event: fs-changed`
 cp "$G/red.jpg" "$G/new.jpg"                               # watcher → broadcast → SSE
+
+# Which layouts the gallery offers — and so which thumbnail tiers the idle
+# worker pre-warms. Host config, so it is not writable from a paired browser;
+# with no desktop app this subcommand is the only way to reach it. Safe against
+# the running server (WAL), which picks the change up within a few seconds.
+./target/debug/lightview-headless views "$G"                    # show
+./target/debug/lightview-headless views "$G" justified,map      # square grid off
 ```
 
 Notes: the watcher only catches changes made *after* startup (a restart

@@ -388,8 +388,9 @@ bottleneck under burst load.
 **E1 first**, whenever the tree is quiet enough to take it: until it lands, the
 gate advertised in `AGENTS.md` cannot pass and `cargo clippy --fix` stays a trap
 for every other change in this file. It is a scheduling constraint rather than a
-priority — it wants no branches in flight — so E2 goes first if that window has
-not arrived.
+priority — it wants no branches in flight — so **E2** goes first if that window
+has not arrived; it is also the one of the three a headless deployment feels
+today. **E3** is self-contained and desktop-only, so it waits for neither.
 
 ### E1. The tree is not rustfmt-formatted
 
@@ -401,7 +402,27 @@ scope to one change. Worth doing when no branches are in flight, together with
 the ~50 remaining clippy style warnings (`collapsible_if` dominates). See
 [`build-and-verify.md`](build-and-verify.md).
 
-### E2. "Open folder with LightView" on Linux
+### E2. Most host settings are unreachable on a headless server
+
+Every per-gallery host setting is a `#[tauri::command]`, so it exists only in
+the desktop app: the gallery password and its inactivity window, the upload
+enable/scheme, and the remote-delete flag. A paired browser is deliberately not
+allowed to change any of them — they administer the boundary `/api/invoke`
+enforces — which is right, but it means a Docker deployment has no way to reach
+them at all, short of editing `gallery_meta` in SQLite by hand.
+
+`lightview-headless` has the shape of the answer already: `pair` and `views`
+both open the served gallery's `cache.db` from a second process (safe under
+WAL) and mutate one key. The remaining settings want the same treatment, and
+probably one `config` subcommand rather than one verb each — `views` earned its
+own name by being a list rather than a value, and that argument does not
+generalise.
+
+The password is the one with a wrinkle: `set_remote_password` argon2-hashes its
+input, so the subcommand must read the password from a prompt or stdin rather
+than argv, where it would land in shell history and `ps`.
+
+### E3. "Open folder with LightView" on Linux
 
 `lightview.desktop` already declares `MimeType=inode/directory` and
 `Exec=lightview %f`, and `main.rs` already opens a directory passed as argv[1] —

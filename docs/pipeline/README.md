@@ -209,6 +209,12 @@ zoomed-in tiers' LRU byte budget already sheds the genuinely stale ones. See
 [`views.rs`](../../src-tauri/src/views.rs) and
 [decision 0002](../decisions/0002-two-families-of-thumbnail-tiers.md).
 
+The setting is host configuration, so it is read-only over `/api/invoke` and a
+paired browser cannot change it. The desktop app has a toggle in Settings; a
+headless server has `lightview-headless views <gallery> [<list>]`, which writes
+the same `gallery_meta` key from a second process. Either way the worker re-reads
+it each poll, so the change lands without a restart.
+
 ## Where the frontend picks a tier
 
 The grids own this; see [`frontend/grid-loading.md`](../frontend/grid-loading.md). Briefly:
