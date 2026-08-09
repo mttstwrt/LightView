@@ -30,9 +30,33 @@ use super::config::AuthMode;
 use super::devices;
 use super::server::ServerState;
 
-/// Cookie name carrying the per-device pairing cookie. The value is of the
-/// form `<device_id>.<secret>` — see `devices::verify_cookie`.
-pub const DEVICE_COOKIE: &str = "lv_device";
+/// Look up the device cookie, preferring this gallery's own name
+/// (`lv_device_<suffix>`, see [`devices::cookie_name`]) and falling back to the
+/// bare `lv_device` a device paired before per-gallery scoping still holds.
+///
+/// The `bool` is true when only the legacy name matched; callers answer that by
+/// re-issuing the same value under the gallery's name with
+/// [`device_cookie_header`], so nobody has to pair again. The legacy cookie is
+/// deliberately *not* cleared — it is the one entry two galleries share, so
+/// expiring it here would un-pair whichever gallery has not yet re-issued.
+pub fn device_cookie(headers: &HeaderMap, name: &str) -> Option<(String, bool)> {
+    if let Some(value) = cookie_value(headers, name) {
+        return Some((value, false));
+    }
+    // A cookie named `lv_device_ab12` cannot match the `lv_device=` prefix, so
+    // the fallback never shadows a gallery-scoped cookie.
+    cookie_value(headers, devices::DEVICE_COOKIE_BASE).map(|value| (value, true))
+}
+
+/// `Set-Cookie` for a device cookie. One year, `HttpOnly`, `SameSite=Strict`,
+/// and `Secure` whenever the connection is TLS so the value never travels in
+/// the clear to the same host on a plaintext port.
+pub fn device_cookie_header(name: &str, value: &str, tls: bool) -> String {
+    format!(
+        "{name}={value}; Path=/; Max-Age=31536000; SameSite=Strict; HttpOnly{}",
+        if tls { "; Secure" } else { "" }
+    )
+}
 
 /// Record every request from a non-loopback peer. A non-zero counter is proof
 /// that an external device reached the server, which is the only dependable
@@ -119,13 +143,17 @@ pub async fn static_cache_control(request: axum::extract::Request, next: Next) -
 /// Per-device cookie auth. Pass-through when `AuthMode::None`.
 ///
 /// Flow:
-///   1. Read `lv_device` cookie. Missing → 401.
-///   2. Lock the open gallery's cache.db. None → 503 (gallery closed).
+///   1. Lock the open gallery's cache.db. None → 503 (gallery closed). The
+///      lock comes first because the cookie's *name* is per-gallery and lives
+///      in that DB.
+///   2. Read this gallery's cookie, or the legacy bare `lv_device`. Missing
+///      → 401.
 ///   3. Verify cookie → device. Failure → 401.
 ///   4. If a gallery password is set and the device has been silent for
 ///      longer than the inactivity window, return 401 with
 ///      `WWW-Authenticate: LV-Password` so the client knows to prompt.
-///   5. Touch `last_seen` and pass.
+///   5. Touch `last_seen` and pass, re-issuing the cookie under this
+///      gallery's name if it arrived under the legacy one.
 pub async fn auth_layer(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -136,15 +164,10 @@ pub async fn auth_layer(
         return Ok(next.run(request).await);
     }
 
-    let cookie = match cookie_value(&headers, DEVICE_COOKIE) {
-        Some(c) => c,
-        None => return Err(StatusCode::UNAUTHORIZED),
-    };
-
     // Hold the cache_db lock only long enough to do the verification + state
     // updates. SHA-256 verify is fast enough to run inline; we don't want to
     // re-lock for the touch.
-    let needs_password_challenge = {
+    let (needs_password_challenge, reissue) = {
         let guard = state.app.cache_db.lock().await;
         let Some(db) = guard.as_ref() else {
             // No gallery open — there's no per-gallery DB to authenticate
@@ -152,6 +175,11 @@ pub async fn auth_layer(
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         };
         let conn = db.conn();
+
+        let name = devices::cookie_name(conn);
+        let Some((cookie, via_legacy)) = device_cookie(&headers, &name) else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
 
         let device = match devices::verify_cookie(conn, &cookie) {
             Some(d) => d,
@@ -171,14 +199,24 @@ pub async fn auth_layer(
             let _ = devices::touch_device(conn, &device.id);
         }
 
-        stale
+        let reissue =
+            via_legacy.then(|| device_cookie_header(&name, &cookie, state.config.tls));
+        (stale, reissue)
     };
 
     if needs_password_challenge {
         return Ok(password_challenge_response());
     }
 
-    Ok(next.run(request).await)
+    let mut response = next.run(request).await;
+    // Append rather than insert: the inner handler may already be setting
+    // cookies of its own, and this must not replace them.
+    if let Some(header) = reissue
+        && let Ok(v) = header.parse()
+    {
+        response.headers_mut().append("set-cookie", v);
+    }
+    Ok(response)
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {

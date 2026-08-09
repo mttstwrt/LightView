@@ -11,6 +11,10 @@
 //! (`last_thumb_activity`, touched by the desktop protocol handler and the
 //! frontend batch commands). Both signals are re-checked between small work
 //! units, so the worker yields within one batch of a user showing up.
+//!
+//! *Which* tiers get warmed comes from the gallery's enabled views — see
+//! [`crate::views`]. Disabling a view stops its generation; it never deletes
+//! rows already cached.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -30,14 +34,25 @@ const THUMB_BATCH: usize = 8;
 /// Phashes computed per DB-lock acquisition.
 const PHASH_BATCH: usize = 64;
 
-/// Tiers the worker pre-warms. Standard ("m") backs the square grid;
+/// Tiers the worker pre-warms, derived from the gallery's enabled views
+/// ([`crate::views::prewarm_tiers`]). Standard ("m") backs the square grid;
 /// Justified ("j") backs the justified layout's base zoom — the phone web
 /// client's default view. Justified is aspect-preserving, so it cannot be
 /// derived from the square-cropped Standard bytes; it needs its own source
 /// decode, which is exactly what idle time is for. Work cycles rotate
 /// between the tiers (rather than draining one first) so both views' newest
 /// items warm early on a large cold backlog.
-const PREWARM_TIERS: [ThumbTier; 2] = [ThumbTier::Standard, ThumbTier::Justified];
+///
+/// Re-read each cycle rather than captured at start: a view toggled in
+/// settings takes effect at the next poll instead of at the next gallery open,
+/// and the read is one indexed `gallery_meta` lookup every [`POLL_SECS`].
+async fn prewarm_tiers(state: &AppState) -> Vec<ThumbTier> {
+    let db = state.cache_db.lock().await;
+    match db.as_ref() {
+        Some(db) => crate::views::prewarm_tiers(db.conn()),
+        None => Vec::new(),
+    }
+}
 
 /// Paths whose generation failed, grouped by tier. See the field comment in
 /// [`start_idle_worker`] for why it isn't a flat set of pairs.
@@ -87,11 +102,12 @@ pub fn start_idle_worker(state: &AppState) {
                 continue;
             }
 
+            let tiers = prewarm_tiers(&state).await;
             let mut worked = false;
-            for offset in 0..PREWARM_TIERS.len() {
-                let tier = PREWARM_TIERS[(tier_cursor + offset) % PREWARM_TIERS.len()];
+            for offset in 0..tiers.len() {
+                let tier = tiers[(tier_cursor + offset) % tiers.len()];
                 if backfill_thumbnails(&state, tier, &mut failed).await {
-                    tier_cursor = (tier_cursor + offset + 1) % PREWARM_TIERS.len();
+                    tier_cursor = (tier_cursor + offset + 1) % tiers.len();
                     worked = true;
                     break;
                 }

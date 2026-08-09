@@ -36,20 +36,24 @@ export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/
 The container image (`Dockerfile`) uses Arch, where `pacman -S libheif` is
 current enough; this only bites on Debian-family hosts.
 
-## The desktop binary needs `dist/`
+## Every Rust build needs `dist/`
 
-`tauri::generate_context!()` is a proc macro that reads `frontendDist`
-(`../dist`) at *compile* time and fails the build if the directory is absent —
-a confusing error, since nothing about the Rust source is wrong:
+Run `npm ci && npm run build` once before any `cargo` command. Two things read
+`dist/` at *compile* time, so its absence fails the build before any of our code
+is reached — a confusing error, since nothing about the Rust source is wrong:
 
-```
-error: proc macro panicked
-   = help: message: The `frontendDist` configuration is set to `"../dist"` but this path doesn't exist
-```
+- `tauri::generate_context!()` reads `frontendDist` (`../dist`) and fails the
+  `lightview` binary with `error: proc macro panicked … this path doesn't
+  exist`.
+- `#[derive(RustEmbed)]` in `http_server::web_assets` embeds the same directory
+  into the *library*, and so into `lightview-headless` and `lightview-worker`
+  too: `folder '…/dist' does not exist`.
 
-Run `npm ci && npm run build` once before `cargo check --all-targets`. The
-library, the tests, `lightview-headless`, and `lightview-worker` all compile
-without it; only the `lightview` binary needs it.
+This used to be the desktop binary's problem alone. Embedding the SPA
+(`docs/remote/README.md`) extended it to the library, which is the price of a
+self-contained server binary. A rebuilt frontend does *not* need a Rust rebuild
+to take effect in a debug build — rust-embed reads from disk there — but the
+directory has to exist when the crate is first compiled.
 
 ## Current state of the quality gates
 
@@ -80,8 +84,8 @@ with no WebKitGTK, so every route can be driven with `curl`. `CLAUDE.md` has
 the canonical recipe; this is the short form plus the browser step.
 
 ```bash
+npm ci && npm run build                          # dist/ — needed to compile at all
 cd src-tauri && cargo build --bin lightview-headless
-npm run build                                    # dist/ for the SPA it serves
 
 G=$(mktemp -d)                                   # throwaway gallery
 python3 -c "
@@ -94,9 +98,11 @@ for i, c in enumerate([(220,60,60),(60,180,90),(70,110,230)]):
 ./target/debug/lightview-headless serve "$G" --port 8799 &
 
 PIN=$(./target/debug/lightview-headless pair "$G" | sed -n 's/Pairing PIN: //p')
+# The cookie name carries a per-gallery suffix (`lv_device_<id>`), so match the
+# base name rather than `lv_device=`. See docs/remote/README.md.
 COOKIE=$(curl -sk -D- -o/dev/null -X POST https://localhost:8799/pair/redeem \
   -H 'Content-Type: application/json' -d "{\"code\":\"$PIN\",\"device_name\":\"test\"}" \
-  | sed -nE 's/.*(lv_device=[^;]+).*/\1/p')
+  | sed -nE 's/.*(lv_device[^=]*=[^;]+).*/\1/p')
 ```
 
 Everything is HTTPS with a self-signed cert, so `curl -k` throughout. Useful
@@ -131,7 +137,8 @@ to verify grid changes, which `tsc` cannot cover:
 import { chromium } from 'playwright';
 const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium' });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 900 } });
-await ctx.addCookies([{ name: 'lv_device', value: '<from $COOKIE>', domain: 'localhost', path: '/' }]);
+// $COOKIE is already `name=value`; split it, since the name is per-gallery.
+await ctx.addCookies([{ name: '<name from $COOKIE>', value: '<value from $COOKIE>', domain: 'localhost', path: '/' }]);
 const page = await ctx.newPage();
 page.on('pageerror', e => console.log('PAGEERROR', e.message));
 await page.goto('https://localhost:8799/', { waitUntil: 'networkidle' });

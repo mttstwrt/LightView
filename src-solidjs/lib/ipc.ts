@@ -605,6 +605,13 @@ export interface ServerCapabilities {
 export const getServerCapabilities = () =>
   invoke<ServerCapabilities>("get_server_capabilities");
 
+/** Views this gallery offers, as `ViewMode` strings. Readable by both clients;
+ *  the setter is desktop-only, since it configures the gallery rather than the
+ *  device looking at it. */
+export const getEnabledViews = () => invoke<string[]>("get_enabled_views");
+export const setEnabledViews = (enabled: string[]) =>
+  invoke<void>("set_enabled_views", { enabled });
+
 /** Desktop-only host toggle for the web client's delete capability. */
 export const getRemoteDeleteConfig = () => invoke<boolean>("get_remote_delete_config");
 export const setRemoteDeleteConfig = (enabled: boolean) =>

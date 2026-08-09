@@ -5,23 +5,7 @@
 Known gaps, in rough priority order. Anything here is understood but not done;
 anything with enough shape to be designed belongs in a subsystem page instead.
 
-## 1. Two galleries on one host share one device cookie
-
-Pairing a browser with a second gallery silently un-pairs it from the first.
-`POST /pair/redeem` sets a fixed cookie name — `lv_device`, `Path=/`
-(`http_server/auth_routes.rs`) — and cookies are scoped by host, *not* by port,
-so two servers on `server:8787` and `server:8788` write to the same jar and the
-second redemption overwrites the first. iOS home-screen web apps escape it only
-because each gets its own storage container; a desktop browser has one jar and
-loses a pairing every time.
-
-The fix is to make the cookie name carry a per-gallery identifier — mint one
-into `gallery_meta` on first open and suffix the name with it — so the two
-servers stop colliding. Keep accepting a bare `lv_device` as a fallback and
-re-issue it under the new name on the next request, so no already-paired device
-has to pair again. See [`remote/`](remote/README.md).
-
-## 2. Videos are dropped from every remote tagging job
+## 1. Videos are dropped from every remote tagging job
 
 Sending mp4s to a remote worker produces no tags and no worker log line,
 because the job is never offered to a worker at all. `resolve_target`
@@ -83,7 +67,7 @@ keeping plugin-side sampling for local runs and server-side sampling for remote
 ones — two policies that would quietly disagree per plugin. The frame edge
 should come from the same manifest-declared input size as still images.
 
-## 3. Nothing updates an installed plugin, and a stale one deadlocks silently
+## 2. Nothing updates an installed plugin, and a stale one deadlocks silently
 
 Plugins are *copied* into a worker's `data_dir()/plugins`, and nothing
 afterwards compares that copy against the repo. A worker binary can be rebuilt
@@ -112,7 +96,7 @@ at `log::debug!` (`plugin/runner.rs`), so at the default level the one channel
 that would have explained this — the plugin saying nothing at all — is
 invisible. It should surface at info, or at least be replayed when a job fails.
 
-## 4. Move the real plugins to their own repository
+## 3. Move the real plugins to their own repository
 
 `plugins/` should keep only `example-auto-tagger`; the three ML taggers (`wd`,
 `camie`, `pixai`) move out. They are 11 tracked files and ~200 KB, so this is
@@ -163,7 +147,7 @@ which host contract it was written against, which is why a script that predates
 the streaming requirement installs cleanly and then deadlocks. Across a repo
 boundary that drift stops being a mistake and becomes the normal case.
 
-## 5. Two ways a tagging job can still hang forever
+## 4. Two ways a tagging job can still hang forever
 
 Distinct from the stale-plugin deadlock above, which the 20-minute fail-out does
 catch. These two paths defeat the timers themselves.
@@ -186,7 +170,7 @@ The real repair underneath both is a per-file deadline: a downloaded file that
 has gone unanswered for its own timeout releases its permit and counts as one
 failed image, so the batch continues instead of dying at 64.
 
-## 6. `cargo tauri build` never builds `lightview-worker`
+## 5. `cargo tauri build` never builds `lightview-worker`
 
 `npm run tauri build` produces no worker binary. That is not a build failure:
 the bin declares `required-features = ["worker"]` (`src-tauri/Cargo.toml`), so
@@ -199,7 +183,7 @@ the release build and shipped alongside the app. Either way it should be
 written down, because the quiet failure mode is a developer running a
 months-old worker binary against a current server and debugging the wrong code.
 
-## 7. The tree is not rustfmt-formatted
+## 6. The tree is not rustfmt-formatted
 
 `cargo fmt --check` fails on ~70 files, and formatting would be a ~4,200-line
 diff. Until that lands as its own commit, the gate advertised in `AGENTS.md` is
@@ -209,7 +193,7 @@ scope to one change. Worth doing when no branches are in flight, together with
 the ~60 remaining clippy style warnings (`collapsible_if` dominates). See
 [`build-and-verify.md`](build-and-verify.md).
 
-## 8. ~250–300 duplicated lines between the two grids
+## 7. ~250–300 duplicated lines between the two grids
 
 Structurally identical fetch loops, eviction, pruning, and URL versioning, with
 small policy differences that make a naive merge unsafe.
@@ -217,29 +201,13 @@ small policy differences that make a naive merge unsafe.
 differences and proposes a four-step extraction ordered smallest-risk-first.
 Each step needs browser verification, not just `tsc`.
 
-## 9. `reindex_gallery` does not regenerate thumbnails
+## 8. `reindex_gallery` does not regenerate thumbnails
 
 Re-indexing rebuilds the media and tag indexes but does not kick off background
 thumbnail regeneration, so a re-index after a bulk external edit leaves stale
 thumbnails until something else asks for them.
 
-## 10. Memory-pressure polling 403s on the web client
-
-`lib/memoryPressure.ts` polls `get_memory_status`, which is not in the
-`/api/invoke` allowlist and never has been. The poll is wrapped in a bare
-`try/catch`, so every cycle fails silently and the viewer cache's
-pressure-based eviction never engages in a browser — only on the desktop.
-
-Adding it to the allowlist is the wrong fix: the command reports the *server's*
-RAM, and sizing a phone's image cache from the host's free memory is
-meaningless. The web client should either use its own signal
-(`performance.memory`, `navigator.deviceMemory`) or not poll at all. Either way
-the empty `catch` should stop hiding it.
-
-Found by driving the SPA against `lightview-headless`; it is invisible from
-`tsc` and from the Rust tests.
-
-## 11. Colour labels stop half way
+## 9. Colour labels stop half way
 
 The column is indexed, `color:` filters, the context menu picks one and
 `ThumbnailCell` draws the dot — but the label is invisible everywhere else and
@@ -252,7 +220,7 @@ not having it.
 Ordering needs a defined sequence — labels are a fixed list, so sort on that
 list's index rather than the stored string, with unlabelled items last.
 
-## 12. Taggers decode full-resolution originals on the local path
+## 10. Taggers decode full-resolution originals on the local path
 
 Remote workers already pull `?fit=1024` (`bin/lightview-worker/config.rs`), so
 this is only half missing: `tagging/local.rs` hands the plugin every original
@@ -268,26 +236,10 @@ requested size allows it, instead of resizing from source each time; the
 request currently repeats the same decode. See
 [`plugins/`](plugins/README.md) and [`pipeline/`](pipeline/README.md).
 
-## 13. Square thumbnails are generated for a view you may never open
+## 11. A view API, only once there are two implementations
 
-`PREWARM_TIERS` is `[Standard, Justified]` (`pipeline/idle.rs`), unconditional
-and per gallery. A gallery browsed only in the justified layout still pays the
-full square-tier cost — gigabytes, on a large collection — for cells nobody
-renders, and the same is true in reverse.
-
-Enablement and generation should be one setting: a per-gallery list of enabled
-views, with the idle worker pre-warming only the tiers those views ask for.
-This is the cheap half of the modular-views work below and worth doing on its
-own; it needs no plugin machinery, only a per-gallery setting and a `const`
-that becomes a lookup. Existing rows for a disabled view should stay put rather
-than being deleted — re-enabling the view must not re-decode the library — and
-the tier's LRU budget already bounds the ones that are genuinely stale. See
-[`pipeline/`](pipeline/README.md) and
-[decision 0002](decisions/0002-two-families-of-thumbnail-tiers.md).
-
-## 14. Optional views, and a view API only once there are two of them
-
-Beyond disabling the square grid and the map per gallery, the wanted view is an
+Views can already be enabled per gallery (`views.rs`), and the idle worker
+pre-warms only what the enabled ones ask for. The view still wanted is an
 infinite scrolling canvas: the top of the current sort in the centre, later
 items spiralling outward, reusing the aspect-preserving justified tiers so it
 costs no new thumbnails.
@@ -302,7 +254,7 @@ cannot load a host `.so` at all, and an IPC-per-scroll arrangement puts a round
 trip in the one loop that must not have one. Whatever lands must stay a single
 Docker image, which also rules out a cargo feature per view.
 
-## 15. Plugin-driven UI, and naming what a plugin found
+## 12. Plugin-driven UI, and naming what a plugin found
 
 Recognising faces is the case the current protocol cannot express: the plugin
 can emit a cluster, but nothing can tell it that cluster is a particular
@@ -320,16 +272,7 @@ The face case additionally needs something declarative UI does not give: a host
 screen for naming and merging plugin-emitted clusters, which any plugin that
 produces groups can feed. That belongs to the host, not to a plugin.
 
-## 16. Ship the SPA inside the binary
-
-`lightview-headless` serves `dist/` from disk (`http_server/server.rs`), so the
-Docker image and any manual deployment carry a directory that must stay in step
-with the executable. `dist/` is 648 KB — embedding it with `rust-embed` costs
-almost nothing and makes the binary self-contained. Keep the existing
-`--web-root` path as an override so a dev build can still point at a live Vite
-output without recompiling.
-
-## 17. "Open folder with LightView" on Linux
+## 13. "Open folder with LightView" on Linux
 
 `lightview.desktop` already declares `MimeType=inode/directory` and
 `Exec=lightview %f`, and `main.rs` already opens a directory passed as argv[1] —
@@ -339,7 +282,7 @@ mismatch, install the desktop file and an icon from the bundle, and add a
 `Desktop Action` so file managers offer "Open LightView here" on a folder's
 background as well as "Open With" on the folder itself. Linux only for now.
 
-## 18. Absolute paths as primary keys
+## 14. Absolute paths as primary keys
 
 Every path-keyed row stores an absolute path, which is why `rebase_root` and
 `infer_old_root` exist. Storing gallery-relative paths would delete that entire
@@ -348,7 +291,7 @@ current machinery works and is tested. Recorded as a structural observation, not
 a recommendation — see
 [decision 0001](decisions/0001-one-cache-per-gallery.md).
 
-## 19. Smaller items
+## 15. Smaller items
 
 - **A worker pool for image decode on the client.** A single decode worker is
   fine in practice — the browser parallelizes `createImageBitmap` — but a small

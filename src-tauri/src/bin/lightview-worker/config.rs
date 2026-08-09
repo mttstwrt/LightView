@@ -11,7 +11,9 @@ pub struct WorkerConfig {
     /// Base URL of the LightView server, no trailing slash (e.g.
     /// `https://192.168.1.10:8787`).
     pub server_url: String,
-    /// The `lv_device=<id>.<secret>` cookie pair obtained at pairing.
+    /// The `<cookie-name>=<id>.<secret>` cookie pair obtained at pairing. The
+    /// name is the server's per-gallery `lv_device_<suffix>` (older servers
+    /// issue a bare `lv_device`), stored verbatim and replayed as-is.
     pub cookie: String,
     /// Hex SHA-256 of the server's TLS certificate (TOFU pin). The server cert
     /// is self-signed, so this — not a CA — is what authenticates the server.

@@ -23,7 +23,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem, loadEnabledViews } from "./stores/galleryStore";
 import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { createOpenAtBottom } from "./lib/openAtBottom";
 import { VIEWER_CLOSE_REQUEST_EVENT } from "./lib/viewerTransition";
@@ -319,6 +319,7 @@ export function App() {
 
       // Restore per-gallery settings from .lightview folder
       await loadSettingsFromGallery();
+      await loadEnabledViews();
 
       const filtered = await applyDefaultFilter();
       const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filtered, subSortField(), subSortOrder());
@@ -470,6 +471,7 @@ export function App() {
   // same-origin `lv_device` cookie so only paired devices connect.
   if (isWeb()) {
     loadCapabilities();
+    void loadEnabledViews();
     const source = new EventSource("/api/events");
     source.addEventListener("fs-changed", (event) => {
       try {

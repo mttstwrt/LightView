@@ -15,8 +15,14 @@ pub struct HttpConfig {
     pub bind: IpAddr,
     pub port: u16,
     pub auth: AuthMode,
-    /// Directory of the built SPA to serve at `/`. `None` disables static
-    /// serving (the desktop webview loads the app from Tauri, not over HTTP).
+    /// Serve the SPA at `/`. False for the desktop's loopback media server,
+    /// which exists only for `<video>` Range requests — the webview loads the
+    /// app from Tauri, not over HTTP.
+    pub serve_spa: bool,
+    /// Directory to serve the SPA from instead of the copy compiled into the
+    /// binary (`http_server::web_assets`). The dev escape hatch: point it at a
+    /// live Vite output and a frontend rebuild takes effect with no
+    /// recompile. Ignored when `serve_spa` is false.
     pub web_root: Option<PathBuf>,
     /// Serve HTTPS with the persisted self-signed certificate (see `tls.rs`).
     /// Required for non-loopback binds: browsers only grant secure-context
@@ -52,25 +58,34 @@ impl HttpConfig {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             auth: AuthMode::None,
+            serve_spa: false,
             web_root: None,
             tls: false,
             tls_sans: Vec::new(),
         }
     }
 
-    /// LAN-accessible, per-device cookie auth, serving the SPA from `web_root`.
-    /// `port` of 0 lets the OS assign one. Seeds `tls_sans` from the
-    /// environment so a container can declare its reachable address without a
-    /// CLI flag; callers append their own with [`Self::with_tls_sans`].
-    pub fn remote(port: u16, web_root: Option<PathBuf>) -> Self {
+    /// LAN-accessible, per-device cookie auth, serving the SPA compiled into
+    /// the binary. `port` of 0 lets the OS assign one. Seeds `tls_sans` from
+    /// the environment so a container can declare its reachable address
+    /// without a CLI flag; callers append their own with
+    /// [`Self::with_tls_sans`].
+    pub fn remote(port: u16) -> Self {
         Self {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port,
             auth: AuthMode::DeviceCookie,
-            web_root,
+            serve_spa: true,
+            web_root: None,
             tls: true,
             tls_sans: super::tls::sans_from_env(),
         }
+    }
+
+    /// Serve the SPA from this directory rather than from the embedded copy.
+    pub fn with_web_root(mut self, web_root: Option<PathBuf>) -> Self {
+        self.web_root = web_root;
+        self
     }
 
     /// Append additional TLS SANs (from a CLI flag) to whatever the

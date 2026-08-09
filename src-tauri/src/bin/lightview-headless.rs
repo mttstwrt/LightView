@@ -9,11 +9,14 @@
 //!
 //! Usage:
 //!   lightview-headless serve <gallery-path> [--port <port>] [--tls-san <host>]
+//!                            [--web-root <dir>]
 //!   lightview-headless pair  <gallery-path>
 //!
 //! `serve` opens the gallery and listens on 0.0.0.0 with per-device cookie auth,
-//! serving the built SPA from `./dist`. `pair` mints a single 6-digit PIN,
-//! prints it, and exits — redeem it at `https://<host>:<port>/pair` on the device.
+//! serving the SPA compiled into this binary (`--web-root` overrides it with a
+//! directory, for development against a live Vite build). `pair` mints a single
+//! 6-digit PIN, prints it, and exits — redeem it at
+//! `https://<host>:<port>/pair` on the device.
 //!
 //! `--tls-san` names an address the cert must cover that this process can't
 //! detect on its own. In Docker that's mandatory: detection sees the container's
@@ -42,7 +45,7 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("serve") => match parse_serve(&args[2..]) {
-            Ok((path, port, tls_sans)) => serve(path, port, tls_sans).await,
+            Ok(a) => serve(a).await,
             Err(e) => {
                 eprintln!("error: {e}\n");
                 usage();
@@ -69,7 +72,8 @@ async fn main() -> ExitCode {
 }
 
 /// Open the gallery and serve it over the LAN until the server task ends.
-async fn serve(path: PathBuf, port: u16, tls_sans: Vec<String>) -> ExitCode {
+async fn serve(args: ServeArgs) -> ExitCode {
+    let ServeArgs { path, port, tls_sans, web_root } = args;
     let path = match std::fs::canonicalize(&path) {
         Ok(p) => p,
         Err(e) => {
@@ -85,19 +89,20 @@ async fn serve(path: PathBuf, port: u16, tls_sans: Vec<String>) -> ExitCode {
 
     let state = AppState::new();
 
-    let web_root = resolve_web_root();
-    if web_root.is_none() {
-        log::warn!(
-            "No dist/ directory found in the CWD or next to the binary — the web \
-             UI will not load. Build it with `npm run build` and place dist/ here."
-        );
+    if let Some(root) = &web_root
+        && !root.is_dir()
+    {
+        eprintln!("error: --web-root {} is not a directory", root.display());
+        return ExitCode::FAILURE;
     }
 
     // Bind the listener *before* the gallery scan, which can take minutes on
     // a large library. Until the gallery finishes opening, the gallery gate
     // in the HTTP layer answers every request with a 503 "starting" page —
     // a sign of life instead of a refused connection.
-    let config = HttpConfig::remote(port, web_root).with_tls_sans(tls_sans);
+    let config = HttpConfig::remote(port)
+        .with_web_root(web_root)
+        .with_tls_sans(tls_sans);
     let server = match http_server::start(config, state.clone()).await {
         Ok(s) => s,
         Err(e) => {
@@ -234,18 +239,33 @@ fn pair(path: &Path) -> ExitCode {
     }
 }
 
+struct ServeArgs {
+    path: PathBuf,
+    port: u16,
+    tls_sans: Vec<String>,
+    /// Serve the SPA from this directory instead of the copy compiled into
+    /// the binary.
+    web_root: Option<PathBuf>,
+}
+
 /// Parse `serve` args: a single positional gallery path plus optional
-/// `--port`/`-p` and repeatable `--tls-san`.
-fn parse_serve(args: &[String]) -> Result<(PathBuf, u16, Vec<String>), String> {
+/// `--port`/`-p`, `--web-root`, and repeatable `--tls-san`.
+fn parse_serve(args: &[String]) -> Result<ServeArgs, String> {
     let mut path: Option<PathBuf> = None;
     let mut port: u16 = DEFAULT_PORT;
     let mut tls_sans: Vec<String> = Vec::new();
+    let mut web_root: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--port" | "-p" => {
                 let v = args.get(i + 1).ok_or("--port requires a value")?;
                 port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                i += 2;
+            }
+            "--web-root" => {
+                let v = args.get(i + 1).ok_or("--web-root requires a value")?;
+                web_root = Some(PathBuf::from(v));
                 i += 2;
             }
             "--tls-san" => {
@@ -267,35 +287,27 @@ fn parse_serve(args: &[String]) -> Result<(PathBuf, u16, Vec<String>), String> {
             }
         }
     }
-    Ok((path.ok_or("`serve` requires a gallery path")?, port, tls_sans))
-}
-
-/// Resolve the built SPA directory (`dist/`). Mirrors the desktop app's lookup:
-/// checks the CWD, its parent, and the directory next to the executable.
-fn resolve_web_root() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("dist"));
-        candidates.push(cwd.join("..").join("dist"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("dist"));
-        }
-    }
-    candidates.into_iter().find(|p| p.is_dir())
+    Ok(ServeArgs {
+        path: path.ok_or("`serve` requires a gallery path")?,
+        port,
+        tls_sans,
+        web_root,
+    })
 }
 
 fn usage() {
     eprintln!(
         "LightView headless server\n\n\
          USAGE:\n  \
-         lightview-headless serve <gallery-path> [--port <port>] [--tls-san <host>]\n  \
+         lightview-headless serve <gallery-path> [--port <port>] [--tls-san <host>]\n                              \
+         [--web-root <dir>]\n  \
          lightview-headless pair  <gallery-path>\n\n\
          COMMANDS:\n  \
          serve   Open a gallery and serve it over the LAN (default port {DEFAULT_PORT}).\n  \
          pair    Mint a one-time 6-digit pairing PIN for the gallery and exit.\n\n\
          OPTIONS:\n  \
+         --web-root <dir>  Serve the web app from this directory instead of the copy\n                    \
+         compiled into the binary. For development against a live Vite build.\n  \
          --tls-san <host>  Additional IP or DNS name the TLS certificate must cover.\n                    \
          Repeatable; also accepts a comma-separated list. Required when the\n                    \
          address clients dial isn't one this process can detect — notably in\n                    \

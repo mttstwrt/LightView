@@ -67,6 +67,26 @@ render config — are absent from the allowlist rather than hidden in the UI.
 `capabilitiesStore` asks the server what this client may do and the components
 render accordingly, but the enforcement is server-side.
 
+### A command absent from the allowlist is not a command the web client may call
+
+`lib/memoryPressure.ts` polled `get_memory_status` from both runtimes. It is not
+on the allowlist and never was, so in a browser every five-second cycle `403`'d
+into an empty `catch` — the viewer cache's pressure-based eviction simply did
+not exist on the web, and nothing said so. `tsc` cannot see this, and neither
+can the Rust tests; it turned up by driving the SPA against
+`lightview-headless`.
+
+Allowlisting it would have been the wrong repair: it reports the *server's* RAM,
+and sizing a phone's image cache from a NAS's free memory is meaningless. Each
+runtime now reads a signal it actually has — free host RAM over IPC on the
+desktop, `navigator.deviceMemory` in a browser. The browser one is sampled once
+rather than polled, because it is a static device class and the live alternative
+(`performance.memory`) measures the JS heap, which is not where decoded images
+live.
+
+The general shape: an empty `catch` around an IPC call is how a
+transport-specific failure stays invisible. Log it, at least once.
+
 ## Invariants
 
 **Grid cells are keyed by path, never by index.** Both grids render with a

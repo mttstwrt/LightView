@@ -10,7 +10,11 @@ import type {
   SortedItem,
 } from "../lib/types";
 import { loadPref, savePref } from "../lib/clientPrefs";
-import { setRating as setRatingIpc, setColorLabel as setColorLabelIpc } from "../lib/ipc";
+import {
+  setRating as setRatingIpc,
+  setColorLabel as setColorLabelIpc,
+  getEnabledViews,
+} from "../lib/ipc";
 
 // ---------------------------------------------------------------------------
 // Gallery state
@@ -102,6 +106,15 @@ const [selectionMode, setSelectionMode] = createSignal(false);
 // map (geographic browsing).
 export type ViewMode = "grid" | "justified" | "map";
 
+/** The views, in switcher order, with the labels every switcher uses. One
+ *  table rather than a literal per call site: the top bar, the mobile settings
+ *  panel and the desktop enable/disable list all render the same three. */
+export const VIEW_CHOICES: { mode: ViewMode; label: string; title: string }[] = [
+  { mode: "grid", label: "Grid", title: "Uniform square grid" },
+  { mode: "justified", label: "Justified", title: "Aspect-preserving rows" },
+  { mode: "map", label: "Map", title: "Geographic map" },
+];
+
 // Persist the chosen layout per client so the last-used view is restored on the
 // next open (localStorage — per browser/device, matching per-client settings).
 const VIEW_MODE_PREF = "viewMode";
@@ -116,6 +129,41 @@ const setViewMode = ((value) => {
   savePref(VIEW_MODE_PREF, next);
   return next;
 }) as typeof setViewModeRaw;
+
+// Which views the *gallery* offers, as opposed to which one this client last
+// used. A view the gallery has turned off generates no thumbnails for its tier
+// (see the Rust `views` module), so offering it in the switcher would show a
+// grid that has to decode the whole library on the spot. Optimistically all
+// three until the backend answers — the same reasoning as capabilitiesStore's
+// baseline: assuming none makes the switcher flash empty.
+const ALL_VIEWS: ViewMode[] = ["grid", "justified", "map"];
+const [enabledViews, setEnabledViewsRaw] = createSignal<ViewMode[]>(ALL_VIEWS);
+
+/** Apply the gallery's enabled-view list, falling back to a view that exists
+ *  if the one this client last used has since been turned off. A gallery with
+ *  every view disabled is left on the stored view rather than on nothing —
+ *  App renders a grid either way, and stranding the user on a blank screen
+ *  they cannot navigate out of is worse than honouring a stale preference. */
+export function applyEnabledViews(views: string[]) {
+  const next = ALL_VIEWS.filter((v) => views.includes(v));
+  setEnabledViewsRaw(next);
+  if (next.length > 0 && !next.includes(viewMode())) setViewMode(next[0]);
+}
+
+/** Fetch the gallery's enabled views. Called once per gallery open on desktop
+ *  and once at boot on the web client. A failure leaves the optimistic
+ *  all-views default: the switcher offering a view whose tier isn't pre-warmed
+ *  is a slow grid, while hiding one the gallery does offer is a feature the
+ *  user cannot reach. */
+export async function loadEnabledViews() {
+  try {
+    applyEnabledViews(await getEnabledViews());
+  } catch (e) {
+    console.warn("Failed to load enabled views:", e);
+  }
+}
+
+export { enabledViews };
 
 // Whether the settings panel is open. On mobile the panel is a full-screen
 // page, so App uses this to stop rendering the grid behind it.

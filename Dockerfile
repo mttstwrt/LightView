@@ -38,8 +38,10 @@ COPY . .
 ARG GIT_SHA=""
 ENV VITE_GIT_SHA=$GIT_SHA
 
-# Frontend SPA → dist/ (served by the headless binary). Only npm's download
-# cache is mounted; node_modules/ and dist/ stay real files in the layer.
+# Frontend SPA → dist/. This must run *before* cargo: the Rust build embeds
+# dist/ into the binary (http_server::web_assets) and fails to compile without
+# it. Only npm's download cache is mounted; node_modules/ and dist/ stay real
+# files in the layer.
 RUN --mount=type=cache,target=/root/.npm \
     npm ci && npm run build
 
@@ -76,7 +78,8 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,sharing=locked \
       ca-certificates
 
 WORKDIR /opt/lightview
-COPY --from=build /app/dist ./dist
+# The SPA is compiled into the binary, so the runtime image carries no dist/ —
+# there is nothing left that can fall out of step with the executable.
 # Staged to /usr/local/bin by the build stage — target/ is a cache mount and so
 # doesn't exist in that stage's filesystem.
 COPY --from=build /usr/local/bin/lightview-headless ./lightview-headless

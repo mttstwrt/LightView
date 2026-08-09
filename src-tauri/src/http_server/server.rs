@@ -12,7 +12,9 @@
 //!   upstream of holding a cookie. It is public regardless — every TLS
 //!   handshake hands the same bytes to anyone who connects.
 //! * **Static** — the SPA. Outside auth because the shell must load before the
-//!   client can pair; it contains no gallery data.
+//!   client can pair; it contains no gallery data. Served from the bytes
+//!   compiled into the binary ([`super::web_assets`]) unless `web_root` names
+//!   a directory to use instead.
 //!
 //! The upload body limit is applied to `/api/upload` alone rather than
 //! globally, so the other routes keep axum's small default and a hostile client
@@ -38,6 +40,7 @@ use super::config::HttpConfig;
 use super::middleware as mw;
 use super::routes;
 use super::tls;
+use super::web_assets;
 use crate::AppState;
 
 #[derive(Clone)]
@@ -160,23 +163,24 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
         .merge(protected)
         .merge(bootstrap);
 
-    if let Some(web_root) = state.config.web_root.clone() {
-        if web_root.is_dir() {
-            let index = web_root.join("index.html");
-            // Wrap the static file service in its own router so the cache-policy
-            // middleware applies only to SPA assets — not to media/thumb/api,
-            // which have their own caching needs. See `mw::static_cache_control`.
-            let static_files = Router::new()
-                .fallback_service(ServeDir::new(&web_root).fallback(ServeFile::new(index)))
-                .layer(middleware::from_fn(mw::static_cache_control));
-            router = router.fallback_service(static_files);
-            log::info!("Serving web app from {}", web_root.display());
-        } else {
-            log::warn!(
-                "web_root {} does not exist; SPA will not be served",
-                web_root.display()
-            );
-        }
+    if state.config.serve_spa {
+        // Wrap the static file service in its own router so the cache-policy
+        // middleware applies only to SPA assets — not to media/thumb/api,
+        // which have their own caching needs. See `mw::static_cache_control`.
+        // Both branches sit behind it so the embedded and on-disk paths cannot
+        // drift in their caching.
+        let static_files = Router::new()
+            .fallback_service(match state.config.web_root.clone() {
+                Some(web_root) => {
+                    let index = web_root.join("index.html");
+                    log::info!("Serving web app from {}", web_root.display());
+                    Router::new()
+                        .fallback_service(ServeDir::new(&web_root).fallback(ServeFile::new(index)))
+                }
+                None => Router::new().fallback(web_assets::serve),
+            })
+            .layer(middleware::from_fn(mw::static_cache_control));
+        router = router.fallback_service(static_files);
     }
 
     let router = router

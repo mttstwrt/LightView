@@ -49,22 +49,25 @@ command; the headless binary calls `open_gallery_impl` and starts the watcher
 itself, so both paths watch for disk changes.
 
 ```bash
-# Build the binary (debug is fine for testing) and the SPA it serves from dist/
+# Build the SPA first — dist/ is embedded at compile time, so the Rust build
+# fails without it (see docs/build-and-verify.md).
+npm run build
 cd src-tauri && cargo build --bin lightview-headless
-npm run build      # produces dist/ at the repo root; resolve_web_root() finds it
 
 # Make a throwaway gallery
 G=$(mktemp -d); for c in red green blue; do magick -size 64x64 xc:$c "$G/$c.jpg"; done
 
 # Serve it (0.0.0.0, HTTPS with a self-signed cert, per-device cookie auth,
-# SPA from dist/). Use `curl -k` — the cert is self-signed.
+# SPA from the embedded copy). Use `curl -k` — the cert is self-signed.
+# `--web-root <dir>` serves a directory instead, for a live Vite output.
 ./target/debug/lightview-headless serve "$G" --port 8799 &
 
-# Pair a device: mint a PIN, redeem it for the lv_device cookie
+# Pair a device: mint a PIN, redeem it for the device cookie. The cookie name
+# carries a per-gallery suffix (`lv_device_<id>`), so match the base name.
 PIN=$(./target/debug/lightview-headless pair "$G" | sed -n 's/Pairing PIN: //p')
 COOKIE=$(curl -sk -D- -o/dev/null -X POST https://localhost:8799/pair/redeem \
   -H 'Content-Type: application/json' -d "{\"code\":\"$PIN\",\"device_name\":\"test\"}" \
-  | sed -nE 's/.*(lv_device=[^;]+).*/\1/p')
+  | sed -nE 's/.*(lv_device[^=]*=[^;]+).*/\1/p')
 
 # Now hit auth-gated routes. Example: watch the SSE change stream, then add a file
 curl -skN --cookie "$COOKIE" https://localhost:8799/api/events &  # streams `event: fs-changed`
@@ -73,7 +76,7 @@ cp "$G/red.jpg" "$G/new.jpg"                               # watcher → broadca
 
 Notes: the watcher only catches changes made *after* startup (a restart
 re-indexes). `/api/events`, `/api/upload`, and `/api/invoke` all require the
-`lv_device` cookie; unauthenticated requests get `401`. Default port is `8787`.
+device cookie; unauthenticated requests get `401`. Default port is `8787`.
 Remote serving is always HTTPS — browsers need a secure context for the async
 Clipboard API and friends. The self-signed ECDSA cert persists at
 `<exe_dir>/data/tls/` and regenerates when the LAN IP changes or expiry nears

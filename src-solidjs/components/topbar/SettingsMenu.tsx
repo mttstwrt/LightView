@@ -2,7 +2,7 @@ import { createSignal, createEffect, Show, For, onCleanup, onMount } from "solid
 import { Portal, Dynamic } from "solid-js/web";
 import { GearIcon, CloseIcon } from "./icons";
 import { settings, setSettings } from "../../stores/settingsStore";
-import { displayPaths, settingsOpen, setSettingsOpen, viewMode, setViewMode } from "../../stores/galleryStore";
+import { displayPaths, settingsOpen, setSettingsOpen, viewMode, setViewMode, enabledViews, applyEnabledViews, loadEnabledViews, VIEW_CHOICES, type ViewMode } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
 import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
 import { versionLabel, GIT_SHA } from "../../lib/version";
@@ -31,6 +31,7 @@ import {
   setUploadConfig,
   getRemoteDeleteConfig,
   setRemoteDeleteConfig,
+  setEnabledViews,
   getRenderConfig,
   setRenderConfig,
   type RenderConfig,
@@ -365,6 +366,25 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     }
   };
 
+  // ── Enabled views (per-gallery, host-only) ──
+  //
+  // Turning the last one off would leave a switcher with nothing in it and no
+  // way back, so the final enabled view can't be removed.
+  const toggleView = async (mode: ViewMode) => {
+    const current = enabledViews();
+    const next = current.includes(mode)
+      ? current.filter((v) => v !== mode)
+      : VIEW_CHOICES.map((v) => v.mode).filter((v) => v === mode || current.includes(v));
+    if (next.length === 0) return;
+    applyEnabledViews(next); // optimistic
+    try {
+      await setEnabledViews(next);
+    } catch (e) {
+      console.error("Set enabled views failed:", e);
+      loadEnabledViews(); // revert to server truth
+    }
+  };
+
   const formatRelative = (ts: number) => {
     if (!ts) return "never";
     const diff = Math.max(0, Date.now() / 1000 - ts);
@@ -687,11 +707,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             <Show when={isMobile()}>
               <Section label="View" order={0}>
                 <div class="flex items-center gap-1 p-0.5 rounded bg-neutral-800/60">
-                  <For each={[
-                    { mode: "grid" as const, label: "Grid" },
-                    { mode: "justified" as const, label: "Justified" },
-                    { mode: "map" as const, label: "Map" },
-                  ]}>
+                  <For each={VIEW_CHOICES.filter((v) => enabledViews().includes(v.mode))}>
                     {(v) => (
                       <button
                         onClick={() => { setViewMode(v.mode); setOpen(false); }}
@@ -703,6 +719,43 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                     )}
                   </For>
                 </div>
+              </Section>
+            </Show>
+
+            {/* ── Views (desktop only — this configures the gallery, not the
+                device, so a paired phone reads the list but cannot change
+                it) ── */}
+            <Show when={!isWeb()}>
+              <Section label="Views" order={4}>
+                <Field label="Available in this gallery">
+                  <div class="flex flex-col gap-1.5">
+                    <For each={VIEW_CHOICES}>
+                      {(v) => (
+                        <div class="flex items-center justify-between">
+                          <span class="text-[11px] text-neutral-400">{v.label}</span>
+                          <button
+                            onClick={() => toggleView(v.mode)}
+                            class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                              enabledViews().includes(v.mode) ? "bg-teal-600" : "bg-neutral-700"
+                            }`}
+                            title={v.title}
+                          >
+                            <span
+                              class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
+                                enabledViews().includes(v.mode) ? "left-[18px]" : "left-0.5"
+                              }`}
+                            />
+                          </button>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Field>
+                <span class="text-[10px] text-neutral-600 leading-snug">
+                  A disabled view stops pre-generating its thumbnails — on a large
+                  gallery that is gigabytes for cells nobody renders. Thumbnails
+                  already cached are kept, so re-enabling a view costs nothing.
+                </span>
               </Section>
             </Show>
 
