@@ -63,4 +63,7 @@ answer to "why not the obvious thing?" is longer than a sentence.
 
 [`todo.md`](todo.md) is the running list of known gaps — things that are
 understood but not done. It is deliberately short; anything with enough shape
-to be designed belongs in a subsystem page instead.
+to be designed belongs in a subsystem page instead. Items are grouped by the
+part of the system they touch and ordered *within* a group by the sequence they
+should be done in, with the reasoning for that sequence stated; the groups
+themselves are independent of one another.
