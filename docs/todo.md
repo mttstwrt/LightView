@@ -429,10 +429,41 @@ settings is rare. Search and select keep their corners. That hierarchy is
 already half-built by accident; this makes it the rule.
 
 The commands worth listing: manage tags, find duplicates, view trash, upload,
-run a plugin, open a folder. Anything scoped to a *selection* stays out —
-`SelectionBar` and `ContextMenu` already own that, and moving selection actions
-into a global list would break the one thing the mobile chrome currently gets
-right.
+run a plugin, open a folder — **and settings**. Opening the settings panel is a
+command like any other, so it is the last entry rather than a button beside the
+list, which takes the phone from four floating controls to three and keeps the
+one-list rule free of a special case. It costs settings a second tap, which is
+the premise of the whole split: rare things are allowed to be further away.
+
+Anything scoped to a *selection* stays out — `SelectionBar` and `ContextMenu`
+already own that, and moving selection actions into a global list would break
+the one thing the mobile chrome currently gets right. That the actions button
+inherits the FAB's "hide while the selection bar is up" rule is therefore
+correct, not a gap.
+
+Two constraints make folding settings in safe rather than clever:
+
+- **The button and the settings entry must render from local state alone.**
+  Today's upload FAB is `<Show when={config()?.enabled}>` — a server-fetched
+  gate that removes the entire button when the fetch fails. Inheriting that
+  would delete the only route to Settings whenever the server is unreachable,
+  and Settings → Connection is exactly where "Install server certificate" and
+  "Reset connection" live: the recovery actions for an unreachable server.
+  Individual entries may be gated; the button and the settings entry may not.
+  (`ConnectionBanner` offers "Reset connection" independently once
+  `serverUnreachable` is set, so this is not a single point of failure — but
+  the certificate link has no second home, and the case that needs it is the
+  *working* client whose click-through exception is about to lapse.)
+- **The icon has to mean "more", not "add".** An overflow glyph reads as
+  "everything else" and plausibly contains Settings; a `+` reads as create,
+  over-promising upload and under-promising the rest. The cost is that upload —
+  probably the most-used action on a phone — moves to two taps. Worth paying
+  for one extensible control instead of four fixed ones, but it is a real cost,
+  not a free win.
+
+The viewer is not a complication: `MediaViewer` is `z-50` and the mobile chrome
+is `z-40`, so the gear is already covered while the viewer is open. Nothing is
+lost by moving it.
 
 **Why the `order` prop decayed, and what replaces it.** It was a deliberate
 attempt to float the most-used sections to the top, and it stopped being
@@ -451,10 +482,10 @@ already has an exception.
 Still open, and worth deciding before writing code: where the desktop toolbar
 lives, given the top bar already carries filter, sort, the item count, the view
 switcher and the gear — a second row, icons appended to that row, or a rail.
-And whether the mobile gear folds into the actions sheet as a final "Settings"
-entry, which would take the phone down to three floating buttons at the cost of
-a second tap. Once those are settled this has enough shape to graduate out of
-this file into a `frontend/` page.
+Settings folds into the toolbar there too, for the same reason as on mobile;
+that is consistency rather than pressure, since the desktop has the room.
+Once the placement is settled this has enough shape to graduate out of this
+file into a `frontend/` page.
 
 ---
 
