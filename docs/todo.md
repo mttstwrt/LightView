@@ -7,10 +7,12 @@ belongs in a subsystem page instead.
 
 Items are grouped by the part of the system they touch, and **within a group
 they are listed in the order they should be done**: each group's opening
-paragraph says why that order and not another. The groups themselves are
-independent — nothing in *Frontend structure* waits on *Remote tagging* — so
-they can be worked in any order or in parallel. Ids (`A1`, `B2`, …) are stable
-references; they encode position within a group, not global priority.
+paragraph says why that order and not another. The groups are near-independent —
+nothing in *Frontend structure* waits on *Remote tagging* — so they can largely
+be worked in parallel. The one cross-group dependency is D1 before C2: building
+the infinite canvas before the two grids are de-duplicated makes it a third copy
+of their loading machinery. Ids (`A1`, `B2`, …) are stable references; they
+encode position within a group, not global priority.
 
 Items marked **(small)** are hours, not days. Those, plus C3, were previously
 collected under a single "Smaller items" heading; they now sit in the group each
@@ -320,7 +322,7 @@ not having it.
 Ordering needs a defined sequence — labels are a fixed list, so sort on that
 list's index rather than the stored string, with unlabelled items last.
 
-### C2. A view API, only once there are two implementations
+### C2. The infinite canvas, and the view-API question behind it
 
 Views can already be enabled per gallery (`views.rs`), and the idle worker
 pre-warms only what the enabled ones ask for. The view still wanted is an
@@ -328,11 +330,38 @@ infinite scrolling canvas: the top of the current sort in the centre, later
 items spiralling outward, reusing the aspect-preserving justified tiers so it
 costs no new thumbnails.
 
-Build it as a native view first. Extract a view-module API when the canvas
-exists and is the *second* real consumer of it, not before — the shape of the
-contract is unknowable from one implementation, and
-[`plugins/`](plugins/README.md) §3 already sets out why the core views
-themselves should not be routed through it. Native dynamic libraries were
+Build it as a native view first, and do not extract a view-module API until it
+exists. **Not because there is only one view today** — there are three, and an
+earlier phrasing of this item wrongly implied otherwise. The reason is that the
+three do not span the design space a contract would have to cover:
+
+- `GalleryGrid` and `JustifiedGrid` are one design with two layout policies, not
+  two designs. [`grid-loading.md`](frontend/grid-loading.md) describes them
+  running "the same seven-part machine", their props differ by three fields out
+  of thirteen (`aspects`, `itemMeta`, `groupStarts`), and
+  [D1](#d1-250300-duplicated-lines-between-the-two-grids) is 250–300 lines still
+  copied between them. Two near-identical points do not define a line.
+- `MapView` is the opposite problem: it is not a renderer of the sorted list at
+  all. It takes no data props — `App.tsx` passes it nothing — queries
+  `getGeoPaths`/`getGeoPoints` itself, *writes* `displayPaths` and `sortedItems`,
+  and ends by calling `setViewMode("grid")` to hand you back. Any contract the
+  grids suggest, it could not implement; any contract loose enough to include it
+  says only "a component that may mutate the stores", which is what exists now.
+
+So the missing data point is a view that consumes the *same* model as the grids
+— current sort order, aspect-preserving tiers, windowed loading — while laying
+out non-linearly. That is exactly the canvas, and it is what separates the
+shared loading machinery from the per-view layout policy the two are currently
+fused into. Note also that "consumer" here means consumer *of the API*: per
+[`plugins/`](plugins/README.md) §3 the core views stay native and would not be
+routed through it even once it exists, so counting core views was never the
+right test.
+
+Build the canvas after [D1](#d1-250300-duplicated-lines-between-the-two-grids),
+or it becomes a third copy of that seven-part machine rather than the first
+consumer of an extracted one.
+
+Native dynamic libraries were
 considered and rejected for this: layout runs in a webview, the LAN web client
 cannot load a host `.so` at all, and an IPC-per-scroll arrangement puts a round
 trip in the one loop that must not have one. Whatever lands must stay a single
