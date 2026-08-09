@@ -37,6 +37,24 @@ step with the Rust serde structs on the other side.
 | `components/auth/` | `PairApp`, `PasswordModal` — the web-only bootstrap flows |
 | `components/shared/` | `ContextMenu`, `ScrollBar`, `ConfirmButton` |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |
+| `components/map/` | `MapView` — the one component behind a `lazy()` split (see below) |
+
+### Views are native, and the expensive one is split out
+
+The five views — square grid, justified grid, map, and the two unbuilt ones —
+are ordinary components, wired directly in `App.tsx`. There is no view
+registry or module API, and [decision 0008](../decisions/0008-no-view-module-api.md)
+records why: the thing an API was wanted for is that an unused view should cost
+nothing, and that is a bundling question. Per-gallery enablement (`views.rs`,
+surfaced through `enabledViews` in `galleryStore`) plus a dynamic `import()` on
+the views that carry their own libraries delivers it with no public contract.
+
+`MapView` is the only one that qualifies, and by a wide margin: leaflet plus its
+CSS is 153 kB of a 445 kB build. It loads through Solid's `lazy()`, so a gallery
+browsed in the grids never fetches it, and a gallery with the map disabled never
+even triggers the import. Every other view sits on machinery the main bundle
+carries regardless — splitting them would save single-digit kilobytes. Split the
+next view that brings its own renderer; measure first.
 
 ## The IPC boundary
 

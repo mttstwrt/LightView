@@ -93,7 +93,9 @@ maps them to the thumbnail tiers the idle worker should pre-warm. It is a single
 small module because enablement and generation are one decision: a view nobody
 can open should not be spending gigabytes pre-generating cells. Read by
 [`pipeline/`](pipeline/README.md) and by both clients; written only from the
-desktop.
+desktop. Together with a `lazy()` split on the one view that carries its own
+rendering library, it is also the whole of what a view-module API would have
+bought — see [decision 0008](decisions/0008-no-view-module-api.md).
 
 **`hardware/`** detects storage type, core count, RAM, and GPU once at startup.
 Its output sizes the thumbnail thread pool and decides whether the GPU pipeline

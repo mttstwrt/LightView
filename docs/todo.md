@@ -303,11 +303,15 @@ the class.
 
 ## C. Views and browsing
 
+Five views, all native: the two grids and the map exist, the canvas and the
+virtual folder hierarchy do not. There is no view-module API and there is not
+going to be one — [decision 0008](decisions/0008-no-view-module-api.md) records
+why, and what replaced it.
+
 **C1 first**: it finishes something already half-built and shipped, and an
 existing feature that misleads is worse than a missing one. Only then start new
-views. **C2 before C3** because the infinite canvas is the view actually wanted
-and is the one that settles the view-module API question; the virtual folder
-view is a well-specified idea with no pressure behind it.
+views. **C2 before C3** because the infinite canvas is the view actually wanted;
+the virtual folder view is a well-specified idea with no pressure behind it.
 
 ### C1. Colour labels stop half way
 
@@ -322,50 +326,29 @@ not having it.
 Ordering needs a defined sequence — labels are a fixed list, so sort on that
 list's index rather than the stored string, with unlabelled items last.
 
-### C2. The infinite canvas, and the view-API question behind it
+### C2. The infinite scrolling canvas
 
-Views can already be enabled per gallery (`views.rs`), and the idle worker
-pre-warms only what the enabled ones ask for. The view still wanted is an
-infinite scrolling canvas: the top of the current sort in the centre, later
-items spiralling outward, reusing the aspect-preserving justified tiers so it
-costs no new thumbnails.
+The top of the current sort in the centre, later items spiralling outward,
+reusing the aspect-preserving justified tiers so it costs no new thumbnails.
 
-Build it as a native view first, and do not extract a view-module API until it
-exists. **Not because there is only one view today** — there are three, and an
-earlier phrasing of this item wrongly implied otherwise. The reason is that the
-three do not span the design space a contract would have to cover:
+A native view, like the other four. The view-module API this item used to be
+about is settled and not happening — see
+[decision 0008](decisions/0008-no-view-module-api.md). The short version: the
+thing an API was wanted for was "a view you never use costs nothing", and that
+is a bundling question, not a contract question. Per-gallery enablement
+(`views.rs`) plus a dynamic `import()` on the views that are actually expensive
+delivers it with no public surface at all — the map, the only view carrying its
+own rendering library, is 153 kB of a 445 kB bundle and is already split out;
+the canvas and [C3](#c3-a-virtual-folder-view) reuse machinery the main bundle
+carries regardless, so splitting them would save single-digit kilobytes.
 
-- `GalleryGrid` and `JustifiedGrid` are one design with two layout policies, not
-  two designs. [`grid-loading.md`](frontend/grid-loading.md) describes them
-  running "the same seven-part machine", their props differ by three fields out
-  of thirteen (`aspects`, `itemMeta`, `groupStarts`), and
-  [D1](#d1-250300-duplicated-lines-between-the-two-grids) is 250–300 lines still
-  copied between them. Two near-identical points do not define a line.
-- `MapView` is the opposite problem: it is not a renderer of the sorted list at
-  all. It takes no data props — `App.tsx` passes it nothing — queries
-  `getGeoPaths`/`getGeoPoints` itself, *writes* `displayPaths` and `sortedItems`,
-  and ends by calling `setViewMode("grid")` to hand you back. Any contract the
-  grids suggest, it could not implement; any contract loose enough to include it
-  says only "a component that may mutate the stores", which is what exists now.
-
-So the missing data point is a view that consumes the *same* model as the grids
-— current sort order, aspect-preserving tiers, windowed loading — while laying
-out non-linearly. That is exactly the canvas, and it is what separates the
-shared loading machinery from the per-view layout policy the two are currently
-fused into. Note also that "consumer" here means consumer *of the API*: per
-[`plugins/`](plugins/README.md) §3 the core views stay native and would not be
-routed through it even once it exists, so counting core views was never the
-right test.
-
-Build the canvas after [D1](#d1-250300-duplicated-lines-between-the-two-grids),
-or it becomes a third copy of that seven-part machine rather than the first
-consumer of an extracted one.
-
-Native dynamic libraries were
-considered and rejected for this: layout runs in a webview, the LAN web client
-cannot load a host `.so` at all, and an IPC-per-scroll arrangement puts a round
-trip in the one loop that must not have one. Whatever lands must stay a single
-Docker image, which also rules out a cargo feature per view.
+What the canvas *does* need is shared implementation, which the frontend already
+has a pattern for: behaviour lives in `lib/` as factory functions taking
+accessors (`scrollDynamics.ts`, `loadPriority.ts`, `thumbSwap.ts`, …), each
+component keeping its own policy. So build it after
+[D1](#d1-250300-duplicated-lines-between-the-two-grids), or it becomes a third
+copy of the grids' seven-part loading machine rather than the first consumer of
+an extracted one.
 
 ### C3. A virtual folder view
 

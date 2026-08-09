@@ -58,6 +58,7 @@ answer to "why not the obvious thing?" is longer than a sentence.
 - [0005 — Remote command dispatch is an allowlist](decisions/0005-remote-invoke-is-an-allowlist.md)
 - [0006 — Plugins are subprocesses speaking NDJSON](decisions/0006-plugins-are-ndjson-subprocesses.md)
 - [0007 — Two nested render windows in the grids](decisions/0007-two-zone-render-window.md)
+- [0008 — No view-module API; enablement plus code-splitting instead](decisions/0008-no-view-module-api.md)
 
 ## Open work
 
