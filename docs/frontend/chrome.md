@@ -135,3 +135,36 @@ prop entirely.
   and the mobile chrome is `z-40`, so the gear is covered today.
 - **Selection mode.** See above: the actions button hiding while the selection
   bar is up follows from selection actions living elsewhere.
+
+## Still open
+
+The container question is settled; these are not, and they are why this is not
+yet ready to implement end to end. The first two are the same shape: a section
+whose content does not fit `{label, icon, availability, handler}`.
+
+**Plugins and Remote Tagging are panels, not commands.** "Run a plugin" is
+listed above as one entry, but the Plugins section is a `<For>` over `plugins()`
+with a "Run All" button per plugin, gated on `pluginRunning()` and trailed by
+`pluginStatus()`; Remote Tagging is a live worker roster (busy/idle per worker)
+plus a row per plugin×worker from `taggingActions()`, plus job progress. Neither
+collapses to a single command. Tags, duplicates and trash already show the way
+out — each is a command that opens a dedicated panel (`TagManagerPanel`,
+`DuplicatesPanel`, `TrashPanel`) — but the equivalent panels for plugins and
+remote tagging do not exist, so "no new container" holds for the trigger and not
+for these two. Decide whether they become panels behind a command, or stay in
+the settings panel as the exception.
+
+**The mobile view switcher has no home.** `Section label="View" order={0}` is
+mobile-only and exists because the phone's top bar cannot fit the switcher the
+desktop top bar carries. It is neither a command nor configuration — it is a
+mode selector used constantly, so burying it two taps deep would be a
+regression. (Note also that it sits next to a *different* section named "Views",
+which is the per-gallery enable/disable list and genuinely is configuration. The
+two names should not survive the same pass.)
+
+**Extraction is not a cut-and-paste.** `SettingsMenu` owns around twenty signals
+covering remote access, pairing and QR, password, upload config, remote delete,
+render config, rebuild and precache progress, and plugins. Moving six sections
+out means deciding which state travels with them — `plugins`, `pluginRunning`,
+`pluginStatus` and `handleRunOnAll` go; most of the rest stays — and the plugin
+progress listeners are wired in the same component.

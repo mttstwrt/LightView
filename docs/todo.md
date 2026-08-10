@@ -14,11 +14,11 @@ the infinite canvas before the two grids are de-duplicated makes it a third copy
 of their loading machinery. Ids (`A1`, `B2`, …) are stable references; they
 encode position within a group, not global priority.
 
-Items marked **(small)** are hours, not days. Those, plus C3, were previously
-collected under a single "Smaller items" heading; they now sit in the group each
-one belongs to, because size turned out to be the least useful thing about them
-— B1 is something a much larger item is waiting on, and D2 costs twice as much
-if it is done before D1.
+Items marked **(small)** are hours, not days. Those, plus C3 and D2, were
+previously collected under a single "Smaller items" heading; they now sit in the
+group each one belongs to, because size turned out to be the least useful thing
+about them — B1 is something a much larger item is waiting on, and D2 turned out
+not to be small at all once its premise was checked against the code.
 
 ---
 
@@ -363,14 +363,18 @@ files into were considered and set aside for that reason.
 
 ## D. Frontend structure and performance
 
-**D1 before D2**, and the order matters more than it looks: the decode worker
-pool lives in exactly the fetch loops D1 is extracting, so doing it first means
-writing and verifying it twice, in two copies that already differ in small ways.
-D1 also goes first because [C2](#c2-the-infinite-scrolling-canvas) waits on it.
+**D1 is the only one of the three ready to start.** It has a difference table
+and a named four-step extraction in
+[`grid-loading.md`](frontend/grid-loading.md), and
+[C2](#c2-the-infinite-scrolling-canvas) waits on it. Either reading of D2 also
+lands in the code D1 is extracting, so D1 first there too — otherwise it gets
+written and verified twice, in two copies that already differ in small ways.
 
-**D3 shares nothing with either** — a different file, no common code — and is
-listed last only so the D1→D2 chain stays intact. Take it whenever; it is the
-one item in this group a user would notice.
+**D2 and D3 both need a decision before code.** D2's premise turned out to be
+wrong (there is no decode worker), so it needs restating and then measuring.
+D3's design is written up but three questions under "Still open" in
+[`chrome.md`](frontend/chrome.md) are unanswered. Neither is blocked by D1;
+both are blocked on someone deciding something.
 
 ### D1. ~250–300 duplicated lines between the two grids
 
@@ -380,11 +384,30 @@ small policy differences that make a naive merge unsafe.
 differences and proposes a four-step extraction ordered smallest-risk-first.
 Each step needs browser verification, not just `tsc`.
 
-### D2. A worker pool for image decode on the client *(small)*
+### D2. A worker pool for image decode on the client — premise does not hold
 
-A single decode worker is fine in practice — the browser parallelizes
-`createImageBitmap` — but a small pool would remove the JS orchestration
-bottleneck under burst load.
+As written this said "a single decode worker is fine in practice… but a small
+pool would remove the JS orchestration bottleneck under burst load". **There is
+no decode worker to pool.** `new Worker(` appears nowhere in `src-solidjs/`;
+every "worker" in the frontend is a tagging worker or the service worker. The
+only two `createImageBitmap` calls are `ContextMenu` (clipboard copy) and
+`GifCanvas` (atlas frames), both on the main thread, and `thumbSwap.ts` uses
+`img.decode()` — a browser facility, not a worker of ours.
+
+So this is not a small item and cannot be picked up as one. Restate it before
+scheduling it, as whichever of these was meant:
+
+- **Move thumbnail decode off the main thread at all** — a pool of workers
+  running `createImageBitmap` and transferring bitmaps back. That is a real
+  piece of work, and its case is strongest on WebKitGTK, where decode is a
+  main-thread hit that `thumbSwap` deliberately skips its `decode()` call to
+  avoid ([`grid-loading.md`](frontend/grid-loading.md)).
+- **Widen the grids' drain concurrency** — the two single-flight slots and the
+  one-at-a-time swap, which is orchestration rather than decode and belongs
+  with [D1](#d1-250300-duplicated-lines-between-the-two-grids).
+
+Either way it needs a measurement first, on the engine it is meant to help.
+Neither reading is small, so the tag is gone.
 
 ### D3. Commands and settings are the same drawer, on both surfaces
 
@@ -395,17 +418,23 @@ room: four controls float over an edge-to-edge grid, and the upload FAB already
 carries three hide conditions because it competes for the bottom edge with the
 selection bar and the video player.
 
-The design is settled and written up in [`frontend/chrome.md`](frontend/chrome.md):
-one command list rendered as a dropdown behind an icon that replaces the desktop
-gear, and as a sheet behind a FAB that replaces the mobile upload button, with
-settings as the last entry and the panel keeping only configuration. Neither
-surface gains a control and no new kind of container is introduced. That page
-also carries the two constraints that make it safe, and why the `Section`
-`order` prop decayed.
+The design is in [`frontend/chrome.md`](frontend/chrome.md): one command list
+rendered as a dropdown behind an icon that replaces the desktop gear, and as a
+sheet behind a FAB that replaces the mobile upload button, with settings as the
+last entry and the panel keeping only configuration. Neither surface gains a
+control and no new kind of container is introduced. That page also carries the
+two constraints that make it safe, and why the `Section` `order` prop decayed.
 
-What is left is the work itself, in the order it wants doing: extract the
-command list and its two renderings, move the six action sections out of the
-panel, then re-order what remains as a single list and delete the `order` prop.
+The order of work: extract the command list and its two renderings, move the
+action sections out of the panel, then re-order what remains as a single list
+and delete the `order` prop.
+
+**Not ready to start end to end.** The container question is settled; three
+things under "Still open" on that page are not. Plugins and Remote Tagging are
+stateful panels rather than commands and have nowhere to go yet; the mobile view
+switcher is a constantly-used mode selector that fits neither half; and pulling
+six sections out of a component holding twenty-odd signals needs those signals
+triaged first. The first two are decisions, not code.
 
 ---
 
