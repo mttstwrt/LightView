@@ -238,12 +238,12 @@ buffer stdin to EOF) — see [`docs/remote/worker-tagging.md`](docs/remote/worke
 
 | Path | Purpose |
 |---|---|
-| `stores/` | SolidJS signals for global state: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore` (remote-tagging workers/jobs, web), `thumbnailProgressStore` |
+| `stores/` | SolidJS signals for global state: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore` (remote-tagging workers/jobs, web), `uploadStore`, `thumbnailProgressStore` |
 | `lib/ipc.ts` | All Tauri `invoke()` calls — the single IPC boundary |
 | `lib/types.ts` | Shared TypeScript types |
 | `components/gallery/` | Grid views: `GalleryGrid`, `ThumbnailCell`, `SelectionBar` |
 | `components/viewer/` | Full-resolution `MediaViewer` |
-| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `SettingsMenu` |
+| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `CommandMenu` (the one list of things you *do*, as a desktop dropdown and a mobile sheet), `ViewSwitcher`, `SettingsMenu` (configuration only) — see [`docs/frontend/chrome.md`](docs/frontend/chrome.md) |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |
 
 ### Key design patterns

@@ -299,11 +299,13 @@ a desktop host serving remote access. It is the same queue protocol as
   `getTaggingStatus()` on open; render the plugins submenu from
   `taggingActions()` → `enqueueTaggingJob(name, {paths}, workerId?)`
   (batch-aware via the existing selection handling). Desktop path unchanged.
-- `SettingsMenu.tsx`: web-only **Remote Tagging** section — connected
+- `AutoTagPanel.tsx`: the web body of the **Auto-tagging** panel, reached from
+  the command list ([`frontend/chrome.md`](../frontend/chrome.md)) — connected
   workers (the in-process executor gets a `server` badge), per-action
-  "Tag All Untagged"
+  "Tag untagged"
   (`filter: "type:image AND NOT has::plugin.<tagPrefix>"`, pinned when the
-  action is), job list with cancel, and a no-worker hint.
+  action is), job list with cancel, and a no-worker hint. The panel's desktop
+  body is the installed-plugin list instead; the two never coexist.
 
 ## Testing without ML
 
