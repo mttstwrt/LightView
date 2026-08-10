@@ -1,56 +1,72 @@
 // ---------------------------------------------------------------------------
-// Memory Pressure Monitor — Phase 3 pressure-aware cache management
+// Memory pressure — how much the viewer cache is allowed to hold
 // ---------------------------------------------------------------------------
 //
-// Periodically polls system RAM via IPC and computes a target cache capacity.
-// Formula (from OptimizationPlan §3.1):
-//   - Base:       10% of Total_RAM (in image count)
-//   - Constraint: never exceed 40% of Available_RAM
-//   - Emergency:  if Available_RAM < 1.5 GB, purge to visible-only
+// This module produces one thing: a pressure level. What each level costs is
+// PRESSURE_CONFIGS in viewerCache.ts, which is the only consumer.
 //
-// The monitor converts MB budgets into image counts using a per-image estimate.
+// The two runtimes get different signals, because only one of them has a
+// meaningful one:
+//
+//   Desktop — the host's free RAM, polled over IPC. The app and the images are
+//   on the same machine, so this is the real constraint.
+//
+//   Web — `navigator.deviceMemory`, read once. This is a device class (GB,
+//   quantized, capped at 8), not a live reading.
+//
+// The web client used to poll `get_memory_status` as well. That command is not
+// on the `/api/invoke` allowlist and never has been, so in a browser every
+// cycle 403'd into an empty `catch` and the level never left "normal" —
+// pressure-based eviction simply did not exist there. Allowlisting it would
+// have been the wrong repair: it reports the *server's* RAM, and sizing a
+// phone's image cache from a NAS's free memory means nothing.
+//
+// Why the web signal is sampled once instead of polled: `deviceMemory` is
+// static, and the live alternative — `performance.memory` — measures the JS
+// heap, which is not where decoded images live. Polling it would report a
+// number that cannot move in response to the thing being bounded. Safari
+// exposes neither, so those clients stay at "normal", which is exactly what
+// they were already getting from the broken poll.
 
 import { getMemoryStatus } from "./ipc";
-
-/** Estimated memory footprint of one decoded thumbnail (ImageBitmap). */
-const BYTES_PER_IMAGE = 40 * 1024; // ~40 KB average JPEG thumbnail decoded
+import { isWeb } from "./runtime";
 
 const POLL_INTERVAL_MS = 5_000;
-const EMERGENCY_THRESHOLD_MB = 1536; // 1.5 GB
-const MIN_CACHE_SIZE = 50;
-const MAX_CACHE_SIZE = 500;
+
+/** Host RAM (MB) below which the desktop cache drops to the current image. */
+const EMERGENCY_THRESHOLD_MB = 1536;
+/** Twice the emergency floor: still comfortable, but worth shrinking for. */
+const WARNING_THRESHOLD_MB = EMERGENCY_THRESHOLD_MB * 2;
+
+/** `navigator.deviceMemory` values (GB) at or below which a browser trims. */
+const DEVICE_MEMORY_EMERGENCY_GB = 1;
+const DEVICE_MEMORY_WARNING_GB = 2;
 
 export type PressureLevel = "normal" | "warning" | "emergency";
 
-export interface PressureState {
-  level: PressureLevel;
-  targetCacheSize: number;
-  availableMb: number;
-  totalMb: number;
-}
-
-export type PressureCallback = (state: PressureState) => void;
+export type PressureCallback = (level: PressureLevel) => void;
 
 export class MemoryPressureMonitor {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private callback: PressureCallback;
-  private lastLevel: PressureLevel = "normal";
-  private visibleCount = 0;
+  /** Set after the first failed poll so a persistently failing IPC logs once
+   *  rather than every five seconds — the old empty `catch` hid the failure
+   *  entirely, which is how the web client's dead poll went unnoticed. */
+  private reportedFailure = false;
 
   constructor(callback: PressureCallback) {
     this.callback = callback;
   }
 
-  /** Update the number of currently visible items (used for emergency purge target). */
-  setVisibleCount(count: number) {
-    this.visibleCount = count;
-  }
-
   start() {
+    if (isWeb()) {
+      this.callback(deviceMemoryLevel());
+      return; // static signal — nothing to poll
+    }
     if (this.intervalId !== null) return;
     // Poll immediately, then on interval
-    this.poll();
-    this.intervalId = setInterval(() => this.poll(), POLL_INTERVAL_MS);
+    void this.poll();
+    this.intervalId = setInterval(() => void this.poll(), POLL_INTERVAL_MS);
   }
 
   stop() {
@@ -63,47 +79,33 @@ export class MemoryPressureMonitor {
   private async poll() {
     try {
       const status = await getMemoryStatus();
-      const state = this.computeState(status.total_ram_mb, status.available_ram_mb);
-      this.lastLevel = state.level;
-      this.callback(state);
-    } catch {
-      // IPC failure — don't crash, just skip this cycle
+      this.reportedFailure = false;
+      this.callback(hostMemoryLevel(status.available_ram_mb));
+    } catch (e) {
+      if (!this.reportedFailure) {
+        this.reportedFailure = true;
+        console.warn(
+          "Memory status unavailable — viewer cache stays at its current size:",
+          e,
+        );
+      }
     }
   }
+}
 
-  private computeState(totalMb: number, availableMb: number): PressureState {
-    // Emergency: available RAM dangerously low
-    if (availableMb < EMERGENCY_THRESHOLD_MB) {
-      // Purge to last 2 visible rows worth of images (or visibleCount as proxy)
-      const emergencySize = Math.max(MIN_CACHE_SIZE, this.visibleCount);
-      return {
-        level: "emergency",
-        targetCacheSize: emergencySize,
-        availableMb,
-        totalMb,
-      };
-    }
+function hostMemoryLevel(availableMb: number): PressureLevel {
+  if (availableMb < EMERGENCY_THRESHOLD_MB) return "emergency";
+  if (availableMb < WARNING_THRESHOLD_MB) return "warning";
+  return "normal";
+}
 
-    // Base budget: 10% of total RAM
-    const baseBudgetBytes = totalMb * 1024 * 1024 * 0.10;
-    const baseCount = Math.floor(baseBudgetBytes / BYTES_PER_IMAGE);
-
-    // Constraint: never exceed 40% of available RAM
-    const availBudgetBytes = availableMb * 1024 * 1024 * 0.40;
-    const availCount = Math.floor(availBudgetBytes / BYTES_PER_IMAGE);
-
-    const target = Math.min(baseCount, availCount);
-    const clamped = Math.max(MIN_CACHE_SIZE, Math.min(MAX_CACHE_SIZE, target));
-
-    // Warning level if we're constrained significantly by available RAM
-    const level: PressureLevel =
-      availableMb < EMERGENCY_THRESHOLD_MB * 2 ? "warning" : "normal";
-
-    return {
-      level,
-      targetCacheSize: clamped,
-      availableMb,
-      totalMb,
-    };
-  }
+/** Device class from `navigator.deviceMemory`. Absent (Safari, Firefox) means
+ *  no signal, not a small device — assume "normal" rather than throttling a
+ *  desktop browser on a guess. */
+function deviceMemoryLevel(): PressureLevel {
+  const gb = (navigator as { deviceMemory?: number }).deviceMemory;
+  if (typeof gb !== "number") return "normal";
+  if (gb <= DEVICE_MEMORY_EMERGENCY_GB) return "emergency";
+  if (gb <= DEVICE_MEMORY_WARNING_GB) return "warning";
+  return "normal";
 }

@@ -33,6 +33,7 @@ pub mod util;
 pub mod http_server;
 pub mod tagging;
 pub mod thumb_serve;
+pub mod views;
 pub mod gif_serve;
 pub mod file_clipboard;
 

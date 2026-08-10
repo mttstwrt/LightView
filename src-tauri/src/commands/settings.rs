@@ -22,6 +22,7 @@ use crate::http_server::tls::detect_lan_ip;
 use crate::http_server::uploads::{self, UploadConfig, UploadScheme};
 use crate::http_server::{self, HttpConfig, RemoteAccess};
 use crate::pipeline::thumbnailer::STANDARD_THUMB_SIZE;
+use crate::views;
 use crate::{AppState, RecentGallery};
 
 /// Debug information about which hardware optimizations are active.
@@ -146,22 +147,6 @@ fn detect_firewall_hint(_port: u16) -> Option<String> {
     None
 }
 
-/// Resolve the built SPA directory (`dist/`). Checks paths relative to the CWD
-/// (dev runs from `src-tauri`) and the executable. Returns None if not built.
-fn resolve_web_root() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("dist"));
-        candidates.push(cwd.join("..").join("dist"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("dist"));
-        }
-    }
-    candidates.into_iter().find(|p| p.is_dir())
-}
-
 fn build_info(remote: &RemoteAccess) -> RemoteAccessInfo {
     let addr_port = remote.addr.port();
     let lan_ip = detect_lan_ip().map(|ip| ip.to_string());
@@ -195,14 +180,7 @@ pub async fn enable_remote_access(
         return Ok(build_info(existing));
     }
 
-    let web_root = resolve_web_root();
-    if web_root.is_none() {
-        log::warn!(
-            "No dist/ directory found — remote clients cannot load the app. Run `npm run build`."
-        );
-    }
-
-    let config = HttpConfig::remote(port.unwrap_or(0), web_root);
+    let config = HttpConfig::remote(port.unwrap_or(0));
     let app_state: AppState = (*state).clone();
     let server = http_server::start(config, app_state)
         .await
@@ -459,6 +437,47 @@ pub async fn get_server_capabilities(
     state: tauri::State<'_, AppState>,
 ) -> Result<ServerCapabilities, String> {
     get_server_capabilities_impl(&state).await
+}
+
+// ---------------------------------------------------------------------------
+// Enabled views
+// ---------------------------------------------------------------------------
+
+/// The views this gallery offers, as the frontend's `ViewMode` strings. Read
+/// by both clients (the web client needs it to hide layouts the gallery does
+/// not offer); writing stays desktop-only, like every other setting that
+/// configures the gallery rather than the device looking at it.
+pub async fn get_enabled_views_impl(state: &AppState) -> Result<Vec<String>, String> {
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    Ok(views::enabled(db.conn())
+        .into_iter()
+        .map(|v| v.as_str().to_string())
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_enabled_views(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    get_enabled_views_impl(&state).await
+}
+
+/// Set the views this gallery offers (host-only, via the desktop UI). Cached
+/// thumbnails for a view being turned off are left alone — see
+/// [`crate::views`].
+#[tauri::command]
+pub async fn set_enabled_views(
+    state: tauri::State<'_, AppState>,
+    enabled: Vec<String>,
+) -> Result<(), String> {
+    let parsed = enabled
+        .iter()
+        .map(|name| views::View::parse(name).ok_or_else(|| format!("unknown view: {name}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let db = state.cache_db.lock().await;
+    let db = db.as_ref().ok_or("No gallery open")?;
+    views::set_enabled(db.conn(), &parsed).map_err(|e| e.to_string())
 }
 
 /// Set the per-gallery remote-delete flag (host-only, via the desktop UI).

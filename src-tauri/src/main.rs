@@ -386,6 +386,8 @@ fn main() {
             commands::settings::get_server_capabilities,
             commands::settings::get_remote_delete_config,
             commands::settings::set_remote_delete_config,
+            commands::settings::get_enabled_views,
+            commands::settings::set_enabled_views,
             commands::settings::reindex_gallery,
             commands::settings::rebuild_thumbnails,
             commands::settings::get_debug_info,

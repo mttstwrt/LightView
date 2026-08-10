@@ -88,6 +88,15 @@ running on a machine with a GPU. See
 `commands/duplicates.rs`: perceptual hashing, grouping, and the merge that
 folds several copies' metadata onto one survivor before trashing the rest.
 
+**`views.rs`** records which layouts a gallery offers, in `gallery_meta`, and
+maps them to the thumbnail tiers the idle worker should pre-warm. It is a single
+small module because enablement and generation are one decision: a view nobody
+can open should not be spending gigabytes pre-generating cells. Read by
+[`pipeline/`](pipeline/README.md) and by both clients; written only from the
+desktop. Together with a `lazy()` split on the one view that carries its own
+rendering library, it is also the whole of what a view-module API would have
+bought — see [decision 0008](decisions/0008-no-view-module-api.md).
+
 **`hardware/`** detects storage type, core count, RAM, and GPU once at startup.
 Its output sizes the thumbnail thread pool and decides whether the GPU pipeline
 is worth initializing — it is read, never written, after startup.

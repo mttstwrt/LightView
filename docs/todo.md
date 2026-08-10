@@ -2,26 +2,135 @@
 
 [← docs index](README.md)
 
-Known gaps, in rough priority order. Anything here is understood but not done;
-anything with enough shape to be designed belongs in a subsystem page instead.
+Known gaps — understood but not done. Anything with enough shape to be designed
+belongs in a subsystem page instead.
 
-## 1. Two galleries on one host share one device cookie
+Items are grouped by the part of the system they touch, and **within a group
+they are listed in the order they should be done**: each group's opening
+paragraph says why that order and not another. The groups are near-independent —
+nothing in *Frontend structure* waits on *Remote tagging* — so they can largely
+be worked in parallel. The one cross-group dependency is D1 before C2: building
+the infinite canvas before the two grids are de-duplicated makes it a third copy
+of their loading machinery. Ids (`A1`, `B2`, …) are stable references; they
+encode position within a group, not global priority.
 
-Pairing a browser with a second gallery silently un-pairs it from the first.
-`POST /pair/redeem` sets a fixed cookie name — `lv_device`, `Path=/`
-(`http_server/auth_routes.rs`) — and cookies are scoped by host, *not* by port,
-so two servers on `server:8787` and `server:8788` write to the same jar and the
-second redemption overwrites the first. iOS home-screen web apps escape it only
-because each gets its own storage container; a desktop browser has one jar and
-loses a pairing every time.
+Items marked **(small)** are hours, not days. Those, plus C3 and D2, were
+previously collected under a single "Smaller items" heading; they now sit in the
+group each one belongs to, because size turned out to be the least useful thing
+about them — B1 is something a much larger item is waiting on, and D2 turned out
+not to be small at all once its premise was checked against the code.
 
-The fix is to make the cookie name carry a per-gallery identifier — mint one
-into `gallery_meta` on first open and suffix the name with it — so the two
-servers stop colliding. Keep accepting a bare `lv_device` as a fallback and
-re-issue it under the new name on the next request, so no already-paired device
-has to pair again. See [`remote/`](remote/README.md).
+---
 
-## 2. Videos are dropped from every remote tagging job
+## A. Remote tagging and plugins
+
+The largest cluster, and one chain: today you cannot tell what a worker is
+actually running, a job that goes wrong can hang forever without saying so, and
+videos silently produce nothing.
+
+The order is driven by verification cost and by two hard dependencies. **A1
+first** because every later item in this group is verified by running jobs, and
+a job that wedges forever turns each of those into a debugging session — and
+because A5 multiplies files-per-job about fivefold, which makes the 64-file
+permit leak far more likely to bite. **A2 and A3 next** as a pair: they are the
+two halves of "what version is actually running on that machine", plugins and
+binary respectively, and A2's installer is a hard prerequisite for A6. **A4
+before A5**, because A4 introduces the manifest-declared input size that A5's
+frame extraction is specified to reuse. **A5 before A6**, because it is what
+takes ffmpeg and video handling out of every plugin, which is worth having
+before they move across a repository boundary. **A7 last** — it is the largest
+and most speculative, and it wants the versioned protocol A6 delivers.
+
+### A1. Two ways a tagging job can still hang forever
+
+Distinct from the stale-plugin deadlock in [A2](#a2-nothing-updates-an-installed-plugin-and-a-stale-one-deadlocks-silently),
+which the 20-minute fail-out does catch. These two paths defeat the timers
+themselves.
+
+On the worker, `last_result` is refreshed before the result is matched against
+`pending` (`bin/lightview-worker/job.rs`), so a plugin that answers with paths
+the worker cannot match keeps the 20-minute `NO_RESULT_STALL_SECS` timer alive
+while leaking a disk permit per file. Downloads stop at 64, the plugin goes
+quiet, and nothing ever trips. Only count a result that matched an entry.
+
+On the server, `TaggingState::reap` is called from `announce_worker`,
+`enqueue_job`, `claim_job` and `get_status` — but not from `update_job`
+(`tagging/mod.rs`), and a worker inside a running job stops announcing and
+claiming. So during exactly the situation the no-progress deadline exists for,
+the only traffic reaching the server is the heartbeat that skips the reaper, and
+`JOB_NO_PROGRESS_SECS` never evaluates. The comment claiming commands "arrive
+constantly, so there is no background reaper task" is wrong for a wedged job.
+
+The real repair underneath both is a per-file deadline: a downloaded file that
+has gone unanswered for its own timeout releases its permit and counts as one
+failed image, so the batch continues instead of dying at 64.
+
+### A2. Nothing updates an installed plugin, and a stale one deadlocks silently
+
+Plugins are *copied* into a worker's `data_dir()/plugins`, and nothing
+afterwards compares that copy against the repo. A worker binary can be rebuilt
+and re-paired while the plugin beside it stays whatever it was on the day it was
+copied — which is how the 64-image stall survives a "latest worker binary".
+
+Any tagger predating commit `1eaa7ed` reads stdin to EOF before loading its
+model. Under `lightview-worker` that is a guaranteed deadlock past
+`MAX_PENDING_FILES`: the host holds stdin open while it waits for results, the
+plugin waits for EOF before it starts, and neither moves. The signature is
+distinctive — the model never loads, so *no VRAM is ever allocated*, jobs under
+64 images finish normally (the downloader drains, stdin closes, EOF arrives),
+and the same plugin works for any batch size in the desktop app, which writes
+every request up front and closes stdin immediately. Reproduced end to end: the
+current `example-auto-tagger` tags 100 images through a remote worker without
+stalling, so the host path itself is sound.
+
+The streaming contract is documented in
+[`remote/worker-tagging.md`](remote/worker-tagging.md) but only enforced by
+convention. Worth having: an install/update command that refreshes plugins from
+a known source rather than leaving `cp -r` as the mechanism, and a version the
+worker reports so a server can see what its workers are actually running.
+
+Making it diagnosable matters as much as preventing it. Plugin stderr is logged
+at `log::debug!` (`plugin/runner.rs`), so at the default level the one channel
+that would have explained this — the plugin saying nothing at all — is
+invisible. It should surface at info, or at least be replayed when a job fails.
+That half is a few lines and pays for itself immediately; do it first, before
+the installer.
+
+### A3. `cargo tauri build` never builds `lightview-worker`
+
+`npm run tauri build` produces no worker binary. That is not a build failure:
+the bin declares `required-features = ["worker"]` (`src-tauri/Cargo.toml`), so
+Cargo skips it unless the feature is on, and the Tauri bundle only carries the
+app's own binary. It needs its own
+`cargo build --release --bin lightview-worker --features worker`.
+
+Decide whether that stays a documented separate step or the worker is added to
+the release build and shipped alongside the app. Either way it should be
+written down, because the quiet failure mode is a developer running a
+months-old worker binary against a current server and debugging the wrong code
+— the same class of problem as [A2](#a2-nothing-updates-an-installed-plugin-and-a-stale-one-deadlocks-silently),
+one level down, which is why the two belong together.
+
+### A4. Taggers decode full-resolution originals on the local path
+
+Remote workers already pull `?fit=1024` (`bin/lightview-worker/config.rs`), so
+this is only half missing: `tagging/local.rs` hands the plugin every original
+path, which means a server-local run of a 448-pixel model decodes 60-megapixel
+files in Python for nothing.
+
+Rather than a second hard-coded number, let the plugin state the longest edge it
+wants in `manifest.json` and honour it on both paths — as the `?fit=` value the
+worker requests, and as a downscaled temp file the local executor hands over in
+place of the original. Point those downloads at the cached `jm` tier where the
+requested size allows it, instead of resizing from source each time; the
+`?fit=` route has no coalescer ([B1](#b1-the-fit-resize-route-has-no-coalescer-small)),
+so every concurrent tagger request currently repeats the same decode. See
+[`plugins/`](plugins/README.md) and [`pipeline/`](pipeline/README.md).
+
+That manifest field is also what [A5](#a5-videos-are-dropped-from-every-remote-tagging-job)
+needs for its frame edge, which is why this comes first.
+
+### A5. Videos are dropped from every remote tagging job
 
 Sending mp4s to a remote worker produces no tags and no worker log line,
 because the job is never offered to a worker at all. `resolve_target`
@@ -81,38 +190,10 @@ is worth having before the taggers move to their own repository. That argues
 for converging the desktop path onto the same host-side extraction rather than
 keeping plugin-side sampling for local runs and server-side sampling for remote
 ones — two policies that would quietly disagree per plugin. The frame edge
-should come from the same manifest-declared input size as still images.
+should come from the same manifest-declared input size as still images
+([A4](#a4-taggers-decode-full-resolution-originals-on-the-local-path)).
 
-## 3. Nothing updates an installed plugin, and a stale one deadlocks silently
-
-Plugins are *copied* into a worker's `data_dir()/plugins`, and nothing
-afterwards compares that copy against the repo. A worker binary can be rebuilt
-and re-paired while the plugin beside it stays whatever it was on the day it was
-copied — which is how the 64-image stall survives a "latest worker binary".
-
-Any tagger predating commit `1eaa7ed` reads stdin to EOF before loading its
-model. Under `lightview-worker` that is a guaranteed deadlock past
-`MAX_PENDING_FILES`: the host holds stdin open while it waits for results, the
-plugin waits for EOF before it starts, and neither moves. The signature is
-distinctive — the model never loads, so *no VRAM is ever allocated*, jobs under
-64 images finish normally (the downloader drains, stdin closes, EOF arrives),
-and the same plugin works for any batch size in the desktop app, which writes
-every request up front and closes stdin immediately. Reproduced end to end: the
-current `example-auto-tagger` tags 100 images through a remote worker without
-stalling, so the host path itself is sound.
-
-The streaming contract is documented in
-[`remote/worker-tagging.md`](remote/worker-tagging.md) but only enforced by
-convention. Worth having: an install/update command that refreshes plugins from
-a known source rather than leaving `cp -r` as the mechanism, and a version the
-worker reports so a server can see what its workers are actually running.
-
-Making it diagnosable matters as much as preventing it. Plugin stderr is logged
-at `log::debug!` (`plugin/runner.rs`), so at the default level the one channel
-that would have explained this — the plugin saying nothing at all — is
-invisible. It should surface at info, or at least be replayed when a job fails.
-
-## 4. Move the real plugins to their own repository
+### A6. Move the real plugins to their own repository
 
 `plugins/` should keep only `example-auto-tagger`; the three ML taggers (`wd`,
 `camie`, `pixai`) move out. They are 11 tracked files and ~200 KB, so this is
@@ -131,11 +212,12 @@ Two things make this more than a `git mv`:
 
 **The install path stops existing.** Today a plugin is installed by copying
 `../plugins/<name>` out of the checkout. With no local copy, that instruction
-has no source, so the install/update mechanism described above stops being a
-nice-to-have and becomes the only way to get a plugin onto a worker. These two
-items should land together or the split will strand every worker on whatever it
-last copied — which is exactly the failure that has already cost a debugging
-session.
+has no source, so the install/update mechanism from
+[A2](#a2-nothing-updates-an-installed-plugin-and-a-stale-one-deadlocks-silently)
+stops being a nice-to-have and becomes the only way to get a plugin onto a
+worker. These two items should land together or the split will strand every
+worker on whatever it last copied — which is exactly the failure that has
+already cost a debugging session.
 
 **The three taggers share a virtualenv that is not in the repo.** Each manifest
 runs `{plugin_dir}/../.venv/bin/python`, a sibling of the plugin directory in
@@ -163,146 +245,7 @@ which host contract it was written against, which is why a script that predates
 the streaming requirement installs cleanly and then deadlocks. Across a repo
 boundary that drift stops being a mistake and becomes the normal case.
 
-## 5. Two ways a tagging job can still hang forever
-
-Distinct from the stale-plugin deadlock above, which the 20-minute fail-out does
-catch. These two paths defeat the timers themselves.
-
-On the worker, `last_result` is refreshed before the result is matched against
-`pending` (`bin/lightview-worker/job.rs`), so a plugin that answers with paths
-the worker cannot match keeps the 20-minute `NO_RESULT_STALL_SECS` timer alive
-while leaking a disk permit per file. Downloads stop at 64, the plugin goes
-quiet, and nothing ever trips. Only count a result that matched an entry.
-
-On the server, `TaggingState::reap` is called from `announce_worker`,
-`enqueue_job`, `claim_job` and `get_status` — but not from `update_job`
-(`tagging/mod.rs`), and a worker inside a running job stops announcing and
-claiming. So during exactly the situation the no-progress deadline exists for,
-the only traffic reaching the server is the heartbeat that skips the reaper, and
-`JOB_NO_PROGRESS_SECS` never evaluates. The comment claiming commands "arrive
-constantly, so there is no background reaper task" is wrong for a wedged job.
-
-The real repair underneath both is a per-file deadline: a downloaded file that
-has gone unanswered for its own timeout releases its permit and counts as one
-failed image, so the batch continues instead of dying at 64.
-
-## 6. `cargo tauri build` never builds `lightview-worker`
-
-`npm run tauri build` produces no worker binary. That is not a build failure:
-the bin declares `required-features = ["worker"]` (`src-tauri/Cargo.toml`), so
-Cargo skips it unless the feature is on, and the Tauri bundle only carries the
-app's own binary. It needs its own
-`cargo build --release --bin lightview-worker --features worker`.
-
-Decide whether that stays a documented separate step or the worker is added to
-the release build and shipped alongside the app. Either way it should be
-written down, because the quiet failure mode is a developer running a
-months-old worker binary against a current server and debugging the wrong code.
-
-## 7. The tree is not rustfmt-formatted
-
-`cargo fmt --check` fails on ~70 files, and formatting would be a ~4,200-line
-diff. Until that lands as its own commit, the gate advertised in `AGENTS.md` is
-aspirational and `cargo clippy --fix` is a trap: its let-chain rewrites leave
-bodies at the old indentation and only look right after a `cargo fmt` you cannot
-scope to one change. Worth doing when no branches are in flight, together with
-the ~60 remaining clippy style warnings (`collapsible_if` dominates). See
-[`build-and-verify.md`](build-and-verify.md).
-
-## 8. ~250–300 duplicated lines between the two grids
-
-Structurally identical fetch loops, eviction, pruning, and URL versioning, with
-small policy differences that make a naive merge unsafe.
-[`frontend/grid-loading.md`](frontend/grid-loading.md) inventories the
-differences and proposes a four-step extraction ordered smallest-risk-first.
-Each step needs browser verification, not just `tsc`.
-
-## 9. `reindex_gallery` does not regenerate thumbnails
-
-Re-indexing rebuilds the media and tag indexes but does not kick off background
-thumbnail regeneration, so a re-index after a bulk external edit leaves stale
-thumbnails until something else asks for them.
-
-## 10. Memory-pressure polling 403s on the web client
-
-`lib/memoryPressure.ts` polls `get_memory_status`, which is not in the
-`/api/invoke` allowlist and never has been. The poll is wrapped in a bare
-`try/catch`, so every cycle fails silently and the viewer cache's
-pressure-based eviction never engages in a browser — only on the desktop.
-
-Adding it to the allowlist is the wrong fix: the command reports the *server's*
-RAM, and sizing a phone's image cache from the host's free memory is
-meaningless. The web client should either use its own signal
-(`performance.memory`, `navigator.deviceMemory`) or not poll at all. Either way
-the empty `catch` should stop hiding it.
-
-Found by driving the SPA against `lightview-headless`; it is invisible from
-`tsc` and from the Rust tests.
-
-## 11. Colour labels stop half way
-
-The column is indexed, `color:` filters, the context menu picks one and
-`ThumbnailCell` draws the dot — but the label is invisible everywhere else and
-cannot order anything. `SortField` (`lib/types.ts`) has no `color` arm, so
-neither `SortMenu` nor the backend sorter offers it, there is no grouping by
-label, and `JustifiedGrid` never renders the dot the square grid does. A colour
-you can set, search for and not see in the view you actually use is worse than
-not having it.
-
-Ordering needs a defined sequence — labels are a fixed list, so sort on that
-list's index rather than the stored string, with unlabelled items last.
-
-## 12. Taggers decode full-resolution originals on the local path
-
-Remote workers already pull `?fit=1024` (`bin/lightview-worker/config.rs`), so
-this is only half missing: `tagging/local.rs` hands the plugin every original
-path, which means a server-local run of a 448-pixel model decodes 60-megapixel
-files in Python for nothing.
-
-Rather than a second hard-coded number, let the plugin state the longest edge it
-wants in `manifest.json` and honour it on both paths — as the `?fit=` value the
-worker requests, and as a downscaled temp file the local executor hands over in
-place of the original. Point those downloads at the cached `jm` tier where the
-requested size allows it, instead of resizing from source each time; the
-`?fit=` route has no coalescer (see Smaller items), so every concurrent tagger
-request currently repeats the same decode. See
-[`plugins/`](plugins/README.md) and [`pipeline/`](pipeline/README.md).
-
-## 13. Square thumbnails are generated for a view you may never open
-
-`PREWARM_TIERS` is `[Standard, Justified]` (`pipeline/idle.rs`), unconditional
-and per gallery. A gallery browsed only in the justified layout still pays the
-full square-tier cost — gigabytes, on a large collection — for cells nobody
-renders, and the same is true in reverse.
-
-Enablement and generation should be one setting: a per-gallery list of enabled
-views, with the idle worker pre-warming only the tiers those views ask for.
-This is the cheap half of the modular-views work below and worth doing on its
-own; it needs no plugin machinery, only a per-gallery setting and a `const`
-that becomes a lookup. Existing rows for a disabled view should stay put rather
-than being deleted — re-enabling the view must not re-decode the library — and
-the tier's LRU budget already bounds the ones that are genuinely stale. See
-[`pipeline/`](pipeline/README.md) and
-[decision 0002](decisions/0002-two-families-of-thumbnail-tiers.md).
-
-## 14. Optional views, and a view API only once there are two of them
-
-Beyond disabling the square grid and the map per gallery, the wanted view is an
-infinite scrolling canvas: the top of the current sort in the centre, later
-items spiralling outward, reusing the aspect-preserving justified tiers so it
-costs no new thumbnails.
-
-Build it as a native view first. Extract a view-module API when the canvas
-exists and is the *second* real consumer of it, not before — the shape of the
-contract is unknowable from one implementation, and
-[`plugins/`](plugins/README.md) §3 already sets out why the core views
-themselves should not be routed through it. Native dynamic libraries were
-considered and rejected for this: layout runs in a webview, the LAN web client
-cannot load a host `.so` at all, and an IPC-per-scroll arrangement puts a round
-trip in the one loop that must not have one. Whatever lands must stay a single
-Docker image, which also rules out a cargo feature per view.
-
-## 15. Plugin-driven UI, and naming what a plugin found
+### A7. Plugin-driven UI, and naming what a plugin found
 
 Recognising faces is the case the current protocol cannot express: the plugin
 can emit a cluster, but nothing can tell it that cluster is a particular
@@ -320,16 +263,221 @@ The face case additionally needs something declarative UI does not give: a host
 screen for naming and merging plugin-emitted clusters, which any plugin that
 produces groups can feed. That belongs to the host, not to a plugin.
 
-## 16. Ship the SPA inside the binary
+This is the group's largest item and wants the versioned protocol
+[A6](#a6-move-the-real-plugins-to-their-own-repository) introduces — a UI
+contract that can drift silently across a repository boundary is worse than no
+UI contract.
 
-`lightview-headless` serves `dist/` from disk (`http_server/server.rs`), so the
-Docker image and any manual deployment carry a directory that must stay in step
-with the executable. `dist/` is 648 KB — embedding it with `rust-embed` costs
-almost nothing and makes the binary self-contained. Keep the existing
-`--web-root` path as an override so a dev build can still point at a live Vite
-output without recompiling.
+---
 
-## 17. "Open folder with LightView" on Linux
+## B. Thumbnails, cache, and serving
+
+Three independent items with no dependency between them, so the order is by
+what unblocks work elsewhere and by size. **B1 first** because it is the
+smallest of the three and because [A4](#a4-taggers-decode-full-resolution-originals-on-the-local-path)
+is about to make the `?fit=` route hot; landing the coalescer before that means
+the tagger work is measured against a route that behaves like the tier path
+rather than against one that redundantly decodes. **B2 next**, a user-visible
+staleness bug. **B3 last** — a latent hazard with no current symptom, safe to
+do at any point.
+
+### B1. The `?fit=` resize route has no coalescer *(small)*
+
+Unlike the tier serve path, concurrent requests for the same resize each do the
+work. Every duplicate is a full source decode.
+
+### B2. `reindex_gallery` does not regenerate thumbnails
+
+Re-indexing rebuilds the media and tag indexes but does not kick off background
+thumbnail regeneration, so a re-index after a bulk external edit leaves stale
+thumbnails until something else asks for them.
+
+### B3. `too_many_arguments` on the thumbnail write paths *(small)*
+
+`write_standard_row` and `write_tier_row` take nine positional arguments each,
+two of them adjacent `u32`s (`width`, `height`). Transposing them at a call site
+would compile and store a wrong aspect ratio. A small `ThumbRow` struct removes
+the class.
+
+---
+
+## C. Views and browsing
+
+Five views, all native: the two grids and the map exist, the canvas and the
+virtual folder hierarchy do not. There is no view-module API and there is not
+going to be one — [decision 0008](decisions/0008-no-view-module-api.md) records
+why, and what replaced it.
+
+**C1 first**: it finishes something already half-built and shipped, and an
+existing feature that misleads is worse than a missing one. Only then start new
+views. **C2 before C3** because the infinite canvas is the view actually wanted;
+the virtual folder view is a well-specified idea with no pressure behind it.
+
+### C1. Colour labels stop half way
+
+The column is indexed, `color:` filters, the context menu picks one and
+`ThumbnailCell` draws the dot — but the label is invisible everywhere else and
+cannot order anything. `SortField` (`lib/types.ts`) has no `color` arm, so
+neither `SortMenu` nor the backend sorter offers it, there is no grouping by
+label, and `JustifiedGrid` never renders the dot the square grid does. A colour
+you can set, search for and not see in the view you actually use is worse than
+not having it.
+
+Ordering needs a defined sequence — labels are a fixed list, so sort on that
+list's index rather than the stored string, with unlabelled items last.
+
+### C2. The infinite scrolling canvas
+
+The top of the current sort in the centre, later items spiralling outward,
+reusing the aspect-preserving justified tiers so it costs no new thumbnails.
+
+A native view, like the other four. The view-module API this item used to be
+about is settled and not happening — see
+[decision 0008](decisions/0008-no-view-module-api.md). The short version: the
+thing an API was wanted for was "a view you never use costs nothing", and that
+is a bundling question, not a contract question. Per-gallery enablement
+(`views.rs`) plus a dynamic `import()` on the views that are actually expensive
+delivers it with no public surface at all — the map, the only view carrying its
+own rendering library, is 153 kB of a 445 kB bundle and is already split out;
+the canvas and [C3](#c3-a-virtual-folder-view) reuse machinery the main bundle
+carries regardless, so splitting them would save single-digit kilobytes.
+
+What the canvas *does* need is shared implementation, which the frontend already
+has a pattern for: behaviour lives in `lib/` as factory functions taking
+accessors (`scrollDynamics.ts`, `loadPriority.ts`, `thumbSwap.ts`, …), each
+component keeping its own policy. So build it after
+[D1](#d1-250300-duplicated-lines-between-the-two-grids), or it becomes a third
+copy of the grids' seven-part loading machine rather than the first consumer of
+an extracted one.
+
+### C3. A virtual folder view
+
+Default hierarchy: plugin names and user folders at the top level, then a folder
+per tag inside. Entirely virtual — it would never copy or move files. Membership
+is *derived*, not curated: every node is a saved query over the existing index,
+which means no new tables, nothing to repair when files move or are deleted, and
+no second source of truth beside the companion files. Curated albums you drag
+files into were considered and set aside for that reason.
+
+---
+
+## D. Frontend structure and performance
+
+**D1 is the only one of the three ready to start.** It has a difference table
+and a named four-step extraction in
+[`grid-loading.md`](frontend/grid-loading.md), and
+[C2](#c2-the-infinite-scrolling-canvas) waits on it. Either reading of D2 also
+lands in the code D1 is extracting, so D1 first there too — otherwise it gets
+written and verified twice, in two copies that already differ in small ways.
+
+**D2 and D3 both need a decision before code.** D2's premise turned out to be
+wrong (there is no decode worker), so it needs restating and then measuring.
+D3's design is written up but three questions under "Still open" in
+[`chrome.md`](frontend/chrome.md) are unanswered. Neither is blocked by D1;
+both are blocked on someone deciding something.
+
+### D1. ~250–300 duplicated lines between the two grids
+
+Structurally identical fetch loops, eviction, pruning, and URL versioning, with
+small policy differences that make a naive merge unsafe.
+[`frontend/grid-loading.md`](frontend/grid-loading.md) inventories the
+differences and proposes a four-step extraction ordered smallest-risk-first.
+Each step needs browser verification, not just `tsc`.
+
+### D2. A worker pool for image decode on the client — premise does not hold
+
+As written this said "a single decode worker is fine in practice… but a small
+pool would remove the JS orchestration bottleneck under burst load". **There is
+no decode worker to pool.** `new Worker(` appears nowhere in `src-solidjs/`;
+every "worker" in the frontend is a tagging worker or the service worker. The
+only two `createImageBitmap` calls are `ContextMenu` (clipboard copy) and
+`GifCanvas` (atlas frames), both on the main thread, and `thumbSwap.ts` uses
+`img.decode()` — a browser facility, not a worker of ours.
+
+So this is not a small item and cannot be picked up as one. Restate it before
+scheduling it, as whichever of these was meant:
+
+- **Move thumbnail decode off the main thread at all** — a pool of workers
+  running `createImageBitmap` and transferring bitmaps back. That is a real
+  piece of work, and its case is strongest on WebKitGTK, where decode is a
+  main-thread hit that `thumbSwap` deliberately skips its `decode()` call to
+  avoid ([`grid-loading.md`](frontend/grid-loading.md)).
+- **Widen the grids' drain concurrency** — the two single-flight slots and the
+  one-at-a-time swap, which is orchestration rather than decode and belongs
+  with [D1](#d1-250300-duplicated-lines-between-the-two-grids).
+
+Either way it needs a measurement first, on the engine it is meant to help.
+Neither reading is small, so the tag is gone.
+
+### D3. Commands and settings are the same drawer, on both surfaces
+
+`SettingsMenu.tsx` is 1,705 lines rendering thirteen `Section`s and no longer
+separates things you *do* from things you *set* — three of those sections are a
+heading plus a single button. The mobile chrome drifted the same way with less
+room: four controls float over an edge-to-edge grid, and the upload FAB already
+carries three hide conditions because it competes for the bottom edge with the
+selection bar and the video player.
+
+The design is in [`frontend/chrome.md`](frontend/chrome.md): one command list
+rendered as a dropdown behind an icon that replaces the desktop gear, and as a
+sheet behind a FAB that replaces the mobile upload button, with settings as the
+last entry and the panel keeping only configuration. Neither surface gains a
+control and no new kind of container is introduced. That page also carries the
+two constraints that make it safe, and why the `Section` `order` prop decayed.
+
+The order of work: extract the command list and its two renderings, move the
+action sections out of the panel, then re-order what remains as a single list
+and delete the `order` prop.
+
+**Not ready to start end to end.** The container question is settled; three
+things under "Still open" on that page are not. Plugins and Remote Tagging are
+stateful panels rather than commands and have nowhere to go yet; the mobile view
+switcher is a constantly-used mode selector that fits neither half; and pulling
+six sections out of a component holding twenty-odd signals needs those signals
+triaged first. The first two are decisions, not code.
+
+---
+
+## E. Build and platform integration
+
+**E1 first**, whenever the tree is quiet enough to take it: until it lands, the
+gate advertised in `AGENTS.md` cannot pass and `cargo clippy --fix` stays a trap
+for every other change in this file. It is a scheduling constraint rather than a
+priority — it wants no branches in flight — so **E2** goes first if that window
+has not arrived; it is also the one of the three a headless deployment feels
+today. **E3** is self-contained and desktop-only, so it waits for neither.
+
+### E1. The tree is not rustfmt-formatted
+
+`cargo fmt --check` fails on ~70 files, and formatting would be a ~4,200-line
+diff. Until that lands as its own commit, the gate advertised in `AGENTS.md` is
+aspirational and `cargo clippy --fix` is a trap: its let-chain rewrites leave
+bodies at the old indentation and only look right after a `cargo fmt` you cannot
+scope to one change. Worth doing when no branches are in flight, together with
+the ~50 remaining clippy style warnings (`collapsible_if` dominates). See
+[`build-and-verify.md`](build-and-verify.md).
+
+### E2. Most host settings are unreachable on a headless server
+
+Every per-gallery host setting is a `#[tauri::command]`, so it exists only in
+the desktop app: the gallery password and its inactivity window, the upload
+enable/scheme, and the remote-delete flag. A paired browser is deliberately not
+allowed to change any of them — they administer the boundary `/api/invoke`
+enforces — which is right, but it means a Docker deployment has no way to reach
+them at all, short of editing `gallery_meta` in SQLite by hand.
+
+`lightview-headless` has the shape of the answer already: `pair` and `views`
+both open the served gallery's `cache.db` from a second process (safe under
+WAL) and mutate one key. The remaining settings want the same treatment, and
+probably one `config` subcommand rather than one verb each — `views` earned its
+own name by being a list rather than a value, and that argument does not
+generalise.
+
+The password is the one with a wrinkle: `set_remote_password` argon2-hashes its
+input, so the subcommand must read the password from a prompt or stdin rather
+than argv, where it would land in shell history and `ps`.
+
+### E3. "Open folder with LightView" on Linux
 
 `lightview.desktop` already declares `MimeType=inode/directory` and
 `Exec=lightview %f`, and `main.rs` already opens a directory passed as argv[1] —
@@ -339,7 +487,14 @@ mismatch, install the desktop file and an icon from the bundle, and add a
 `Desktop Action` so file managers offer "Open LightView here" on a folder's
 background as well as "Open With" on the folder itself. Linux only for now.
 
-## 18. Absolute paths as primary keys
+---
+
+## F. Structural observations
+
+Not scheduled, and deliberately so. Recorded because the shape of the system
+only makes sense once you know them.
+
+### F1. Absolute paths as primary keys
 
 Every path-keyed row stores an absolute path, which is why `rebase_root` and
 `infer_old_root` exist. Storing gallery-relative paths would delete that entire
@@ -347,22 +502,3 @@ mechanism, but it is a migration touching every table and every query, and the
 current machinery works and is tested. Recorded as a structural observation, not
 a recommendation — see
 [decision 0001](decisions/0001-one-cache-per-gallery.md).
-
-## 19. Smaller items
-
-- **A worker pool for image decode on the client.** A single decode worker is
-  fine in practice — the browser parallelizes `createImageBitmap` — but a small
-  pool would remove the JS orchestration bottleneck under burst load.
-- **A virtual folder view.** Default hierarchy: plugin names and user folders at
-  the top level, then a folder per tag inside. Entirely virtual — it would never
-  copy or move files. Membership is *derived*, not curated: every node is a
-  saved query over the existing index, which means no new tables, nothing to
-  repair when files move or are deleted, and no second source of truth beside
-  the companion files. Curated albums you drag files into were considered and
-  set aside for that reason.
-- **`too_many_arguments` on the thumbnail write paths.** `write_standard_row`
-  and `write_tier_row` take nine positional arguments each, two of them adjacent
-  `u32`s (`width`, `height`). Transposing them at a call site would compile and
-  store a wrong aspect ratio. A small `ThumbRow` struct removes the class.
-- **The `?fit=` resize route has no coalescer**, unlike the tier serve path, so
-  concurrent requests for the same resize each do the work.

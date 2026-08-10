@@ -373,7 +373,8 @@ fn encode_media_path(rel: &str) -> String {
         .join("/")
 }
 
-/// Redeem a pairing PIN for the `lv_device` cookie, over a pinned connection.
+/// Redeem a pairing PIN for the server's device cookie, over a pinned
+/// connection.
 pub async fn redeem_pin(
     base: &str,
     cert_sha256: &str,
@@ -401,7 +402,10 @@ pub async fn redeem_pin(
         .get("set-cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|raw| raw.split(';').next())
-        .filter(|pair| pair.starts_with("lv_device="))
+        // The cookie name carries a per-gallery suffix (`lv_device_<id>`) so
+        // two galleries on one host don't share a jar entry; match the base
+        // name, and keep accepting the bare legacy name from an older server.
+        .filter(|pair| pair.starts_with("lv_device"))
         .map(|pair| pair.to_string())
         .ok_or_else(|| "server response had no lv_device cookie".to_string())
 }

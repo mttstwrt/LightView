@@ -17,13 +17,13 @@
 // the pieces together and owns the keyboard map, the paste/drop handlers, and
 // the Tauri event subscriptions — not gallery logic.
 
-import { Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { Show, createEffect, createSignal, lazy, onCleanup, onMount } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem, loadEnabledViews } from "./stores/galleryStore";
 import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { createOpenAtBottom } from "./lib/openAtBottom";
 import { VIEWER_CLOSE_REQUEST_EVENT } from "./lib/viewerTransition";
@@ -33,7 +33,18 @@ import { openGallery, getBootState, getSortedItems, getRecentGalleries, removeRe
 import { setFilterQuery, refreshFilteredItems } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { JustifiedGrid } from "./components/gallery/JustifiedGrid";
-import { MapView } from "./components/map/MapView";
+// Split out of the main bundle, not merely deferred: leaflet plus its CSS is
+// 153 kB of a 445 kB build — a third of it — and a gallery browsed only in the
+// grids never needs a byte of it. Every other view reuses machinery the main
+// bundle already carries, so this is the one view where the split is worth a
+// dedicated chunk. See decision 0008.
+//
+// No `<Suspense>` boundary: the map is already inside a `<Show>`, and Solid's
+// `lazy` renders nothing until the chunk resolves, which over loopback or a LAN
+// is imperceptible. Add a fallback here if that ever stops being true.
+const MapView = lazy(() =>
+  import("./components/map/MapView").then((m) => ({ default: m.MapView })),
+);
 import { MediaViewer } from "./components/viewer/MediaViewer";
 import { TopBar } from "./components/topbar/TopBar";
 import { TitleBar } from "./components/topbar/TitleBar";
@@ -319,6 +330,7 @@ export function App() {
 
       // Restore per-gallery settings from .lightview folder
       await loadSettingsFromGallery();
+      await loadEnabledViews();
 
       const filtered = await applyDefaultFilter();
       const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), filtered, subSortField(), subSortOrder());
@@ -470,6 +482,7 @@ export function App() {
   // same-origin `lv_device` cookie so only paired devices connect.
   if (isWeb()) {
     loadCapabilities();
+    void loadEnabledViews();
     const source = new EventSource("/api/events");
     source.addEventListener("fs-changed", (event) => {
       try {

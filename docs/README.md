@@ -42,6 +42,8 @@ Deeper topics that outgrew their subsystem page:
   worker protocol that let a capable machine run taggers for a weak server.
 - [`frontend/grid-loading.md`](frontend/grid-loading.md) — the machinery both
   grids use to stream thumbnails into a virtual scroller.
+- [`frontend/chrome.md`](frontend/chrome.md) — the planned split between
+  commands and settings, and the space they compete for on a phone.
 
 ## Decisions
 
@@ -58,9 +60,13 @@ answer to "why not the obvious thing?" is longer than a sentence.
 - [0005 — Remote command dispatch is an allowlist](decisions/0005-remote-invoke-is-an-allowlist.md)
 - [0006 — Plugins are subprocesses speaking NDJSON](decisions/0006-plugins-are-ndjson-subprocesses.md)
 - [0007 — Two nested render windows in the grids](decisions/0007-two-zone-render-window.md)
+- [0008 — No view-module API; enablement plus code-splitting instead](decisions/0008-no-view-module-api.md)
 
 ## Open work
 
 [`todo.md`](todo.md) is the running list of known gaps — things that are
 understood but not done. It is deliberately short; anything with enough shape
-to be designed belongs in a subsystem page instead.
+to be designed belongs in a subsystem page instead. Items are grouped by the
+part of the system they touch and ordered *within* a group by the sequence they
+should be done in, with the reasoning for that sequence stated; the groups
+themselves are independent of one another.

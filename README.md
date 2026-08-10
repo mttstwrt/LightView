@@ -89,12 +89,15 @@ network — no desktop session required.
 It shares everything with the desktop app: the same `.lightview/cache.db`, the same
 companion files, and the same device pairings. A device you paired through the desktop
 app stays paired against the headless server, as long as it connects to the same
-`host:port` origin (browsers scope the pairing cookie to the origin).
+`host:port` origin (browsers scope the pairing cookie to the origin). Serving two
+galleries from one machine is fine: each issues its own cookie name, so pairing with
+the second no longer un-pairs the browser from the first.
 
 ### Building it
 
 ```bash
-# Build the web UI it serves
+# Build the web UI first — it's compiled into the binary, so the Rust build
+# fails without it
 npm run build               # produces dist/
 
 # Build the headless binary (release recommended — codecs/SQLite are slow in debug)
@@ -103,9 +106,10 @@ cargo build --release --bin lightview-headless
 # → src-tauri/target/release/lightview-headless
 ```
 
-The server serves the built SPA from a `dist/` directory, which it looks for in the
-current working directory, its parent, and next to the executable. Run it from the repo
-root (or copy `dist/` next to the binary) so it can find the UI.
+A release binary carries the SPA inside it, so it is the only file you need to
+deploy — there is no `dist/` to keep alongside it and no working directory it has to
+run from. `--web-root <dir>` serves a directory instead, for developing against a live
+Vite build.
 
 ### Running it
 
@@ -118,13 +122,31 @@ lightview-headless serve /path/to/gallery --port 9000
 
 # Mint a one-time 6-digit pairing PIN for a device, then exit
 lightview-headless pair /path/to/gallery
+
+# Show which layouts this gallery offers, then turn the square grid off
+lightview-headless views /path/to/gallery
+lightview-headless views /path/to/gallery justified,map
 ```
 
 | Command | Purpose |
 |---|---|
 | `serve <gallery-path> [--port <n>]` | Open the gallery and serve it on `0.0.0.0:<port>` (default `8787`) with per-device cookie auth |
 | `pair <gallery-path>` | Create a single-use PIN (stored in the gallery's `cache.db`) and print it; redeem it at `http://<host>:<port>/pair` on the device |
+| `views <gallery-path> [<list>]` | Show the enabled views, or set them from a comma-separated list of `grid`, `justified`, `map` |
 | `-h` / `--help` | Usage |
+
+`pair` and `views` act on a gallery a server is already serving, and must be
+given the same path that server was given (inside Docker, the container-side
+path). Both write to the gallery's own `cache.db`, which is safe while `serve`
+is running.
+
+**Disabling a view stops it pre-generating thumbnails.** That is the point of
+`views` on a headless box: a gallery browsed only in the justified layout would
+otherwise keep building square-cropped thumbnails nobody renders, which on a
+large library is gigabytes of work on the weakest machine you own. Thumbnails
+already cached for a disabled view are kept, so re-enabling one costs nothing.
+A running server picks the change up within seconds; browsers already open need
+a reload.
 
 The port is fixed (not OS-assigned) on purpose: the pairing cookie is scoped to
 `host:port`, so a stable origin means devices don't have to re-pair after a restart.
@@ -152,7 +174,6 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Run from a directory that contains dist/ (or place dist/ next to the binary)
 WorkingDirectory=/opt/lightview
 ExecStart=/opt/lightview/lightview-headless serve /srv/photos --port 8787
 Environment=RUST_LOG=info
@@ -214,8 +235,8 @@ Load it with `launchctl load ~/Library/LaunchAgents/com.lightview.headless.plist
 
 Run at startup with Task Scheduler — create a task triggered "At log on" (or "At
 startup" for a service-like task) whose action runs
-`lightview-headless.exe serve C:\Photos --port 8787`, with "Start in" set to the folder
-containing `dist/`. For a true background service, wrap it with a tool like
+`lightview-headless.exe serve C:\Photos --port 8787`. For a true background service,
+wrap it with a tool like
 [NSSM](https://nssm.cc/).
 
 #### Docker / Podman

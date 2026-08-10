@@ -29,6 +29,8 @@
 //!   optional gallery password.
 //! - [`tls`] — the persisted self-signed certificate and its SANs.
 //! - [`uploads`] — the one write channel a device has, confined three ways.
+//! - [`web_assets`] — the built SPA, compiled into the binary. Used unless
+//!   `HttpConfig::web_root` names a directory to serve instead.
 //!
 //! Every route that resolves a filesystem path must call `path_in_gallery`
 //! first. Without it a non-loopback bind exposes the whole host. It answers 404
@@ -44,6 +46,7 @@ pub mod routes;
 pub mod server;
 pub mod tls;
 pub mod uploads;
+pub mod web_assets;
 
 pub use config::{AuthMode, HttpConfig};
 pub use server::{start, RemoteAccess, RunningServer};

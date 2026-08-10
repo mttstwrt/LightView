@@ -126,6 +126,11 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
         // actions instead of surfacing 403s. Enforcement stays in this match.
         "get_server_capabilities" => ok(settings::get_server_capabilities_impl(app).await),
 
+        // Read-only: which layouts this gallery offers, so the view switcher
+        // doesn't present one whose thumbnails are never generated. Changing
+        // the list configures the gallery, so it stays desktop-only.
+        "get_enabled_views" => ok(settings::get_enabled_views_impl(app).await),
+
         "get_sorted_items" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]

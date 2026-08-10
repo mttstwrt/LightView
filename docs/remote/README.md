@@ -22,6 +22,13 @@ is a bug unless the command is deliberately absent from the allowlist.
 `AppState::remote_server`), `HttpConfig::{local_only, remote}`, and the routes
 themselves.
 
+**Invariants callers must uphold:** a device cookie is only ever read through
+`middleware::device_cookie` and only ever written through
+`middleware::device_cookie_header`, both given the name `devices::cookie_name`
+returns for the currently open gallery — a hard-coded `lv_device` re-introduces
+the cross-gallery collision described below. Every route that resolves a
+filesystem path calls `path_in_gallery` first.
+
 **Depends on:** [`cache/`](../cache/README.md) (device rows, pairings, and
 per-gallery settings all live in the gallery's `cache.db`),
 [`pipeline/`](../pipeline/README.md) via the serve modules, `commands/*_impl`,
@@ -40,7 +47,31 @@ from the LAN server means enabling remote access never adds an auth layer to the
 desktop webview's own requests.
 
 The LAN server (`HttpConfig::remote`) binds `0.0.0.0`, always over TLS, with
-per-device cookie auth and the SPA served from `web_root`.
+per-device cookie auth and the SPA served from the copy compiled into the
+binary.
+
+## Where the SPA comes from
+
+`web_assets` embeds the built `dist/` in the executable with `rust-embed`, so a
+deployment is one file rather than a binary plus a directory that has to stay in
+step with it — a mismatch there showed up as a blank page or a silently stale
+bundle. The whole build is a few hundred KB.
+
+`HttpConfig::web_root` (the `--web-root` flag on `lightview-headless`) overrides
+it with a directory served by `ServeDir`. That is the development path: point it
+at a live Vite output and a frontend rebuild takes effect with no recompile. In
+debug builds rust-embed does not embed either — `Assets::get` reads `dist/` off
+disk at the path recorded at compile time — so the same is true of a plain debug
+build with no flag. Release builds carry the bytes.
+
+Both branches sit behind the same cache-policy middleware, so the two paths
+cannot drift: hashed asset filenames get a year of `immutable`, the shell gets
+`no-cache`. The embedded handler emits an ETag over each file's content hash,
+because "revalidate every load" is only cheap if there is a validator to answer
+`304` against.
+
+The folder must exist when the crate is compiled — see
+[`build-and-verify.md`](../build-and-verify.md).
 
 ## Layers, and why routes are grouped the way they are
 
@@ -66,9 +97,30 @@ before the client can pair. The shell contains no gallery data.
 
 ## Authentication
 
-A paired device holds a cookie `lv_device=<device_id>.<secret>`. The server
-stores only a SHA-256 hash of the secret, keyed by device id, so a leaked
+A paired device holds a cookie `lv_device_<gallery>=<device_id>.<secret>`. The
+server stores only a SHA-256 hash of the secret, keyed by device id, so a leaked
 database alone grants nothing.
+
+### Why the cookie name carries a gallery id
+
+Cookies are scoped by host and **not** by port. Two galleries served from one
+machine on different ports therefore share a jar entry, and pairing a browser
+with the second silently un-paired it from the first — the second `Set-Cookie`
+simply overwrote the value the first had issued. iOS home-screen web apps
+escaped it only because each gets its own storage container; a desktop browser
+has one jar and lost a pairing every time.
+
+`devices::cookie_name` suffixes the name with a random per-gallery id minted on
+first use and kept in `gallery_meta`, so it travels with the gallery rather than
+with whichever server is currently serving it. Two processes can hold the same
+gallery open, so the mint is an `INSERT OR IGNORE` followed by a re-read: both
+must agree on the name or each keeps issuing a cookie the other ignores.
+
+A bare `lv_device` is still accepted, for devices paired before this existed;
+`auth_layer` re-issues the same value under the gallery's name on the first
+request that uses it, so nobody has to pair again. The legacy cookie is
+deliberately **not** expired — it is precisely the entry two galleries share, so
+clearing it would un-pair whichever gallery has not yet re-issued.
 
 SHA-256 rather than argon2 is deliberate and worth understanding before
 "fixing" it: the secret is 32 random bytes, so the brute-force resistance of a

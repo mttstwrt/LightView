@@ -33,10 +33,51 @@ step with the Rust serde structs on the other side.
 | `lib/` | The non-visual machinery: `ipc`, `runtime`, `types`, plus the grid primitives both grids share (see [`grid-loading.md`](grid-loading.md)) |
 | `components/gallery/` | `GalleryGrid`, `JustifiedGrid`, `ThumbnailCell`, `SelectionBar` |
 | `components/viewer/` | `MediaViewer`, `VideoPlayer`, `InfoPanel` |
-| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `SettingsMenu`, `TitleBar` |
+| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `SettingsMenu`, `TitleBar` — the commands/settings split these want is planned in [`chrome.md`](chrome.md) |
 | `components/auth/` | `PairApp`, `PasswordModal` — the web-only bootstrap flows |
 | `components/shared/` | `ContextMenu`, `ScrollBar`, `ConfirmButton` |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |
+| `components/map/` | `MapView` — the one component behind a `lazy()` split (see below) |
+
+### Views are native, and the expensive one is split out
+
+The five views — square grid, justified grid, map, and the two unbuilt ones —
+are ordinary components, wired directly in `App.tsx`. There is no view
+registry or module API, and [decision 0008](../decisions/0008-no-view-module-api.md)
+records why: the thing an API was wanted for is that an unused view should cost
+nothing, and that is a bundling question. Per-gallery enablement (`views.rs`,
+surfaced through `enabledViews` in `galleryStore`) plus a dynamic `import()` on
+the views that carry their own libraries delivers it with no public contract.
+
+`MapView` is the only one that qualifies, and by a wide margin: leaflet plus its
+CSS is 153 kB of a 445 kB build. It loads through Solid's `lazy()`, so a gallery
+browsed in the grids never fetches it, and a gallery with the map disabled never
+even triggers the import. Every other view sits on machinery the main bundle
+carries regardless — splitting them would save single-digit kilobytes. Split the
+next view that brings its own renderer; measure first.
+
+### Reading the build output
+
+The chunk names mislead, and it is worth knowing why before chasing one. There
+are two HTML entries — `index.html` and `devtools.html` — so Rollup hoists what
+they share into a common chunk and names it after one member, which is neither
+stable nor descriptive. Two artifacts that look alarming and are not:
+
+- **`Sparkline-*.css`, ~53 kB.** This is the whole Tailwind stylesheet, not
+  anything to do with the sparkline. `styles/global.css` is imported by both
+  `index.tsx` and `devtools.tsx`, so it attaches to the shared chunk and inherits
+  its name. It belongs on the critical path and is 9.5 kB gzipped.
+- **`Sparkline-*.js`, ~37 kB, `modulepreload`ed from `index.html`.** The shared
+  chunk itself: the Solid DOM runtime and `lib/ipc.ts` (34 kB of source on its
+  own), both of which the main entry needs immediately. Lazy-loading
+  `DebugOverlay` — the only genuinely optional thing in it — was measured at
+  6.9 kB raw / **2.3 kB gzipped** off first load, and renames the chunk to
+  `ipc-*`. Not taken: a lazy boundary is not worth 2 kB, and the name is
+  cosmetic. Recorded so the measurement is not repeated.
+
+`solid-devtools` is a devDependency and its Vite plugin compiles out of
+production builds; the shipped bundle contains no instrumentation. Checked, for
+the same reason.
 
 ## The IPC boundary
 
@@ -66,6 +107,26 @@ Commands that exist only on the desktop — file copy/move, plugin execution,
 render config — are absent from the allowlist rather than hidden in the UI.
 `capabilitiesStore` asks the server what this client may do and the components
 render accordingly, but the enforcement is server-side.
+
+### A command absent from the allowlist is not a command the web client may call
+
+`lib/memoryPressure.ts` polled `get_memory_status` from both runtimes. It is not
+on the allowlist and never was, so in a browser every five-second cycle `403`'d
+into an empty `catch` — the viewer cache's pressure-based eviction simply did
+not exist on the web, and nothing said so. `tsc` cannot see this, and neither
+can the Rust tests; it turned up by driving the SPA against
+`lightview-headless`.
+
+Allowlisting it would have been the wrong repair: it reports the *server's* RAM,
+and sizing a phone's image cache from a NAS's free memory is meaningless. Each
+runtime now reads a signal it actually has — free host RAM over IPC on the
+desktop, `navigator.deviceMemory` in a browser. The browser one is sampled once
+rather than polled, because it is a static device class and the live alternative
+(`performance.memory`) measures the JS heap, which is not where decoded images
+live.
+
+The general shape: an empty `catch` around an IPC call is how a
+transport-specific failure stays invisible. Log it, at least once.
 
 ## Invariants
 

@@ -37,6 +37,11 @@ pub const DEFAULT_INACTIVITY_SECS: i64 = 6 * 60 * 60; // 6 hours
 
 const META_PASSWORD_HASH: &str = "remote.password_hash";
 const META_INACTIVITY_SECS: &str = "remote.inactivity_secs";
+const META_COOKIE_SUFFIX: &str = "remote.cookie_suffix";
+
+/// Base name of the per-device pairing cookie, and the name galleries indexed
+/// before per-gallery scoping still hold. See [`cookie_name`].
+pub const DEVICE_COOKIE_BASE: &str = "lv_device";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -343,18 +348,64 @@ pub fn mark_authenticated(conn: &Connection, device_id: &str) -> Result<(), Auth
 }
 
 // ─────────────────────────────────────────────────────────────
+// Cookie naming
+// ─────────────────────────────────────────────────────────────
+
+/// The device-cookie name this gallery issues: `lv_device_<suffix>`.
+///
+/// Cookies are scoped by host and **not** by port, so two galleries served
+/// from one machine on different ports share a jar entry — pairing a browser
+/// with the second silently un-paired it from the first. The suffix is a
+/// per-gallery random id, minted on first use and stored in `gallery_meta` so
+/// it travels with the gallery rather than with the server that happens to be
+/// serving it.
+///
+/// On a DB error this falls back to the bare legacy name. That is the right
+/// failure: the same error will make `verify_cookie` fail a moment later, and
+/// answering under a name no client holds would turn a transient DB problem
+/// into a forced re-pair.
+pub fn cookie_name(conn: &Connection) -> String {
+    match cookie_suffix(conn) {
+        Ok(suffix) => format!("{DEVICE_COOKIE_BASE}_{suffix}"),
+        Err(e) => {
+            log::warn!("could not read this gallery's cookie suffix: {e}");
+            DEVICE_COOKIE_BASE.to_string()
+        }
+    }
+}
+
+fn cookie_suffix(conn: &Connection) -> Result<String, AuthError> {
+    if let Some(existing) = meta_get(conn, META_COOKIE_SUFFIX)? {
+        return Ok(existing);
+    }
+    let fresh = random_hex(4);
+    conn.execute(
+        "INSERT OR IGNORE INTO gallery_meta (key, value) VALUES (?1, ?2)",
+        params![META_COOKIE_SUFFIX, fresh],
+    )?;
+    // Re-read instead of returning `fresh`: the desktop app and a headless
+    // server can hold the same gallery open, so another process may have won
+    // the insert, and both must agree on the name or each will keep issuing a
+    // cookie the other ignores.
+    Ok(meta_get(conn, META_COOKIE_SUFFIX)?.unwrap_or(fresh))
+}
+
+// ─────────────────────────────────────────────────────────────
 // Gallery password + inactivity settings
 // ─────────────────────────────────────────────────────────────
 
-pub fn get_password_hash(conn: &Connection) -> Result<Option<String>, AuthError> {
-    let row: Option<String> = conn
+fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, AuthError> {
+    Ok(conn
         .query_row(
             "SELECT value FROM gallery_meta WHERE key = ?1",
-            params![META_PASSWORD_HASH],
+            params![key],
             |row| row.get(0),
         )
-        .optional()?;
-    Ok(row)
+        .optional()?)
+}
+
+pub fn get_password_hash(conn: &Connection) -> Result<Option<String>, AuthError> {
+    meta_get(conn, META_PASSWORD_HASH)
 }
 
 pub fn set_password(conn: &Connection, password: &str) -> Result<(), AuthError> {
@@ -382,14 +433,7 @@ pub fn verify_password(conn: &Connection, password: &str) -> Result<bool, AuthEr
 }
 
 pub fn get_inactivity_secs(conn: &Connection) -> Result<i64, AuthError> {
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM gallery_meta WHERE key = ?1",
-            params![META_INACTIVITY_SECS],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(stored
+    Ok(meta_get(conn, META_INACTIVITY_SECS)?
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(DEFAULT_INACTIVITY_SECS))
 }

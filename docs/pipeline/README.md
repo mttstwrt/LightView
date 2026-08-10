@@ -24,8 +24,9 @@ handler and the HTTP route.
 — `pipeline::gpu_pipeline::GpuPipeline`.
 
 **Depends on:** [`cache/`](../cache/README.md) for the tier definitions and the
-write path, `provider/` for file access, `hardware/` for pool sizing, and the
-external `ffmpeg`/`ffprobe` binaries at runtime.
+write path, `provider/` for file access, `hardware/` for pool sizing, `views`
+for which tiers the idle worker should pre-warm, and the external
+`ffmpeg`/`ffprobe` binaries at runtime.
 
 **Depended on by:** `commands/media.rs`, `thumb_serve.rs`, and the idle worker.
 
@@ -78,7 +79,7 @@ fixed-cell grid; the **aspect-preserving** ("fit") tiers back the justified
 layout, which needs true proportions. A fit tier cannot be derived from a
 square one — the crop already threw the pixels away — so `j` needs its own
 source decode even when `m` is warm. That is exactly what the idle worker's
-`PREWARM_TIERS` rotation is for.
+pre-warm rotation is for.
 
 `Standard` is the hub: it is the only tier with a `resize_filter` column, the
 only one carrying the `thumbhash` blob, and the only one other tiers are
@@ -190,6 +191,29 @@ yields within one batch of a user showing up.
 It walks the backlog newest-first — the same order the default date-descending
 sort presents — so the first screen a phone opens onto is the first thing
 warmed, rather than whatever the table scan happened upon.
+
+### Which tiers it warms
+
+Whichever the gallery's *enabled views* ask for — `views::prewarm_tiers`, read
+fresh each poll so toggling a view takes effect at the next cycle rather than at
+the next gallery open. Grid asks for `m`, justified asks for `j`, and map asks
+for nothing: it draws one micro thumbnail per cluster, a few dozen images that
+generate on demand faster than a backlog pass would reach them.
+
+This used to be an unconditional `[Standard, Justified]`, so a gallery browsed
+only in the justified layout still paid the full square-tier cost — gigabytes on
+a large collection, for cells nobody would render — and the reverse held too.
+Disabling a view stops *generation* and nothing else: rows already cached are
+kept, because re-enabling a view must not re-decode the library, and the
+zoomed-in tiers' LRU byte budget already sheds the genuinely stale ones. See
+[`views.rs`](../../src-tauri/src/views.rs) and
+[decision 0002](../decisions/0002-two-families-of-thumbnail-tiers.md).
+
+The setting is host configuration, so it is read-only over `/api/invoke` and a
+paired browser cannot change it. The desktop app has a toggle in Settings; a
+headless server has `lightview-headless views <gallery> [<list>]`, which writes
+the same `gallery_meta` key from a second process. Either way the worker re-reads
+it each poll, so the change lands without a restart.
 
 ## Where the frontend picks a tier
 

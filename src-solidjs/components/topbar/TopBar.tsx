@@ -4,7 +4,7 @@ import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
 import { TitleBar } from "./TitleBar";
 import { GearIcon, CloseIcon, SelectIcon } from "./icons";
-import { viewMode, setViewMode, displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode } from "../../stores/galleryStore";
+import { viewMode, setViewMode, enabledViews, VIEW_CHOICES, displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode } from "../../stores/galleryStore";
 import { settings } from "../../stores/settingsStore";
 import { isMobile, isTauri } from "../../lib/runtime";
 
@@ -225,13 +225,11 @@ export function TopBar(props: TopBarProps) {
           >
             {displayPaths().length.toLocaleString()}
           </div>
-          {/* View-mode selector. */}
+          {/* View-mode selector. Only the views this gallery has enabled —
+              a disabled view generates no thumbnails, so offering it would
+              open onto a grid decoding the library on the spot. */}
           <div class="shrink-0 flex items-center gap-0.5 p-0.5 rounded bg-neutral-800/60">
-            <For each={[
-              { mode: "grid" as const, label: "Grid", title: "Uniform square grid" },
-              { mode: "justified" as const, label: "Justified", title: "Aspect-preserving rows" },
-              { mode: "map" as const, label: "Map", title: "Geographic map" },
-            ]}>
+            <For each={VIEW_CHOICES.filter((v) => enabledViews().includes(v.mode))}>
               {(v) => (
                 <button
                   onClick={() => setViewMode(v.mode)}

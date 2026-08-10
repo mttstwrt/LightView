@@ -13,14 +13,14 @@
 //   - Normal:    cache up to 10 images / 512MB, preload 2 ahead/behind
 //   - Warning:   cache up to 5 images / 192MB,  preload 1 ahead/behind
 //   - Emergency: cache only current image / 64MB floor, no preloading
+//
+// The level comes from memoryPressure.ts, which reads the host's free RAM on
+// the desktop and the device class on the web — see that module for why the
+// two runtimes cannot share one signal.
 
 import { mediaUrl } from "./ipc";
 import { isVideoPath } from "./mediaExts";
-import {
-  MemoryPressureMonitor,
-  type PressureLevel,
-  type PressureState,
-} from "./memoryPressure";
+import { MemoryPressureMonitor, type PressureLevel } from "./memoryPressure";
 
 interface CacheEntry {
   img: HTMLImageElement;
@@ -64,8 +64,8 @@ export class ViewerImageCache {
   private readyCallback: ((path: string) => void) | null = null;
 
   constructor() {
-    this.monitor = new MemoryPressureMonitor((state: PressureState) => {
-      this.pressureLevel = state.level;
+    this.monitor = new MemoryPressureMonitor((level: PressureLevel) => {
+      this.pressureLevel = level;
       this.trimToCapacity();
     });
     this.monitor.start();

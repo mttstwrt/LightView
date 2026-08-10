@@ -235,19 +235,25 @@ maintain forever, and the motivating case (naming recognised faces) does not
 need one. That case needs a *host* surface for naming and merging
 plugin-emitted clusters, which any grouping plugin can feed.
 
-**New views are built native; a view-module API waits for a second consumer.**
-The infinite-canvas view lands as core code alongside the grid, justified and
-map views. Extracting a view API from one implementation would freeze a guess;
-extract it when the canvas has shipped and something else wants the same
-contract. Section 3 above still holds — the core views do not get routed
-through whatever that API turns out to be.
+**New views are built native, and there is no view-module API.** Superseded
+what this paragraph used to say ("waits for a second consumer") — see
+[decision 0008](../decisions/0008-no-view-module-api.md). The API was wanted so
+that an unused view would cost nothing, and that turned out to be a bundling
+question rather than a contract question: per-gallery enablement plus a dynamic
+`import()` on the views that carry their own libraries delivers it with no
+public surface. The map is the only such view — 153 kB of a 445 kB bundle — and
+is already split out; the canvas and the virtual folder view reuse machinery the
+main bundle carries anyway. Section 3 above is why the contract would have been
+expensive; 0008 is why it is not needed.
 
 **Native `.so`/`.dll` view plugins are rejected.** Layout runs in a webview, and
 the LAN web client cannot load a host dynamic library at all, so a dylib view
 would exist on the desktop only. Handing the host layout results over IPC
 instead keeps the browser working but puts a round trip inside the scroll loop.
 A cargo feature per view was also rejected: it gives up runtime availability and
-multiplies the single Docker image the project ships.
+multiplies the single Docker image the project ships. Both are recorded in
+[decision 0008](../decisions/0008-no-view-module-api.md) alongside the option
+that was taken.
 
 ## 7. Suggested first step
 

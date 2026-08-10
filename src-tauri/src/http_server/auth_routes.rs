@@ -1,7 +1,7 @@
 //! Unauthenticated endpoints used to bootstrap a device's auth state:
 //!
-//!   - `POST /pair/redeem` — exchange a pairing code (QR token or PIN) for an
-//!     `lv_device` cookie.
+//!   - `POST /pair/redeem` — exchange a pairing code (QR token or PIN) for
+//!     this gallery's `lv_device_<suffix>` cookie.
 //!   - `POST /auth/password` — clear the inactivity challenge for an already
 //!     paired device by proving the gallery password.
 //!   - `GET  /auth/status`  — let the SPA discover whether it's authenticated
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::devices::{self, AuthError};
-use super::middleware::DEVICE_COOKIE;
+use super::middleware::{device_cookie, device_cookie_header};
 use super::server::ServerState;
 
 #[derive(Deserialize)]
@@ -38,7 +38,8 @@ pub struct RedeemResponse {
     pub device_name: String,
 }
 
-/// `POST /pair/redeem` — consume a pairing code and set `lv_device`.
+/// `POST /pair/redeem` — consume a pairing code and set this gallery's device
+/// cookie (`lv_device_<suffix>`; see `devices::cookie_name`).
 pub async fn redeem(
     State(state): State<ServerState>,
     Json(req): Json<RedeemRequest>,
@@ -48,18 +49,17 @@ pub async fn redeem(
         let Some(db) = guard.as_ref() else {
             return (StatusCode::SERVICE_UNAVAILABLE, "no gallery open").into_response();
         };
-        devices::redeem_pairing(db.conn(), req.code.trim(), &req.device_name)
+        let conn = db.conn();
+        devices::redeem_pairing(conn, req.code.trim(), &req.device_name)
+            .map(|redeemed| (redeemed, devices::cookie_name(conn)))
     };
 
     match result {
-        Ok(redeemed) => {
-            // `Secure` when serving HTTPS so the cookie is never sent over a
-            // plaintext connection to the same host/port.
-            let cookie_header = format!(
-                "{}={}; Path=/; Max-Age=31536000; SameSite=Strict; HttpOnly{}",
-                DEVICE_COOKIE,
-                redeemed.cookie_value,
-                if state.config.tls { "; Secure" } else { "" }
+        Ok((redeemed, cookie_name)) => {
+            let cookie_header = device_cookie_header(
+                &cookie_name,
+                &redeemed.cookie_value,
+                state.config.tls,
             );
             let body = Json(RedeemResponse {
                 device_id: redeemed.device.id.clone(),
@@ -93,7 +93,7 @@ pub struct PasswordRequest {
 }
 
 /// `POST /auth/password` — accept the gallery password and clear the
-/// inactivity challenge for the requesting device. Requires the `lv_device`
+/// inactivity challenge for the requesting device. Requires the device
 /// cookie but not a successful auth-layer pass (the cookie may exist while
 /// the device is in the "stale" state).
 pub async fn submit_password(
@@ -101,15 +101,16 @@ pub async fn submit_password(
     headers: HeaderMap,
     Json(req): Json<PasswordRequest>,
 ) -> Response {
-    let Some(cookie) = read_cookie(&headers, DEVICE_COOKIE) else {
-        return (StatusCode::UNAUTHORIZED, "no device cookie").into_response();
-    };
-
     let guard = state.app.cache_db.lock().await;
     let Some(db) = guard.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no gallery open").into_response();
     };
     let conn = db.conn();
+
+    let name = devices::cookie_name(conn);
+    let Some((cookie, _)) = device_cookie(&headers, &name) else {
+        return (StatusCode::UNAUTHORIZED, "no device cookie").into_response();
+    };
 
     let device = match devices::verify_cookie(conn, &cookie) {
         Some(d) => d,
@@ -144,13 +145,14 @@ pub struct AuthStatus {
 /// `GET /auth/status` — let the SPA decide what UI to show without
 /// provoking 401s on every load.
 pub async fn status(State(state): State<ServerState>, headers: HeaderMap) -> Response {
-    let cookie = read_cookie(&headers, DEVICE_COOKIE);
-
     let guard = state.app.cache_db.lock().await;
     let Some(db) = guard.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no gallery open").into_response();
     };
     let conn = db.conn();
+
+    let name = devices::cookie_name(conn);
+    let cookie = device_cookie(&headers, &name).map(|(value, _)| value);
 
     let password_enabled = devices::get_password_hash(conn)
         .ok()
@@ -172,15 +174,6 @@ pub async fn status(State(state): State<ServerState>, headers: HeaderMap) -> Res
         password_enabled,
     })
     .into_response()
-}
-
-fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get("cookie")?.to_str().ok()?;
-    let prefix = format!("{}=", name);
-    raw.split(';').find_map(|part| {
-        let trimmed = part.trim();
-        trimmed.strip_prefix(&prefix).map(|v| v.to_string())
-    })
 }
 
 fn now_secs() -> i64 {
