@@ -42,6 +42,8 @@ Deeper topics that outgrew their subsystem page:
   worker protocol that let a capable machine run taggers for a weak server.
 - [`frontend/grid-loading.md`](frontend/grid-loading.md) — the machinery both
   grids use to stream thumbnails into a virtual scroller.
+- [`frontend/chrome.md`](frontend/chrome.md) — the planned split between
+  commands and settings, and the space they compete for on a phone.
 
 ## Decisions
 

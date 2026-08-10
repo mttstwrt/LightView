@@ -388,104 +388,24 @@ bottleneck under burst load.
 
 ### D3. Commands and settings are the same drawer, on both surfaces
 
-`SettingsMenu.tsx` is 1,705 lines rendering thirteen `Section`s, and it has
-stopped distinguishing between things you *do* and things you *set*. Three of
-those sections are a heading plus a single button — Tags → "Manage Tags…",
-Deduplication → "Find Duplicates…", Trash → "View Trash…" — each spending a
-section header on one verb. On mobile the panel is a full-screen page, so
-scrolling past configuration to reach a button pressed daily costs the whole
-screen.
+`SettingsMenu.tsx` is 1,705 lines rendering thirteen `Section`s and no longer
+separates things you *do* from things you *set* — three of those sections are a
+heading plus a single button. The mobile chrome drifted the same way with less
+room: four controls float over an edge-to-edge grid, and the upload FAB already
+carries three hide conditions because it competes for the bottom edge with the
+selection bar and the video player.
 
-The mobile chrome has drifted the same way and has less room to absorb it. Four
-things float over an edge-to-edge grid today: search (top-left), select and the
-gear (top-right), and the web client's upload FAB (bottom-right). The FAB is
-the tell — it carries three separate hide conditions (`viewerOpen`, mobile
-selection mode, mobile selection non-empty) because it is one button competing
-for the bottom edge with the selection bar and the video player's controls. A
-fifth floating button is not available, so any answer that adds chrome per
-action is already ruled out on the surface that needs it most.
+The design is settled and written up in [`frontend/chrome.md`](frontend/chrome.md):
+one command list rendered as a dropdown behind an icon that replaces the desktop
+gear, and as a sheet behind a FAB that replaces the mobile upload button, with
+settings as the last entry and the panel keeping only configuration. Neither
+surface gains a control and no new kind of container is introduced. That page
+also carries the two constraints that make it safe, and why the `Section`
+`order` prop decayed.
 
-**One command list, three presentations.** Declare the actions once as data —
-label, icon, an availability predicate (`capabilities()`, `isWeb()`,
-desktop-only), and a handler — and render that same list three ways:
-
-- **Desktop:** a toolbar.
-- **Mobile:** a sheet, opened from one button, reusing the sheet the filter and
-  sort controls already use.
-- **Settings panel:** not at all. It keeps only configuration, which is what
-  makes it shrink.
-
-Nothing about the phone's button count changes, because the actions button
-takes the upload FAB's place rather than adding to it — upload becomes the
-first entry in the list instead of its own control, which also deletes those
-three hide conditions. After that, adding a seventh action costs no chrome at
-all.
-
-**On a phone, frequency should map to reachability**, which is the same split
-this item is about expressed as geometry rather than as section order. The
-bottom-right FAB position is the thumb zone: that is where the actions belong.
-The gear stays in the top-right corner, deliberately harder to reach, because
-settings is rare. Search and select keep their corners. That hierarchy is
-already half-built by accident; this makes it the rule.
-
-The commands worth listing: manage tags, find duplicates, view trash, upload,
-run a plugin, open a folder — **and settings**. Opening the settings panel is a
-command like any other, so it is the last entry rather than a button beside the
-list, which takes the phone from four floating controls to three and keeps the
-one-list rule free of a special case. It costs settings a second tap, which is
-the premise of the whole split: rare things are allowed to be further away.
-
-Anything scoped to a *selection* stays out — `SelectionBar` and `ContextMenu`
-already own that, and moving selection actions into a global list would break
-the one thing the mobile chrome currently gets right. That the actions button
-inherits the FAB's "hide while the selection bar is up" rule is therefore
-correct, not a gap.
-
-Two constraints make folding settings in safe rather than clever:
-
-- **The button and the settings entry must render from local state alone.**
-  Today's upload FAB is `<Show when={config()?.enabled}>` — a server-fetched
-  gate that removes the entire button when the fetch fails. Inheriting that
-  would delete the only route to Settings whenever the server is unreachable,
-  and Settings → Connection is exactly where "Install server certificate" and
-  "Reset connection" live: the recovery actions for an unreachable server.
-  Individual entries may be gated; the button and the settings entry may not.
-  (`ConnectionBanner` offers "Reset connection" independently once
-  `serverUnreachable` is set, so this is not a single point of failure — but
-  the certificate link has no second home, and the case that needs it is the
-  *working* client whose click-through exception is about to lapse.)
-- **The icon has to mean "more", not "add".** An overflow glyph reads as
-  "everything else" and plausibly contains Settings; a `+` reads as create,
-  over-promising upload and under-promising the rest. The cost is that upload —
-  probably the most-used action on a phone — moves to two taps. Worth paying
-  for one extensible control instead of four fixed ones, but it is a real cost,
-  not a free win.
-
-The viewer is not a complication: `MediaViewer` is `z-50` and the mobile chrome
-is `z-40`, so the gear is already covered while the viewer is open. Nothing is
-lost by moving it.
-
-**Why the `order` prop decayed, and what replaces it.** It was a deliberate
-attempt to float the most-used sections to the top, and it stopped being
-respected as sections were added — four values now collide (three at `1`, two
-each at `2`, `3` and `4`), so ties fall back to source order and the decoupling
-the prop exists for is silently gone. The mechanism is what failed, not the
-intent: a magic number per call site, spread over 1,705 lines, cannot be kept
-consistent because nobody ever sees the thirteen numbers together. The same
-fix serves both halves — one ordered list in one place, where position *is* the
-order and adding a fourteenth entry means looking at the other thirteen.
-
-Also fix in the same pass: **"Gallery" is not a `Section`** but a bare
-`<div style={{ order: 8 }}>` with a border, so the one pattern the panel has
-already has an exception.
-
-Still open, and worth deciding before writing code: where the desktop toolbar
-lives, given the top bar already carries filter, sort, the item count, the view
-switcher and the gear — a second row, icons appended to that row, or a rail.
-Settings folds into the toolbar there too, for the same reason as on mobile;
-that is consistency rather than pressure, since the desktop has the room.
-Once the placement is settled this has enough shape to graduate out of this
-file into a `frontend/` page.
+What is left is the work itself, in the order it wants doing: extract the
+command list and its two renderings, move the six action sections out of the
+panel, then re-order what remains as a single list and delete the `order` prop.
 
 ---
 

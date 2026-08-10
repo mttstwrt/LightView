@@ -33,7 +33,7 @@ step with the Rust serde structs on the other side.
 | `lib/` | The non-visual machinery: `ipc`, `runtime`, `types`, plus the grid primitives both grids share (see [`grid-loading.md`](grid-loading.md)) |
 | `components/gallery/` | `GalleryGrid`, `JustifiedGrid`, `ThumbnailCell`, `SelectionBar` |
 | `components/viewer/` | `MediaViewer`, `VideoPlayer`, `InfoPanel` |
-| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `SettingsMenu`, `TitleBar` |
+| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `SettingsMenu`, `TitleBar` — the commands/settings split these want is planned in [`chrome.md`](chrome.md) |
 | `components/auth/` | `PairApp`, `PasswordModal` — the web-only bootstrap flows |
 | `components/shared/` | `ContextMenu`, `ScrollBar`, `ConfirmButton` |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |
