@@ -493,16 +493,13 @@ export function SettingsMenu(props: { onRequestShow?: () => void }) {
         <div
           class={
             isMobile()
-              ? "fixed inset-0 z-[60] overflow-hidden flex flex-col"
+              ? "fixed inset-0 z-[60] overflow-hidden flex flex-col safe-panel"
               : "absolute top-full right-0 mt-2 w-72 rounded-lg overflow-hidden shadow-xl z-50 flex flex-col max-h-[calc(100vh-5rem)]"
           }
           style={
             isMobile()
               ? {
                   background: "#121212",
-                  // Clear the notch/dynamic island and the home-indicator area.
-                  "padding-top": "env(safe-area-inset-top)",
-                  "padding-bottom": "env(safe-area-inset-bottom)",
                 }
               : {
                   background: "rgba(18, 18, 18, 0.96)",

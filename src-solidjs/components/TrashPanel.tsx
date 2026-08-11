@@ -86,7 +86,7 @@ export function TrashPanel(props: { onClose: () => void }) {
         el.addEventListener("wheel", stop, { passive: false });
         onCleanup(() => el.removeEventListener("wheel", stop));
       }}
-      class="fixed inset-0 z-[200] flex flex-col"
+      class="fixed inset-0 z-[200] flex flex-col safe-panel"
       style={{ background: "rgba(10, 10, 10, 0.98)" }}
     >
       {/* Header */}
@@ -106,6 +106,8 @@ export function TrashPanel(props: { onClose: () => void }) {
           </Show>
           <button
             onClick={props.onClose}
+            title="Close"
+            aria-label="Close trash"
             class="w-8 h-8 flex items-center justify-center text-neutral-400 hover:text-neutral-200 rounded transition-colors cursor-pointer"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

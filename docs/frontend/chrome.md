@@ -195,6 +195,32 @@ thing. With the mobile "View" section gone, the two names no longer collide.
   its own config; `uploadStore` holds the config because two unrelated things
   need it — the sheet, and the command list's availability predicate.
 
+## Full-screen panels and the phone's forehead
+
+Every panel that covers the screen — tags, duplicates, trash, auto-tagging, and
+the mobile settings page — carries `.safe-panel` from `styles/global.css`. It is
+four `env(safe-area-inset-*)` paddings, and it exists because without it a
+panel's close button renders *under* the status bar on a notched phone: visible,
+tappable-looking, and completely dead, because the system takes every touch in
+that strip. The panel reads as unclosable.
+
+Padding on the panel root, specifically — not a smaller box. Padding sits inside
+the background box, so the panel still paints edge to edge and only its content
+moves. Inset the element instead and the gallery shows through the strip behind
+the status bar, which looks like a rendering bug.
+
+Two things to know before reaching for it. It sets all four paddings outright,
+so it silently overrides a `p-*` utility on the same element — the two centered
+dialogs (`MergeDialog`, `PasswordModal`) keep their own `p-6`, which is already
+wider than any inset, rather than taking this class. And it does not help
+anything positioned absolutely against the viewport: the viewer's close button
+computes `top` from the inset itself, because it is not inside a padded panel.
+
+Playwright does not emulate safe-area insets, so `env()` is 0 in the headless
+harness. Verifying this means forcing the class to a realistic inset from an
+init script and asserting both halves — content pushed clear, background still
+painting into the strip.
+
 ## Non-issues, checked
 
 - **The viewer.** Folding the gear into the FAB slot does not make settings

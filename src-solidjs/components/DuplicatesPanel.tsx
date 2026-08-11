@@ -197,7 +197,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
         el.addEventListener("wheel", stop, { passive: false });
         onCleanup(() => el.removeEventListener("wheel", stop));
       }}
-      class="fixed inset-0 z-[200] flex flex-col"
+      class="fixed inset-0 z-[200] flex flex-col safe-panel"
       style={{ background: "rgba(10, 10, 10, 0.98)" }}
     >
       {/* Header */}
@@ -213,6 +213,8 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
         </div>
         <button
           onClick={props.onClose}
+          title="Close"
+          aria-label="Close duplicate detection"
           class="w-8 h-8 flex items-center justify-center text-neutral-400 hover:text-neutral-200 rounded transition-colors cursor-pointer"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -338,7 +340,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
           const g = () => groups()[previewGroup()!];
           return (
             <div
-              class="fixed inset-0 z-[210] flex flex-col items-center justify-center"
+              class="fixed inset-0 z-[210] flex flex-col items-center justify-center safe-panel"
               style={{ background: "rgba(0, 0, 0, 0.95)" }}
               onClick={closePreview}
               ref={(el) => {

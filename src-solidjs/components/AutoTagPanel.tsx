@@ -44,11 +44,8 @@ export function AutoTagPanel(props: { onClose: () => void }) {
   onCleanup(() => window.removeEventListener("keydown", handleKey, true));
 
   return (
-    <div class="fixed inset-0 z-[200] flex flex-col" style={{ background: "rgba(10, 10, 10, 0.98)" }}>
-      <div
-        class="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-neutral-800/60 shrink-0"
-        style={{ "padding-top": "calc(env(safe-area-inset-top, 0px) + 1rem)" }}
-      >
+    <div class="fixed inset-0 z-[200] flex flex-col safe-panel" style={{ background: "rgba(10, 10, 10, 0.98)" }}>
+      <div class="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-neutral-800/60 shrink-0">
         <span class="text-sm font-medium text-neutral-200">Auto-tagging</span>
         <button
           onClick={props.onClose}
@@ -60,10 +57,7 @@ export function AutoTagPanel(props: { onClose: () => void }) {
         </button>
       </div>
 
-      <div
-        class="flex-1 overflow-y-auto overscroll-contain px-5 sm:px-6 py-5"
-        style={{ "padding-bottom": "calc(env(safe-area-inset-bottom, 0px) + 1.25rem)" }}
-      >
+      <div class="flex-1 overflow-y-auto overscroll-contain px-5 sm:px-6 py-5">
         <div class="max-w-2xl mx-auto flex flex-col gap-5">
           <Show when={isWeb()} fallback={<LocalPlugins />}>
             <RemoteTagging />
