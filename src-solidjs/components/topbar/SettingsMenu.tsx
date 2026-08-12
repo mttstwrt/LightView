@@ -1,10 +1,20 @@
+// Configuration only — the things you *set*.
+//
+// Everything you *do* moved out to the command list (`CommandMenu.tsx`) when
+// this drawer stopped distinguishing between the two; opening this panel is
+// itself the last entry in that list, on both surfaces. What is left is one
+// ordered list of `Section`s, and the order is source order: the `order` prop
+// this used to carry let thirteen call sites each pick a magic number, four of
+// which collided, because nobody ever saw all thirteen at once. See
+// docs/frontend/chrome.md.
+
 import { createSignal, createEffect, Show, For, onCleanup, onMount } from "solid-js";
 import { Portal, Dynamic } from "solid-js/web";
-import { GearIcon, CloseIcon } from "./icons";
+import { CloseIcon } from "./icons";
 import { settings, setSettings } from "../../stores/settingsStore";
-import { displayPaths, settingsOpen, setSettingsOpen, viewMode, setViewMode, enabledViews, applyEnabledViews, loadEnabledViews, VIEW_CHOICES, type ViewMode } from "../../stores/galleryStore";
+import { displayPaths, settingsOpen, setSettingsOpen, enabledViews, applyEnabledViews, loadEnabledViews, VIEW_CHOICES, type ViewMode } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
-import type { AppSettings, CompanionLocation, PluginInfo } from "../../lib/types";
+import type { AppSettings, CompanionLocation } from "../../lib/types";
 import { versionLabel, GIT_SHA } from "../../lib/version";
 import { resetServiceWorker } from "../../lib/swControl";
 import {
@@ -12,10 +22,6 @@ import {
   getSortedItems,
   precacheThumbnails,
   ensureTierThumbnails,
-  listPlugins,
-  installPlugin,
-  runPluginBatch,
-  cancelPluginBatch,
   enableRemoteAccess,
   disableRemoteAccess,
   getRemoteAccessInfo,
@@ -41,13 +47,7 @@ import {
   type UploadScheme,
 } from "../../lib/ipc";
 import QRCode from "qrcode";
-import { pluginStarted, pluginProgress, pluginFinished, pluginFailed, pluginCancelled } from "../../stores/pluginStore";
-import { taggingWorkers, taggingJobs, taggingActions, refreshTaggingStatus, trackQueuedJob } from "../../stores/taggingStore";
-import { enqueueTaggingJob, cancelTaggingJob, type TaggingJob } from "../../lib/ipc";
 import { thumbGenStarted, thumbGenProgress, thumbGenFinished, thumbGenFailed } from "../../stores/thumbnailProgressStore";
-import { capabilities } from "../../stores/capabilitiesStore";
-import { safeListen as listen } from "../../lib/runtime";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { isWeb, isMobile } from "../../lib/runtime";
 import { thumbSizeForCols, currentColCount } from "../../lib/gridLayout";
 
@@ -71,19 +71,16 @@ const GAP_PRESETS = [
   { label: "Wide", value: 8 },
 ] as const;
 
-export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicates?: () => void; onOpenTrash?: () => void; onOpenTagManager?: () => void; onRequestShow?: () => void; hideTrigger?: boolean }) {
-  // Open state lives in the store (`settingsOpen`) so external chrome — e.g. the
-  // mobile floating gear button — can open this panel, and so App can hide the
-  // grid behind the full-screen mobile settings page. Cleared on unmount.
+/** The settings panel. It has no trigger of its own — the command list opens
+ *  it, on both surfaces. `onRequestShow` lets the keyboard shortcut reveal the
+ *  auto-hiding chrome before the panel appears over it. */
+export function SettingsMenu(props: { onRequestShow?: () => void }) {
+  // Open state lives in the store (`settingsOpen`) so the command list can
+  // open this panel, and so App can hide the grid behind the full-screen
+  // mobile settings page. Cleared on unmount.
   const open = settingsOpen;
   const setOpen = setSettingsOpen;
   onCleanup(() => setSettingsOpen(false));
-
-  // Web: re-sync worker/job state whenever the menu opens, so the Remote
-  // Tagging section is current even if an SSE event was missed.
-  createEffect(() => {
-    if (open() && isWeb()) refreshTaggingStatus();
-  });
 
   const toggle = () => setOpen((v) => !v);
 
@@ -471,168 +468,9 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
     setPrecachingAll(false);
   };
 
-  // ── Plugins ──
-  const [plugins, setPlugins] = createSignal<PluginInfo[]>([]);
-  const [pluginRunning, setPluginRunning] = createSignal<string | null>(null);
-  const [pluginStatus, setPluginStatus] = createSignal("");
-
-  const refreshPlugins = async () => {
-    // Same capability gate as ContextMenu: the web /api/invoke allowlist
-    // rejects list_plugins, so calling it on boot is a guaranteed 403.
-    if (!capabilities().plugins) return;
-    try {
-      setPlugins(await listPlugins());
-    } catch {}
-  };
-
-  onMount(refreshPlugins);
-
-  const handleAddPlugin = async () => {
-    const selected = await openDialog({
-      title: "Select plugin Python file",
-      directory: false,
-      multiple: false,
-      filters: [{ name: "Python Plugin", extensions: ["py"] }],
-    });
-    if (!selected) return;
-    try {
-      await installPlugin(selected as string);
-      await refreshPlugins();
-      setPluginStatus("Plugin installed");
-      setTimeout(() => setPluginStatus(""), 3000);
-    } catch (e) {
-      console.error("Install failed:", e);
-      setPluginStatus("Install failed");
-      setTimeout(() => setPluginStatus(""), 3000);
-    }
-  };
-
-  const handleAddPluginDir = async () => {
-    const selected = await openDialog({
-      title: "Select plugin directory",
-      directory: true,
-      multiple: false,
-    });
-    if (!selected) return;
-    try {
-      await installPlugin(selected as string);
-      await refreshPlugins();
-      setPluginStatus("Plugin installed");
-      setTimeout(() => setPluginStatus(""), 3000);
-    } catch (e) {
-      console.error("Install failed:", e);
-      setPluginStatus("Install failed");
-      setTimeout(() => setPluginStatus(""), 3000);
-    }
-  };
-
-  /** Web: enqueue a "tag everything this plugin hasn't seen" job for a
-   * connected worker (pinned to `workerId` when the user picked one). The
-   * filter resolves at claim time, so it's idempotent — re-running after new
-   * uploads only tags the new files. */
-  const handleTagAllUntagged = async (pluginName: string, tagPrefix: string, workerId?: string) => {
-    try {
-      const job = await enqueueTaggingJob(
-        pluginName,
-        { filter: `type:image AND NOT has::plugin.${tagPrefix}` },
-        workerId,
-      );
-      trackQueuedJob(job);
-    } catch (e) {
-      console.error("Failed to enqueue tagging job:", e);
-      // The desktop plugin-status line isn't rendered on web; surface the
-      // error through the toast instead.
-      pluginStarted(pluginName, pluginName, 0);
-      pluginFailed(String(e));
-    }
-  };
-
-  /** Newest-first slice of the server's job list for the status readout. */
-  const recentTaggingJobs = () => taggingJobs().slice(-5).reverse();
-
-  const jobStateColor = (job: TaggingJob) => {
-    switch (job.state) {
-      case "running": return "text-teal-400";
-      case "queued": return "text-neutral-400";
-      case "done": return "text-green-400";
-      case "failed": return "text-red-400";
-      case "cancelled": return "text-yellow-400";
-    }
-  };
-
-  const handleRunOnAll = async (pluginName: string) => {
-    const paths = displayPaths();
-    if (paths.length === 0) return;
-    const plugin = plugins().find((p) => p.name === pluginName);
-    const displayName = plugin?.display_name ?? pluginName;
-    setPluginRunning(pluginName);
-    setPluginStatus(`Running on ${paths.length} photos...`);
-    pluginStarted(pluginName, displayName, paths.length);
-
-    // Listen for per-file progress and completion events from the background task
-    const unlistenProgress = await listen<{
-      completed: number;
-      total: number;
-    }>("plugin:progress", (event) => {
-      pluginProgress(event.payload.completed, event.payload.total);
-    });
-
-    const unlistenDone = await listen<{
-      succeeded: number;
-      failed: number;
-      cancelled: boolean;
-    }>("plugin:done", (event) => {
-      const { succeeded, failed, cancelled } = event.payload;
-      if (cancelled) {
-        pluginCancelled();
-      } else if (failed > 0) {
-        const msg = `Done: ${succeeded} tagged, ${failed} failed`;
-        setPluginStatus(msg);
-        pluginFailed(msg);
-      } else {
-        const msg = `Tagged ${succeeded} photos`;
-        setPluginStatus(msg);
-        pluginFinished(msg);
-      }
-      cleanup();
-    });
-
-    const cleanup = () => {
-      unlistenProgress();
-      unlistenDone();
-      setPluginRunning(null);
-      setTimeout(() => setPluginStatus(""), 5000);
-    };
-
-    // Fire-and-forget — the backend runs the batch in a background task
-    // and reports progress/completion via events.
-    try {
-      await runPluginBatch(pluginName, paths, "tag");
-    } catch (e) {
-      console.error("Plugin batch launch failed:", e);
-      setPluginStatus("Run failed");
-      pluginFailed("Run failed");
-      cleanup();
-    }
-  };
-
   return (
-    <div class="relative">
-      {/* Gear button — hidden when an external trigger (the mobile floating
-          button) drives the panel instead. */}
-      <Show when={!props.hideTrigger}>
-      <button
-        onClick={toggle}
-        class="shrink-0 w-8 h-8 flex items-center justify-center text-neutral-400 hover:text-neutral-200 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors cursor-pointer"
-        title="Settings"
-        aria-label="Settings"
-      >
-        <GearIcon size={16} />
-      </button>
-      </Show>
-
-      {/* Dropdown panel (desktop) / full-screen page (mobile) */}
-      <Show when={open()}>
+    // Dropdown panel (desktop) / full-screen page (mobile)
+    <Show when={open()}>
         {/* Backdrop — click to close (desktop only; the mobile page is opaque
             and covers the whole viewport, so there's nothing to click behind). */}
         <Show when={!isMobile()}>
@@ -649,21 +487,19 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             by the top bar's `backdrop-filter`, which establishes a containing
             block for fixed descendants and clips the page to the bar's height.
             Desktop stays in place — its `absolute` panel is positioned by the
-            gear's `relative` wrapper. */}
+            wrapper it shares with the command button in `TopBar`, so it drops
+            from the control that opened it. */}
         <Dynamic component={isMobile() ? Portal : InPlace}>
         <div
           class={
             isMobile()
-              ? "fixed inset-0 z-[60] overflow-hidden flex flex-col"
+              ? "fixed inset-0 z-[60] overflow-hidden flex flex-col safe-panel"
               : "absolute top-full right-0 mt-2 w-72 rounded-lg overflow-hidden shadow-xl z-50 flex flex-col max-h-[calc(100vh-5rem)]"
           }
           style={
             isMobile()
               ? {
                   background: "#121212",
-                  // Clear the notch/dynamic island and the home-indicator area.
-                  "padding-top": "env(safe-area-inset-top)",
-                  "padding-bottom": "env(safe-area-inset-bottom)",
                 }
               : {
                   background: "rgba(18, 18, 18, 0.96)",
@@ -702,65 +538,8 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
               "dupes-scroll": !isMobile(),
             }}
           >
-            {/* ── View (mobile only — relocated from the top bar, which is too
-                cramped on phones to fit it alongside the search field) ── */}
-            <Show when={isMobile()}>
-              <Section label="View" order={0}>
-                <div class="flex items-center gap-1 p-0.5 rounded bg-neutral-800/60">
-                  <For each={VIEW_CHOICES.filter((v) => enabledViews().includes(v.mode))}>
-                    {(v) => (
-                      <button
-                        onClick={() => { setViewMode(v.mode); setOpen(false); }}
-                        class="flex-1 px-2 py-1.5 text-sm rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
-                        classList={{ "bg-neutral-700 text-white": viewMode() === v.mode }}
-                      >
-                        {v.label}
-                      </button>
-                    )}
-                  </For>
-                </div>
-              </Section>
-            </Show>
-
-            {/* ── Views (desktop only — this configures the gallery, not the
-                device, so a paired phone reads the list but cannot change
-                it) ── */}
-            <Show when={!isWeb()}>
-              <Section label="Views" order={4}>
-                <Field label="Available in this gallery">
-                  <div class="flex flex-col gap-1.5">
-                    <For each={VIEW_CHOICES}>
-                      {(v) => (
-                        <div class="flex items-center justify-between">
-                          <span class="text-[11px] text-neutral-400">{v.label}</span>
-                          <button
-                            onClick={() => toggleView(v.mode)}
-                            class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
-                              enabledViews().includes(v.mode) ? "bg-teal-600" : "bg-neutral-700"
-                            }`}
-                            title={v.title}
-                          >
-                            <span
-                              class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
-                                enabledViews().includes(v.mode) ? "left-[18px]" : "left-0.5"
-                              }`}
-                            />
-                          </button>
-                        </div>
-                      )}
-                    </For>
-                  </div>
-                </Field>
-                <span class="text-[10px] text-neutral-600 leading-snug">
-                  A disabled view stops pre-generating its thumbnails — on a large
-                  gallery that is gigabytes for cells nobody renders. Thumbnails
-                  already cached are kept, so re-enabling a view costs nothing.
-                </span>
-              </Section>
-            </Show>
-
             {/* ── Display ── */}
-            <Section label="Display" order={4}>
+            <Section label="Display">
               {/* Thumbnail size — mobile uses a column-count picker so the
                   presets stay meaningful on a 400px-wide viewport; desktop
                   keeps the fixed-pixel S/M/L/XL buckets. */}
@@ -1002,33 +781,87 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
 
             </Section>
 
-            {/* ── Default filter (desktop-managed; LAN clients inherit it) ── */}
+            {/* ── Views (desktop only — this configures the gallery, not the
+                device, so a paired phone reads the list but cannot change
+                it) ── */}
             <Show when={!isWeb()}>
-            <Section label="Default Filter" order={5}>
-              <Toggle
-                label="Apply on gallery open"
-                checked={settings().default_filter?.enabled ?? false}
-                onChange={(v) => updateDefaultFilter("enabled", v)}
-              />
-              <Show when={settings().default_filter?.enabled}>
-                <input
-                  type="text"
-                  value={settings().default_filter?.query ?? ""}
-                  onInput={(e) => updateDefaultFilter("query", e.currentTarget.value)}
-                  placeholder="e.g. rating>=3 AND NOT auto::indoor"
-                  class="w-full px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
-                />
+              <Section label="Views">
+                <Field label="Available in this gallery">
+                  <div class="flex flex-col gap-1.5">
+                    <For each={VIEW_CHOICES}>
+                      {(v) => (
+                        <div class="flex items-center justify-between">
+                          <span class="text-[11px] text-neutral-400">{v.label}</span>
+                          <button
+                            onClick={() => toggleView(v.mode)}
+                            class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
+                              enabledViews().includes(v.mode) ? "bg-teal-600" : "bg-neutral-700"
+                            }`}
+                            title={v.title}
+                          >
+                            <span
+                              class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
+                                enabledViews().includes(v.mode) ? "left-[18px]" : "left-0.5"
+                              }`}
+                            />
+                          </button>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Field>
                 <span class="text-[10px] text-neutral-600 leading-snug">
-                  Applied automatically the next time this gallery is opened — including
-                  from LAN web clients.
+                  A disabled view stops pre-generating its thumbnails — on a large
+                  gallery that is gigabytes for cells nobody renders. Thumbnails
+                  already cached are kept, so re-enabling a view costs nothing.
                 </span>
+              </Section>
+            </Show>
+
+            {/* ── Thumbnails ── */}
+            <Section label="Thumbnails">
+              <button
+                onClick={handlePrecacheAll}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+              >
+                {precachingAll() ? "Cancel Generation" : "Generate Missing Thumbnails"}
+              </button>
+              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
+                Pre-generates every thumbnail size the gallery views use, so
+                they don't burst-generate (CPU spikes) while scrolling new
+                areas. Safe to cancel and re-run — already-generated
+                thumbnails are skipped.
+              </p>
+              {/* Rebuild + rendering are desktop-only (destructive / local) */}
+              <Show when={!isWeb()}>
+                <button
+                  onClick={handleRebuild}
+                  disabled={rebuilding()}
+                  class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
+                </button>
+                <Toggle
+                  label="GPU acceleration (experimental)"
+                  checked={gpuOn()}
+                  onChange={toggleGpu}
+                />
+                <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
+                  Uses the GPU compositing path for much smoother scrolling and
+                  faster image display. Disabled by default because it can crash
+                  on some drivers. Takes effect after restarting the app.
+                </p>
+                <Show when={renderRestart()}>
+                  <p class="text-[10px] text-amber-400/80 pl-0.5">
+                    Restart LightView to apply the new rendering mode.
+                  </p>
+                </Show>
               </Show>
             </Section>
-            </Show>
 
             {/* ── Remote access (desktop only) ── */}
             <Show when={!isWeb()}>
-              <Section label="Remote Access" order={2}>
+              <Section label="Remote Access">
                 <Toggle
                   label="Enable LAN web access"
                   checked={remote() !== null}
@@ -1323,197 +1156,6 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
               </Section>
             </Show>
 
-            {/* ── Thumbnails ── */}
-            <Section label="Thumbnails" order={6}>
-              <button
-                onClick={handlePrecacheAll}
-                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-              >
-                {precachingAll() ? "Cancel Generation" : "Generate Missing Thumbnails"}
-              </button>
-              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
-                Pre-generates every thumbnail size the gallery views use, so
-                they don't burst-generate (CPU spikes) while scrolling new
-                areas. Safe to cancel and re-run — already-generated
-                thumbnails are skipped.
-              </p>
-              {/* Rebuild + rendering are desktop-only (destructive / local) */}
-              <Show when={!isWeb()}>
-                <button
-                  onClick={handleRebuild}
-                  disabled={rebuilding()}
-                  class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
-                </button>
-                <Toggle
-                  label="GPU acceleration (experimental)"
-                  checked={gpuOn()}
-                  onChange={toggleGpu}
-                />
-                <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
-                  Uses the GPU compositing path for much smoother scrolling and
-                  faster image display. Disabled by default because it can crash
-                  on some drivers. Takes effect after restarting the app.
-                </p>
-                <Show when={renderRestart()}>
-                  <p class="text-[10px] text-amber-400/80 pl-0.5">
-                    Restart LightView to apply the new rendering mode.
-                  </p>
-                </Show>
-              </Show>
-            </Section>
-
-            {/* ── Storage (desktop only) ── */}
-            <Show when={!isWeb()}>
-            <Section label="Storage" order={7}>
-              <Field label="Companion file location">
-                <div class="flex gap-1">
-                  {([
-                    { value: "lightview_folder" as const, label: ".lightview folder" },
-                    { value: "alongside" as const, label: "Alongside images" },
-                  ]).map((opt) => (
-                    <button
-                      class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                        settings().storage.companion_location === opt.value
-                          ? "bg-teal-700/60 text-teal-200"
-                          : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                      }`}
-                      onClick={() => updateStorage("companion_location", opt.value)}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </Field>
-            </Section>
-            </Show>
-
-            {/* ── Plugins (desktop only) ── */}
-            <Show when={!isWeb()}>
-            <Section label="Plugins" order={3}>
-              <div class="flex flex-col gap-2">
-                <For each={plugins()}>
-                  {(plugin) => (
-                    <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-neutral-800/50">
-                      <div class="flex flex-col min-w-0">
-                        <span class="text-xs text-neutral-300 truncate">{plugin.display_name}</span>
-                        <span class="text-[10px] text-neutral-500 truncate">{plugin.description}</span>
-                      </div>
-                      <button
-                        disabled={pluginRunning() !== null}
-                        onClick={() => handleRunOnAll(plugin.name)}
-                        class="shrink-0 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors bg-neutral-700 text-neutral-300 hover:bg-neutral-600 hover:text-neutral-100 disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        {pluginRunning() === plugin.name ? "Running..." : "Run All"}
-                      </button>
-                    </div>
-                  )}
-                </For>
-                <Show when={plugins().length === 0}>
-                  <span class="text-xs text-neutral-600">No plugins installed</span>
-                </Show>
-              </div>
-              <Show when={pluginStatus()}>
-                <span class="text-xs text-neutral-400">{pluginStatus()}</span>
-              </Show>
-
-              <div class="flex gap-1">
-                <button
-                  onClick={handleAddPlugin}
-                  class="flex-1 px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                >
-                  Add .py File...
-                </button>
-                <button
-                  onClick={handleAddPluginDir}
-                  class="flex-1 px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                >
-                  Add Folder...
-                </button>
-              </div>
-            </Section>
-            </Show>
-
-            {/* ── Remote Tagging (web only): jobs executed by a paired
-                   lightview-worker on a capable machine ── */}
-            <Show when={isWeb()}>
-            <Section label="Remote Tagging" order={3}>
-              <Show
-                when={taggingWorkers().length > 0}
-                fallback={
-                  <span class="text-xs text-neutral-600">
-                    No tagging worker connected — run <code class="text-neutral-500">lightview-worker</code> on
-                    a machine with your plugins installed, or install plugins on the server itself.
-                  </span>
-                }
-              >
-                <div class="flex flex-col gap-1">
-                  <For each={taggingWorkers()}>
-                    {(worker) => (
-                      <span class="text-[11px] text-neutral-500">
-                        ● {worker.workerName}
-                        <Show when={worker.local}>
-                          <span class="ml-1 px-1 py-px rounded bg-neutral-800 text-[9px] text-neutral-400 align-middle">server</span>
-                        </Show>
-                        {worker.busyJobId ? " (tagging...)" : " (idle)"}
-                      </span>
-                    )}
-                  </For>
-                </div>
-                <div class="flex flex-col gap-2">
-                  {/* One row per (plugin, place-to-run-it): plugins offered by
-                      several workers get a pinned row each ("on <worker>"). */}
-                  <For each={taggingActions()}>
-                    {(action) => (
-                      <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-neutral-800/50">
-                        <div class="flex flex-col min-w-0">
-                          <span class="text-xs text-neutral-300 truncate">
-                            {action.plugin.display_name}
-                            <Show when={action.where}>
-                              <span class="text-neutral-500"> {action.where}</span>
-                            </Show>
-                          </span>
-                          <span class="text-[10px] text-neutral-500 truncate">{action.plugin.description}</span>
-                        </div>
-                        <button
-                          onClick={() => handleTagAllUntagged(action.plugin.name, action.plugin.tag_prefix, action.workerId)}
-                          class="shrink-0 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors bg-neutral-700 text-neutral-300 hover:bg-neutral-600 hover:text-neutral-100"
-                        >
-                          Tag All Untagged
-                        </button>
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </Show>
-              <Show when={recentTaggingJobs().length > 0}>
-                <div class="flex flex-col gap-1">
-                  <For each={recentTaggingJobs()}>
-                    {(job) => (
-                      <div class="flex items-center gap-2 px-2 py-1 rounded bg-neutral-800/30">
-                        <span class={`text-[10px] ${jobStateColor(job)}`}>{job.state}</span>
-                        <span class="text-[11px] text-neutral-400 truncate flex-1">
-                          {job.displayName}
-                          {job.total > 0 ? ` — ${job.completed + job.failed}/${job.total}` : ""}
-                          {job.failed > 0 ? ` (${job.failed} failed)` : ""}
-                        </span>
-                        <Show when={job.state === "queued" || job.state === "running"}>
-                          <button
-                            onClick={() => cancelTaggingJob(job.id).catch(() => {})}
-                            class="shrink-0 px-1.5 py-0.5 text-[10px] rounded cursor-pointer bg-neutral-700 text-neutral-400 hover:bg-neutral-600 hover:text-neutral-200"
-                          >
-                            Cancel
-                          </button>
-                        </Show>
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </Show>
-            </Section>
-            </Show>
-
             {/* ── Connection (web only) ──
                 The certificate link also lives on /pair, but that page is only
                 reachable while *un*paired — after a successful pair the client
@@ -1522,7 +1164,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
                 (to stop the click-through exception lapsing), it needs a home
                 here too. */}
             <Show when={isWeb()}>
-            <Section label="Connection" order={2}>
+            <Section label="Connection">
               <a
                 href="/cert"
                 class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 text-center"
@@ -1550,61 +1192,53 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
             </Section>
             </Show>
 
-            {/* ── Tags ── */}
-            <Show when={props.onOpenTagManager}>
-            <Section label="Tags" order={1}>
-              <button
-                onClick={() => {
-                  setOpen(false);
-                  props.onOpenTagManager?.();
-                }}
-                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-              >
-                Manage Tags...
-              </button>
+            {/* ── Default filter (desktop-managed; LAN clients inherit it) ── */}
+            <Show when={!isWeb()}>
+            <Section label="Default Filter">
+              <Toggle
+                label="Apply on gallery open"
+                checked={settings().default_filter?.enabled ?? false}
+                onChange={(v) => updateDefaultFilter("enabled", v)}
+              />
+              <Show when={settings().default_filter?.enabled}>
+                <input
+                  type="text"
+                  value={settings().default_filter?.query ?? ""}
+                  onInput={(e) => updateDefaultFilter("query", e.currentTarget.value)}
+                  placeholder="e.g. rating>=3 AND NOT auto::indoor"
+                  class="w-full px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
+                />
+                <span class="text-[10px] text-neutral-600 leading-snug">
+                  Applied automatically the next time this gallery is opened — including
+                  from LAN web clients.
+                </span>
+              </Show>
             </Section>
             </Show>
 
-            {/* ── Deduplication ── */}
-            <Show when={props.onOpenDuplicates}>
-            <Section label="Deduplication" order={1}>
-              <button
-                onClick={() => {
-                  setOpen(false);
-                  props.onOpenDuplicates?.();
-                }}
-                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-              >
-                Find Duplicates...
-              </button>
+            {/* ── Storage (desktop only) ── */}
+            <Show when={!isWeb()}>
+            <Section label="Storage">
+              <Field label="Companion file location">
+                <div class="flex gap-1">
+                  {([
+                    { value: "lightview_folder" as const, label: ".lightview folder" },
+                    { value: "alongside" as const, label: "Alongside images" },
+                  ]).map((opt) => (
+                    <button
+                      class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
+                        settings().storage.companion_location === opt.value
+                          ? "bg-teal-700/60 text-teal-200"
+                          : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+                      }`}
+                      onClick={() => updateStorage("companion_location", opt.value)}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </Field>
             </Section>
-            </Show>
-
-            {/* ── Trash (on web only when the host allows remote delete) ── */}
-            <Show when={props.onOpenTrash && capabilities().delete}>
-            <Section label="Trash" order={1}>
-              <button
-                onClick={() => {
-                  setOpen(false);
-                  props.onOpenTrash?.();
-                }}
-                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-              >
-                View Trash...
-              </button>
-            </Section>
-            </Show>
-
-            {/* ── Gallery ── */}
-            <Show when={props.onOpenFolder && !isWeb()}>
-              <div class="border-t border-neutral-800/60 pt-3" style={{ order: 8 }}>
-                <button
-                  onClick={() => { props.onOpenFolder!(); setOpen(false); }}
-                  class="w-full px-3 py-2 text-xs text-neutral-300 hover:text-neutral-100 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors cursor-pointer text-left"
-                >
-                  Open Folder...
-                </button>
-              </div>
             </Show>
 
             {/* ── Build identity — always last. Lets a running client be matched
@@ -1613,8 +1247,7 @@ export function SettingsMenu(props: { onOpenFolder?: () => void; onOpenDuplicate
           </div>
         </div>
         </Dynamic>
-      </Show>
-    </div>
+    </Show>
   );
 }
 
@@ -1645,7 +1278,6 @@ function AboutFooter() {
     <button
       onClick={copy}
       title="Copy build info"
-      style={{ order: 99 }}
       class="mt-1 pt-3 border-t border-neutral-800/60 text-left text-[10px] font-mono text-neutral-600 hover:text-neutral-400 transition-colors cursor-pointer select-text"
     >
       <span class="text-neutral-500">LightView</span> {copied() ? "copied ✓" : label}
@@ -1653,15 +1285,11 @@ function AboutFooter() {
   );
 }
 
-function Section(props: { label: string; children: any; order?: number }) {
-  // `order` controls visual position within the flex-column settings panel
-  // independently of source order, so frequently-used sections (Deduplication,
-  // Remote Access, Plugins) can sit at the top while their JSX stays put.
+/** One group of related settings. Position is source order — there is no
+ *  `order` prop, deliberately; see the note at the top of this file. */
+function Section(props: { label: string; children: any }) {
   return (
-    <div
-      class="flex flex-col gap-2.5"
-      style={props.order != null ? { order: props.order } : undefined}
-    >
+    <div class="flex flex-col gap-2.5">
       <span class="text-[11px] uppercase tracking-wider text-neutral-500 font-medium">
         {props.label}
       </span>

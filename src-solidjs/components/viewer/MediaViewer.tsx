@@ -1508,12 +1508,13 @@ export function MediaViewer(props: MediaViewerProps) {
         classList={{
           "text-xl": !hasTouch(),
           "text-3xl p-1": hasTouch(),
-          // Clear the frameless titlebar so it isn't covered (and so the image
-          // close isn't confused with the window close).
-          "top-12": frameless(),
-          "top-4": !frameless(),
         }}
         style={{
+          // Clear the frameless titlebar so it isn't covered (and so the image
+          // close isn't confused with the window close), and clear the phone's
+          // notch, which otherwise swallows every tap on this button — it is
+          // the only close affordance besides the swipe-down gesture.
+          top: frameless() ? "3rem" : "calc(env(safe-area-inset-top, 0px) + 1rem)",
           opacity: chromeVisible() ? undefined : "0",
           "pointer-events": chromeVisible() ? undefined : "none",
         }}

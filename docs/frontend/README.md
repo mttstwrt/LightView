@@ -10,7 +10,7 @@ images on the main thread.
 
 **Responsible for:** all rendering and interaction — the two grids, the
 full-resolution viewer, the top bar and its menus, the panels (tags,
-duplicates, trash, map), and the pairing/password flows. Also the client-side
+duplicates, trash, auto-tagging, map), and the pairing/password flows. Also the client-side
 caches: the service worker, the boot snapshot, and the in-memory viewer cache.
 
 **Not responsible for:** anything the backend can do. There is no image
@@ -29,11 +29,11 @@ step with the Rust serde structs on the other side.
 
 | Path | What lives there |
 |---|---|
-| `stores/` | Global signals: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore`, `capabilitiesStore`, `thumbnailProgressStore` |
+| `stores/` | Global signals: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore`, `capabilitiesStore`, `uploadStore`, `thumbnailProgressStore` |
 | `lib/` | The non-visual machinery: `ipc`, `runtime`, `types`, plus the grid primitives both grids share (see [`grid-loading.md`](grid-loading.md)) |
 | `components/gallery/` | `GalleryGrid`, `JustifiedGrid`, `ThumbnailCell`, `SelectionBar` |
 | `components/viewer/` | `MediaViewer`, `VideoPlayer`, `InfoPanel` |
-| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `SettingsMenu`, `TitleBar` — the commands/settings split these want is planned in [`chrome.md`](chrome.md) |
+| `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `CommandMenu`, `ViewSwitcher`, `SettingsMenu`, `TitleBar` — how these divide between things you do and things you set is [`chrome.md`](chrome.md) |
 | `components/auth/` | `PairApp`, `PasswordModal` — the web-only bootstrap flows |
 | `components/shared/` | `ContextMenu`, `ScrollBar`, `ConfirmButton` |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |

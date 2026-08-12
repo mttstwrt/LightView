@@ -132,6 +132,29 @@ html, body, #root {
   background: rgba(255,255,255,0.25);
 }
 
+/* Full-screen overlays: keep their content clear of the notch, the home
+   indicator and the rounded corners.
+
+   Padding rather than a smaller box, deliberately. Padding sits inside the
+   background box, so the overlay still paints edge to edge — inset the element
+   itself instead and the gallery shows through the strip behind the status bar.
+
+   Without this a panel header's close button renders *under* the phone's
+   forehead: visible, but every tap there goes to the system rather than the
+   page, so the panel looks unclosable. Left/right matter in landscape, where
+   the notch takes a side.
+
+   For edge-to-edge overlays only. It sets all four paddings outright, so it
+   would silently drop a `p-*` utility on the same element — the centered
+   dialogs keep their own padding instead, which is already wider than any
+   inset. */
+.safe-panel {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
 /* Inset box-shadow (not outline) so it doesn't collide with the inline
    `outline` that ThumbnailCell sets for selection. */
 .thumb-cell:hover {

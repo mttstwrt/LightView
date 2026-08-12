@@ -23,7 +23,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { safeListen as listen, NOT_PAIRED_EVENT } from "./lib/runtime";
 import { isTauri, isWeb, isMobile } from "./lib/runtime";
 import { PasswordModal } from "./components/auth/PasswordModal";
-import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem, loadEnabledViews } from "./stores/galleryStore";
+import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, setSettingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem, loadEnabledViews } from "./stores/galleryStore";
 import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { createOpenAtBottom } from "./lib/openAtBottom";
 import { VIEWER_CLOSE_REQUEST_EVENT } from "./lib/viewerTransition";
@@ -61,7 +61,10 @@ import { DebugOverlay } from "./components/debug/DebugOverlay";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { TrashPanel } from "./components/TrashPanel";
 import { TagManagerPanel } from "./components/TagManagerPanel";
-import { UploadButton } from "./components/upload/UploadButton";
+import { AutoTagPanel } from "./components/AutoTagPanel";
+import { UploadSheet } from "./components/upload/UploadSheet";
+import { loadUploadConfig } from "./stores/uploadStore";
+import type { CommandHandlers } from "./components/topbar/CommandMenu";
 import { ConnectionBanner } from "./components/ConnectionBanner";
 import type { SortedItem, SortField } from "./lib/types";
 
@@ -253,6 +256,8 @@ export function App() {
   const [duplicatesOpen, setDuplicatesOpen] = createSignal(false);
   const [trashOpen, setTrashOpen] = createSignal(false);
   const [tagManagerOpen, setTagManagerOpen] = createSignal(false);
+  const [autoTagOpen, setAutoTagOpen] = createSignal(false);
+  const [uploadOpen, setUploadOpen] = createSignal(false);
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState | null>(null);
   const [galleryContentHeight, setGalleryContentHeight] = createSignal(0);
   // Web client: true once a boot round-trip has failed and nothing has
@@ -482,6 +487,10 @@ export function App() {
   // same-origin `lv_device` cookie so only paired devices connect.
   if (isWeb()) {
     loadCapabilities();
+    // Decides whether the command list offers "Upload photos" at all, so it
+    // has to land before the user opens the list rather than when a sheet
+    // mounts.
+    void loadUploadConfig();
     void loadEnabledViews();
     const source = new EventSource("/api/events");
     source.addEventListener("fs-changed", (event) => {
@@ -550,6 +559,19 @@ export function App() {
     } catch (e) {
       console.error("Dialog failed:", e);
     }
+  };
+
+  // What the command list runs. Declared here because this is where the
+  // panels' open state lives; the list itself — what is offered, in what
+  // order, on which surface — is `CommandMenu.tsx`.
+  const commandHandlers: CommandHandlers = {
+    openTagManager: () => setTagManagerOpen(true),
+    openDuplicates: () => setDuplicatesOpen(true),
+    openTrash: () => setTrashOpen(true),
+    openAutoTag: () => setAutoTagOpen(true),
+    openUpload: () => setUploadOpen(true),
+    openFolder: handleOpenFolder,
+    openSettings: () => setSettingsOpen(true),
   };
 
   // Throttle held arrow keys to one navigation per frame so the viewer
@@ -667,7 +689,7 @@ export function App() {
           </>
         }
       >
-        <TopBar onOpenFolder={handleOpenFolder} onOpenDuplicates={() => setDuplicatesOpen(true)} onOpenTrash={() => setTrashOpen(true)} onOpenTagManager={() => setTagManagerOpen(true)} />
+        <TopBar commands={commandHandlers} />
         <Show when={(viewMode() === "grid" || viewMode() === "justified") && !contentHidden()}>
           <Show when={viewMode() === "grid"}>
             <GalleryGrid
@@ -792,16 +814,13 @@ export function App() {
             onChanged={() => { void refreshFilteredItems(); }}
           />
         </Show>
+        <Show when={autoTagOpen()}>
+          <AutoTagPanel onClose={() => setAutoTagOpen(false)} />
+        </Show>
         <Show when={isWeb()}>
-          {/* Hidden (not unmounted — that would refetch the upload config)
-              while the viewer is open: it floats bottom-right, on top of the
-              video player's mute button. Same for the mobile selection bar,
-              which spans that whole bottom edge. */}
-          <UploadButton
-            hidden={
-              viewerOpen() ||
-              (isMobile() && (selectionMode() || selectedPaths().size > 0))
-            }
+          <UploadSheet
+            open={uploadOpen()}
+            onClose={() => setUploadOpen(false)}
             onUploaded={refreshAfterUpload}
           />
         </Show>

@@ -153,7 +153,7 @@ is wrong: it also confines a remote-supplied path list to files actually
 indexed in this gallery, which is the only thing stopping a paired device from
 naming arbitrary filesystem paths for a worker to download. Widen the
 `media_type` predicate; do not drop the join. The second half is
-`SettingsMenu.tsx`, where "Tag All Untagged" hardcodes
+`AutoTagPanel.tsx`, where "Tag untagged" hardcodes
 `type:image AND NOT has::plugin.<prefix>` and would keep excluding videos even
 after the backend stops doing so.
 
@@ -363,18 +363,21 @@ files into were considered and set aside for that reason.
 
 ## D. Frontend structure and performance
 
-**D1 is the only one of the three ready to start.** It has a difference table
+Two items left, and **D1 is the one ready to start.** It has a difference table
 and a named four-step extraction in
 [`grid-loading.md`](frontend/grid-loading.md), and
 [C2](#c2-the-infinite-scrolling-canvas) waits on it. Either reading of D2 also
 lands in the code D1 is extracting, so D1 first there too — otherwise it gets
 written and verified twice, in two copies that already differ in small ways.
 
-**D2 and D3 both need a decision before code.** D2's premise turned out to be
-wrong (there is no decode worker), so it needs restating and then measuring.
-D3's design is written up but three questions under "Still open" in
-[`chrome.md`](frontend/chrome.md) are unanswered. Neither is blocked by D1;
-both are blocked on someone deciding something.
+**D2 still needs a decision before code.** Its premise turned out to be wrong
+(there is no decode worker), so it needs restating and then measuring. It is
+not blocked by D1; it is blocked on someone deciding something.
+
+**D3 is done** — the commands/settings split shipped, and
+[`chrome.md`](frontend/chrome.md) now describes what exists rather than what was
+planned. The two questions that had been holding it up are settled in
+[decision 0009](decisions/0009-commands-panels-and-configuration.md).
 
 ### D1. ~250–300 duplicated lines between the two grids
 
@@ -409,32 +412,21 @@ scheduling it, as whichever of these was meant:
 Either way it needs a measurement first, on the engine it is meant to help.
 Neither reading is small, so the tag is gone.
 
-### D3. Commands and settings are the same drawer, on both surfaces
+### ~~D3. Commands and settings are the same drawer, on both surfaces~~ — done
 
-`SettingsMenu.tsx` is 1,705 lines rendering thirteen `Section`s and no longer
-separates things you *do* from things you *set* — three of those sections are a
-heading plus a single button. The mobile chrome drifted the same way with less
-room: four controls float over an edge-to-edge grid, and the upload FAB already
-carries three hide conditions because it competes for the bottom edge with the
-selection bar and the video player.
+The command list lives in `components/topbar/CommandMenu.tsx` and renders two
+ways: a dropdown behind an overflow icon where the desktop gear was, and a sheet
+behind a FAB where the mobile upload button was. Settings is its last entry, and
+`SettingsMenu` keeps only configuration — six sections left it, the `Section`
+`order` prop is gone, and the remaining seven are read in source order. Neither
+surface gained a control; the phone went from four floating buttons to three.
 
-The design is in [`frontend/chrome.md`](frontend/chrome.md): one command list
-rendered as a dropdown behind an icon that replaces the desktop gear, and as a
-sheet behind a FAB that replaces the mobile upload button, with settings as the
-last entry and the panel keeping only configuration. Neither surface gains a
-control and no new kind of container is introduced. That page also carries the
-two constraints that make it safe, and why the `Section` `order` prop decayed.
-
-The order of work: extract the command list and its two renderings, move the
-action sections out of the panel, then re-order what remains as a single list
-and delete the `order` prop.
-
-**Not ready to start end to end.** The container question is settled; three
-things under "Still open" on that page are not. Plugins and Remote Tagging are
-stateful panels rather than commands and have nowhere to go yet; the mobile view
-switcher is a constantly-used mode selector that fits neither half; and pulling
-six sections out of a component holding twenty-odd signals needs those signals
-triaged first. The first two are decisions, not code.
+The two open questions were settled in
+[decision 0009](decisions/0009-commands-panels-and-configuration.md): Plugins
+and Remote Tagging became one `AutoTagPanel` behind one command, and the mobile
+view switcher took the corner the gear vacated. Details in
+[`frontend/chrome.md`](frontend/chrome.md), which is now a description rather
+than a plan.
 
 ---
 

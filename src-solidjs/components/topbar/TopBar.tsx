@@ -3,16 +3,18 @@ import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
 import { TitleBar } from "./TitleBar";
-import { GearIcon, CloseIcon, SelectIcon } from "./icons";
-import { viewMode, setViewMode, enabledViews, VIEW_CHOICES, displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode } from "../../stores/galleryStore";
+import { CommandMenu, CommandFab, commandsOpen, setCommandsOpen, type CommandHandlers } from "./CommandMenu";
+import { ViewSwitcher } from "./ViewSwitcher";
+import { CloseIcon, SearchIcon, SelectIcon } from "./icons";
+import { viewMode, setViewMode, enabledViews, VIEW_CHOICES, displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode, selectedPaths } from "../../stores/galleryStore";
+import { viewerOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { isMobile, isTauri } from "../../lib/runtime";
 
 interface TopBarProps {
-  onOpenFolder: () => void;
-  onOpenDuplicates?: () => void;
-  onOpenTrash?: () => void;
-  onOpenTagManager?: () => void;
+  /** What the command list runs. Declared once in `App`, which owns the
+   *  panels these open. */
+  commands: CommandHandlers;
 }
 
 // Pixels the user must scroll past 0 before we'll consider hiding the bar.
@@ -86,15 +88,15 @@ export function TopBar(props: TopBarProps) {
     });
   });
 
-  // Mobile: the filter sheet and the settings page are "screens", so the
-  // platform back gesture (Android back button, browser edge-swipe) should
-  // close them rather than leave the gallery. Opening one pushes a history
-  // entry; the popstate from the back gesture closes them. A UI close (X /
-  // backdrop) consumes the pushed entry with history.back() so a later back
-  // gesture isn't swallowed by a stale entry.
+  // Mobile: the filter sheet, the command sheet and the settings page are
+  // "screens", so the platform back gesture (Android back button, browser
+  // edge-swipe) should close them rather than leave the gallery. Opening one
+  // pushes a history entry; the popstate from the back gesture closes them. A
+  // UI close (X / backdrop) consumes the pushed entry with history.back() so a
+  // later back gesture isn't swallowed by a stale entry.
   let overlayPushed = false;
   createEffect(() => {
-    const overlayShown = isMobile() && (filterOpen() || settingsOpen());
+    const overlayShown = isMobile() && (filterOpen() || settingsOpen() || commandsOpen());
     if (overlayShown && !overlayPushed) {
       overlayPushed = true;
       history.pushState({ lvOverlay: true }, "");
@@ -172,6 +174,7 @@ export function TopBar(props: TopBarProps) {
         overlayPushed = false;
         setFilterOpen(false);
         setSettingsOpen(false);
+        setCommandsOpen(false);
       }
     };
     window.addEventListener("popstate", onPopState);
@@ -242,17 +245,25 @@ export function TopBar(props: TopBarProps) {
               )}
             </For>
           </div>
-          <SettingsMenu onOpenFolder={props.onOpenFolder} onOpenDuplicates={props.onOpenDuplicates} onOpenTrash={props.onOpenTrash} onOpenTagManager={props.onOpenTagManager} onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
+          {/* Actions and settings drop from the same anchor: only one of them
+              is ever open, and sharing the wrapper keeps the settings panel
+              aligned to the button that opens it now that it has no trigger of
+              its own. */}
+          <div class="relative shrink-0">
+            <CommandMenu handlers={props.commands} />
+            <SettingsMenu onRequestShow={() => { setHoverVisible(true); setScrollHidden(false); }} />
+          </div>
         </div>
       </Show>
 
       {/* ── Mobile chrome ──────────────────────────────────────────────── */}
-      {/* Opaque floating buttons over an edge-to-edge grid instead of a
-          full-width bar: a search button (left) that expands filter + sort,
-          then a Select toggle and a settings gear (right). All sit below the
-          safe-area inset so they clear the notch / dynamic island, and all
-          slide away on scroll-down (reusing the scroll-direction `visible()`
-          signal). */}
+      {/* Three floating buttons over an edge-to-edge grid instead of a
+          full-width bar, positioned by how often each is used: search
+          top-left, Select and the view switcher top-right, and the command
+          list in the bottom-right thumb zone (rendered below, after the
+          sheets). The top row sits below the safe-area inset so it clears the
+          notch / dynamic island, and slides away on scroll-down off the
+          scroll-direction `visible()` signal. See docs/frontend/chrome.md. */}
       <Show when={isMobile()}>
         {/* Search / filter button */}
         <button
@@ -270,57 +281,45 @@ export function TopBar(props: TopBarProps) {
           title="Filter and sort"
           aria-label="Filter and sort"
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="11" cy="11" r="7" />
-            <path d="M21 21l-4.3-4.3" />
-          </svg>
+          <SearchIcon size={20} />
         </button>
 
-        {/* Select-mode toggle. Touch has no Ctrl/Cmd, so this is the only way
-            into multi-select on a phone: while it's lit, a tap on a cell
-            toggles that cell instead of opening the viewer. Stays put when the
-            bar hides on scroll-down like its neighbours. */}
-        <button
-          class="fixed z-40 w-11 h-11 flex items-center justify-center rounded-full shadow-lg transition-[transform,opacity,background] duration-200"
-          style={{
-            // Sits one button-width (44px) plus a 8px gap left of the gear.
-            right: "calc(env(safe-area-inset-right, 0px) + 64px)",
-            top: "calc(env(safe-area-inset-top, 0px) + 8px)",
-            background: selectionMode() ? "rgb(37, 99, 235)" : "rgba(23, 23, 23, 0.92)",
-            color: selectionMode() ? "#fff" : "rgb(245, 245, 245)",
-            border: selectionMode()
-              ? "1px solid rgba(255, 255, 255, 0.25)"
-              : "1px solid rgba(255, 255, 255, 0.10)",
-            transform: visible() ? "translateY(0)" : "translateY(-150%)",
-            opacity: visible() ? "1" : "0",
-            "pointer-events": visible() ? "auto" : "none",
-          }}
-          onClick={() => toggleSelectionMode()}
-          title={selectionMode() ? "Exit selection" : "Select items"}
-          aria-label={selectionMode() ? "Exit selection" : "Select items"}
-          aria-pressed={selectionMode()}
-        >
-          <SelectIcon size={20} />
-        </button>
-
-        {/* Settings gear button */}
-        <button
-          class="fixed z-40 w-11 h-11 flex items-center justify-center rounded-full text-neutral-100 shadow-lg transition-[transform,opacity] duration-200"
+        {/* Top-right pair: Select, then the view switcher in the corner the
+            gear used to hold. A flex row rather than two absolutely-placed
+            buttons, because the switcher removes itself on a single-view
+            gallery and a hard-coded offset would leave a hole where it was. */}
+        <div
+          class="fixed z-40 flex items-center gap-2 transition-[transform,opacity] duration-200"
           style={{
             right: "calc(env(safe-area-inset-right, 0px) + 12px)",
             top: "calc(env(safe-area-inset-top, 0px) + 8px)",
-            background: "rgba(23, 23, 23, 0.92)",
-            border: "1px solid rgba(255, 255, 255, 0.10)",
             transform: visible() ? "translateY(0)" : "translateY(-150%)",
             opacity: visible() ? "1" : "0",
             "pointer-events": visible() ? "auto" : "none",
           }}
-          onClick={() => setSettingsOpen(true)}
-          title="Settings"
-          aria-label="Settings"
         >
-          <GearIcon size={20} />
-        </button>
+          {/* Select-mode toggle. Touch has no Ctrl/Cmd, so this is the only way
+              into multi-select on a phone: while it's lit, a tap on a cell
+              toggles that cell instead of opening the viewer. */}
+          <button
+            class="w-11 h-11 flex items-center justify-center rounded-full shadow-lg transition-colors duration-200"
+            style={{
+              background: selectionMode() ? "rgb(37, 99, 235)" : "rgba(23, 23, 23, 0.92)",
+              color: selectionMode() ? "#fff" : "rgb(245, 245, 245)",
+              border: selectionMode()
+                ? "1px solid rgba(255, 255, 255, 0.25)"
+                : "1px solid rgba(255, 255, 255, 0.10)",
+            }}
+            onClick={() => toggleSelectionMode()}
+            title={selectionMode() ? "Exit selection" : "Select items"}
+            aria-label={selectionMode() ? "Exit selection" : "Select items"}
+            aria-pressed={selectionMode()}
+          >
+            <SelectIcon size={20} />
+          </button>
+
+          <ViewSwitcher visible={visible()} />
+        </div>
 
         {/* Filter + sort sheet */}
         <Show when={filterOpen()}>
@@ -379,15 +378,24 @@ export function TopBar(props: TopBarProps) {
           </div>
         </Show>
 
-        {/* Settings drawer — full-screen page, opened by the gear button. */}
-        <SettingsMenu
-          hideTrigger
-          onOpenFolder={props.onOpenFolder}
-          onOpenDuplicates={props.onOpenDuplicates}
-          onOpenTrash={props.onOpenTrash}
-          onOpenTagManager={props.onOpenTagManager}
-          onRequestShow={() => { setScrollHidden(false); }}
+        {/* Command list — the thumb-zone button and its sheet. Hidden while
+            something else owns the bottom edge: the viewer's controls, and the
+            selection bar (whose actions live in `SelectionBar` by design, so
+            the two never need to be up together). All three conditions are
+            local signals — nothing here waits on the server. */}
+        <CommandFab
+          handlers={props.commands}
+          hidden={
+            !visible() ||
+            viewerOpen() ||
+            selectionMode() ||
+            selectedPaths().size > 0 ||
+            settingsOpen()
+          }
         />
+
+        {/* Settings — full-screen page, opened from the command list. */}
+        <SettingsMenu onRequestShow={() => { setScrollHidden(false); }} />
       </Show>
     </>
   );
