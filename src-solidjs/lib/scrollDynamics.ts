@@ -59,6 +59,19 @@ const JUMP_VIEWPORTS = 2;
 // Sized to a human's repeat-tap cadence: land once and you get full resolution
 // a beat later; keep jumping and the intermediate stops never upgrade at all.
 const JUMP_DWELL_MS = 450;
+// How long after a scrollbar release the view still counts as unsettled.
+//
+// JUMP_DWELL_MS above can only react to a warp *after* it has happened, which
+// is the best we can do for scroll-to-index. A scrollbar gesture we know about
+// while it is still running, and it needs a longer tail: a scrollbar is worked
+// in bursts — press, look, adjust, press again — and each landing reveals a
+// screenful of cells the grid has never shown. Upgrading every one of those
+// stops to the target tier is what makes a phone run out of memory, because
+// the browser keeps the decoded bitmaps in its own image cache long after the
+// cells are evicted and nothing the page does to the <img> gives that memory
+// back. One upgrade at the end of a burst instead of one per stop is the
+// difference between tens of megabytes and hundreds.
+const SCROLLBAR_RELEASE_MS = 900;
 // How far ahead (seconds) a fling's momentum is projected when estimating
 // where it will land. iOS-style deceleration coasts roughly velocity × 0.5s
 // past the current position; projecting a bit short of that keeps the warm
@@ -93,6 +106,32 @@ export function constrainedNetwork(): boolean {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Scrollbar gesture state
+//
+// Module-level rather than per-instance: there is one scrollbar and one grid on
+// screen at a time, and the grid must not have to know the scrollbar exists.
+// ---------------------------------------------------------------------------
+
+const [scrollBarActive, setScrollBarActive] = createSignal(false);
+let scrollBarReleaseTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Called by `ScrollBar` on every press and move of a scrollbar gesture. */
+export function markScrollBarActive() {
+  if (scrollBarReleaseTimer) clearTimeout(scrollBarReleaseTimer);
+  scrollBarReleaseTimer = undefined;
+  if (!untrack(scrollBarActive)) setScrollBarActive(true);
+}
+
+/** Called by `ScrollBar` when the pointer lifts; starts the release tail. */
+export function markScrollBarReleased() {
+  if (scrollBarReleaseTimer) clearTimeout(scrollBarReleaseTimer);
+  scrollBarReleaseTimer = setTimeout(() => {
+    scrollBarReleaseTimer = undefined;
+    setScrollBarActive(false);
+  }, SCROLLBAR_RELEASE_MS);
+}
+
 export interface ScrollFrame {
   /** Current window.scrollY. */
   y: number;
@@ -124,6 +163,7 @@ export interface ScrollDynamics {
   /**
    * Reactive: false while a fling is in progress (velocity above the
    * viewport-relative threshold), flipping back true shortly after it calms.
+   * Also false for the whole of a scrollbar gesture and its release tail.
    * Drives cheap-rung assignment and the upgrade pass on all platforms.
    */
   settled: Accessor<boolean>;
@@ -139,8 +179,10 @@ export interface ScrollDynamics {
    * rows the current velocity covers in one measured image-load round-trip
    * (velocity × ewmaImageLoadMs), clamped to `max` so DOM growth stays
    * bounded. A slow network or big tiers ⇒ deeper prefetch; instant
-   * localhost or idle ⇒ exactly `base` (today's static behavior). Also
-   * `base` on a constrained network, where speculation isn't worth the data.
+   * localhost or idle ⇒ exactly `base` (today's static behavior). Held at
+   * `base` on a constrained network, where speculation isn't worth the data,
+   * and during a scrollbar gesture, where the direction it extrapolates from
+   * is meaningless.
    */
   bufferAheadRows: (base: number, max: number) => number;
   /** Release the gate / mark settled now (scrollend, wheel animation done). */
@@ -159,7 +201,13 @@ export function createScrollDynamics(opts: {
   onFrame: (frame: ScrollFrame) => void;
 }): ScrollDynamics {
   const [decodeGate, setDecodeGate] = createSignal(false);
-  const [settled, setSettled] = createSignal(true);
+  const [rested, setRested] = createSignal(true);
+  // A scrollbar gesture keeps the view unsettled for its whole duration, so a
+  // burst of scrollbar stops costs one tier upgrade at the end rather than one
+  // per stop (see SCROLLBAR_RELEASE_MS). Everything downstream — the cheap-rung
+  // assignment in both grids and the drain-on-settle effect — reads this.
+  const settled = () => rested() && !scrollBarActive();
+  const setSettled = setRested;
 
   let lastY = window.scrollY;
   let lastTs = performance.now();
@@ -184,7 +232,14 @@ export function createScrollDynamics(opts: {
   };
 
   const bufferAheadRows = (base: number, max: number) => {
-    if (constrainedNetwork()) return base;
+    // The adaptive part of this buffer is a bet that the scroll will keep going
+    // the way it is going, which is how a fling behaves and how a scrollbar
+    // does not: a warp reports an enormous velocity for a single frame and then
+    // stops dead, so the bet inflates the window to `max` rows of look-ahead
+    // around a position the user is about to leave. Every one of those rows is
+    // a thumbnail the browser then holds on to. Stay at `base` for the whole
+    // gesture, the same concession `constrainedNetwork` makes.
+    if (scrollBarActive() || constrainedNetwork()) return base;
     const rh = opts.rowHeight();
     if (rh <= 0) return base;
     const extra = Math.ceil((velocity() * ewmaImageLoadMs()) / 1000 / rh);

@@ -1,4 +1,5 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show, For } from "solid-js";
+import { markScrollBarActive, markScrollBarReleased } from "../../lib/scrollDynamics";
 
 export interface ScrollIndicator {
   /** Position along the track as a fraction 0–1. */
@@ -28,9 +29,14 @@ interface ScrollBarProps {
  * Works in two modes:
  *   - Window mode (no container): tracks window.scrollY
  *   - Element mode (container ref): tracks element.scrollTop
+ *
+ * The thumb sits inside a larger invisible "grip" that owns the drag; see the
+ * comment on it in the markup for why the drag lives there and not on the
+ * track. Pressing the bare track still jumps.
  */
 export function ScrollBar(props: ScrollBarProps) {
   let trackRef: HTMLDivElement | undefined;
+  let gripRef: HTMLDivElement | undefined;
   const [thumbTop, setThumbTop] = createSignal(0);
   const [thumbHeight, setThumbHeight] = createSignal(0);
   const [scrollFraction, setScrollFraction] = createSignal(0);
@@ -41,8 +47,14 @@ export function ScrollBar(props: ScrollBarProps) {
   let hideTimeout: ReturnType<typeof setTimeout> | undefined;
   let dragStartY = 0;
   let dragStartScroll = 0;
+  let dragPointerId: number | undefined;
 
   const MIN_THUMB = 24;
+  // Grip dimensions — the draggable box around the thumb. 44px is the smallest
+  // reliable touch target, and the width reaches inwards from the rail so a
+  // fingertip has somewhere to land without the rail itself getting wider.
+  const GRIP_MIN_H = 44;
+  const GRIP_W = 34;
 
   const getMetrics = () => {
     if (props.container) {
@@ -58,6 +70,15 @@ export function ScrollBar(props: ScrollBarProps) {
       viewportH: window.innerHeight,
       contentH: props.contentHeight ?? document.documentElement.scrollHeight,
     };
+  };
+
+  const scrollTo = (y: number, range: number) => {
+    const clamped = Math.max(0, Math.min(y, range));
+    if (props.container) {
+      props.container.scrollTop = clamped;
+    } else {
+      window.scrollTo(0, clamped);
+    }
   };
 
   const recalc = () => {
@@ -93,59 +114,70 @@ export function ScrollBar(props: ScrollBarProps) {
     showTemporarily();
   };
 
-  // Drag handling
-  const onThumbMouseDown = (e: MouseEvent) => {
+  // --- Dragging the thumb (cursor and finger alike) -------------------------
+  //
+  // Pointer events rather than mouse events, so one code path serves both. That
+  // is not cosmetic: with mouse handlers only, a touch-drag on the thumb was
+  // never a scrollbar drag at all — the browser claimed the gesture and panned
+  // the page under the finger — so the only thing that worked on a phone was
+  // tapping the track, and finding a spot meant a rapid series of full-distance
+  // jumps. `touch-action: none` on the grip is what takes the gesture back.
+
+  const onGripPointerDown = (e: PointerEvent) => {
+    // Middle/right buttons keep their native meaning.
+    if (e.button !== 0 && e.pointerType === "mouse") return;
+    // preventDefault only — the press must keep bubbling to window, where
+    // `createOpenAtBottom` watches for it to know the user has taken over.
     e.preventDefault();
-    e.stopPropagation();
+
+    markScrollBarActive();
     setDragging(true);
+    dragPointerId = e.pointerId;
     dragStartY = e.clientY;
     dragStartScroll = getMetrics().scrollTop;
-
-    const onMove = (ev: MouseEvent) => {
-      const { viewportH, contentH } = getMetrics();
-      const trackH = trackRef?.clientHeight ?? viewportH;
-      const rawThumb = Math.max(MIN_THUMB, trackH * (viewportH / contentH));
-      const maxTravel = trackH - rawThumb;
-      if (maxTravel <= 0) return;
-
-      const dy = ev.clientY - dragStartY;
-      const scrollRange = contentH - viewportH;
-      const newScroll = dragStartScroll + (dy / maxTravel) * scrollRange;
-
-      if (props.container) {
-        props.container.scrollTop = Math.max(0, Math.min(newScroll, scrollRange));
-      } else {
-        window.scrollTo(0, Math.max(0, Math.min(newScroll, scrollRange)));
-      }
-    };
-
-    const onUp = () => {
-      setDragging(false);
-      showTemporarily();
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    try { gripRef?.setPointerCapture(e.pointerId); } catch {}
+    showTemporarily();
   };
 
-  // Click on track to jump
+  const onGripPointerMove = (e: PointerEvent) => {
+    if (dragPointerId !== e.pointerId) return;
+    e.preventDefault();
+    markScrollBarActive();
+
+    const { viewportH, contentH } = getMetrics();
+    const trackH = trackRef?.clientHeight ?? viewportH;
+    const rawThumb = Math.max(MIN_THUMB, trackH * (viewportH / contentH));
+    const maxTravel = trackH - rawThumb;
+    if (maxTravel <= 0) return;
+
+    const dy = e.clientY - dragStartY;
+    const scrollRange = contentH - viewportH;
+    scrollTo(dragStartScroll + (dy / maxTravel) * scrollRange, scrollRange);
+  };
+
+  const onGripPointerUp = (e: PointerEvent) => {
+    if (dragPointerId !== e.pointerId) return;
+    dragPointerId = undefined;
+    try { gripRef?.releasePointerCapture(e.pointerId); } catch {}
+    setDragging(false);
+    // A finger leaves no cursor behind, so the hover affordances must not
+    // outlive the gesture — otherwise the indicator rail and the thumb label
+    // stay pinned on screen for the rest of the session.
+    if (e.pointerType !== "mouse") setHovering(false);
+    markScrollBarReleased();
+    showTemporarily();
+  };
+
+  /** Press on the bare track: jump there. */
   const onTrackClick = (e: MouseEvent) => {
     if (e.target !== trackRef) return;
+    markScrollBarActive();
     const rect = trackRef!.getBoundingClientRect();
-    const clickY = e.clientY - rect.top;
     const { viewportH, contentH } = getMetrics();
     const trackH = trackRef!.clientHeight;
     const scrollRange = contentH - viewportH;
-    const fraction = clickY / trackH;
-    const target = fraction * scrollRange;
-
-    if (props.container) {
-      props.container.scrollTop = Math.max(0, Math.min(target, scrollRange));
-    } else {
-      window.scrollTo(0, Math.max(0, Math.min(target, scrollRange)));
-    }
+    scrollTo(((e.clientY - rect.top) / trackH) * scrollRange, scrollRange);
+    markScrollBarReleased();
   };
 
   onMount(() => {
@@ -158,6 +190,7 @@ export function ScrollBar(props: ScrollBarProps) {
       target.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", recalc);
       if (hideTimeout) clearTimeout(hideTimeout);
+      if (dragPointerId !== undefined) markScrollBarReleased();
     });
   });
 
@@ -224,24 +257,51 @@ export function ScrollBar(props: ScrollBarProps) {
           </For>
         </Show>
 
-        {/* Thumb */}
+        {/* The grip: an invisible box around the thumb that owns the drag.
+            Deliberately larger than the thumb it wraps — on a long gallery the
+            thumb is only MIN_THUMB tall, which no fingertip can hit — and it is
+            the *only* element that sets `touch-action: none`. Claiming the whole
+            track would mean any swipe along the right edge of the screen warped
+            the gallery instead of scrolling it, which on a phone is where a
+            thumb naturally rests. */}
         <div
+          ref={gripRef}
           style={{
             position: "absolute",
-            top: `${thumbTop()}px`,
-            left: "1px",
-            right: "1px",
-            height: `${thumbHeight()}px`,
-            "border-radius": "4px",
-            background: dragging() || hovering()
-              ? "rgba(255, 255, 255, 0.55)"
-              : "rgba(255, 255, 255, 0.35)",
-            "box-shadow": "0 0 2px rgba(0, 0, 0, 0.6), inset 0 0 0 0.5px rgba(255, 255, 255, 0.40)",
-            transition: dragging() ? "none" : "background 0.15s ease",
+            top: `${thumbTop() + thumbHeight() / 2 - Math.max(GRIP_MIN_H, thumbHeight()) / 2}px`,
+            // Anchored to the track's right edge and grown leftwards, so none
+            // of it falls off the side of the screen.
+            right: "0",
+            width: `${GRIP_W}px`,
+            height: `${Math.max(GRIP_MIN_H, thumbHeight())}px`,
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "flex-end",
+            "padding-right": "1px",
+            "box-sizing": "border-box",
+            "touch-action": "none",
             cursor: "grab",
           }}
-          onMouseDown={onThumbMouseDown}
-        />
+          onPointerDown={onGripPointerDown}
+          onPointerMove={onGripPointerMove}
+          onPointerUp={onGripPointerUp}
+          onPointerCancel={onGripPointerUp}
+        >
+          {/* Thumb */}
+          <div
+            style={{
+              width: "8px",
+              height: `${thumbHeight()}px`,
+              "border-radius": "4px",
+              background: dragging() || hovering()
+                ? "rgba(255, 255, 255, 0.55)"
+                : "rgba(255, 255, 255, 0.35)",
+              "box-shadow": "0 0 2px rgba(0, 0, 0, 0.6), inset 0 0 0 0.5px rgba(255, 255, 255, 0.40)",
+              transition: dragging() ? "none" : "background 0.15s ease",
+              "pointer-events": "none",
+            }}
+          />
+        </div>
 
         {/* Thumb label (tooltip) */}
         <Show when={thumbLabel()}>

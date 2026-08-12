@@ -40,7 +40,71 @@ Both grids run the same seven-part machine:
    `inFlightWarm` for speculation. See the invariants in
    [`frontend/`](README.md) for why one slot was a session-killing bug.
 7. **Eviction.** Paths far outside the rendered range have their `thumbMap`
-   entry dropped, releasing the decoded bitmap.
+   entry dropped, so the `<img>` goes away and the DOM stays small. It does
+   *not* give the memory back — see below.
+
+## Evicting a cell does not release its thumbnail
+
+This is the constraint that shapes everything above, and it is worth stating
+plainly because the code reads as though eviction were a free.
+
+Measured in Chromium against the SPA (a phone-sized viewport, a five-thousand
+item gallery, synthetic thumbnails): renderer memory grows with the number of
+distinct thumbnail URLs the page has *ever* loaded, and comes back neither when
+the cell is evicted, nor when the `<img>` is removed from the document, nor
+when its `src` is cleared first, nor after a forced GC. Loading six hundred
+images and then removing every one of them costs the same as keeping them all.
+The browser holds them in its own image cache, keyed by URL, and the page has
+no way to ask for them back. Sizes differ by roughly the square of the tier: a
+1024px `l` thumbnail retains about six times what a 128px `s` one does.
+
+So the only lever the frontend has is **how many distinct thumbnails it causes
+to be loaded, and at what tier**. That is not an optimization; on a phone it is
+the difference between working and being killed. The two-window shape, the
+resolution ladder, the landing-zone warm, and the scrollbar behaviour below all
+exist to keep that number down, and any change that loads "just a few more,
+just in case" is spending a budget that is never refunded.
+
+### Why the scrollbar gets special treatment
+
+A scrollbar is the fastest way to burn that budget. Every landing reveals a
+screenful of cells the grid has never shown, and a person hunting for a spot
+lands a few dozen times in a few seconds — a volume of fresh thumbnails that
+would take minutes of ordinary scrolling to reach. Left alone, each of those
+stops also committed a full-resolution upgrade of the whole inner window, at
+the most expensive tier.
+
+`ScrollBar` therefore reports its gesture to `scrollDynamics`
+(`markScrollBarActive` / `markScrollBarReleased`), which holds `settled` false
+for the gesture and a release tail after it. Two things follow, both in code
+that already existed:
+
+- the resolution ladder keeps every new cell on the cheap rung, so an entire
+  burst upgrades once at the end instead of once per stop;
+- `bufferAheadRows` stops extrapolating. Its adaptive part is a bet that the
+  scroll will continue as it is going, which is true of a fling and false of a
+  warp — a jump reports an enormous single-frame velocity and then stops dead,
+  inflating the look-ahead to its maximum around a position the user is about
+  to leave.
+
+Measured over sixty scrollbar landings on a phone-sized viewport, this takes
+the renderer from +566 MB to +270 MB and removes the largest tier from the
+gesture entirely (284 `l` loads → 0). The remainder is the cheap rung for the
+cells actually shown, which is the floor.
+
+The other half of it is that the bar can now be dragged by touch at all.
+`ScrollBar` was written with mouse handlers only, so on a phone a drag was never
+a scrollbar drag: the browser claimed the gesture and panned the page under the
+finger, moving the view by the length of the swipe. The only thing that worked
+was tapping the track, so "using the scrollbar" *was* the burst of jumps
+described above. The drag lives on pointer events now, and on a grip — an
+invisible 44×34px box around the thumb, which on a long gallery is only 24px
+tall and unhittable otherwise.
+
+The grip, and nothing else, sets `touch-action: none`. That containment is the
+point: claiming the whole track would mean any swipe along the right edge of the
+screen warped the gallery instead of scrolling it, which on a phone is exactly
+where a thumb rests. Pressing the bare track still jumps, as it always did.
 
 ## What is already extracted
 

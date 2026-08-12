@@ -35,7 +35,7 @@ step with the Rust serde structs on the other side.
 | `components/viewer/` | `MediaViewer`, `VideoPlayer`, `InfoPanel` |
 | `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `CommandMenu`, `ViewSwitcher`, `SettingsMenu`, `TitleBar` — how these divide between things you do and things you set is [`chrome.md`](chrome.md) |
 | `components/auth/` | `PairApp`, `PasswordModal` — the web-only bootstrap flows |
-| `components/shared/` | `ContextMenu`, `ScrollBar`, `ConfirmButton` |
+| `components/shared/` | `ContextMenu`, `ScrollBar` (its touch behaviour, and why the grids care, is in [`grid-loading.md`](grid-loading.md)), `ConfirmButton` |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |
 | `components/map/` | `MapView` — the one component behind a `lazy()` split (see below) |
 
