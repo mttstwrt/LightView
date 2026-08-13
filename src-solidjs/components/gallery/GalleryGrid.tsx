@@ -14,7 +14,7 @@
 
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, hasTouch, isTauri, type UnlistenFn } from "../../lib/runtime";
+import { safeListen as listen, hasTouch, isTauri, renderScale, type UnlistenFn } from "../../lib/runtime";
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
@@ -95,21 +95,13 @@ const TIER_RANK: Partial<Record<ThumbTier, number>> = { s: 0, m: 1, l: 2 };
 // ~640px instead of punting to 1024.
 const TIER_UPSCALE_TOLERANCE = 1.25;
 
-// Cap on the DPR multiplier so a 4×-DPR phone doesn't always punt to the
-// largest tier (which would dominate bandwidth on cellular).
-const MAX_DPR_SCALE = 3;
-
 function pickTier(cellPx: number): ThumbTier {
   // Match the decoded image to the *rendered* pixel size (cell × DPR), on
   // desktop too. Serving a far larger tier than the cell shows forces the
   // webview to decode + downscale a big bitmap per cell — see
-  // docs/pipeline/README.md. DPR is capped so a 4×-DPR phone doesn't
-  // always punt to the largest tier.
-  const dpr =
-    typeof window !== "undefined"
-      ? Math.min(window.devicePixelRatio || 1, MAX_DPR_SCALE)
-      : 1;
-  const needed = cellPx * dpr;
+  // docs/pipeline/README.md. The multiplier is capped (`renderScale`) so a
+  // high-DPR phone doesn't punt every cell to the largest tier.
+  const needed = cellPx * renderScale();
   if (needed <= TIER_PX.s * TIER_UPSCALE_TOLERANCE) return "s";
   if (needed <= TIER_PX.m * TIER_UPSCALE_TOLERANCE) return "m";
   return "l";

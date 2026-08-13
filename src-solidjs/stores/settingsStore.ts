@@ -9,17 +9,53 @@
 import { createSignal } from "solid-js";
 import type { AppSettings, SortField, SortOrder, GroupBy } from "../lib/types";
 import { saveGallerySettings, loadGallerySettings } from "../lib/ipc";
-import { isWeb } from "../lib/runtime";
+import { isWeb, isMobile } from "../lib/runtime";
 import { loadPref, savePref } from "../lib/clientPrefs";
 
 const SETTINGS_PREF = "settings";
 
+/** Desktop default cell size. On a wide window this is around six columns. */
+const DESKTOP_THUMBNAIL_SIZE = 200;
+
+/** Columns a phone should open on. */
+const MOBILE_COLUMNS = 2;
+
+/**
+ * The default cell size, which on a phone is a *column count* in disguise.
+ *
+ * `thumbnail_size` is a size, not a count, so the same 200px that gives a
+ * desktop window six columns gives a 390px phone exactly one — a "grid" one
+ * photo wide, and one whose 390px cells ask for the largest thumbnail tier,
+ * which is the most expensive thing the grid can do on the device least able
+ * to afford it (see docs/frontend/grid-loading.md).
+ *
+ * So on mobile, derive the size that yields MOBILE_COLUMNS instead, using the
+ * same bucket-midpoint arithmetic as the Ctrl+wheel/pinch column stepper, so
+ * the layout has room to breathe either side of the target before it snaps to
+ * a different count. Measured against the *short* edge, so a phone opened in
+ * landscape still gets a portrait-sensible size rather than two enormous cells
+ * that become one on rotation.
+ *
+ * Only ever consulted when nothing is stored, and only the web client can be
+ * mobile (`isMobile` is false in the Tauri build), so the desktop's per-gallery
+ * settings.toml can never be seeded from this branch.
+ */
+function defaultThumbnailSize(gap: number): number {
+  if (!isMobile() || typeof window === "undefined") return DESKTOP_THUMBNAIL_SIZE;
+  const w = Math.min(window.innerWidth, window.innerHeight);
+  const upper = (w + gap) / MOBILE_COLUMNS - gap;
+  const lower = (w + gap) / (MOBILE_COLUMNS + 1) - gap;
+  return Math.round((upper + lower) / 2);
+}
+
+const DEFAULT_GRID_GAP = 2;
+
 const DEFAULT_SETTINGS: AppSettings = {
   display: {
-    thumbnail_size: 200,
+    thumbnail_size: defaultThumbnailSize(DEFAULT_GRID_GAP),
     thumb_size_min: 120,
     thumb_size_max: 700,
-    grid_gap: 2,
+    grid_gap: DEFAULT_GRID_GAP,
     background_color: "#0a0a0a",
     video_hover_preview: false,
     video_autoplay_loop: false,

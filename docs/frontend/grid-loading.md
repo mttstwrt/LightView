@@ -41,33 +41,78 @@ Both grids run the same seven-part machine:
    [`frontend/`](README.md) for why one slot was a session-killing bug.
 7. **Eviction.** Paths far outside the rendered range have their `thumbMap`
    entry dropped, so the `<img>` goes away and the DOM stays small. It does
-   *not* give the memory back — see below.
+   *not* hand the memory straight back — see below.
 
-## Evicting a cell does not release its thumbnail
+## What browsing actually costs, and which half is ours
 
-This is the constraint that shapes everything above, and it is worth stating
-plainly because the code reads as though eviction were a free.
+Measured in Chromium against the built SPA at a phone viewport (390×664, DPR 3)
+over a five-thousand-item gallery, with synthetic thumbnails sized to match real
+JPEGs. Worth reading before "optimizing" anything here, because two plausible
+beliefs about it are wrong.
 
-Measured in Chromium against the SPA (a phone-sized viewport, a five-thousand
-item gallery, synthetic thumbnails): renderer memory grows with the number of
-distinct thumbnail URLs the page has *ever* loaded, and comes back neither when
-the cell is evicted, nor when the `<img>` is removed from the document, nor
-when its `src` is cleared first, nor after a forced GC. Loading six hundred
-images and then removing every one of them costs the same as keeping them all.
-The browser holds them in its own image cache, keyed by URL, and the page has
-no way to ask for them back. Sizes differ by roughly the square of the tier: a
-1024px `l` thumbnail retains about six times what a 128px `s` one does.
+**Eviction does not release a thumbnail, but retention is not unbounded
+either.** Dropping the `thumbMap` entry, removing the `<img>`, clearing its
+`src` first, and forcing a GC all reclaim nothing measurable — the browser keeps
+the image in a cache of its own that the page cannot address. But loading and
+discarding batches of 300 distinct images repeatedly does *not* grow without
+limit: it climbs and then flattens, because that cache is a fraction of device
+memory. So the client cannot free anything; what it controls is **how fast
+browsing walks toward the ceiling**. On a desktop the ceiling is high and far
+away. On a phone it is low, and iOS enforces it by killing the tab rather than
+by pruning — which is what a blank screen needing a restart is.
 
-So the only lever the frontend has is **how many distinct thumbnails it causes
-to be loaded, and at what tier**. That is not an optimization; on a phone it is
-the difference between working and being killed. The two-window shape, the
-resolution ladder, the landing-zone warm, and the scrollbar behaviour below all
-exist to keep that number down, and any change that loads "just a few more,
-just in case" is spending a budget that is never refunded.
+**The tier is what sets the pace.** Loading and dropping 1200 distinct
+thumbnails costs roughly 28 MB at the 128px `s` tier, 104 MB at 512px `m`, and
+409 MB at 1024px `l` — about four times per step of the ladder. So a cell that
+asks for one tier more than it can display is not a rounding error, and
+`renderScale()` in [`lib/runtime.ts`](../../src-solidjs/lib/runtime.ts) exists
+because taking a phone's 3× DPR literally pushed every ordinary cell to the top
+of both ladders.
+
+**Most of the rest is not ours.** Scrolling the whole gallery with the server
+returning 1×1 images still grows the renderer by hundreds of megabytes, while
+the DOM holds steady around 500 nodes and 170 `<img>`s and the JS heap stays
+under 12 MB. Virtualization and eviction are doing their job; the remainder is
+the browser's own raster and allocator behaviour for a very tall scroller. It is
+not a leak in the app and there is no client-side lever for it — the one that
+looks like a lever is a trap: removing `will-change: transform` from the slice,
+on the theory that a permanent composited layer is expensive, *doubled* the
+growth (630 MB → 1232 MB over a full-gallery scroll), because every scroll then
+re-rastered. Leave it.
+
+The practical reading: keep the tier honest and keep the number of cells
+materialized per landing down, and do not expect the absolute figures above to
+be reachable on a phone — they are a desktop browser's ceiling, not one a phone
+would ever be allowed.
+
+### Two columns on a phone, and why it is a tier decision
+
+`thumbnail_size` is a cell size, not a column count, so one default has to serve
+both surfaces — and the 200px that gives a desktop window six columns gave a
+390px phone exactly one. That is a strange gallery (one photo wide), and it was
+also the most expensive possible layout: a 390px cell asks for the 1024px tier
+in the square grid, and in the justified grid it cleared the top threshold
+outright, backing a phone-width thumbnail with a 2560px image or a ~1800px
+on-demand resize of the original.
+
+`defaultThumbnailSize` in [`settingsStore`](../../src-solidjs/stores/settingsStore.ts)
+therefore derives a mobile default from the viewport's *short* edge — so
+rotating does not change the answer — sized for two columns using the same
+bucket-midpoint arithmetic as the pinch/Ctrl+wheel column stepper. Combined with
+the capped `renderScale()`, a phone's cells then sit on the 512px tier in both
+grids.
+
+It is a trade, not a free win: two columns materializes about twice the cells
+per screenful, and the look-ahead buffers are counted in *rows*, so they double
+in cell terms too. In viewport-distance terms this is what brings mobile in line
+with the desktop tuning — 12 rows ahead is ~3.5 viewports at two columns, and
+was an unintended ~7 at one — but a scrollbar landing does now build twice the
+DOM. Only ever consulted when the client has nothing stored, and only the web
+client can be mobile, so no desktop `settings.toml` is ever seeded from it.
 
 ### Why the scrollbar gets special treatment
 
-A scrollbar is the fastest way to burn that budget. Every landing reveals a
+A scrollbar is the fastest way to spend that budget. Every landing reveals a
 screenful of cells the grid has never shown, and a person hunting for a spot
 lands a few dozen times in a few seconds — a volume of fresh thumbnails that
 would take minutes of ordinary scrolling to reach. Left alone, each of those
@@ -87,10 +132,14 @@ that already existed:
   inflating the look-ahead to its maximum around a position the user is about
   to leave.
 
-Measured over sixty scrollbar landings on a phone-sized viewport, this takes
-the renderer from +566 MB to +270 MB and removes the largest tier from the
-gesture entirely (284 `l` loads → 0). The remainder is the cheap rung for the
-cells actually shown, which is the floor.
+Measured over sixty scrollbar landings on a phone-sized viewport, against the
+tier and column defaults below: renderer growth falls from +254 MB to +186 MB,
+the largest tier leaves the gesture entirely (281 `l` loads → 0), and returning
+to positions already visited stops costing anything (+55 MB → +2 MB).
+
+Take the absolute figures as a ratio, not a budget. They come from a desktop
+Chromium with a large cache ceiling; the useful part is which tier is being
+loaded and how many cells each landing materializes.
 
 The other half of it is that the bar can now be dragged by touch at all.
 `ScrollBar` was written with mouse handlers only, so on a phone a drag was never

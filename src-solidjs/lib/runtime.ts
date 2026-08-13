@@ -65,6 +65,36 @@ export function hasTouch(): boolean {
   return _hasTouch;
 }
 
+/**
+ * Ceiling on the device-pixel-ratio multiplier the grids use when choosing a
+ * thumbnail tier.
+ *
+ * Both grids size their request as `cell CSS px × DPR` — the pixels the cell
+ * can actually show. Taken literally on a 3× phone that triples the linear
+ * request and so multiplies the image's memory by nine, and it pushes every
+ * ordinary phone cell to the top of the tier ladder: a 194px cell in the square
+ * grid asked for the 1024px tier, and in the justified grid for the 2560px one.
+ *
+ * Measured (Chromium, phone viewport, loading and dropping 1200 thumbnails):
+ * memory climbs about five times faster per image at 1024px than at 512px, and
+ * about twenty times faster than at 128px. Both browsers plateau eventually —
+ * the cache is a fraction of device memory — but a phone's ceiling is low and
+ * iOS enforces it by killing the tab rather than by pruning, so how fast a tier
+ * takes you there is the whole game. See docs/frontend/grid-loading.md.
+ *
+ * Two is the point where more stops being visible on a thumbnail and starts
+ * being purely cost: a 512px image in a 194px cell on a 3× screen is still 88%
+ * of native resolution. Nothing at DPR 2 or below is affected, which is every
+ * desktop and most laptops — this only ever binds on phones and tablets.
+ */
+const MAX_DPR_SCALE = 2;
+
+/** The DPR multiplier to size a thumbnail request by. See MAX_DPR_SCALE. */
+export function renderScale(): number {
+  if (typeof window === "undefined") return 1;
+  return Math.min(window.devicePixelRatio || 1, MAX_DPR_SCALE);
+}
+
 /** Event emitted when the server asks the web client to (re-)authenticate
  *  with the gallery password — i.e. it responded 401 with
  *  `WWW-Authenticate: LV-Password`. The App listens for this and shows the

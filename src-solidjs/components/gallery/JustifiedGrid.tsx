@@ -19,7 +19,7 @@
 
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { isMobile, isTauri } from "../../lib/runtime";
+import { isMobile, isTauri, renderScale } from "../../lib/runtime";
 import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
@@ -102,13 +102,29 @@ const VELOCITY_FAST = 3000;
 // extra storage) and a 2560px "jh" thumbnail for large/non-native ones. The
 // byte cutoff for "serve original" grows with zoom: at "mid" only smaller files
 // stream as originals; at "high" most do. Thresholds compare the rendered row
-// height in *physical* pixels (row height × DPR), so hi-DPI screens step up
-// earlier — exactly where the 512px tier starts to look soft. The gap between
-// each up/down pair is hysteresis to avoid thrashing at a boundary.
-const MID_UP = 360;
-const MID_DOWN = 320;
-const HIGH_UP = 560;
-const HIGH_DOWN = 500;
+// height in *physical* pixels (row height × `renderScale()`), so hi-DPI screens
+// step up earlier — exactly where the 512px tier starts to look soft. The gap
+// between each up/down pair is hysteresis to avoid thrashing at a boundary.
+//
+// The scale is capped rather than the raw DPR, and this is where that matters
+// most: taken literally, a phone's 3× put every ordinary cell past HIGH_UP, so
+// a 194px-wide thumbnail was backed by a 2560px image — around forty times the
+// pixels the screen can show, on the device least able to hold them.
+//
+// The values carry `GalleryGrid`'s TIER_UPSCALE_TOLERANCE, and for the same
+// reason: a tier that has to stretch slightly is barely visible, while stepping
+// up costs four times the memory per cell (measured — see
+// docs/frontend/grid-loading.md). Without it the two grids disagreed about how
+// much softness is acceptable, and this one stepped up the moment a tier was
+// stretched at all: a phone at two columns needs 576 physical px on the long
+// edge and so left the 512px "j" tier for the 1280px "jm" one to cover a 12%
+// gap. The bases are the row heights at which each tier's long edge is exactly
+// covered, assuming the ~1.5 landscape aspect these rows average.
+const TIER_UPSCALE_TOLERANCE = 1.25;
+const MID_UP = 360 * TIER_UPSCALE_TOLERANCE;
+const MID_DOWN = 320 * TIER_UPSCALE_TOLERANCE;
+const HIGH_UP = 560 * TIER_UPSCALE_TOLERANCE;
+const HIGH_DOWN = 500 * TIER_UPSCALE_TOLERANCE;
 // "Serve original" byte cutoffs per level (native image formats only).
 const MID_MAX_BYTES = 1.5 * 1024 * 1024;
 const HIGH_MAX_BYTES = 3 * 1024 * 1024;
@@ -192,8 +208,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       setDetailLevel("base");
       return;
     }
-    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-    const px = targetRowHeight() * dpr;
+    const px = targetRowHeight() * renderScale();
     setDetailLevel((prev): DetailLevel => {
       if (prev === "base") return px > HIGH_UP ? "high" : px > MID_UP ? "mid" : "base";
       if (prev === "mid") return px > HIGH_UP ? "high" : px < MID_DOWN ? "base" : "mid";
@@ -221,9 +236,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // aspect, a per-image stand-in for its row's average (exact for the
   // portrait-only rows where the boost actually bites).
   const displayedLongEdge = (aspect: number): number => {
-    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
     const h = targetRowHeight() * portraitRowBoost(aspect);
-    return h * Math.max(1, aspect) * dpr;
+    return h * Math.max(1, aspect) * renderScale();
   };
 
   // Whether `path` should be served via the media server's cell-fit resize
