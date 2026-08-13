@@ -355,13 +355,18 @@ export function GalleryGrid(props: GalleryGridProps) {
   // -----------------------------------------------------------------------
 
   createEffect(on(
-    [visibleItems, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow],
-    ([items, gated, settled, fullStart, fullEnd]) => {
+    [visibleItems, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow, dynamics.warping],
+    ([items, gated, settled, fullStart, fullEnd, warping]) => {
     // While the WebKitGTK decode gate is up, leave new cells on their skeleton
     // so the main thread isn't buried under image decodes mid-scroll. When it
     // releases this effect re-runs and assigns whatever's now on screen.
     // Already-assigned cells keep their src, so visible content stays.
     if (gated && !CHEAP_RUNG_DURING_GATE) return;
+    // Same, on every platform, while the view is being scrubbed past far faster
+    // than anything could load — the window turns over completely each frame,
+    // so this would issue a request per cell for thousands of cells nobody
+    // sees. Assignment resumes on the frame the scrub slows down.
+    if (warping) return;
     const target = tier();
     // Resolution ladder: a cell gets the tiny "s" tier when it's outside the
     // inner full-res window (deep look-ahead stays cheap) or while a fling is
@@ -880,6 +885,13 @@ export function GalleryGrid(props: GalleryGridProps) {
       // early, so running eviction last would starve it for as long as there's
       // work queued — and it's cheap.
       evictFaraway();
+
+      // Mid-scrub: no generation, and above all no speculation. The projected
+      // landing zone is recomputed from a position that has already moved on by
+      // the time the batch is issued, and `landingWarmed` is cleared on every
+      // jump — which during a scrub is every frame — so the same paths would be
+      // re-warmed over and over. Eviction above is the only useful work here.
+      if (dynamics.warping()) return;
 
       // During a fling, near-viewport generation is wasted work — those cells
       // fly past unseen. Warm the projected landing zone instead; queued

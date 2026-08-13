@@ -44,6 +44,26 @@ const SETTLE_DEBOUNCE_MS = 150;
 // A single scroll frame moving more than this many viewports is a jump — the
 // user warped (scrollbar tap/drag, scroll-to-index) rather than scrolled.
 const JUMP_VIEWPORTS = 2;
+// Sustained scroll rate (viewport-heights per second) past which the grids stop
+// giving new cells an <img> at all until it drops.
+//
+// This is not a fling. iOS lets you press and hold the system scroll indicator
+// and scrub, and a scrub crosses the whole gallery in a second or two — every
+// frame reveals dozens of rows the grid has never shown, so the render window
+// turns over completely ~60 times a second. Assigning a source to each of those
+// cells issues thousands of requests and decodes for content nobody will see a
+// frame of, and on a phone that is what kills the tab. The cheap rung is not
+// enough here: it lowers the price per cell, and the problem is the count.
+//
+// Two orders of magnitude above the fling threshold, so it separates cleanly:
+// a hard touch fling peaks around 6–9 viewports/s, a scrub is in the hundreds.
+// Frames still render (the layout is cheap; the cells show their skeleton), and
+// assignment resumes the moment the rate drops, which is the frame the user
+// starts actually looking at anything.
+const WARP_VIEWPORTS_PER_SEC = 25;
+// Idle gap (ms) after the last warping frame before assignment resumes. Short —
+// this is the delay between a scrub stopping and its cells filling in.
+const WARP_RELEASE_MS = 80;
 // How long the view must then sit still before it counts as settled.
 //
 // A jump is instantaneous: one huge-delta frame and `scrollend` right behind
@@ -168,6 +188,15 @@ export interface ScrollDynamics {
    */
   settled: Accessor<boolean>;
   /**
+   * Reactive: true while the view is moving faster than any loading could keep
+   * up with — an iOS scroll-indicator scrub, mainly. The grids assign no new
+   * sources and start no speculation while it is set; see
+   * [`WARP_VIEWPORTS_PER_SEC`]. Unlike `decodeGate` this is not
+   * WebKitGTK-specific — it is about the number of cells turning over, not the
+   * cost of decoding one.
+   */
+  warping: Accessor<boolean>;
+  /**
    * Estimated scroll position (px) where the current fling will land:
    * scrollY + signed velocity × FLING_PROJECTION_S, clamped to the document's
    * scroll range. Equals the current scrollY when not scrolling. Drives
@@ -201,6 +230,7 @@ export function createScrollDynamics(opts: {
   onFrame: (frame: ScrollFrame) => void;
 }): ScrollDynamics {
   const [decodeGate, setDecodeGate] = createSignal(false);
+  const [warping, setWarping] = createSignal(false);
   const [rested, setRested] = createSignal(true);
   // A scrollbar gesture keeps the view unsettled for its whole duration, so a
   // burst of scrollbar stops costs one tier upgrade at the end rather than one
@@ -216,6 +246,7 @@ export function createScrollDynamics(opts: {
   let rafId = 0;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
   let settleDebounce: ReturnType<typeof setTimeout> | undefined;
+  let warpTimer: ReturnType<typeof setTimeout> | undefined;
   /** When the last positional jump landed; 0 = none this session. */
   let lastJumpTs = 0;
 
@@ -257,6 +288,13 @@ export function createScrollDynamics(opts: {
     // until the next 500ms poll or a manual scroll (docs/decisions/0007-two-zone-render-window.md).
     vel = 0;
     if (untrack(decodeGate)) setDecodeGate(false);
+    // `warping` is deliberately NOT cleared here. Its own timer owns it, and
+    // this function is not the reliable "scrolling stopped" signal it looks
+    // like: `scrollend` fires after *every* programmatic scroll, so during a
+    // scrub it arrives between frames, and clearing here reopened the gate for
+    // one frame in each — which was enough to assign a source to a whole window
+    // of cells, sixty times a second. If scrolling really has stopped, the
+    // timer expires a few tens of ms later and assignment resumes anyway.
     if (settleDebounce) clearTimeout(settleDebounce);
 
     // A jump lands with `scrollend` immediately behind it, so settling here
@@ -295,6 +333,19 @@ export function createScrollDynamics(opts: {
         }
       }
 
+      // Sustained warp speed — a scrub, not a fling. Held with its own short
+      // timer rather than read from `velocity()` at consumption time, so the
+      // grids see one stable state for the whole gesture instead of it
+      // flickering off on every frame the finger pauses.
+      if (vel > window.innerHeight * WARP_VIEWPORTS_PER_SEC) {
+        if (!untrack(warping)) setWarping(true);
+        if (warpTimer) clearTimeout(warpTimer);
+        warpTimer = setTimeout(() => {
+          warpTimer = undefined;
+          setWarping(false);
+        }, WARP_RELEASE_MS);
+      }
+
       // A warp (scrollbar tap/drag, scroll-to-index) rather than a scroll.
       const isJump = dy > window.innerHeight * JUMP_VIEWPORTS;
       if (isJump) lastJumpTs = now;
@@ -317,6 +368,7 @@ export function createScrollDynamics(opts: {
   return {
     velocity,
     direction: () => dir,
+    warping,
     projectedLandingY,
     bufferAheadRows,
     decodeGate,
@@ -327,6 +379,7 @@ export function createScrollDynamics(opts: {
       if (rafId) cancelAnimationFrame(rafId);
       if (settleTimer) clearTimeout(settleTimer);
       if (settleDebounce) clearTimeout(settleDebounce);
+      if (warpTimer) clearTimeout(warpTimer);
     },
   };
 }

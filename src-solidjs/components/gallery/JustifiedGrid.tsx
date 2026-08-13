@@ -601,13 +601,18 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // instantly; uncached ones 404 → onError → queued for generation.
   createEffect(on(
     [visibleCells, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow, pinnedPath,
-     viewStartRow, viewEndRow, awaitingCount],
-    ([cells, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting]) => {
+     viewStartRow, viewEndRow, awaitingCount, dynamics.warping],
+    ([cells, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting, warping]) => {
     // While the WebKitGTK decode gate is up, leave new cells on their
     // placeholder so the main thread isn't buried under image decodes
     // mid-scroll. When it releases this re-runs and assigns whatever's now on
     // screen.
     if (gated && !CHEAP_RUNG_DURING_GATE) return;
+    // Same, on every platform, while the view is being scrubbed past far
+    // faster than anything could load — the window turns over completely each
+    // frame, so this would issue a request per cell for thousands of cells
+    // nobody sees. Assignment resumes on the frame the scrub slows down.
+    if (warping) return;
     // Resolution ladder: at mid/high detail a cell gets the base "j" tier
     // (small, precached) when it's outside the inner full-res window or while
     // a fling is in progress, and upgrades to the level's real source
@@ -1005,6 +1010,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
     const scheduleFetch = () => {
       evictFaraway();
+
+      // Mid-scrub: no generation, and above all no speculation. The projected
+      // landing zone is recomputed from a position that has already moved on by
+      // the time the batch is issued, and `landingWarmed` is cleared on every
+      // jump — which during a scrub is every frame — so the same paths would be
+      // re-warmed over and over. Eviction above is the only useful work here.
+      if (dynamics.warping()) return;
 
       // During a fling, near-viewport generation is wasted work — those cells
       // fly past unseen. Warm the projected landing zone instead; queued

@@ -46,7 +46,7 @@ export function ScrollBar(props: ScrollBarProps) {
 
   let hideTimeout: ReturnType<typeof setTimeout> | undefined;
   let dragStartY = 0;
-  let dragStartScroll = 0;
+  let dragStartThumbTop = 0;
   let dragPointerId: number | undefined;
 
   const MIN_THUMB = 24;
@@ -96,8 +96,15 @@ export function ScrollBar(props: ScrollBarProps) {
     const frac = scrollTop / (contentH - viewportH);
     const top = maxTravel * frac;
 
-    setScrollFraction(Math.max(0, Math.min(1, frac)));
     setThumbHeight(rawThumb);
+    // While a drag is in progress the thumb follows the finger, not the scroll
+    // position it asked for. Those are the same number on a desktop, but not on
+    // iOS: scrolling is committed on the compositor and `scrollY` reads back a
+    // frame or more stale, so feeding it into the thumb's position mid-gesture
+    // makes the thumb chase the finger and visibly jitter. `onGripPointerMove`
+    // owns these two while dragging.
+    if (dragging()) return;
+    setScrollFraction(Math.max(0, Math.min(1, frac)));
     setThumbTop(Math.max(0, Math.min(top, maxTravel)));
   };
 
@@ -134,7 +141,7 @@ export function ScrollBar(props: ScrollBarProps) {
     setDragging(true);
     dragPointerId = e.pointerId;
     dragStartY = e.clientY;
-    dragStartScroll = getMetrics().scrollTop;
+    dragStartThumbTop = thumbTop();
     try { gripRef?.setPointerCapture(e.pointerId); } catch {}
     showTemporarily();
   };
@@ -152,7 +159,15 @@ export function ScrollBar(props: ScrollBarProps) {
 
     const dy = e.clientY - dragStartY;
     const scrollRange = contentH - viewportH;
-    scrollTo(dragStartScroll + (dy / maxTravel) * scrollRange, scrollRange);
+
+    // Drive the thumb from the pointer and the scroll from the thumb, rather
+    // than both from the scroll position — see the note in `recalc`. The thumb
+    // is then pinned under the finger for the whole gesture whatever the
+    // scroller does behind it.
+    const top = Math.max(0, Math.min(dragStartThumbTop + dy, maxTravel));
+    setThumbTop(top);
+    setScrollFraction(maxTravel > 0 ? top / maxTravel : 0);
+    scrollTo((top / maxTravel) * scrollRange, scrollRange);
   };
 
   const onGripPointerUp = (e: PointerEvent) => {
@@ -164,6 +179,10 @@ export function ScrollBar(props: ScrollBarProps) {
     // outlive the gesture — otherwise the indicator rail and the thumb label
     // stay pinned on screen for the rest of the session.
     if (e.pointerType !== "mouse") setHovering(false);
+    // Re-sync to where the scroller actually ended up: `recalc` has been
+    // leaving the thumb alone for the length of the drag, and the two can
+    // differ at the ends of the range or if the content height changed.
+    recalc();
     markScrollBarReleased();
     showTemporarily();
   };

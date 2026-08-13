@@ -155,6 +155,42 @@ point: claiming the whole track would mean any swipe along the right edge of the
 screen warped the gallery instead of scrolling it, which on a phone is exactly
 where a thumb rests. Pressing the bare track still jumps, as it always did.
 
+While a drag is running, the thumb is positioned from the pointer and the
+scroller is driven from the thumb — not both from the scroll position. On a
+desktop those are the same number. On iOS they are not: scrolling is committed
+on the compositor and `scrollY` reads back a frame or more stale, so feeding it
+into the thumb mid-gesture made the thumb chase the finger and visibly jitter.
+`recalc` leaves the thumb alone while `dragging()`, and re-syncs on release.
+
+### The scrub gate
+
+iOS has a scrollbar of its own, and it is not just an indicator: press and hold
+it and you can scrub, crossing the whole gallery in a second or two. (It cannot
+be hidden — `::-webkit-scrollbar` only reaches element scrollers, which is why
+`.hide-scrollbar` works on the panels but not on the document.)
+
+A scrub is not a fling, and the cheap rung is not enough for it. At scrub speed
+every frame reveals dozens of rows the grid has never shown, so the render
+window turns over completely sixty times a second; the cheap rung lowers the
+price per cell, and the problem here is the *count*. Measured over three
+full-gallery scrubs, the grid asked for 4442 thumbnails and grew the renderer by
+528 MB, for content nobody saw a frame of.
+
+So `dynamics.warping` goes true above `WARP_VIEWPORTS_PER_SEC`, and while it is
+set the grids assign no sources at all and start no speculation — cells render
+as skeletons, which is all a scrub can show anyway, and assignment resumes on
+the frame the rate drops. Same three scrubs: 88 thumbnails and +124 MB, with the
+landing screen still upgrading to the target tier once it settles.
+
+One trap is worth recording, because it made the gate look like it was working
+when it was not. `warping` must **not** be cleared by `markSettled()`. That
+function reads like "scrolling has stopped", but `scrollend` fires after every
+programmatic scroll, so mid-scrub it arrives between frames — reopening the gate
+for one frame in each, which was enough to assign a whole window of cells sixty
+times a second. The frame-level state said the gate was up 59 frames out of 60
+while thousands of requests went out anyway. Its own timer owns it; if scrolling
+really has stopped, that timer expires a few tens of milliseconds later.
+
 ## What is already extracted
 
 `src-solidjs/lib/` holds the pieces both grids call rather than reimplement:
