@@ -3,11 +3,13 @@
 import { createSignal, untrack, type Accessor } from "solid-js";
 import { isTauri } from "./runtime";
 import { ewmaImageLoadMs } from "./perfMonitor";
+import { maxScroll, onScrollHost, scrollTop, viewportHeight } from "./scrollHost";
 
 // ---------------------------------------------------------------------------
 // Shared scroll dynamics for the virtualized grid views.
 //
-// Owns the window scroll listener (rAF-coalesced), velocity/direction
+// Owns the scroll listener on the gallery's scroll host (rAF-coalesced),
+// velocity/direction
 // tracking, and the WebKitGTK decode gate. Extracted from GalleryGrid /
 // JustifiedGrid so both share one implementation and one set of tuning
 // constants (same pattern as galleryControls.ts).
@@ -153,7 +155,7 @@ export function markScrollBarReleased() {
 }
 
 export interface ScrollFrame {
-  /** Current window.scrollY. */
+  /** Current scroll offset of the gallery's scroller. */
   y: number;
   /** Absolute scroll delta (px) since the previous frame. */
   dy: number;
@@ -239,7 +241,7 @@ export function createScrollDynamics(opts: {
   const settled = () => rested() && !scrollBarActive();
   const setSettled = setRested;
 
-  let lastY = window.scrollY;
+  let lastY = scrollTop();
   let lastTs = performance.now();
   let vel = 0;
   let dir: 1 | -1 = 1;
@@ -254,12 +256,8 @@ export function createScrollDynamics(opts: {
     performance.now() - lastTs > VELOCITY_STALE_MS ? 0 : vel;
 
   const projectedLandingY = () => {
-    const maxScroll = Math.max(
-      0,
-      document.documentElement.scrollHeight - window.innerHeight,
-    );
-    const projected = window.scrollY + dir * velocity() * FLING_PROJECTION_S;
-    return Math.max(0, Math.min(maxScroll, projected));
+    const projected = scrollTop() + dir * velocity() * FLING_PROJECTION_S;
+    return Math.max(0, Math.min(maxScroll(), projected));
   };
 
   const bufferAheadRows = (base: number, max: number) => {
@@ -314,7 +312,7 @@ export function createScrollDynamics(opts: {
   const onScroll = () => {
     if (rafId) return;
     rafId = requestAnimationFrame((now) => {
-      const y = window.scrollY;
+      const y = scrollTop();
       const dt = (now - lastTs) / 1000;
       const dy = Math.abs(y - lastY);
       vel = dt > 0 ? dy / dt : 0;
@@ -337,7 +335,7 @@ export function createScrollDynamics(opts: {
       // timer rather than read from `velocity()` at consumption time, so the
       // grids see one stable state for the whole gesture instead of it
       // flickering off on every frame the finger pauses.
-      if (vel > window.innerHeight * WARP_VIEWPORTS_PER_SEC) {
+      if (vel > viewportHeight() * WARP_VIEWPORTS_PER_SEC) {
         if (!untrack(warping)) setWarping(true);
         if (warpTimer) clearTimeout(warpTimer);
         warpTimer = setTimeout(() => {
@@ -347,10 +345,10 @@ export function createScrollDynamics(opts: {
       }
 
       // A warp (scrollbar tap/drag, scroll-to-index) rather than a scroll.
-      const isJump = dy > window.innerHeight * JUMP_VIEWPORTS;
+      const isJump = dy > viewportHeight() * JUMP_VIEWPORTS;
       if (isJump) lastJumpTs = now;
 
-      if (isJump || vel > window.innerHeight * FLING_VIEWPORTS_PER_SEC) {
+      if (isJump || vel > viewportHeight() * FLING_VIEWPORTS_PER_SEC) {
         if (untrack(settled)) setSettled(false);
         if (settleDebounce) clearTimeout(settleDebounce);
         settleDebounce = setTimeout(
@@ -363,7 +361,7 @@ export function createScrollDynamics(opts: {
       rafId = 0;
     });
   };
-  window.addEventListener("scroll", onScroll, { passive: true });
+  const detachScroll = onScrollHost("scroll", onScroll, { passive: true });
 
   return {
     velocity,
@@ -375,7 +373,7 @@ export function createScrollDynamics(opts: {
     settled,
     markSettled,
     dispose: () => {
-      window.removeEventListener("scroll", onScroll);
+      detachScroll();
       if (rafId) cancelAnimationFrame(rafId);
       if (settleTimer) clearTimeout(settleTimer);
       if (settleDebounce) clearTimeout(settleDebounce);

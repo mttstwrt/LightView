@@ -31,6 +31,7 @@ import { recordCacheMiss } from "../../lib/perfMonitor";
 import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
+import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
 import { createThumbSwapper } from "../../lib/thumbSwap";
 import { VIEWER_PATH_EVENT } from "../../lib/viewerTransition";
 import { pickByPriority } from "../../lib/loadPriority";
@@ -697,8 +698,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         if (untrack(startRow) !== 0 || untrack(endRow) !== 0) batch(() => { setStartRow(0); setEndRow(0); });
         return;
       }
-      const sy = window.scrollY;
-      const vh = window.innerHeight;
+      const sy = scrollTop();
+      const vh = viewportHeight();
       const offset = containerRef?.offsetTop ?? 0;
       const relativeTop = Math.max(0, sy - offset);
       const relativeBottom = relativeTop + vh;
@@ -812,7 +813,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       const lay = layout();
       if (lay.rows.length === 0) return;
       const offset = containerRef?.offsetTop ?? 0;
-      const vh = window.innerHeight;
+      const vh = viewportHeight();
       const landingTop = Math.max(0, dynamics.projectedLandingY() - offset);
       const firstRow = rowIndexAtOffset(lay.rowTops, Math.max(0, landingTop - vh));
       const lastRow = Math.min(
@@ -1039,7 +1040,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       dynamics.markSettled();
       scheduleFetch();
     };
-    window.addEventListener("scrollend", onScrollEnd);
+    const detachScrollEnd = onScrollHost("scrollend", onScrollEnd);
 
     const bgIntervalId = setInterval(scheduleFetch, 500);
 
@@ -1084,17 +1085,17 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       const offset = containerRef?.offsetTop ?? 0;
       const imageTop = offset + row.y;
       const imageBottom = imageTop + row.height;
-      const viewTop = window.scrollY;
-      const viewBottom = viewTop + window.innerHeight;
+      const viewTop = scrollTop();
+      const viewBottom = viewTop + viewportHeight();
       if (imageTop < viewTop || imageBottom > viewBottom) {
-        window.scrollTo(0, imageTop - (window.innerHeight - row.height) / 2);
+        scrollToY(imageTop - (viewportHeight() - row.height) / 2);
       }
     };
     window.addEventListener("lightview:scroll-to-index", onScrollToIndex);
 
     onCleanup(() => {
       ro.disconnect();
-      window.removeEventListener("scrollend", onScrollEnd);
+      detachScrollEnd();
       detachWheel();
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);

@@ -10,6 +10,7 @@ import { viewMode, setViewMode, enabledViews, VIEW_CHOICES, displayPaths, settin
 import { viewerOpen } from "../../stores/viewerStore";
 import { settings } from "../../stores/settingsStore";
 import { isMobile, isTauri } from "../../lib/runtime";
+import { onScrollHost, scrollTop } from "../../lib/scrollHost";
 
 interface TopBarProps {
   /** What the command list runs. Declared once in `App`, which owns the
@@ -150,10 +151,10 @@ export function TopBar(props: TopBarProps) {
 
     // Mobile scroll-direction watcher. Always attached — the handler bails out
     // on desktop so behavior stays purely hover-driven there.
-    let lastY = window.scrollY;
+    let lastY = scrollTop();
     const onScroll = () => {
       if (!isMobile()) return;
-      const y = window.scrollY;
+      const y = scrollTop();
       const dy = y - lastY;
       if (y < MOBILE_REVEAL_AT_TOP) {
         setScrollHidden(false);
@@ -164,7 +165,7 @@ export function TopBar(props: TopBarProps) {
       }
       lastY = y;
     };
-    window.addEventListener("scroll", onScroll, { passive: true });
+    const detachScroll = onScrollHost("scroll", onScroll, { passive: true });
 
     // Back gesture / back button closes mobile overlays (see the pushState
     // effect above). When we consume our own entry after a UI close, this
@@ -181,7 +182,7 @@ export function TopBar(props: TopBarProps) {
 
     onCleanup(() => {
       window.removeEventListener("keydown", handleGlobalKeyDown);
-      window.removeEventListener("scroll", onScroll);
+      detachScroll();
       window.removeEventListener("popstate", onPopState);
     });
   });

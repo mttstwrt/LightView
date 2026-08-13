@@ -1,5 +1,6 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show, For } from "solid-js";
 import { markScrollBarActive, markScrollBarReleased } from "../../lib/scrollDynamics";
+import { scrollHost } from "../../lib/scrollHost";
 
 export interface ScrollIndicator {
   /** Position along the track as a fraction 0–1. */
@@ -56,9 +57,13 @@ export function ScrollBar(props: ScrollBarProps) {
   const GRIP_MIN_H = 44;
   const GRIP_W = 34;
 
+  /** The element this bar drives: an explicit `container`, else the gallery's
+   *  scroll host, else nothing (and we fall back to the window). */
+  const target = () => props.container ?? scrollHost() ?? undefined;
+
   const getMetrics = () => {
-    if (props.container) {
-      const el = props.container;
+    const el = target();
+    if (el) {
       return {
         scrollTop: el.scrollTop,
         viewportH: el.clientHeight,
@@ -74,11 +79,9 @@ export function ScrollBar(props: ScrollBarProps) {
 
   const scrollTo = (y: number, range: number) => {
     const clamped = Math.max(0, Math.min(y, range));
-    if (props.container) {
-      props.container.scrollTop = clamped;
-    } else {
-      window.scrollTo(0, clamped);
-    }
+    const el = target();
+    if (el) el.scrollTop = clamped;
+    else window.scrollTo(0, clamped);
   };
 
   const recalc = () => {
@@ -199,14 +202,23 @@ export function ScrollBar(props: ScrollBarProps) {
     markScrollBarReleased();
   };
 
+  // Follow the scroller, which for the gallery bar appears a tick after this
+  // mounts (the host's ref is assigned as its subtree is created). `scroll`
+  // does not bubble, so binding once to the wrong object would leave the bar
+  // frozen for the session.
+  createEffect(() => {
+    const el = target();
+    const src: HTMLElement | Window = el ?? window;
+    src.addEventListener("scroll", onScroll, { passive: true });
+    recalc();
+    onCleanup(() => src.removeEventListener("scroll", onScroll));
+  });
+
   onMount(() => {
-    const target = props.container ?? window;
-    target.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("resize", recalc);
     recalc();
 
     onCleanup(() => {
-      target.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", recalc);
       if (hideTimeout) clearTimeout(hideTimeout);
       if (dragPointerId !== undefined) markScrollBarReleased();

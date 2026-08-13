@@ -1,4 +1,4 @@
-// Wheel-driven window scrolling with momentum smoothing.
+// Wheel-driven scrolling of the gallery's scroll host, with momentum smoothing.
 //
 // WebKitGTK doesn't propagate wheel events to window scroll natively, so the
 // grids intercept them and drive the scroll themselves. Two quirks (vs.
@@ -7,7 +7,7 @@
 //   1. Traditional mouse wheels arrive as DOM_DELTA_LINE (deltaY ±1 per notch),
 //      not pixels — normalized by deltaMode via `wheelPxPerUnit`, which maps one
 //      WebKitGTK notch to one grid row. `lib/wheel.ts` has the full table.
-//   2. Fractional `window.scrollBy()` steps get rounded away every frame, so
+//   2. Fractional relative scroll steps get rounded away every frame, so
 //      relative stepping silently drops the tail of each gesture by an amount
 //      that varies with frame timing. We instead animate an absolute float
 //      target and keep our own float position, immune to engine rounding.
@@ -17,6 +17,7 @@
 // those are the two hooks the caller supplies.
 
 import { wheelPxPerUnit } from "./wheel";
+import { maxScroll, scrollToY, scrollTop } from "./scrollHost";
 
 /** Fraction of the remaining distance covered per frame. */
 const DECAY = 0.8;
@@ -42,7 +43,8 @@ export interface WheelScroll {
 }
 
 /**
- * Create a wheel-driven momentum scroller for `window`. The returned handle's
+ * Create a wheel-driven momentum scroller for the gallery's scroll host. The
+ * returned handle's
  * `attach()` registers the (non-passive) listener and gives back a disposer
  * that also cancels any in-flight animation frame.
  */
@@ -56,14 +58,14 @@ export function createWheelScroll(opts: WheelScrollOptions): WheelScroll {
     const diff = targetY - currentY;
     if (Math.abs(diff) < SETTLE) {
       currentY = targetY;
-      window.scrollTo(0, Math.round(targetY));
+      scrollToY(Math.round(targetY));
       animating = false;
       rafId = 0;
       opts.onSettle();
       return;
     }
     currentY += diff * (1 - DECAY);
-    window.scrollTo(0, Math.round(currentY));
+    scrollToY(Math.round(currentY));
     rafId = requestAnimationFrame(drain);
   };
 
@@ -77,16 +79,12 @@ export function createWheelScroll(opts: WheelScrollOptions): WheelScroll {
     // pick up any scrollbar drag / keyboard scroll that happened between
     // gestures. While animating we keep accumulating into targetY.
     if (!animating) {
-      currentY = window.scrollY;
-      targetY = window.scrollY;
+      currentY = scrollTop();
+      targetY = scrollTop();
       animating = true;
     }
-    const maxScroll = Math.max(
-      0,
-      document.documentElement.scrollHeight - window.innerHeight,
-    );
     const deltaPx = e.deltaY * wheelPxPerUnit(e, opts.rowHeight());
-    targetY = Math.max(0, Math.min(maxScroll, targetY + deltaPx));
+    targetY = Math.max(0, Math.min(maxScroll(), targetY + deltaPx));
     if (!rafId) rafId = requestAnimationFrame(drain);
   };
 

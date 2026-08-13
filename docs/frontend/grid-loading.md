@@ -162,12 +162,46 @@ on the compositor and `scrollY` reads back a frame or more stale, so feeding it
 into the thumb mid-gesture made the thumb chase the finger and visibly jitter.
 `recalc` leaves the thumb alone while `dragging()`, and re-syncs on release.
 
+### The scroll host
+
+The gallery scrolls an element, not the document. `App` renders a fixed,
+full-viewport `overflow-y: auto` container around the two grids and registers it
+with [`lib/scrollHost.ts`](../../src-solidjs/lib/scrollHost.ts), which everything
+else reads instead of touching `window.scrollY`.
+
+The reason is iOS. Its scroll indicator is drawn over the page, it is
+interactive, and it cannot be styled away on the *document* scroller —
+`::-webkit-scrollbar` only reaches element scrollers, which is exactly why
+`.hide-scrollbar` works on the app's panels and never worked on the page. Two
+bars were visible at once, one of them ours and one we could not remove. Owning
+the scroller removes it and leaves LightView's bar, the one with the date
+markers, as the only one.
+
+Three things this constrains:
+
+- **The host must be positioned.** Both grids measure their content with
+  `offsetTop`, which is relative to the nearest positioned ancestor, and that
+  has to be the same origin `scrollTop` counts from.
+- **`scroll` does not bubble.** A listener bound to `window` silently watches a
+  scroller that never moves again, so subscriptions go through `onScrollHost`,
+  which rebinds them when the host registers. That indirection is not
+  decoration: Solid creates a child before appending it to its parent, so a
+  grid's `onMount` routinely runs before the host's `ref` has been assigned.
+- **With no host registered, everything falls back to the window**, which is
+  what the welcome screen and the map view get.
+
+One accepted regression: the custom bar's 10px rail is `fixed`, and a fixed
+element's scroll chain is the viewport whichever subtree it sits in — so a swipe
+landing on the rail no longer pans the gallery. It still jumps on a tap, which
+is how a scrollbar behaves everywhere else, and the rail only accepts input
+while it is visible.
+
 ### The scrub gate
 
 iOS has a scrollbar of its own, and it is not just an indicator: press and hold
-it and you can scrub, crossing the whole gallery in a second or two. (It cannot
-be hidden — `::-webkit-scrollbar` only reaches element scrollers, which is why
-`.hide-scrollbar` works on the panels but not on the document.)
+it and you can scrub, crossing the whole gallery in a second or two. It is gone
+now — see [the scroll host](#the-scroll-host) — but the gate it forced stays,
+because any fast programmatic scroll reaches the same speeds.
 
 A scrub is not a fling, and the cheap rung is not enough for it. At scrub speed
 every frame reveals dozens of rows the grid has never shown, so the render

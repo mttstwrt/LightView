@@ -6,6 +6,7 @@
 // depend on how cells are placed.
 
 import { createSignal, createEffect, onMount, onCleanup } from "solid-js";
+import { scrollToY, scrollTop, viewportHeight } from "./scrollHost";
 
 // -------------------------------------------------------------------------
 // Selection: Ctrl/Cmd-drag range select + click-to-open / click-to-toggle.
@@ -165,7 +166,7 @@ export function createEdgeScroll(isDragging: () => boolean) {
       if (!isDragging()) { edgeRafId = 0; return; }
       const dt = Math.min((now - edgeLastTime) / 1000, 0.05);
       edgeLastTime = now;
-      const vh = window.innerHeight;
+      const vh = viewportHeight();
       let speed = 0;
       if (edgeMouseY < EDGE_ZONE_PX) {
         speed = -EDGE_MAX_SPEED * Math.pow(1 - edgeMouseY / EDGE_ZONE_PX, 2);
@@ -173,8 +174,7 @@ export function createEdgeScroll(isDragging: () => boolean) {
         speed = EDGE_MAX_SPEED * Math.pow((edgeMouseY - (vh - EDGE_ZONE_PX)) / EDGE_ZONE_PX, 2);
       }
       if (speed !== 0) {
-        const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-        window.scrollTo(0, Math.max(0, Math.min(maxScroll, window.scrollY + speed * dt)));
+        scrollToY(scrollTop() + speed * dt);
       }
       edgeRafId = requestAnimationFrame(edgeScrollFrame);
     };

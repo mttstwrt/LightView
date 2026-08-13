@@ -26,6 +26,7 @@ import { PasswordModal } from "./components/auth/PasswordModal";
 import { galleryPath, setGalleryPath, setLoading, displayPaths, setDisplayPaths, sortedItems, setSortedItems, loading, selectedPaths, setSelectedPaths, toggleSelection, clearSelection, selectAll, selectionMode, exitSelectionMode, viewMode, settingsOpen, setSettingsOpen, aspectByPath, mediaMetaByPath, groups, rateItem, loadEnabledViews } from "./stores/galleryStore";
 import { loadBootSnapshot, saveBootSnapshot } from "./lib/bootSnapshot";
 import { createOpenAtBottom } from "./lib/openAtBottom";
+import { setScrollHost } from "./lib/scrollHost";
 import { VIEWER_CLOSE_REQUEST_EVENT } from "./lib/viewerTransition";
 import { viewerOpen, closeViewer, openViewer, nextImage, prevImage, viewerIndex, toggleInfoPanel, infoPanelOpen } from "./stores/viewerStore";
 import { settings, sortField, sortOrder, subSortField, subSortOrder, groupBy, loadSettingsFromGallery, loadWebSettings, applyExternalSettings } from "./stores/settingsStore";
@@ -690,7 +691,24 @@ export function App() {
         }
       >
         <TopBar commands={commandHandlers} />
+        {/* The gallery scrolls in here rather than in the document. iOS draws
+            its own scroll indicator over the page, that indicator is
+            interactive (press and hold to scrub), and it cannot be styled away
+            on the document scroller — `::-webkit-scrollbar` only reaches
+            element scrollers. Owning the scroller is what leaves LightView's
+            bar, the one with the date markers, as the only one on screen.
+            Being positioned also makes this the grids' `offsetParent`, so their
+            `offsetTop` measurements share an origin with `scrollTop`. See
+            lib/scrollHost.ts. */}
         <Show when={(viewMode() === "grid" || viewMode() === "justified") && !contentHidden()}>
+          <div
+            ref={(el) => {
+              setScrollHost(el);
+              onCleanup(() => setScrollHost(null));
+            }}
+            class="hide-scrollbar fixed inset-0 overflow-y-auto overflow-x-hidden"
+            style={{ "overscroll-behavior-y": "contain" }}
+          >
           <Show when={viewMode() === "grid"}>
             <GalleryGrid
               paths={displayPaths()}
@@ -732,6 +750,13 @@ export function App() {
               onContentHeight={setGalleryContentHeight}
             />
           </Show>
+          </div>
+          {/* Outside the host on purpose. It is `fixed`, so a fixed element's
+              scroll chain is the viewport either way — being inside would not
+              give a touch on the rail anything to pan, and it would put an
+              overlay inside the scroller for no gain. The 10px rail is
+              therefore a strip that jumps on a tap and does not pan on a swipe,
+              which is how a scrollbar behaves everywhere else. */}
           <ScrollBar
             contentHeight={galleryContentHeight()}
             indicators={scrollIndicators()}

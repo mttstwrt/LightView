@@ -25,6 +25,7 @@ import { createThumbProgress } from "../../lib/thumbProgress";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
+import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
 import { createThumbSwapper } from "../../lib/thumbSwap";
 import { pickByPriority } from "../../lib/loadPriority";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
@@ -432,8 +433,8 @@ export function GalleryGrid(props: GalleryGridProps) {
 
     /** Recompute the visible row range from current scroll position and update signals if changed. */
     recalcRange = () => {
-      const sy = window.scrollY;
-      const vh = window.innerHeight;
+      const sy = scrollTop();
+      const vh = viewportHeight();
       const offset = containerRef?.offsetTop ?? 0;
       const rh = rowHeight();
       const cs = cellSize();
@@ -506,7 +507,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const curCellSize = (w - (curCols - 1) * g) / curCols;
       const curRowHeight = curCellSize + g;
 
-      const anchorPageY = anchorY + window.scrollY;
+      const anchorPageY = anchorY + scrollTop();
       const anchorInGrid = anchorPageY - containerTop;
       const anchorRow = Math.max(0, Math.floor(anchorInGrid / curRowHeight));
 
@@ -517,7 +518,7 @@ export function GalleryGrid(props: GalleryGridProps) {
 
       // Where the anchored image's row currently is on screen
       const imagePageY = containerTop + anchorRow * curRowHeight;
-      const imageClientY = imagePageY - window.scrollY;
+      const imageClientY = imagePageY - scrollTop();
 
       setSettings((prev) => ({
         ...prev,
@@ -529,7 +530,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const newRowHeight = newCellSize + g;
       const newRow = Math.floor(anchorIndex / newCols);
       const newImagePageY = containerTop + newRow * newRowHeight;
-      window.scrollTo(0, newImagePageY - imageClientY);
+      scrollToY(newImagePageY - imageClientY);
     };
 
     // Step to `targetCols` columns (Ctrl+wheel): pick a thumb_size in the middle
@@ -723,7 +724,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const c = cols();
       if (rh <= 0 || c <= 0) return;
       const offset = containerRef?.offsetTop ?? 0;
-      const vh = window.innerHeight;
+      const vh = viewportHeight();
       const landingTop = dynamics.projectedLandingY() - offset;
       const firstRow = Math.max(0, Math.floor((landingTop - vh) / rh));
       const lastRow = Math.min(totalRows(), Math.ceil((landingTop + 2 * vh) / rh));
@@ -916,7 +917,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       dynamics.markSettled();
       scheduleFetch();
     };
-    window.addEventListener("scrollend", onScrollEnd);
+    const detachScrollEnd = onScrollHost("scrollend", onScrollEnd);
 
     // Background interval for precache/eviction when not actively scrolling.
     const bgIntervalId = setInterval(() => {
@@ -966,18 +967,18 @@ export function GalleryGrid(props: GalleryGridProps) {
       const targetRow = Math.floor(index / c);
       const imageTop = offset + targetRow * rh;
       const imageBottom = imageTop + cellSize();
-      const viewTop = window.scrollY;
-      const viewBottom = viewTop + window.innerHeight;
+      const viewTop = scrollTop();
+      const viewBottom = viewTop + viewportHeight();
       if (imageTop < viewTop || imageBottom > viewBottom) {
         // Center the target row in the viewport
-        window.scrollTo(0, imageTop - (window.innerHeight - cellSize()) / 2);
+        scrollToY(imageTop - (viewportHeight() - cellSize()) / 2);
       }
     };
     window.addEventListener("lightview:scroll-to-index", onScrollToIndex);
 
     onCleanup(() => {
       ro.disconnect();
-      window.removeEventListener("scrollend", onScrollEnd);
+      detachScrollEnd();
       detachWheel();
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
