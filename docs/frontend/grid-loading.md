@@ -196,6 +196,33 @@ landing on the rail no longer pans the gallery. It still jumps on a tap, which
 is how a scrollbar behaves everywhere else, and the rail only accepts input
 while it is visible.
 
+### Why the bar does not reach the edges of a phone
+
+On a touch device the track is held clear of the top and bottom of the screen,
+and the grip is clamped inside the track rather than centred on the thumb when
+that would hang it off an end.
+
+Two problems, both invisible on a desktop and both at the top of a gallery,
+which is exactly where a user starts. A phone's screen corners are rounded and
+the rail sits two pixels from the right edge — far enough into the curve that
+the top of the track is not drawn at all, so the thumb was present but
+unseeable, and only appeared after scrolling some way down. And the strip along
+the top edge belongs to the system: a finger starting there pulls down
+Notification Center rather than taking the thumb.
+
+The inset is `max(calc(env(safe-area-inset-<side>, 0px) + 8px), 44px)`. The
+`env()` term handles the status bar and home indicator; the floor handles the
+corner radius, which `env()` does not describe — it reports zero in landscape,
+where the corner is just as round. It is applied on touch devices only, which
+costs a touchscreen laptop a little track for no benefit; that is the cheaper
+way to be wrong than leaving a phone's thumb under the curve.
+
+Chromium reports no insets by default, so a test that only loads the page
+exercises the 44px floor and nothing else. Drive
+`Emulation.setSafeAreaInsetsOverride` over CDP to check the other half — with a
+47px top inset the track resolves to 55px, and with a 34px bottom one the floor
+still wins at 44px.
+
 ### The scrub gate
 
 iOS has a scrollbar of its own, and it is not just an indicator: press and hold

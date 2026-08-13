@@ -1,6 +1,7 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show, For } from "solid-js";
 import { markScrollBarActive, markScrollBarReleased } from "../../lib/scrollDynamics";
 import { scrollHost } from "../../lib/scrollHost";
+import { hasTouch } from "../../lib/runtime";
 
 export interface ScrollIndicator {
   /** Position along the track as a fraction 0–1. */
@@ -51,6 +52,28 @@ export function ScrollBar(props: ScrollBarProps) {
   let dragPointerId: number | undefined;
 
   const MIN_THUMB = 24;
+  // How far the ends of the track are held clear of the screen edges on a
+  // touch device.
+  //
+  // Two separate problems, both invisible on a desktop. A phone's screen
+  // corners are rounded, and the rail sits two pixels from the right edge —
+  // deep enough into the curve that the top of the track is simply not drawn,
+  // so at the top of a gallery the thumb was there but unseeable, and only
+  // appeared once you had scrolled some way down. And the strip along the top
+  // edge belongs to the system: a finger that starts there pulls down
+  // Notification Center instead of taking the thumb.
+  //
+  // `env()` covers the first case in portrait and nothing else — it reports
+  // zero in landscape, where the corner is just as round. So the inset is the
+  // safe area *or* a floor that clears the corner radius on its own, whichever
+  // is larger. Applied on touch devices only: it costs a touchscreen laptop a
+  // little track for no benefit, which is the cheaper way to be wrong than
+  // leaving a phone's thumb under the curve.
+  const TOUCH_EDGE_MIN_PX = 44;
+  const edgeInset = (side: "top" | "bottom") =>
+    hasTouch()
+      ? `max(calc(env(safe-area-inset-${side}, 0px) + 8px), ${TOUCH_EDGE_MIN_PX}px)`
+      : "0px";
   // Grip dimensions — the draggable box around the thumb. 44px is the smallest
   // reliable touch target, and the width reaches inwards from the rail so a
   // fingertip has somewhere to land without the rail itself getting wider.
@@ -236,6 +259,20 @@ export function ScrollBar(props: ScrollBarProps) {
     return visible() ? 0.7 : 0;
   };
 
+  /** Grip box height — the thumb, or the minimum touch target if it is taller. */
+  const gripHeight = () => Math.max(GRIP_MIN_H, thumbHeight());
+
+  /** Grip offset, centred on the thumb but kept inside the track. Without the
+   *  clamp the grip overhangs each end by half the difference, which at the top
+   *  of a gallery puts the only draggable thing back under the screen edge the
+   *  track was inset to avoid. */
+  const gripTop = () => {
+    const h = gripHeight();
+    const centred = thumbTop() + thumbHeight() / 2 - h / 2;
+    const trackH = trackRef?.clientHeight ?? 0;
+    return Math.max(0, Math.min(centred, Math.max(0, trackH - h)));
+  };
+
   const showIndicators = () => (dragging() || hovering()) && (props.indicators?.length ?? 0) > 0;
 
   const thumbLabel = () => {
@@ -247,13 +284,14 @@ export function ScrollBar(props: ScrollBarProps) {
     <Show when={thumbHeight() > 0}>
       <div
         ref={trackRef}
-        class={props.class ?? "fixed right-0.5 top-0 bottom-0 z-[60]"}
+        class={props.class ?? "fixed right-0.5 z-[60]"}
         style={{
           width: "10px",
           cursor: "pointer",
           opacity: opacity(),
           transition: dragging() ? "none" : "opacity 0.25s ease",
           "pointer-events": opacity() > 0 ? "auto" : "none",
+          ...(props.class ? {} : { top: edgeInset("top"), bottom: edgeInset("bottom") }),
         }}
         onClick={onTrackClick}
         onMouseEnter={() => { setHovering(true); showTemporarily(); }}
@@ -299,12 +337,12 @@ export function ScrollBar(props: ScrollBarProps) {
           ref={gripRef}
           style={{
             position: "absolute",
-            top: `${thumbTop() + thumbHeight() / 2 - Math.max(GRIP_MIN_H, thumbHeight()) / 2}px`,
+            top: `${gripTop()}px`,
             // Anchored to the track's right edge and grown leftwards, so none
             // of it falls off the side of the screen.
             right: "0",
             width: `${GRIP_W}px`,
-            height: `${Math.max(GRIP_MIN_H, thumbHeight())}px`,
+            height: `${gripHeight()}px`,
             display: "flex",
             "align-items": "center",
             "justify-content": "flex-end",
