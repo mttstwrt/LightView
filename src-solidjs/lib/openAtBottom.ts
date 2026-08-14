@@ -1,6 +1,7 @@
 // "Start at bottom": land a freshly opened gallery at the end of the grid.
 
 import { createEffect, on, onCleanup } from "solid-js";
+import { maxScroll, scrollToY } from "./scrollHost";
 
 // "Start at bottom": land a freshly opened gallery at the end of the grid
 // instead of the top, so browsing runs bottom-to-top.
@@ -53,12 +54,9 @@ export function createOpenAtBottom(opts: OpenAtBottomOptions) {
   };
 
   const scrollToBottom = () => {
-    const max = Math.max(
-      0,
-      document.documentElement.scrollHeight - window.innerHeight,
-    );
+    const max = maxScroll();
     if (max <= 0) return;
-    window.scrollTo(0, max);
+    scrollToY(max);
   };
 
   /** Pin to the bottom and restart the settle countdown. */

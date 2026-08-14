@@ -19,7 +19,7 @@
 
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { isMobile, isTauri } from "../../lib/runtime";
+import { isMobile, isTauri, renderScale } from "../../lib/runtime";
 import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
@@ -31,6 +31,7 @@ import { recordCacheMiss } from "../../lib/perfMonitor";
 import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
+import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
 import { createThumbSwapper } from "../../lib/thumbSwap";
 import { VIEWER_PATH_EVENT } from "../../lib/viewerTransition";
 import { pickByPriority } from "../../lib/loadPriority";
@@ -102,13 +103,29 @@ const VELOCITY_FAST = 3000;
 // extra storage) and a 2560px "jh" thumbnail for large/non-native ones. The
 // byte cutoff for "serve original" grows with zoom: at "mid" only smaller files
 // stream as originals; at "high" most do. Thresholds compare the rendered row
-// height in *physical* pixels (row height × DPR), so hi-DPI screens step up
-// earlier — exactly where the 512px tier starts to look soft. The gap between
-// each up/down pair is hysteresis to avoid thrashing at a boundary.
-const MID_UP = 360;
-const MID_DOWN = 320;
-const HIGH_UP = 560;
-const HIGH_DOWN = 500;
+// height in *physical* pixels (row height × `renderScale()`), so hi-DPI screens
+// step up earlier — exactly where the 512px tier starts to look soft. The gap
+// between each up/down pair is hysteresis to avoid thrashing at a boundary.
+//
+// The scale is capped rather than the raw DPR, and this is where that matters
+// most: taken literally, a phone's 3× put every ordinary cell past HIGH_UP, so
+// a 194px-wide thumbnail was backed by a 2560px image — around forty times the
+// pixels the screen can show, on the device least able to hold them.
+//
+// The values carry `GalleryGrid`'s TIER_UPSCALE_TOLERANCE, and for the same
+// reason: a tier that has to stretch slightly is barely visible, while stepping
+// up costs four times the memory per cell (measured — see
+// docs/frontend/grid-loading.md). Without it the two grids disagreed about how
+// much softness is acceptable, and this one stepped up the moment a tier was
+// stretched at all: a phone at two columns needs 576 physical px on the long
+// edge and so left the 512px "j" tier for the 1280px "jm" one to cover a 12%
+// gap. The bases are the row heights at which each tier's long edge is exactly
+// covered, assuming the ~1.5 landscape aspect these rows average.
+const TIER_UPSCALE_TOLERANCE = 1.25;
+const MID_UP = 360 * TIER_UPSCALE_TOLERANCE;
+const MID_DOWN = 320 * TIER_UPSCALE_TOLERANCE;
+const HIGH_UP = 560 * TIER_UPSCALE_TOLERANCE;
+const HIGH_DOWN = 500 * TIER_UPSCALE_TOLERANCE;
 // "Serve original" byte cutoffs per level (native image formats only).
 const MID_MAX_BYTES = 1.5 * 1024 * 1024;
 const HIGH_MAX_BYTES = 3 * 1024 * 1024;
@@ -192,8 +209,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       setDetailLevel("base");
       return;
     }
-    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-    const px = targetRowHeight() * dpr;
+    const px = targetRowHeight() * renderScale();
     setDetailLevel((prev): DetailLevel => {
       if (prev === "base") return px > HIGH_UP ? "high" : px > MID_UP ? "mid" : "base";
       if (prev === "mid") return px > HIGH_UP ? "high" : px < MID_DOWN ? "base" : "mid";
@@ -221,9 +237,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // aspect, a per-image stand-in for its row's average (exact for the
   // portrait-only rows where the boost actually bites).
   const displayedLongEdge = (aspect: number): number => {
-    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
     const h = targetRowHeight() * portraitRowBoost(aspect);
-    return h * Math.max(1, aspect) * dpr;
+    return h * Math.max(1, aspect) * renderScale();
   };
 
   // Whether `path` should be served via the media server's cell-fit resize
@@ -587,13 +602,18 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // instantly; uncached ones 404 → onError → queued for generation.
   createEffect(on(
     [visibleCells, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow, pinnedPath,
-     viewStartRow, viewEndRow, awaitingCount],
-    ([cells, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting]) => {
+     viewStartRow, viewEndRow, awaitingCount, dynamics.warping],
+    ([cells, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting, warping]) => {
     // While the WebKitGTK decode gate is up, leave new cells on their
     // placeholder so the main thread isn't buried under image decodes
     // mid-scroll. When it releases this re-runs and assigns whatever's now on
     // screen.
     if (gated && !CHEAP_RUNG_DURING_GATE) return;
+    // Same, on every platform, while the view is being scrubbed past far
+    // faster than anything could load — the window turns over completely each
+    // frame, so this would issue a request per cell for thousands of cells
+    // nobody sees. Assignment resumes on the frame the scrub slows down.
+    if (warping) return;
     // Resolution ladder: at mid/high detail a cell gets the base "j" tier
     // (small, precached) when it's outside the inner full-res window or while
     // a fling is in progress, and upgrades to the level's real source
@@ -678,8 +698,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
         if (untrack(startRow) !== 0 || untrack(endRow) !== 0) batch(() => { setStartRow(0); setEndRow(0); });
         return;
       }
-      const sy = window.scrollY;
-      const vh = window.innerHeight;
+      const sy = scrollTop();
+      const vh = viewportHeight();
       const offset = containerRef?.offsetTop ?? 0;
       const relativeTop = Math.max(0, sy - offset);
       const relativeBottom = relativeTop + vh;
@@ -793,7 +813,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       const lay = layout();
       if (lay.rows.length === 0) return;
       const offset = containerRef?.offsetTop ?? 0;
-      const vh = window.innerHeight;
+      const vh = viewportHeight();
       const landingTop = Math.max(0, dynamics.projectedLandingY() - offset);
       const firstRow = rowIndexAtOffset(lay.rowTops, Math.max(0, landingTop - vh));
       const lastRow = Math.min(
@@ -992,6 +1012,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     const scheduleFetch = () => {
       evictFaraway();
 
+      // Mid-scrub: no generation, and above all no speculation. The projected
+      // landing zone is recomputed from a position that has already moved on by
+      // the time the batch is issued, and `landingWarmed` is cleared on every
+      // jump — which during a scrub is every frame — so the same paths would be
+      // re-warmed over and over. Eviction above is the only useful work here.
+      if (dynamics.warping()) return;
+
       // During a fling, near-viewport generation is wasted work — those cells
       // fly past unseen. Warm the projected landing zone instead; queued
       // 404-generation drains on settle (with stale entries dropped).
@@ -1013,7 +1040,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       dynamics.markSettled();
       scheduleFetch();
     };
-    window.addEventListener("scrollend", onScrollEnd);
+    const detachScrollEnd = onScrollHost("scrollend", onScrollEnd);
 
     const bgIntervalId = setInterval(scheduleFetch, 500);
 
@@ -1058,17 +1085,17 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       const offset = containerRef?.offsetTop ?? 0;
       const imageTop = offset + row.y;
       const imageBottom = imageTop + row.height;
-      const viewTop = window.scrollY;
-      const viewBottom = viewTop + window.innerHeight;
+      const viewTop = scrollTop();
+      const viewBottom = viewTop + viewportHeight();
       if (imageTop < viewTop || imageBottom > viewBottom) {
-        window.scrollTo(0, imageTop - (window.innerHeight - row.height) / 2);
+        scrollToY(imageTop - (viewportHeight() - row.height) / 2);
       }
     };
     window.addEventListener("lightview:scroll-to-index", onScrollToIndex);
 
     onCleanup(() => {
       ro.disconnect();
-      window.removeEventListener("scrollend", onScrollEnd);
+      detachScrollEnd();
       detachWheel();
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);

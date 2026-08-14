@@ -14,7 +14,7 @@
 
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { safeListen as listen, hasTouch, isTauri, type UnlistenFn } from "../../lib/runtime";
+import { safeListen as listen, hasTouch, isTauri, renderScale, type UnlistenFn } from "../../lib/runtime";
 import { pointerDistance, pointerMidpoint, type Point } from "../../lib/touch";
 import { createWheelScroll } from "../../lib/wheelScroll";
 import { settings, setSettings } from "../../stores/settingsStore";
@@ -25,6 +25,7 @@ import { createThumbProgress } from "../../lib/thumbProgress";
 import { recordCacheMiss } from "../../lib/perfMonitor";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
+import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
 import { createThumbSwapper } from "../../lib/thumbSwap";
 import { pickByPriority } from "../../lib/loadPriority";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
@@ -95,21 +96,13 @@ const TIER_RANK: Partial<Record<ThumbTier, number>> = { s: 0, m: 1, l: 2 };
 // ~640px instead of punting to 1024.
 const TIER_UPSCALE_TOLERANCE = 1.25;
 
-// Cap on the DPR multiplier so a 4×-DPR phone doesn't always punt to the
-// largest tier (which would dominate bandwidth on cellular).
-const MAX_DPR_SCALE = 3;
-
 function pickTier(cellPx: number): ThumbTier {
   // Match the decoded image to the *rendered* pixel size (cell × DPR), on
   // desktop too. Serving a far larger tier than the cell shows forces the
   // webview to decode + downscale a big bitmap per cell — see
-  // docs/pipeline/README.md. DPR is capped so a 4×-DPR phone doesn't
-  // always punt to the largest tier.
-  const dpr =
-    typeof window !== "undefined"
-      ? Math.min(window.devicePixelRatio || 1, MAX_DPR_SCALE)
-      : 1;
-  const needed = cellPx * dpr;
+  // docs/pipeline/README.md. The multiplier is capped (`renderScale`) so a
+  // high-DPR phone doesn't punt every cell to the largest tier.
+  const needed = cellPx * renderScale();
   if (needed <= TIER_PX.s * TIER_UPSCALE_TOLERANCE) return "s";
   if (needed <= TIER_PX.m * TIER_UPSCALE_TOLERANCE) return "m";
   return "l";
@@ -363,13 +356,18 @@ export function GalleryGrid(props: GalleryGridProps) {
   // -----------------------------------------------------------------------
 
   createEffect(on(
-    [visibleItems, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow],
-    ([items, gated, settled, fullStart, fullEnd]) => {
+    [visibleItems, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow, dynamics.warping],
+    ([items, gated, settled, fullStart, fullEnd, warping]) => {
     // While the WebKitGTK decode gate is up, leave new cells on their skeleton
     // so the main thread isn't buried under image decodes mid-scroll. When it
     // releases this effect re-runs and assigns whatever's now on screen.
     // Already-assigned cells keep their src, so visible content stays.
     if (gated && !CHEAP_RUNG_DURING_GATE) return;
+    // Same, on every platform, while the view is being scrubbed past far faster
+    // than anything could load — the window turns over completely each frame,
+    // so this would issue a request per cell for thousands of cells nobody
+    // sees. Assignment resumes on the frame the scrub slows down.
+    if (warping) return;
     const target = tier();
     // Resolution ladder: a cell gets the tiny "s" tier when it's outside the
     // inner full-res window (deep look-ahead stays cheap) or while a fling is
@@ -435,8 +433,8 @@ export function GalleryGrid(props: GalleryGridProps) {
 
     /** Recompute the visible row range from current scroll position and update signals if changed. */
     recalcRange = () => {
-      const sy = window.scrollY;
-      const vh = window.innerHeight;
+      const sy = scrollTop();
+      const vh = viewportHeight();
       const offset = containerRef?.offsetTop ?? 0;
       const rh = rowHeight();
       const cs = cellSize();
@@ -509,7 +507,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const curCellSize = (w - (curCols - 1) * g) / curCols;
       const curRowHeight = curCellSize + g;
 
-      const anchorPageY = anchorY + window.scrollY;
+      const anchorPageY = anchorY + scrollTop();
       const anchorInGrid = anchorPageY - containerTop;
       const anchorRow = Math.max(0, Math.floor(anchorInGrid / curRowHeight));
 
@@ -520,7 +518,7 @@ export function GalleryGrid(props: GalleryGridProps) {
 
       // Where the anchored image's row currently is on screen
       const imagePageY = containerTop + anchorRow * curRowHeight;
-      const imageClientY = imagePageY - window.scrollY;
+      const imageClientY = imagePageY - scrollTop();
 
       setSettings((prev) => ({
         ...prev,
@@ -532,7 +530,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const newRowHeight = newCellSize + g;
       const newRow = Math.floor(anchorIndex / newCols);
       const newImagePageY = containerTop + newRow * newRowHeight;
-      window.scrollTo(0, newImagePageY - imageClientY);
+      scrollToY(newImagePageY - imageClientY);
     };
 
     // Step to `targetCols` columns (Ctrl+wheel): pick a thumb_size in the middle
@@ -726,7 +724,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       const c = cols();
       if (rh <= 0 || c <= 0) return;
       const offset = containerRef?.offsetTop ?? 0;
-      const vh = window.innerHeight;
+      const vh = viewportHeight();
       const landingTop = dynamics.projectedLandingY() - offset;
       const firstRow = Math.max(0, Math.floor((landingTop - vh) / rh));
       const lastRow = Math.min(totalRows(), Math.ceil((landingTop + 2 * vh) / rh));
@@ -889,6 +887,13 @@ export function GalleryGrid(props: GalleryGridProps) {
       // work queued — and it's cheap.
       evictFaraway();
 
+      // Mid-scrub: no generation, and above all no speculation. The projected
+      // landing zone is recomputed from a position that has already moved on by
+      // the time the batch is issued, and `landingWarmed` is cleared on every
+      // jump — which during a scrub is every frame — so the same paths would be
+      // re-warmed over and over. Eviction above is the only useful work here.
+      if (dynamics.warping()) return;
+
       // During a fling, near-viewport generation is wasted work — those cells
       // fly past unseen. Warm the projected landing zone instead; queued
       // 404-generation drains on settle (with stale entries dropped).
@@ -912,7 +917,7 @@ export function GalleryGrid(props: GalleryGridProps) {
       dynamics.markSettled();
       scheduleFetch();
     };
-    window.addEventListener("scrollend", onScrollEnd);
+    const detachScrollEnd = onScrollHost("scrollend", onScrollEnd);
 
     // Background interval for precache/eviction when not actively scrolling.
     const bgIntervalId = setInterval(() => {
@@ -962,18 +967,18 @@ export function GalleryGrid(props: GalleryGridProps) {
       const targetRow = Math.floor(index / c);
       const imageTop = offset + targetRow * rh;
       const imageBottom = imageTop + cellSize();
-      const viewTop = window.scrollY;
-      const viewBottom = viewTop + window.innerHeight;
+      const viewTop = scrollTop();
+      const viewBottom = viewTop + viewportHeight();
       if (imageTop < viewTop || imageBottom > viewBottom) {
         // Center the target row in the viewport
-        window.scrollTo(0, imageTop - (window.innerHeight - cellSize()) / 2);
+        scrollToY(imageTop - (viewportHeight() - cellSize()) / 2);
       }
     };
     window.addEventListener("lightview:scroll-to-index", onScrollToIndex);
 
     onCleanup(() => {
       ro.disconnect();
-      window.removeEventListener("scrollend", onScrollEnd);
+      detachScrollEnd();
       detachWheel();
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);

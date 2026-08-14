@@ -30,12 +30,12 @@ step with the Rust serde structs on the other side.
 | Path | What lives there |
 |---|---|
 | `stores/` | Global signals: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore`, `capabilitiesStore`, `uploadStore`, `thumbnailProgressStore` |
-| `lib/` | The non-visual machinery: `ipc`, `runtime`, `types`, plus the grid primitives both grids share (see [`grid-loading.md`](grid-loading.md)) |
+| `lib/` | The non-visual machinery: `ipc`, `runtime`, `types`, `scrollHost` (the gallery scrolls an element, not the document — see [`grid-loading.md`](grid-loading.md)), plus the grid primitives both grids share |
 | `components/gallery/` | `GalleryGrid`, `JustifiedGrid`, `ThumbnailCell`, `SelectionBar` |
 | `components/viewer/` | `MediaViewer`, `VideoPlayer`, `InfoPanel` |
 | `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `CommandMenu`, `ViewSwitcher`, `SettingsMenu`, `TitleBar` — how these divide between things you do and things you set is [`chrome.md`](chrome.md) |
 | `components/auth/` | `PairApp`, `PasswordModal` — the web-only bootstrap flows |
-| `components/shared/` | `ContextMenu`, `ScrollBar`, `ConfirmButton` |
+| `components/shared/` | `ContextMenu`, `ScrollBar` (its touch behaviour, and why the grids care, is in [`grid-loading.md`](grid-loading.md)), `ConfirmButton` |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |
 | `components/map/` | `MapView` — the one component behind a `lazy()` split (see below) |
 
