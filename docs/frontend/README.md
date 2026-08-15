@@ -157,7 +157,9 @@ four cold runs of a three-viewport scroll).
 64-image background batch could hold it for an entire session, leaving every
 subsequent visible request to the one-at-a-time generate-on-serve path. Both
 slots reset in `finally`, not as a trailing statement — the early returns for a
-stale generation would otherwise wedge the slot permanently.
+stale generation would otherwise wedge the slot permanently. Both live in
+`lib/fetchLoop.ts` now, which is also what re-arms the drain when a batch
+settles: the drain slot pokes the loop, the warm slot deliberately does not.
 
 ## Client-side caches, and how they lie
 

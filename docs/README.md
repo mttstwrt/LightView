@@ -62,6 +62,7 @@ answer to "why not the obvious thing?" is longer than a sentence.
 - [0007 — Two nested render windows in the grids](decisions/0007-two-zone-render-window.md)
 - [0008 — No view-module API; enablement plus code-splitting instead](decisions/0008-no-view-module-api.md)
 - [0009 — Three kinds of chrome: commands, panels, and configuration](decisions/0009-commands-panels-and-configuration.md)
+- [0010 — Re-arm the thumbnail drain on completion, not widen it](decisions/0010-re-arm-the-drain-not-widen-it.md)
 
 ## Open work
 

@@ -9,10 +9,11 @@ Items are grouped by the part of the system they touch, and **within a group
 they are listed in the order they should be done**: each group's opening
 paragraph says why that order and not another. The groups are near-independent —
 nothing in *Frontend structure* waits on *Remote tagging* — so they can largely
-be worked in parallel. The one cross-group dependency is D1 before C2: building
-the infinite canvas before the two grids are de-duplicated makes it a third copy
-of their loading machinery. Ids (`A1`, `B2`, …) are stable references; they
-encode position within a group, not global priority.
+be worked in parallel. The one cross-group dependency was D1 before C2 —
+building the infinite canvas before the two grids were de-duplicated would have
+made it a third copy of their loading machinery — and D1 has landed, so C2 is
+free to start. Ids (`A1`, `B2`, …) are stable references; they encode position
+within a group, not global priority.
 
 Items marked **(small)** are hours, not days. Those, plus C3 and D2, were
 previously collected under a single "Smaller items" heading; they now sit in the
@@ -345,10 +346,12 @@ carries regardless, so splitting them would save single-digit kilobytes.
 What the canvas *does* need is shared implementation, which the frontend already
 has a pattern for: behaviour lives in `lib/` as factory functions taking
 accessors (`scrollDynamics.ts`, `loadPriority.ts`, `thumbSwap.ts`, …), each
-component keeping its own policy. So build it after
-[D1](#d1-250300-duplicated-lines-between-the-two-grids), or it becomes a third
-copy of the grids' seven-part loading machine rather than the first consumer of
-an extracted one.
+component keeping its own policy. That is now true of the loading machine as
+well — [D1](#d1-250300-duplicated-lines-between-the-two-grids) extracted
+`urlVersions`, `pathIndex`, `thumbQueue` and `fetchLoop` — so the canvas is the
+first view that can consume it rather than a third copy of it. It supplies its
+own `evict`, `drain` and `speculate` against spiral geometry; everything else it
+inherits. See [`grid-loading.md`](frontend/grid-loading.md).
 
 ### C3. A virtual folder view
 
@@ -363,54 +366,90 @@ files into were considered and set aside for that reason.
 
 ## D. Frontend structure and performance
 
-Two items left, and **D1 is the one ready to start.** It has a difference table
-and a named four-step extraction in
-[`grid-loading.md`](frontend/grid-loading.md), and
-[C2](#c2-the-infinite-scrolling-canvas) waits on it. Either reading of D2 also
-lands in the code D1 is extracting, so D1 first there too — otherwise it gets
-written and verified twice, in two copies that already differ in small ways.
+**D1 is done**, and with it the orchestration half of D2 — the two were the same
+code, which is why they were scheduled together.
+[`grid-loading.md`](frontend/grid-loading.md) now describes the four extracted
+primitives and how the grids stay different through them, and
+[C2](#c2-the-infinite-scrolling-canvas) is unblocked: the infinite canvas can
+consume `createFetchLoop` / `createThumbQueue` rather than become a third copy
+of them.
 
-**D2 still needs a decision before code.** Its premise turned out to be wrong
-(there is no decode worker), so it needs restating and then measuring. It is
-not blocked by D1; it is blocked on someone deciding something.
+**D2 is now one item, and it needs a measurement before code.** What is left of
+it is the decode-worker pool, whose case is strongest on the platform this
+repository cannot measure. It is not blocked by anything; it is blocked on
+someone producing a number.
 
 **D3 is done** — the commands/settings split shipped, and
 [`chrome.md`](frontend/chrome.md) now describes what exists rather than what was
 planned. The two questions that had been holding it up are settled in
 [decision 0009](decisions/0009-commands-panels-and-configuration.md).
 
-### D1. ~250–300 duplicated lines between the two grids
+### ~~D1. ~250–300 duplicated lines between the two grids~~ — done
 
-Structurally identical fetch loops, eviction, pruning, and URL versioning, with
-small policy differences that make a naive merge unsafe.
-[`frontend/grid-loading.md`](frontend/grid-loading.md) inventories the
-differences and proposes a four-step extraction ordered smallest-risk-first.
-Each step needs browser verification, not just `tsc`.
+Four primitives in `src-solidjs/lib/`, extracted in the order the plan proposed
+and each one keeping the grids' policy differences as arguments:
+`urlVersions.ts` (the `?v=` counter and its epoch), `pathIndex.ts` (path →
+position, and pruning), `thumbQueue.ts` (queued / in-flight / failed / warmed,
+parameterized on the payload so GalleryGrid carries none and JustifiedGrid
+carries a `ThumbTier`), and `fetchLoop.ts` (the two single-flight slots and the
+order one pass runs them in). Net ~370 lines out of the two components.
 
-### D2. A worker pool for image decode on the client — premise does not hold
+One thing was deleted rather than moved: GalleryGrid's `coalescedPaths` set was
+redundant with the queued and in-flight sets on every path that reached it, and
+its only distinguishable behaviour was a bug — `onInvalidate` cleared the queue
+but not the coalesced set, blocking a path from re-queueing until the next pass.
 
-As written this said "a single decode worker is fine in practice… but a small
-pool would remove the JS orchestration bottleneck under burst load". **There is
-no decode worker to pool.** `new Worker(` appears nowhere in `src-solidjs/`;
-every "worker" in the frontend is a tagging worker or the service worker. The
-only two `createImageBitmap` calls are `ContextMenu` (clipboard copy) and
+### D2. A worker pool for image decode on the client
+
+The original entry said "a single decode worker is fine in practice… but a small
+pool would remove the JS orchestration bottleneck under burst load", and **there
+is no decode worker to pool**: `new Worker(` appears nowhere in `src-solidjs/`,
+the only two `createImageBitmap` calls are `ContextMenu` (clipboard copy) and
 `GifCanvas` (atlas frames), both on the main thread, and `thumbSwap.ts` uses
-`img.decode()` — a browser facility, not a worker of ours.
+`img.decode()`, a browser facility rather than a worker of ours.
 
-So this is not a small item and cannot be picked up as one. Restate it before
-scheduling it, as whichever of these was meant:
+Restating it produced two readings. **The orchestration one has landed** — see
+the drain re-arm in [`grid-loading.md`](frontend/grid-loading.md) and
+[decision 0010](decisions/0010-re-arm-the-drain-not-widen-it.md). It was not
+"widen the drain concurrency": the slots are not the bottleneck, and widening
+them would put more un-preemptable work on one bounded pool. What was actually
+wrong is that nothing re-armed the loop when a batch settled, and a 404 had no
+way to reach the schedule at all, so the queue drained at one batch per 500 ms
+poll however fast the backend was. The swap half of that reading was simply
+wrong: `createThumbSwapper` already keys in-flight decodes per path and runs
+them concurrently.
 
-- **Move thumbnail decode off the main thread at all** — a pool of workers
-  running `createImageBitmap` and transferring bitmaps back. That is a real
-  piece of work, and its case is strongest on WebKitGTK, where decode is a
-  main-thread hit that `thumbSwap` deliberately skips its `decode()` call to
-  avoid ([`grid-loading.md`](frontend/grid-loading.md)).
-- **Widen the grids' drain concurrency** — the two single-flight slots and the
-  one-at-a-time swap, which is orchestration rather than decode and belongs
-  with [D1](#d1-250300-duplicated-lines-between-the-two-grids).
+Checking it in a browser turned up something that bounds the payoff, and is the
+more useful finding of the two: **the 404 queue is a recovery path, not how a
+gallery fills.** Both thumbnail routes resolve through
+`thumb_serve::get_or_generate`, which generates inside the request and 404s only
+once generation has failed — measured over a cold 1200-image gallery, 880
+thumbnail responses and not one 404. So the re-arm buys recovery latency, and
+anyone trying to make browsing faster should be looking at `get_or_generate`'s
+coalescer and pool and at the speculative warms instead.
 
-Either way it needs a measurement first, on the engine it is meant to help.
-Neither reading is small, so the tag is gone.
+**What remains is moving thumbnail decode off the main thread**, and it is a
+large change, not a small one. Every cell becomes a `<canvas>` fed by
+`createImageBitmap` in a worker (or a transferred `OffscreenCanvas`), which
+carries two consequences the original entry did not name:
+
+- It gives up the browser's own image cache, which is measurably doing work
+  today: returning to already-visited scroll positions costs +2 MB rather than
+  +55 MB, and that is the cache, not us. Canvas cells re-decode on every reveal.
+- It buys back the one lever [`grid-loading.md`](frontend/grid-loading.md) says
+  does not exist — "the client cannot free anything". `ImageBitmap.close()` is
+  explicit. On iOS, where the ceiling is enforced by killing the tab rather than
+  by pruning, that is plausibly a bigger prize than the decode thread, and it is
+  a *different* justification than the WebKitGTK one.
+
+So it has two rationales on two platforms, and the stated one is on the platform
+no harness here can measure. Support is also a floor — `createImageBitmap` in a
+worker needs Safari 16.4+ — so the `<img>` path stays as a fallback either way,
+and the change adds a second rendering model to `ThumbnailCell` rather than
+replacing the first.
+
+Do it as a measured spike on the web client first, where both the harness and
+the iOS memory pain are, and write a decision file for the outcome either way.
 
 ### ~~D3. Commands and settings are the same drawer, on both surfaces~~ — done
 

@@ -7,10 +7,10 @@
 // is shaped that way.
 //
 // What is specific to this file: tier selection maps cell size × DPR to s/m/l
-// with a 1.25× upscale tolerance, and the generation queue is a plain
-// Set<string> because every cell wants the same tier — the justified grid
-// needs a Map, since a cheap-rung cell there must regenerate whichever tier
-// actually 404'd.
+// with a 1.25× upscale tolerance, and the shared generation queue is
+// instantiated with no payload because every cell wants the same tier — the
+// justified grid carries a ThumbTier, since a cheap-rung cell there must
+// regenerate whichever tier actually 404'd.
 
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
@@ -28,6 +28,10 @@ import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from
 import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
 import { createThumbSwapper } from "../../lib/thumbSwap";
 import { pickByPriority } from "../../lib/loadPriority";
+import { createUrlVersions } from "../../lib/urlVersions";
+import { createPathIndex } from "../../lib/pathIndex";
+import { createThumbQueue } from "../../lib/thumbQueue";
+import { createFetchLoop } from "../../lib/fetchLoop";
 import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
 
 interface GalleryGridProps {
@@ -155,55 +159,36 @@ export function GalleryGrid(props: GalleryGridProps) {
    *  serves. During a fling new cells get the cheap "s" rung; the assignment
    *  effect upgrades any entry below the target tier once scrolling settles. */
   const assignedRung = new Map<string, ThumbTier>();
-  /** Paths where the protocol handler returned 404 — need IPC generation. */
-  const needsGeneration = new Set<string>();
-  /** Paths currently in-flight for IPC generation. */
-  const inFlightSet = new Set<string>();
-  /** Paths that permanently failed (won't be retried). */
-  const failedSet = new Set<string>();
-  /** Coalesced paths: accumulated during in-flight fetch, merged into next batch. */
-  const coalescedPaths = new Set<string>();
-  /** Paths already sent to the backend by landing-zone warming during a
-   *  fling, so successive drains of the same fling don't re-issue them. */
-  const landingWarmed = new Set<string>();
-  /** Cache-bust version per path — incremented after IPC generation. */
-  const urlVersions = new Map<string, number>();
-  /** Cache-bust epoch for full invalidations (rebuilds). Thumbnail responses
-   *  are served cacheable, so a rebuild must change every URL — bumping this
-   *  shifts the effective version of every path at once. */
-  let versionEpoch = 0;
+  /** 404 → generation bookkeeping (queued / in flight / failed / warmed). No
+   *  payload: every cell here wants the same tier, so there is nothing to
+   *  remember per path. JustifiedGrid instantiates the same queue at
+   *  `ThumbTier`, because a cheap-rung cell there must regenerate whichever
+   *  tier actually missed. */
+  const queue = createThumbQueue();
+  /** `?v=` cache-busting for the tier URLs. */
+  const versions = createUrlVersions();
   /** Reverse index: path → position in props.paths for O(1) eviction lookups. */
-  const pathToIndex = new Map<string, number>();
+  const pathIndex = createPathIndex();
 
   let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
 
   /** Build the (possibly cache-busted) protocol URL for a path. */
-  const thumbSrcFor = (path: string, t: ThumbTier) => {
-    const v = (urlVersions.get(path) ?? 0) + versionEpoch;
-    return v > 0 ? `${thumbUrl(path, t)}?v=${v}` : thumbUrl(path, t);
-  };
-
-  /** Bump a path's version so its next URL points at fresh bytes. */
-  const bumpVersion = (path: string) => {
-    urlVersions.set(path, (urlVersions.get(path) ?? 0) + 1);
-  };
+  const thumbSrcFor = (path: string, t: ThumbTier) =>
+    versions.versioned(path, thumbUrl(path, t));
 
   // Thumbnail generation progress ("Generating N / M"). Idle means nothing is
   // queued for generation and nothing is in flight.
-  const progress = createThumbProgress(
-    () => needsGeneration.size === 0 && inFlightSet.size === 0,
-  );
+  const progress = createThumbProgress(() => queue.idle());
 
   /** Called by ThumbnailCell when the protocol handler returns 404. */
   const handleThumbError = (path: string) => {
-    if (needsGeneration.has(path) || inFlightSet.has(path) || failedSet.has(path) || coalescedPaths.has(path)) return;
+    if (!queue.queue(path, undefined)) return;
     recordCacheMiss();
-    // If a fetch is in-flight, coalesce into the next batch instead of needsGeneration
-    // to allow merging with other pending requests.
-    needsGeneration.add(path);
-    coalescedPaths.add(path);
     progress.queued();
+    // Wake the loop rather than waiting on its poll. A landing reveals a
+    // screenful of cold cells at once, and every one of them lands here.
+    loop.poke();
   };
 
   // Off-DOM decode-then-swap for tier upgrades on cells already showing an
@@ -226,8 +211,8 @@ export function GalleryGrid(props: GalleryGridProps) {
   onMount(() => {
     listen<ThumbnailResult>("thumb:streamed", (event) => {
       const r = event.payload;
-      if (!inFlightSet.has(r.path)) return;
-      bumpVersion(r.path);
+      if (!queue.inFlight(r.path)) return;
+      versions.bump(r.path);
       if (assignedRung.has(r.path)) assignedRung.set(r.path, tier());
       setThumbMap(r.path, thumbSrcFor(r.path, tier()));
     }).then((fn) => {
@@ -240,7 +225,7 @@ export function GalleryGrid(props: GalleryGridProps) {
   // in-flight batch to gate on — just bump the URL version so WebKit's
   // image cache fetches the fresh bytes from the protocol handler.
   onThumbRegenerated((path) => {
-    bumpVersion(path);
+    versions.bump(path);
     if (assignedRung.has(path)) {
       assignedRung.set(path, tier());
       setThumbMap(path, thumbSrcFor(path, tier()));
@@ -300,16 +285,12 @@ export function GalleryGrid(props: GalleryGridProps) {
       // `evictFaraway` walks to drop a path's thumbMap entry, so clearing it
       // orphaned every cell displayed before the jump — permanently
       // un-evictable, since eviction could no longer see them. The next
-      // scheduleFetch evicts them properly instead, which is the same set and
+      // fetch pass evicts them properly instead, which is the same set and
       // also releases their <img> URLs.
       if (isJump) {
         setGeneration((g) => g + 1);
         swapper.cancelAll();
-        needsGeneration.clear();
-        coalescedPaths.clear();
-        inFlightSet.clear();
-        failedSet.clear();
-        landingWarmed.clear();
+        queue.reset();
         progress.reset();
         // bgCursor is deliberately not reset: `warmBackground` resyncs it to
         // the viewport, so a jump moves the crawl to the new position instead
@@ -414,6 +395,199 @@ export function GalleryGrid(props: GalleryGridProps) {
       swapper.swap(path, thumbSrcFor(path, target));
     }
   }));
+
+  // -----------------------------------------------------------------------
+  // Thumbnail fetch loop — generation, background precache, and eviction
+  //
+  // These live at component scope rather than inside onMount so `loop.poke()`
+  // is reachable from `handleThumbError`: a 404 used to have no way to reach
+  // the schedule, because the schedule was a closure inside onMount, so a
+  // screenful of misses waited on the 500 ms poll before anything was even
+  // asked for.
+  // -----------------------------------------------------------------------
+
+  /** Remove thumbMap entries for paths far from the current viewport. */
+  const evictFaraway = () => {
+    const sr = startRow();
+    const er = endRow();
+    const c = cols();
+    const keepStart = Math.max(0, (sr - EVICT_ROWS)) * c;
+    const keepEnd = Math.min(props.paths.length, (er + EVICT_ROWS) * c);
+
+    const toEvict: string[] = [];
+    for (const p of assignedRung.keys()) {
+      const idx = pathIndex.indexOf(p);
+      if (idx !== undefined && (idx < keepStart || idx >= keepEnd)) {
+        toEvict.push(p);
+      }
+    }
+
+    if (toEvict.length > 0) {
+      batch(() => {
+        for (const p of toEvict) {
+          setThumbMap(p, undefined as any);
+          assignedRung.delete(p);
+          swapper.cancel(p);
+        }
+      });
+    }
+  };
+
+  // A fling has a predictable destination — warm thumbnails around the
+  // projected landing scroll position (± one viewport) so they're cached by
+  // the time the scroll arrives. Backend warm via precacheThumbnails; on
+  // the web client additionally prime the browser's HTTP cache with the
+  // cheap-rung URLs (responses are cacheable for 1h). One batch per pass,
+  // recomputed from the live projection each time, so a redirected fling
+  // self-corrects and wasted warms stay bounded.
+  const warmLandingZone = () => {
+    const rh = rowHeight();
+    const c = cols();
+    if (rh <= 0 || c <= 0) return;
+    const offset = containerRef?.offsetTop ?? 0;
+    const vh = viewportHeight();
+    const landingTop = dynamics.projectedLandingY() - offset;
+    const firstRow = Math.max(0, Math.floor((landingTop - vh) / rh));
+    const lastRow = Math.min(totalRows(), Math.ceil((landingTop + 2 * vh) / rh));
+    const startIdx = firstRow * c;
+    const endIdx = Math.min(props.paths.length, lastRow * c);
+
+    const want: string[] = [];
+    for (let i = startIdx; i < endIdx && want.length < SPECULATIVE_BATCH; i++) {
+      const p = props.paths[i];
+      if (!p || assignedRung.has(p) || !queue.warmable(p)) continue;
+      queue.markWarmed(p);
+      want.push(p);
+    }
+    if (want.length === 0) return;
+
+    loop.warm(async () => {
+      try {
+        await precacheThumbnails(want);
+        // Browser cache warm — low-priority so it can't compete with the
+        // visible cells' loads. `priority` is a progressive enhancement
+        // (ignored where unsupported; absent from TS 5.4's RequestInit).
+        if (!isTauri()) {
+          for (const p of want) {
+            fetch(thumbSrcFor(p, "s"), { priority: "low" } as RequestInit).catch(() => {});
+          }
+        }
+      } catch (e) {
+        console.error("Landing-zone precache failed:", e);
+      }
+    });
+  };
+
+  /** Generate thumbnails for cells that 404'd. Returns true if a batch went
+   *  out. Priorities are computed at drain time from the current windows
+   *  (full-res first, then rendered buffer by distance); leftovers outside
+   *  the rendered window are dropped — they were queued during a scroll that
+   *  has since moved past them, and re-queue via 404 if the user scrolls
+   *  back. */
+  const drainQueued = (): boolean => {
+    if (queue.queuedCount() === 0) return false;
+    const c = cols();
+    const { picked: toGenerate, stale } = pickByPriority(
+      queue.queued(),
+      (p) => pathIndex.indexOf(p),
+      {
+        viewStart: fullStartRow() * c,
+        viewEnd: fullEndRow() * c,
+        renderStart: startRow() * c,
+        renderEnd: endRow() * c,
+      },
+      BATCH_SIZE,
+    );
+    if (stale.length > 0) {
+      queue.drop(stale);
+      progress.dropped(stale.length);
+    }
+    if (toGenerate.length === 0) return false;
+
+    queue.take(toGenerate);
+
+    const gen = generation();
+    const activeTier = tier();
+    loop.fetch(async () => {
+      try {
+        let resultPaths: Set<string>;
+        let generatedCount = 0;
+        if (activeTier === "l" || activeTier === "p") {
+          await ensureTierThumbnails(toGenerate, activeTier);
+          if (loop.aborted() || generation() !== gen) return;
+          resultPaths = new Set(toGenerate);
+          batch(() => {
+            for (const p of toGenerate) {
+              versions.bump(p);
+              if (assignedRung.has(p)) assignedRung.set(p, activeTier);
+              setThumbMap(p, thumbSrcFor(p, activeTier));
+            }
+          });
+          generatedCount = toGenerate.length;
+        } else {
+          const results = await getThumbnailsBatch(toGenerate);
+          if (loop.aborted() || generation() !== gen) return;
+
+          resultPaths = new Set(results.map((r) => r.path));
+          batch(() => {
+            for (const r of results) {
+              versions.bump(r.path);
+              if (assignedRung.has(r.path)) assignedRung.set(r.path, activeTier);
+              setThumbMap(r.path, thumbSrcFor(r.path, activeTier));
+            }
+          });
+
+          generatedCount = results.length;
+        }
+        queue.settle(toGenerate, (p) => !resultPaths.has(p));
+        // After the in-flight set is drained, so "idle" reads correctly.
+        progress.completed(generatedCount);
+      } catch (e) {
+        console.error("Thumbnail generation batch failed:", e);
+        queue.settle(toGenerate, () => true);
+      }
+    });
+    return true;
+  };
+
+  /** Walk the gallery warming thumbnails while idle. Silent, no progress. */
+  const warmBackground = () => {
+    if (dynamics.velocity() >= VELOCITY_SLOW) return;
+    // Start from the viewport, never from wherever the cursor happens to
+    // sit: after a jump the useful work is around the new position, and
+    // crawling up to it from behind buys nothing the user can see.
+    const firstVisible = startRow() * cols();
+    if (bgCursor < firstVisible) bgCursor = firstVisible;
+    if (bgCursor >= props.paths.length) return;
+
+    const bgNeeded: string[] = [];
+    const total = props.paths.length;
+    while (bgNeeded.length < SPECULATIVE_BATCH && bgCursor < total) {
+      const p = props.paths[bgCursor];
+      bgCursor++;
+      if (p && !assignedRung.has(p) && !queue.hasFailed(p)) {
+        bgNeeded.push(p);
+      }
+    }
+    if (bgNeeded.length === 0) return;
+
+    loop.warm(async () => {
+      try {
+        await precacheThumbnails(bgNeeded);
+      } catch (e) {
+        console.error("Background precache failed:", e);
+      }
+    });
+  };
+
+  const loop = createFetchLoop({
+    evict: evictFaraway,
+    warping: dynamics.warping,
+    flinging: () => dynamics.velocity() > VELOCITY_FAST,
+    drain: drainQueued,
+    warmLanding: warmLandingZone,
+    speculate: warmBackground,
+  });
 
   // -----------------------------------------------------------------------
   // Scroll + resize: compute visible range, update signals only when changed
@@ -551,7 +725,7 @@ export function GalleryGrid(props: GalleryGridProps) {
     // can extend the drag past the viewport.
     const detachWheel = createWheelScroll({
       rowHeight,
-      onSettle: () => scheduleFetch(),
+      onSettle: () => loop.schedule(),
       onZoom: (e) => {
         if (isDragging()) return false;
         const w = containerWidth();
@@ -662,272 +836,18 @@ export function GalleryGrid(props: GalleryGridProps) {
 
     recalcRange(); // initial
 
-    // -----------------------------------------------------------------------
-    // Thumbnail fetch loop — generation, background precache, and eviction
-    // -----------------------------------------------------------------------
-
-    // Two single-flight slots, not one. `inFlightFetch` carries the drain of
-    // cells that are on screen right now and showing nothing; `inFlightWarm`
-    // carries speculation (landing zone, background precache).
-    //
-    // Sharing one slot meant a speculative batch blocked the visible drain for
-    // its whole duration — and `scheduleFetch` bails on the very first line
-    // when the slot is busy, so a single 64-image precache of large photos
-    // could stall *every* subsequent generation request for as long as it ran.
-    // Measured on a 600-photo 12 MP gallery: one background batch issued a
-    // second after load held the slot for the entire session, and cells the
-    // user scrolled to took 30 s to appear (they were left to the /thumb
-    // route's one-at-a-time generate-on-miss, queued behind that same batch).
-    // Touching the scrollbar made it obvious because a jump reveals a whole
-    // screenful of cold cells at once.
-    let fetchAbort = false;
-    let inFlightFetch: Promise<void> | null = null;
-    let inFlightWarm: Promise<void> | null = null;
-
-    /** Remove thumbMap entries for paths far from the current viewport. */
-    const evictFaraway = () => {
-      const sr = startRow();
-      const er = endRow();
-      const c = cols();
-      const keepStart = Math.max(0, (sr - EVICT_ROWS)) * c;
-      const keepEnd = Math.min(props.paths.length, (er + EVICT_ROWS) * c);
-
-      const toEvict: string[] = [];
-      for (const p of assignedRung.keys()) {
-        const idx = pathToIndex.get(p);
-        if (idx !== undefined && (idx < keepStart || idx >= keepEnd)) {
-          toEvict.push(p);
-        }
-      }
-
-      if (toEvict.length > 0) {
-        batch(() => {
-          for (const p of toEvict) {
-            setThumbMap(p, undefined as any);
-            assignedRung.delete(p);
-            swapper.cancel(p);
-          }
-        });
-      }
-    };
-
-    // A fling has a predictable destination — warm thumbnails around the
-    // projected landing scroll position (± one viewport) so they're cached by
-    // the time the scroll arrives. Backend warm via precacheThumbnails; on
-    // the web client additionally prime the browser's HTTP cache with the
-    // cheap-rung URLs (responses are cacheable for 1h). Reuses the
-    // single-flight inFlightFetch slot — one batch per drain, recomputed from
-    // the live projection each time, so a redirected fling self-corrects and
-    // wasted warms stay bounded.
-    const warmLandingZone = () => {
-      const rh = rowHeight();
-      const c = cols();
-      if (rh <= 0 || c <= 0) return;
-      const offset = containerRef?.offsetTop ?? 0;
-      const vh = viewportHeight();
-      const landingTop = dynamics.projectedLandingY() - offset;
-      const firstRow = Math.max(0, Math.floor((landingTop - vh) / rh));
-      const lastRow = Math.min(totalRows(), Math.ceil((landingTop + 2 * vh) / rh));
-      const startIdx = firstRow * c;
-      const endIdx = Math.min(props.paths.length, lastRow * c);
-
-      const want: string[] = [];
-      for (let i = startIdx; i < endIdx && want.length < SPECULATIVE_BATCH; i++) {
-        const p = props.paths[i];
-        if (!p || assignedRung.has(p) || inFlightSet.has(p) || failedSet.has(p) || landingWarmed.has(p)) continue;
-        landingWarmed.add(p);
-        want.push(p);
-      }
-      if (want.length === 0) return;
-
-      inFlightWarm = (async () => {
-        try {
-          await precacheThumbnails(want);
-          // Browser cache warm — low-priority so it can't compete with the
-          // visible cells' loads. `priority` is a progressive enhancement
-          // (ignored where unsupported; absent from TS 5.4's RequestInit).
-          if (!isTauri()) {
-            for (const p of want) {
-              fetch(thumbSrcFor(p, "s"), { priority: "low" } as RequestInit).catch(() => {});
-            }
-          }
-        } catch (e) {
-          console.error("Landing-zone precache failed:", e);
-        } finally {
-          inFlightWarm = null;
-        }
-      })();
-    };
-
-    /** Generate thumbnails for cells that 404'd. Returns true if a batch went
-     *  out. Priorities are computed at drain time from the current windows
-     *  (full-res first, then rendered buffer by distance); leftovers outside
-     *  the rendered window are dropped — they were queued during a scroll that
-     *  has since moved past them, and re-queue via 404 if the user scrolls
-     *  back. */
-    const drainQueued = (): boolean => {
-      if (needsGeneration.size === 0) return false;
-      const c = cols();
-      const { picked: toGenerate, stale } = pickByPriority(
-        needsGeneration,
-        (p) => pathToIndex.get(p),
-        {
-          viewStart: fullStartRow() * c,
-          viewEnd: fullEndRow() * c,
-          renderStart: startRow() * c,
-          renderEnd: endRow() * c,
-        },
-        BATCH_SIZE,
-      );
-      if (stale.length > 0) {
-        for (const p of stale) needsGeneration.delete(p);
-        progress.dropped(stale.length);
-      }
-      if (toGenerate.length === 0) return false;
-
-      for (const p of toGenerate) {
-        needsGeneration.delete(p);
-        inFlightSet.add(p);
-      }
-
-      const gen = generation();
-      const activeTier = tier();
-      inFlightFetch = (async () => {
-        try {
-          let resultPaths: Set<string>;
-          let generatedCount = 0;
-          if (activeTier === "l" || activeTier === "p") {
-            await ensureTierThumbnails(toGenerate, activeTier);
-            if (fetchAbort || generation() !== gen) return;
-            resultPaths = new Set(toGenerate);
-            batch(() => {
-              for (const p of toGenerate) {
-                bumpVersion(p);
-                if (assignedRung.has(p)) assignedRung.set(p, activeTier);
-                setThumbMap(p, thumbSrcFor(p, activeTier));
-              }
-            });
-            generatedCount = toGenerate.length;
-          } else {
-            const results = await getThumbnailsBatch(toGenerate);
-            if (fetchAbort || generation() !== gen) return;
-
-            resultPaths = new Set(results.map((r) => r.path));
-            batch(() => {
-              for (const r of results) {
-                bumpVersion(r.path);
-                if (assignedRung.has(r.path)) assignedRung.set(r.path, activeTier);
-                setThumbMap(r.path, thumbSrcFor(r.path, activeTier));
-              }
-            });
-
-            generatedCount = results.length;
-          }
-          for (const p of toGenerate) {
-            inFlightSet.delete(p);
-            if (!resultPaths.has(p)) failedSet.add(p);
-          }
-          // After the in-flight set is drained, so "idle" reads correctly.
-          progress.completed(generatedCount);
-        } catch (e) {
-          console.error("Thumbnail generation batch failed:", e);
-          for (const p of toGenerate) {
-            inFlightSet.delete(p);
-            failedSet.add(p);
-          }
-        } finally {
-          // `finally`, not a trailing statement: the early returns above (stale
-          // generation / abort) would otherwise wedge the slot for the rest of
-          // the session.
-          inFlightFetch = null;
-        }
-      })();
-      return true;
-    };
-
-    /** Walk the gallery warming thumbnails while idle. Silent, no progress. */
-    const warmBackground = () => {
-      if (dynamics.velocity() >= VELOCITY_SLOW) return;
-      // Start from the viewport, never from wherever the cursor happens to
-      // sit: after a jump the useful work is around the new position, and
-      // crawling up to it from behind buys nothing the user can see.
-      const firstVisible = startRow() * cols();
-      if (bgCursor < firstVisible) bgCursor = firstVisible;
-      if (bgCursor >= props.paths.length) return;
-
-      const bgNeeded: string[] = [];
-      const total = props.paths.length;
-      while (bgNeeded.length < SPECULATIVE_BATCH && bgCursor < total) {
-        const p = props.paths[bgCursor];
-        bgCursor++;
-        if (p && !assignedRung.has(p) && !failedSet.has(p)) {
-          bgNeeded.push(p);
-        }
-      }
-      if (bgNeeded.length === 0) return;
-
-      inFlightWarm = (async () => {
-        try {
-          await precacheThumbnails(bgNeeded);
-        } catch (e) {
-          console.error("Background precache failed:", e);
-        } finally {
-          inFlightWarm = null;
-        }
-      })();
-    };
-
-    const scheduleFetch = () => {
-      // Drain coalesced paths into needsGeneration (they're already there,
-      // but clear the coalesced set so new items can accumulate during next fetch).
-      coalescedPaths.clear();
-
-      // Evict far-from-viewport thumbnails up front. The branches below return
-      // early, so running eviction last would starve it for as long as there's
-      // work queued — and it's cheap.
-      evictFaraway();
-
-      // Mid-scrub: no generation, and above all no speculation. The projected
-      // landing zone is recomputed from a position that has already moved on by
-      // the time the batch is issued, and `landingWarmed` is cleared on every
-      // jump — which during a scrub is every frame — so the same paths would be
-      // re-warmed over and over. Eviction above is the only useful work here.
-      if (dynamics.warping()) return;
-
-      // During a fling, near-viewport generation is wasted work — those cells
-      // fly past unseen. Warm the projected landing zone instead; queued
-      // 404-generation drains on settle (with stale entries dropped).
-      const flinging = dynamics.velocity() > VELOCITY_FAST;
-      if (!flinging && !inFlightFetch && drainQueued()) return;
-
-      // Speculation waits for the cells the user is actually looking at. It
-      // all lands on the backend's one bounded decode pool, so anything
-      // started here comes straight out of the visible cells' budget.
-      if (inFlightFetch || inFlightWarm) return;
-      if (flinging) {
-        warmLandingZone();
-        return;
-      }
-      warmBackground();
-    };
-
     // scrollend fires when scrolling stops — replaces manual debounce.
     // Also covers native scrollbar drags and programmatic scrollTo().
     const onScrollEnd = () => {
       dynamics.markSettled();
-      scheduleFetch();
+      loop.schedule();
     };
     const detachScrollEnd = onScrollHost("scrollend", onScrollEnd);
-
-    // Background interval for precache/eviction when not actively scrolling.
-    const bgIntervalId = setInterval(() => {
-      if (!inFlightFetch || needsGeneration.size > 0) scheduleFetch();
-    }, 500);
 
     // Also fire immediately on generation change (jump/path change)
     createEffect(
       on(generation, () => {
-        scheduleFetch();
+        loop.schedule();
       }),
     );
 
@@ -936,7 +856,7 @@ export function GalleryGrid(props: GalleryGridProps) {
     // universal on mobile; scrollDynamics also flips `settled` true via its own
     // fling debounce, and that path had no fetch trigger — so a fast flick on a
     // browser without `scrollend` left cells blank until the 500ms poll.
-    createEffect(on(dynamics.settled, (s) => { if (s) scheduleFetch(); }, { defer: true }));
+    createEffect(on(dynamics.settled, (s) => { if (s) loop.schedule(); }, { defer: true }));
 
     // Listen for thumbnail invalidation (e.g. after rebuild). Thumbnail
     // responses are cacheable, so bump the epoch: every rebuilt URL must
@@ -945,12 +865,9 @@ export function GalleryGrid(props: GalleryGridProps) {
       setThumbMap(reconcile({}));
       assignedRung.clear();
       swapper.cancelAll();
-      needsGeneration.clear();
-      inFlightSet.clear();
-      failedSet.clear();
-      landingWarmed.clear();
-      urlVersions.clear();
-      versionEpoch++;
+      queue.reset();
+      versions.clear();
+      versions.bumpEpoch();
       bgCursor = 0;
       progress.reset();
       setGeneration((g) => g + 1);
@@ -982,8 +899,6 @@ export function GalleryGrid(props: GalleryGridProps) {
       detachWheel();
       window.removeEventListener("lightview:thumbnails-invalidated", onInvalidate);
       window.removeEventListener("lightview:scroll-to-index", onScrollToIndex);
-      clearInterval(bgIntervalId);
-      fetchAbort = true;
     });
   });
 
@@ -997,14 +912,9 @@ export function GalleryGrid(props: GalleryGridProps) {
     on(
       () => props.paths,
       (paths) => {
-        pathToIndex.clear();
-        for (let i = 0; i < paths.length; i++) {
-          pathToIndex.set(paths[i], i);
-        }
+        pathIndex.reindex(paths);
 
-        const gone = new Set<string>();
-        for (const p of Object.keys(thumbMap)) if (!pathToIndex.has(p)) gone.add(p);
-        for (const p of assignedRung.keys()) if (!pathToIndex.has(p)) gone.add(p);
+        const gone = pathIndex.absent(Object.keys(thumbMap), assignedRung.keys());
         if (gone.size > 0) {
           batch(() => {
             for (const p of gone) setThumbMap(p, undefined as any);
@@ -1012,24 +922,10 @@ export function GalleryGrid(props: GalleryGridProps) {
           for (const p of gone) {
             assignedRung.delete(p);
             swapper.cancel(p);
-            urlVersions.delete(p);
+            versions.forget(p);
           }
         }
-        const pruneAbsent = (s: Set<string>) => {
-          for (const p of s) if (!pathToIndex.has(p)) s.delete(p);
-        };
-        pruneAbsent(coalescedPaths);
-        pruneAbsent(inFlightSet);
-        pruneAbsent(failedSet);
-        pruneAbsent(landingWarmed);
-        let droppedQueued = 0;
-        for (const p of needsGeneration) {
-          if (!pathToIndex.has(p)) {
-            needsGeneration.delete(p);
-            droppedQueued++;
-          }
-        }
-        progress.dropped(droppedQueued);
+        progress.dropped(queue.prune(pathIndex.has));
         bgCursor = 0;
         recalcRange?.();
       },
@@ -1064,11 +960,8 @@ export function GalleryGrid(props: GalleryGridProps) {
       () => {
         assignedRung.clear();
         swapper.cancelAll();
-        needsGeneration.clear();
-        inFlightSet.clear();
-        failedSet.clear();
-        landingWarmed.clear();
-        urlVersions.clear();
+        queue.reset();
+        versions.clear();
         bgCursor = 0;
         const newTier = tier();
         const items = visibleItems();
@@ -1141,7 +1034,7 @@ export function GalleryGrid(props: GalleryGridProps) {
             >
               <For each={visiblePaths()}>
                 {(path) => {
-                  const index = () => pathToIndex.get(path) ?? -1;
+                  const index = () => pathIndex.indexOf(path) ?? -1;
                   return (
                     <ThumbnailCell
                       path={path}
