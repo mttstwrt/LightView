@@ -142,6 +142,14 @@ URL-assignment effect has already run for that update and will not fire again
 until the visible range moves, so wiping surviving cells blanks the grid until
 the next scroll — visible as the whole grid going grey after deleting one image.
 
+**A cell's URL, its rung, and its in-flight swap are one unit.** They live
+together in `lib/cellSources.ts` because dropping one without the others fails
+silently in both directions: drop the URL but keep the rung and the cell becomes
+permanently un-evictable, since the rung map is the index eviction walks; drop
+the rung but leave the swap running and an abandoned `Image` keeps fetching with
+nothing left to commit it to. Views call `evict`, `prune` or `clear` and get the
+whole tail; they never hold the three structures themselves.
+
 **Speculation is never free.** Landing-zone warms, look-ahead precache, and
 background crawls all land on the same bounded rayon pool as the cells the user
 is looking at. Both grids gate speculation behind "nothing the viewport is
@@ -157,7 +165,9 @@ four cold runs of a three-viewport scroll).
 64-image background batch could hold it for an entire session, leaving every
 subsequent visible request to the one-at-a-time generate-on-serve path. Both
 slots reset in `finally`, not as a trailing statement — the early returns for a
-stale generation would otherwise wedge the slot permanently.
+stale generation would otherwise wedge the slot permanently. Both live in
+`lib/fetchLoop.ts` now, which is also what re-arms the drain when a batch
+settles: the drain slot pokes the loop, the warm slot deliberately does not.
 
 ## Client-side caches, and how they lie
 

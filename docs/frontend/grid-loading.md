@@ -9,11 +9,6 @@ converged on the same architecture without yet being one component. The
 two-window shape at the centre of it is
 [decision 0007](../decisions/0007-two-zone-render-window.md).
 
-`GalleryGrid` (fixed square cells) and `JustifiedGrid` (aspect-preserving rows)
-are the two views of a gallery. They solve the same problem — stream thumbnails
-into a virtual scroller without burying the main thread — and they have
-converged on the same architecture without yet being one component.
-
 ## The shared architecture
 
 Both grids run the same seven-part machine:
@@ -31,14 +26,18 @@ Both grids run the same seven-part machine:
    they sit in the inner window with scrolling settled — usually off-screen, so
    the swap is not seen.
 4. **404-driven generation.** A cell's `<img>` points optimistically at the
-   tier URL. A cached thumbnail loads instantly; an uncached one 404s, and
-   `onError` queues it.
+   tier URL. A cached thumbnail loads instantly; one the backend cannot produce
+   404s, and `onError` queues it. Read this as the recovery path it is — both
+   thumbnail routes generate on a miss inside the request, so an uncached
+   thumbnail does *not* normally 404. See
+   [below](#404-driven-generation-is-a-recovery-path-not-how-a-gallery-fills).
 5. **Drain-time prioritization.** Queued paths are ranked against the *current*
    windows, never at enqueue time — by the time a batch drains, the scroll may
    be elsewhere entirely.
 6. **Two single-flight slots.** `inFlightFetch` for the visible drain,
-   `inFlightWarm` for speculation. See the invariants in
-   [`frontend/`](README.md) for why one slot was a session-killing bug.
+   `inFlightWarm` for speculation, both owned by `lib/fetchLoop.ts`. See the
+   invariants in [`frontend/`](README.md) for why one slot was a
+   session-killing bug.
 7. **Eviction.** Paths far outside the rendered range have their `thumbMap`
    entry dropped, so the `<img>` goes away and the DOM stays small. It does
    *not* hand the memory straight back — see below.
@@ -266,52 +265,146 @@ really has stopped, that timer expires a few tens of milliseconds later.
 | `wheelScroll.ts` | wheel handling and the Ctrl+wheel zoom hook |
 | `thumbRegeneration.ts` | the desktop-event/DOM-event pair that signals "these bytes changed" |
 | `justifiedLayout.ts`, `gridLayout.ts` | the geometry each grid needs |
+| `urlVersions.ts` | the `?v=` cache-bust counter per path, plus the epoch a rebuild shifts them all by |
+| `pathIndex.ts` | path → position, and the pruning a changed item list forces |
+| `thumbQueue.ts` | queued / in-flight / failed / warmed, and the protocol between a 404 and the bytes arriving |
+| `fetchLoop.ts` | the two single-flight slots and the order one pass runs them in |
+| `cellSources.ts` | what each cell shows, which rung it shows it at, and the swapper that changes one without a flash |
+| `loadedUrls.ts` | which URLs have been decoded once, so a recycled cell does not re-fade |
 
 This is the established pattern: shared grid behavior lives in `lib/` as a
 factory function taking accessors, and the components stay presentational plus
 their own policy.
 
-## What is still duplicated
+## How the two grids stay different
 
-Roughly 250–300 lines of near-identical logic remain, structurally the same in
-both files but differing in small ways that make a naive merge unsafe:
+The four modules at the bottom of that table are the convergence this page used
+to propose. They removed the duplication without merging the components, which
+was the point: the grids' policies genuinely differ, and the differences are now
+arguments rather than parallel code.
 
-| Concern | Difference between the two |
+| Concern | How the difference is expressed |
 |---|---|
-| `pathToIndex` maintenance + the prune-on-`props.paths` effect | JustifiedGrid additionally prunes `jhPrecached`, the pinned viewer path, and `measuredAspects` |
-| `evictFaraway` | index ranges come from `cols()` arithmetic vs. layout row lookups |
-| `warmLandingZone` | warms via `precacheThumbnails` vs. `ensureTierThumbnails(_, "j")` |
-| `drainQueued` | GalleryGrid's queue is a `Set<string>`; JustifiedGrid's is a `Map<string, ThumbTier>` because a cheap-rung cell must regenerate the tier that actually 404'd, not the level's target |
-| `warmBackground` | GalleryGrid crawls at any tier; JustifiedGrid is base-detail only, deliberately (measured: enabling it at high zoom more than doubled time-to-sharp) |
-| `scheduleFetch` | JustifiedGrid additionally gates on `blockingCount()` and has a look-ahead stage |
-| `onScrollToIndex` | row lookup by division vs. by layout search |
-| URL versioning (`urlVersions`, `versionEpoch`, `bumpVersion`) | identical |
+| Queue payload | `createThumbQueue()` in GalleryGrid, where every cell wants the same tier; `createThumbQueue<ThumbTier>()` in JustifiedGrid, where a cheap-rung cell must regenerate whichever tier actually 404'd rather than the level's target |
+| `evictFaraway` | index ranges from `cols()` arithmetic vs. layout row lookups — each grid passes its own function as `evict` |
+| `warmLandingZone` | `precacheThumbnails` vs. `ensureTierThumbnails(_, "j")`, as `warmLanding` |
+| Speculation | GalleryGrid's `speculate` is the background crawl; JustifiedGrid's tries the high-tier look-ahead first and falls through to a crawl that is base-detail only, deliberately (measured: enabling it at high zoom more than doubled time-to-sharp) |
+| Speculation brake | JustifiedGrid passes `blocked: () => blockingCount() > 0`; GalleryGrid has no equivalent and omits it |
+| Prune effect | each grid keeps its own, because JustifiedGrid additionally prunes `jhPrecached`, the pinned viewer path, and `measuredAspects` |
+| `onScrollToIndex` | row lookup by division vs. by layout search — untouched, and not worth sharing |
 
-### A convergence plan, if this is picked up
+One thing was deleted rather than extracted. GalleryGrid kept a `coalescedPaths`
+set alongside its queue, cleared at the top of every pass; a path only ever
+entered it together with `needsGeneration` and left it via the drain, so every
+membership test it guarded was already covered by the queued or in-flight set.
+Its one real effect was a bug: `onInvalidate` cleared the queue but not the
+coalesced set, so a path caught in between was blocked from re-queueing until
+the next pass.
 
-Do it in the direction the codebase already moves — extract primitives, do not
-merge the components. Suggested order, smallest risk first:
+### What a third view has to write, and what it inherits
 
-1. **`createUrlVersions()`** — `urlVersions` + `versionEpoch` + `bumpVersion` +
-   the `?v=` builder. Verbatim in both; no behavioral surface.
-2. **`createPathIndex(paths)`** — the `pathToIndex` map plus a
-   `pruneAbsent(...sets)` helper. Each grid keeps its own effect and passes its
-   own set list, so the extra sets JustifiedGrid prunes stay local.
-3. **`createThumbQueue()`** — the `needsGeneration` / `inFlightSet` /
-   `failedSet` / `landingWarmed` group with its queue-and-drain protocol.
-   Parameterize the queue value type so GalleryGrid's `Set` and
-   JustifiedGrid's tier-keyed `Map` are the same structure with `void` vs
-   `ThumbTier` payloads.
-4. **`createFetchLoop()`** — the two single-flight slots plus `scheduleFetch`'s
-   ordering (drain, then speculate), taking the warm strategies as callbacks.
+The split is meant to be: **the primitives own the bookkeeping that fails
+silently; the view owns its geometry and its policy.**
 
-Steps 1–2 are mechanical. Step 3 is where the real reduction is, and it is also
-where the grids' policies genuinely differ, so it needs the differences kept as
-parameters rather than flattened.
+Inherited whole — a new view constructs these and does not reimplement them:
+`cellSources` (URL store, rung map, swapper, and their teardown),
+`thumbQueue`, `urlVersions`, `pathIndex`, `fetchLoop`, `thumbSwap`,
+`thumbProgress`, `loadPriority`, `galleryControls`, `wheelScroll`,
+`thumbRegeneration`.
 
-**Verify it in a browser, not just with `tsc`.** [`build-and-verify.md`](../build-and-verify.md)
-describes driving the real SPA against `lightview-headless` with Playwright;
-these are exactly the code paths a type check cannot cover.
+Written per view, because it *is* the view: the layout, the range calculation
+that turns a scroll position into rendered/full windows, `evict`'s notion of
+"far away", what `drain` batches and at which tier, and what it speculates on.
+Those arrive as callbacks precisely so two views can disagree about them.
+
+Two things a new view must get right, both of which fail quietly:
+
+- **`drain` must issue its batch through `loop.fetch`**, or the completion
+  re-arm has nothing to hang off and the queue falls back to the poll.
+- **Every loop callback must tolerate running before the view has laid out.**
+  The poll starts when the loop is constructed — before `onMount` for a
+  component-scope call — so `evict` sees an empty layout at least once. Both
+  grids return early on a zero-row layout.
+
+One primitive does **not** carry over unchanged, and it is worth knowing before
+starting the canvas: `loadPriority.ts` ranks against contiguous *index* ranges,
+which is what a reading-order scroller has. A spiral canvas shows an off-centre
+2D window — several disjoint index runs — and wants ranking by distance from the
+viewport centre. That generalization is deliberately not written yet, since its
+shape is a guess until a second kind of view exists; the natural move is to lift
+the zone→rank mapping into a parameter and keep the current function as the
+range-based case.
+
+**Verify changes here in a browser, not just with `tsc`.**
+[`build-and-verify.md`](../build-and-verify.md) describes driving the real SPA
+against `lightview-headless` with Playwright; these are exactly the code paths a
+type check cannot cover.
+
+### Nothing re-armed the drain
+
+The loop had no continuation. `drainQueued()` issued one batch and returned, the
+slot was cleared in a `finally` that called nothing, and the only things that
+started another pass were `scrollend`, the settle effect, a generation bump, and
+a 500 ms poll. Against a still viewport with a deep queue that is batch, up to
+half a second of idle backend, batch — the backend finishing early bought
+nothing.
+
+Enqueueing had the mirror image of the problem, and a structural cause:
+`handleThumbError` is defined at component scope and `scheduleFetch` was a
+closure inside `onMount`, so a 404 *could not* reach the schedule even to ask.
+A landing that reveals a screenful of cold cells waited on the poll before
+anything was requested.
+
+`createFetchLoop` closes both. Its `fetch` slot pokes the loop when a batch
+settles, and `poke` is what a fresh miss calls. Pokes coalesce through a
+zero-delay timer rather than a microtask, because each `<img>` error handler is
+its own task — a microtask runs at the end of the one that scheduled it and
+would merge nothing.
+
+Measured on the loop in isolation, with five synthetic 20 ms batches queued:
+106 ms end to end, where the poll alone would have needed more than two
+seconds. A hundred pokes issued across two separate tasks collapsed to a single
+pass.
+
+**How much this is worth depends on something in the backend, and it is less
+than it looks.** See the next section.
+
+### 404-driven generation is a recovery path, not how a gallery fills
+
+Point 4 of the machine above describes the mechanism accurately and is easy to
+over-read. A cell does point its `<img>` optimistically at a tier URL, and an
+`onError` does queue generation — but a cold thumbnail rarely produces that
+error. Both `lightview://thumb` (`main.rs`) and `GET /thumb`
+(`http_server/routes.rs`) resolve through `thumb_serve::get_or_generate`, which
+looks the tier up, and *on a miss generates it inside the request*, with
+coalescing so concurrent requests for the same key decode once. It returns 404
+only after generation has genuinely failed, three attempts in.
+
+So a cold gallery fills from two places, and the 404 queue is neither: the
+inline generate-on-miss in each request, and the frontend's speculative batch
+warms (`precacheThumbnails`, `ensureTierThumbnails`), which exist precisely
+because the inline path is one decode per request. What reaches `needsGeneration`
+is the residue — sources that could not be decoded at all.
+
+Measured, driving the built SPA against `lightview-headless` over a cold
+1200-image gallery in Chromium: **880 thumbnail responses, none of them a 404**.
+The same run against the pre-extraction frontend gives the same answer, so this
+is a property of the backend, not of any recent change.
+
+Two consequences worth carrying:
+
+- The drain re-arm above bounds how fast the grid recovers from *failed*
+  generation. It does not speed up ordinary browsing, and a measurement that
+  claims it does is measuring the inline path.
+- If you are trying to make a cold gallery fill faster, the levers are
+  `get_or_generate`'s coalescer and pool, and the speculative warms. Not this
+  queue.
+
+The warm slot is deliberately **not** re-armed. Re-arming it would turn the
+background crawl from one batch per poll into a continuous one, which is exactly
+the "speculation is never free" invariant in [`frontend/`](README.md): it lands
+on the same bounded rayon pool as the cells on screen. The visible drain running
+back-to-back while speculation stays on the leash is the intended priority.
 
 ## The one thing that is genuinely different
 

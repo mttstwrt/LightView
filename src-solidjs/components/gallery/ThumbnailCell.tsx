@@ -9,6 +9,7 @@ import { hapticTick } from "../../lib/haptics";
 import { isTauri } from "../../lib/runtime";
 import { recordImageLoad, recordImageLoadStart, recordImageLoadSettled } from "../../lib/perfMonitor";
 import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
+import { hasUrlLoaded, markUrlLoaded } from "../../lib/loadedUrls";
 import { GifCanvas } from "../GifCanvas";
 
 interface ThumbnailCellProps {
@@ -37,17 +38,6 @@ interface ThumbnailCellProps {
   freeSize?: boolean;
 }
 
-// Module-level set of URLs that have already been loaded at least once.
-// Survives cell recycling so a revisited thumbnail won't re-fade.
-// Capped so a long session browsing huge galleries doesn't accumulate
-// URLs forever; on overflow the set resets and some cells fade once more.
-const LOADED_URLS_CAP = 4096;
-const loadedUrls = new Set<string>();
-
-export function markUrlLoaded(url: string): void {
-  if (loadedUrls.size >= LOADED_URLS_CAP) loadedUrls.clear();
-  loadedUrls.add(url);
-}
 
 // --- Grid GIF autoplay budget -------------------------------------------
 // Autoplaying a GIF swaps the cell's <img> to the full-resolution original,
@@ -251,12 +241,12 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       // actually loaded; a recycled cell (path changed) must not linger the
       // previous item's image.
       const [prevPath, prevUrl] = prev ?? [undefined, null];
-      if (url && prevUrl && url !== prevUrl && path === prevPath && loadedUrls.has(prevUrl)) {
+      if (url && prevUrl && url !== prevUrl && path === prevPath && hasUrlLoaded(prevUrl)) {
         setPrevSrc(prevUrl);
       } else {
         setPrevSrc(null);
       }
-      const seen = url ? loadedUrls.has(url) : false;
+      const seen = url ? hasUrlLoaded(url) : false;
       setLoaded(seen);
       // Timestamp every fresh load (seen URLs still skipped): the sample feeds
       // the always-on load-latency EWMA that sizes the grids' look-ahead
