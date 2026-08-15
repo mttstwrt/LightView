@@ -48,7 +48,16 @@ stays legible without this application. That is the whole reason this subsystem
 produces tags rather than a column.
 
 The tags land in the companion's `tags.plugins["location"]` bucket, and so in
-the `plugin.location` namespace once indexed. Nothing about this is a plugin —
+the `plugin.location` namespace once indexed. **Spaces in a name become
+underscores** — `United_States`, `New_York`, `Trinidad_and_Tobago` — because
+[the filter language](../query/README.md) tokenizes on whitespace and has no
+quoting, so a tag with a space in it cannot be named by any query at all: the
+parser reaches the second word with nothing to do and rejects the whole
+expression. This is not a new convention; it is what the ML taggers already
+emit (`hatsune_miku_(vocaloid)`). Only the tag spelling is normalised, and only
+whitespace — accents, apostrophes and hyphens (`Côte_d'Ivoire`,
+`Neuilly-sur-Seine`) tokenize fine and are left as they are, while the fields on
+`Place` keep the real names. Nothing about this is a plugin —
 see [decision 0011](../decisions/0011-location-names-are-companion-tags.md) for
 why the plugin *storage* convention is reused while the plugin *execution* path
 is not. A `PluginTagEntry` is a named, versioned bucket that a re-run replaces
@@ -147,14 +156,29 @@ is the companion writes: one atomic write-and-rename per geotagged file, which
 on a large library is the entire budget of this pass. That is why it runs in the
 background task rather than anywhere near the path that renders the grid.
 
+## Re-tagging when the output changes
+
+`TAGGER_VERSION` names both the gazetteer and the way tags are spelled, and is
+written into every bucket *and* into `gallery_meta` under
+`location_tagger_version`. On each open the stored value is compared against the
+current one; when they differ the per-file skip is suspended for exactly one
+pass and every geotagged file is re-resolved. Rewriting a bucket replaces it
+wholesale and bumps the companion's mtime, so the index pass that follows drops
+the superseded tags from `tag_index` without any special handling.
+
+Bump `TAGGER_VERSION` whenever emitted tags would change — a different dataset,
+a change to which fields are emitted, or a change to how names are spelled. The
+current `/2` revision is the underscore change described above: the gazetteer
+was untouched, but galleries tagged by the previous build carried names with
+spaces in them that no query could reach, and they had to be rewritten.
+
+The version is stamped only when every write in the pass succeeded. A file whose
+sidecar could not be written still carries the old version's tags, and recording
+success would strand it there permanently.
+
 ## Known limits
 
-Re-geocoding after a gazetteer upgrade is not automatic. `DATASET_VERSION` is
-recorded in each bucket so a future pass can recognise its own output, but
-nothing currently compares it — a dataset change would need the existing
-`plugin.location` tags cleared to take effect.
-
-Country names are matched exactly and case-sensitively at query time, like every
-other tag (see [`query/`](../query/README.md)), so `japan` does not match
-`Japan`. Autocomplete is case-insensitive and fuzzy, which is what covers this
-in practice.
+Names are matched exactly and case-sensitively at query time, like every other
+tag (see [`query/`](../query/README.md)), so `japan` does not match `Japan`.
+Autocomplete is case-insensitive and fuzzy, which is what covers this in
+practice.

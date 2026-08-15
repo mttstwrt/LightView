@@ -42,7 +42,7 @@ work as expected; a bare word with no operator searches every namespace.
 vacation                                    any namespace contains this tag
 user::vacation                              a specific namespace
 plugin.face-recognition::person:alice       a plugin namespace
-Japan  Kyoto                                place names, from geocoded GPS
+Japan  Kyoto  United_States                 place names, from geocoded GPS
 plugin.location::Georgia                    …narrowed, when a name is ambiguous
 NOT auto::indoor                            negation
 (user::a OR user::b) AND NOT auto::indoor   grouping
@@ -67,6 +67,14 @@ Dates accept a year, a year-month, or a full date, and expand to the inclusive
 range that spells: `date=2024` is all of 2024, not midnight on New Year's Day.
 The four-digit year requirement is deliberate — `24-01-01` is rejected rather
 than guessed at.
+
+**The tokenizer splits on whitespace and there is no quoting**, so no tag
+containing a space can be named by any query — the parser reaches the second
+word with nothing to do and rejects the expression rather than matching
+anything. Every tag writer therefore joins words with underscores, which is
+where `hatsune_miku_(vocaloid)` and `United_States` both come from. Adding
+quoted strings to the language would lift the restriction; until then, a tag
+with a space in it is unreachable, not merely awkward.
 
 Place names are ordinary tags, not a term of their own. Geotagged media is
 reverse-geocoded at gallery open and the country, region, and city names are

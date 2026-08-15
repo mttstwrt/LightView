@@ -34,9 +34,16 @@ use reverse_geocoder::ReverseGeocoder;
 
 mod countries;
 
-/// Recorded as the `version` of the companion tag bucket, so a future dataset
-/// swap can tell its own output apart from this one's.
-pub const DATASET_VERSION: &str = "geonames-cities1000";
+/// Recorded as the `version` of the companion tag bucket, and mirrored into
+/// `gallery_meta` so a gallery tagged by an older build can be spotted and
+/// re-tagged.
+///
+/// **Bump this whenever the emitted tags would change** — a different gazetteer,
+/// a change to which fields are emitted, or a change to how names are spelled.
+/// The trailing revision exists for the second kind: the dataset is unchanged,
+/// but names gained underscores (see [`Place::tags`]), and every gallery tagged
+/// before that needed its old spellings replaced.
+pub const TAGGER_VERSION: &str = "geonames-cities1000/2";
 
 /// Mean Earth radius, IUGG. Only used to express the two ceilings below in
 /// kilometres instead of the k-d tree's unit-sphere units.
@@ -66,18 +73,38 @@ pub struct Place {
 impl Place {
     /// The tag values to write, coarse to fine and deduplicated.
     ///
+    /// **Spaces become underscores** — `United States` is written
+    /// `United_States`. The filter language tokenizes on whitespace and has no
+    /// quoting, so a tag containing a space cannot be named by any query: the
+    /// parser reaches the second word with nothing to do and fails. Underscores
+    /// are also what the existing ML taggers emit (`hatsune_miku_(vocaloid)`),
+    /// so this is the tree's convention rather than a new one. The fields on
+    /// [`Place`] keep the real names; only the tag spelling is normalised.
+    ///
     /// Deduplication is not cosmetic: city-states and same-named capitals
     /// ("Singapore", "Kyoto" city inside "Kyoto" prefecture) would otherwise
-    /// write the identical string two or three times into one bucket.
+    /// write the identical string two or three times into one bucket. It runs
+    /// *after* normalisation, so two fields differing only in whitespace still
+    /// collapse to one tag.
     pub fn tags(&self) -> Vec<String> {
         let mut tags: Vec<String> = Vec::with_capacity(3);
         for value in [&self.country, &self.region, &self.city].into_iter().flatten() {
-            if !tags.iter().any(|existing| existing == value) {
-                tags.push(value.clone());
+            let tag = as_tag(value);
+            if !tags.iter().any(|existing| *existing == tag) {
+                tags.push(tag);
             }
         }
         tags
     }
+}
+
+/// Spell a place name as something the filter language can name: collapse each
+/// run of whitespace to a single underscore. Every other character is left
+/// alone — accents, apostrophes and hyphens (`Côte d'Ivoire`,
+/// `Neuilly-sur-Seine`) all tokenize fine, so mangling them would only make
+/// tags harder to read and to type.
+fn as_tag(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join("_")
 }
 
 fn geocoder() -> &'static ReverseGeocoder {
@@ -153,6 +180,47 @@ mod tests {
         assert_eq!(place.country.as_deref(), Some("United States"));
         assert_eq!(place.region.as_deref(), Some("New York"));
         assert_eq!(place.city.as_deref(), Some("Manhattan"));
+        // ...but the *tags* must be nameable by a whitespace-tokenized query.
+        assert_eq!(
+            place.tags(),
+            vec![
+                "United_States".to_string(),
+                "New_York".to_string(),
+                "Manhattan".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tags_replace_spaces_with_underscores() {
+        // The filter language splits on whitespace and cannot quote, so a tag
+        // with a space in it is unreachable by any query.
+        assert_eq!(as_tag("United States"), "United_States");
+        assert_eq!(as_tag("Trinidad and Tobago"), "Trinidad_and_Tobago");
+        assert_eq!(as_tag("South Georgia and the South Sandwich Islands"),
+                   "South_Georgia_and_the_South_Sandwich_Islands");
+        // Runs of whitespace collapse rather than producing empty segments.
+        assert_eq!(as_tag("  New   York  "), "New_York");
+    }
+
+    #[test]
+    fn tags_leave_other_punctuation_alone() {
+        // These already tokenize as single words; mangling them would only make
+        // them harder to read and type.
+        assert_eq!(as_tag("Côte d'Ivoire"), "Côte_d'Ivoire");
+        assert_eq!(as_tag("Neuilly-sur-Seine"), "Neuilly-sur-Seine");
+        assert_eq!(as_tag("Ile-de-France"), "Ile-de-France");
+    }
+
+    #[test]
+    fn dedup_runs_after_normalisation() {
+        // Two fields that differ only in whitespace must not both be written.
+        let place = Place {
+            country: Some("New York".into()),
+            region: Some("New  York".into()),
+            city: None,
+        };
+        assert_eq!(place.tags(), vec!["New_York"]);
     }
 
     #[test]
