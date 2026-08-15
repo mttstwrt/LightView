@@ -48,13 +48,24 @@ export interface FetchLoop {
   fetch(work: () => Promise<void>): void;
   /** Run `work` in the speculation slot. */
   warm(work: () => Promise<void>): void;
-  fetching(): boolean;
-  warming(): boolean;
   /** True once the view is being torn down — long-running work should bail
    *  rather than write into a store that is about to be disposed. */
   aborted(): boolean;
 }
 
+/**
+ * Two obligations on the caller, both of which fail quietly rather than loudly:
+ *
+ * - **`drain` must issue its batch through `fetch`.** The completion re-arm
+ *   hangs off that slot, so a `drain` that returns true without going through
+ *   `fetch` leaves the queue waiting on the poll — which still works, just at
+ *   the pace this module exists to improve on.
+ * - **Every callback must tolerate being called before the view has laid
+ *   anything out.** The poll starts when the loop is constructed, which for a
+ *   component-scope call is before `onMount`, so `evict` in particular runs
+ *   against an empty layout at least once. Both grids return early on a
+ *   zero-row layout; a new view needs the same guard.
+ */
 export function createFetchLoop(opts: {
   /** Drop state for cells far outside the rendered range. Runs on every pass,
    *  before the early returns below, because those return often enough that
@@ -179,8 +190,6 @@ export function createFetchLoop(opts: {
     poke,
     fetch,
     warm,
-    fetching: () => inFlightFetch !== null,
-    warming: () => inFlightWarm !== null,
     aborted: () => aborted,
   };
 }

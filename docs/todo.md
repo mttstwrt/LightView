@@ -348,10 +348,17 @@ has a pattern for: behaviour lives in `lib/` as factory functions taking
 accessors (`scrollDynamics.ts`, `loadPriority.ts`, `thumbSwap.ts`, …), each
 component keeping its own policy. That is now true of the loading machine as
 well — [D1](#d1-250300-duplicated-lines-between-the-two-grids) extracted
-`urlVersions`, `pathIndex`, `thumbQueue` and `fetchLoop` — so the canvas is the
-first view that can consume it rather than a third copy of it. It supplies its
-own `evict`, `drain` and `speculate` against spiral geometry; everything else it
-inherits. See [`grid-loading.md`](frontend/grid-loading.md).
+`urlVersions`, `pathIndex`, `thumbQueue`, `fetchLoop` and `cellSources` — so the
+canvas is the first view that can consume it rather than a third copy of it. It
+supplies its own layout, range calculation, `evict`, `drain` and `speculate`
+against spiral geometry; everything else it inherits.
+
+One thing it will have to change rather than reuse: `loadPriority.ts` ranks
+against contiguous *index* ranges, which is what a reading-order scroller has. A
+spiral shows an off-centre 2D window — several disjoint index runs — and wants
+ranking by distance from the viewport centre. Lift the zone→rank mapping into a
+parameter and keep the current function as the range-based case.
+[`grid-loading.md`](frontend/grid-loading.md) has the full inherit/write split.
 
 ### C3. A virtual folder view
 
@@ -391,8 +398,11 @@ and each one keeping the grids' policy differences as arguments:
 `urlVersions.ts` (the `?v=` counter and its epoch), `pathIndex.ts` (path →
 position, and pruning), `thumbQueue.ts` (queued / in-flight / failed / warmed,
 parameterized on the payload so GalleryGrid carries none and JustifiedGrid
-carries a `ThumbTier`), and `fetchLoop.ts` (the two single-flight slots and the
-order one pass runs them in). Net ~370 lines out of the two components.
+carries a `ThumbTier`), `fetchLoop.ts` (the two single-flight slots and the
+order one pass runs them in), and `cellSources.ts` (a cell's URL, its rung and
+its in-flight swap, which only make sense together). `markUrlLoaded` moved to
+`lib/loadedUrls.ts` on the way, so `lib/` no longer imports from a component.
+Net ~440 lines out of the two components.
 
 One thing was deleted rather than moved: GalleryGrid's `coalescedPaths` set was
 redundant with the queued and in-flight sets on every path that reached it, and

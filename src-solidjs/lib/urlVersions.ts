@@ -26,8 +26,14 @@ export interface UrlVersions {
   forget(path: string): void;
   /** Shift every path's effective version at once (a rebuild). */
   bumpEpoch(): void;
-  /** Reset every counter. Leaves the epoch alone, so URLs stay distinct from
-   *  any the browser cached before the last `bumpEpoch()`. */
+  /**
+   * Reset every counter, leaving the epoch alone. This does **not** guarantee
+   * a fresh URL: at epoch 0 a path that was on `?v=3` goes back to the bare
+   * URL, which the browser may still hold bytes for. It is only safe where the
+   * URL is changing for another reason anyway — a tier change moves the tier
+   * segment, so the old bytes are not reachable by the new URL. When the bytes
+   * behind an unchanged URL have changed, pair it with `bumpEpoch()`.
+   */
   clear(): void;
 }
 

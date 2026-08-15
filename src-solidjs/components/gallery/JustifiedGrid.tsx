@@ -32,14 +32,14 @@ import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../.
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
 import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
-import { createThumbSwapper } from "../../lib/thumbSwap";
 import { VIEWER_PATH_EVENT } from "../../lib/viewerTransition";
 import { pickByPriority } from "../../lib/loadPriority";
 import { createUrlVersions } from "../../lib/urlVersions";
 import { createPathIndex } from "../../lib/pathIndex";
 import { createThumbQueue } from "../../lib/thumbQueue";
 import { createFetchLoop } from "../../lib/fetchLoop";
-import { ThumbnailCell, markUrlLoaded } from "./ThumbnailCell";
+import { createCellSources } from "../../lib/cellSources";
+import { ThumbnailCell } from "./ThumbnailCell";
 
 interface JustifiedGridProps {
   paths: string[];
@@ -288,7 +288,6 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   const [viewStartRow, setViewStartRow] = createSignal(0);
   const [viewEndRow, setViewEndRow] = createSignal(0);
   const [generation, setGeneration] = createSignal(0);
-  const [thumbMap, setThumbMap] = createStore<Record<string, string>>({});
 
   let containerRef: HTMLDivElement | undefined;
 
@@ -365,12 +364,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Thumbnail streaming state (lazy "j" tier generation)
   // -----------------------------------------------------------------------
 
-  // Paths with a URL in thumbMap → which rung that URL serves. "cheap" is the
-  // base "j" tier assigned during flings at mid/high detail; "full" is
-  // whatever thumbSrcFor picks for the current detail level (j / jm / jh /
-  // fit-original). Cheap cells upgrade once scrolling settles.
+  // A cell's rung: "cheap" is the base "j" tier assigned during flings at
+  // mid/high detail; "full" is whatever thumbSrcFor picks for the current
+  // detail level (j / jm / jh / fit-original). Cheap cells upgrade once
+  // scrolling settles. The registry itself is created below, once
+  // `clearAwaiting` exists for it to call on eviction.
   type Rung = "cheap" | "full";
-  const assignedRung = new Map<string, Rung>();
   // 404 → generation bookkeeping (queued / in flight / failed / warmed). The
   // queue's payload is the tier whose URL actually 404'd, so the drain
   // regenerates *that* tier. Keying it on the path alone and generating
@@ -441,6 +440,18 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     for (const at of awaitingFull.values()) if (now - at < AWAIT_BLOCK_MS) n++;
     return n;
   };
+  // What each cell is showing and at which rung, plus the off-DOM swapper
+  // that upgrades one without a skeleton flash. Evicting a cell also releases
+  // its hold on the look-ahead: a cell that has gone away is no longer
+  // something the viewport is waiting on, and leaving it in `awaitingFull`
+  // would gate speculation on an image nobody will ever see.
+  const cells = createCellSources<Rung>({
+    generation,
+    onMiss: (path) => handleThumbError(path),
+    onEvict: clearAwaiting,
+  });
+  onCleanup(() => cells.cancelAll());
+
   let bgCursor = 0;
   let recalcRange: (() => void) | undefined;
 
@@ -476,12 +487,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // (bytes changed) clears everything so stale bytes can't linger.
   const resetStreaming = (keepDisplayed = false) => {
     if (!keepDisplayed) {
-      setThumbMap(reconcile({}));
       versions.clear();
       versions.bumpEpoch();
     }
-    assignedRung.clear();
-    swapper.cancelAll();
+    cells.clear({ keepUrls: keepDisplayed });
     awaitingFull.clear();
     setAwaitingCount(0);
     queue.reset();
@@ -524,7 +533,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
    *  404'd. Cheap-rung cells always show the base "j" tier, whatever the
    *  detail level says the full source should be. */
   const missingTierFor = (path: string): ThumbTier =>
-    assignedRung.get(path) === "cheap" ? "j" : thumbTier();
+    cells.rungOf(path) === "cheap" ? "j" : thumbTier();
 
   const handleThumbError = (path: string) => {
     // Cells served their original file aren't thumbnail-backed — a load error
@@ -534,7 +543,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // Failed or not, this cell has stopped waiting — it must not hold the
     // look-ahead back forever.
     clearAwaiting(path);
-    if (assignedRung.get(path) !== "cheap" && servesOriginal(path)) return;
+    if (cells.rungOf(path) !== "cheap" && servesOriginal(path)) return;
     // Re-queuing an already-queued path re-aims it at whatever the cell shows
     // now — a cell can be upgraded between the miss and the drain — and
     // reports false, so only a genuinely fresh miss counts.
@@ -549,49 +558,17 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Regeneration / one-shot invalidation listener.
   onThumbRegenerated((p) => {
     versions.bump(p);
-    if (assignedRung.has(p)) {
-      assignedRung.set(p, "full");
-      setThumbMap(p, thumbSrcFor(p));
-    }
+    if (!cells.has(p)) return;
+    cells.setRung(p, "full");
+    cells.point(p, thumbSrcFor(p));
   });
-
-  // Off-DOM decode-then-swap (shared helper) for cells that already show an
-  // image — zoom tier changes and cheap-rung upgrades. Swaps are dropped if
-  // the cell was evicted or the path list changed meanwhile, and cancelled
-  // per-path on eviction / wholesale on resets. `markUrlLoaded` before the
-  // swap suppresses the cell's fade-in, since the bytes are already decoded.
-  const swapper = createThumbSwapper({
-    generation,
-    isCurrent: (path, gen) => generation() === gen && assignedRung.has(path),
-    apply: (path, url) => {
-      markUrlLoaded(url);
-      setThumbMap(path, url);
-    },
-    onMiss: handleThumbError,
-  });
-  onCleanup(() => swapper.cancelAll());
-
-  // Point a cell at `url`. When the cell has no image yet (first paint, a
-  // freshly scrolled-in row) the URL is assigned directly — a skeleton while
-  // it loads is correct. When the cell *already shows* an image, decode-then-
-  // swap so the previous image stays on screen with no skeleton flash; a cold
-  // new URL (404) leaves the old image up and queues generation, which the
-  // fetch loop swaps in once warm.
-  const assignSrc = (path: string, url: string) => {
-    const current = thumbMap[path];
-    if (!current || current === url) {
-      setThumbMap(path, url);
-      return;
-    }
-    swapper.swap(path, url);
-  };
 
   // Assign protocol URLs as soon as cells become visible. Cached thumbs load
   // instantly; uncached ones 404 → onError → queued for generation.
   createEffect(on(
     [visibleCells, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow, pinnedPath,
      viewStartRow, viewEndRow, awaitingCount, dynamics.warping],
-    ([cells, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting, warping]) => {
+    ([visible, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting, warping]) => {
     // While the WebKitGTK decode gate is up, leave new cells on their
     // placeholder so the main thread isn't buried under image decodes
     // mid-scroll. When it releases this re-runs and assigns whatever's now on
@@ -643,21 +620,21 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       const forced = cell.path === pinned;
       const inFull = forced || onScreenOf(cell.row) || (cell.row >= fullStart && cell.row < fullEnd);
       const takeFull = forced || mayTakeFull;
-      const cur = assignedRung.get(cell.path);
+      const cur = cells.rungOf(cell.path);
       if (cur === undefined) {
         const rung: Rung =
           degradable && !forced && (cheapScroll || !inFull || !takeFull) ? "cheap" : "full";
-        assignedRung.set(cell.path, rung);
+        cells.setRung(cell.path, rung);
         if (rung === "full") markAwaiting(cell.path);
-        assignSrc(cell.path, thumbSrcFor(cell.path, rung === "cheap"));
+        cells.assign(cell.path, thumbSrcFor(cell.path, rung === "cheap"));
       } else if (cur === "cheap" && inFull && takeFull && (forced || !cheapScroll)) {
-        assignedRung.set(cell.path, "full");
+        cells.setRung(cell.path, "full");
         markAwaiting(cell.path);
-        assignSrc(cell.path, thumbSrcFor(cell.path));
+        cells.assign(cell.path, thumbSrcFor(cell.path));
       }
     };
 
-    const all = cells as ReturnType<typeof visibleCells>;
+    const all = visible as ReturnType<typeof visibleCells>;
     const lookAhead: typeof all = [];
     for (const cell of all) {
       if (onScreenOf(cell.row) || cell.path === pinned) apply(cell, true);
@@ -688,20 +665,11 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     const keepEnd = lastKeepRow ? lastKeepRow.cells[lastKeepRow.cells.length - 1].index + 1 : props.paths.length;
 
     const toEvict: string[] = [];
-    for (const p of assignedRung.keys()) {
+    for (const p of cells.held()) {
       const idx = pathIndex.indexOf(p);
       if (idx !== undefined && (idx < keepStart || idx >= keepEnd)) toEvict.push(p);
     }
-    if (toEvict.length > 0) {
-      batch(() => {
-        for (const p of toEvict) {
-          setThumbMap(p, undefined as any);
-          assignedRung.delete(p);
-          swapper.cancel(p);
-          clearAwaiting(p);
-        }
-      });
-    }
+    cells.evict(toEvict);
   };
 
   // A fling has a predictable destination — warm the base "j" tier around
@@ -731,7 +699,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       if (!row) continue;
       for (const cell of row.cells) {
         const p = props.paths[cell.index];
-        if (!p || assignedRung.has(p) || !queue.warmable(p)) continue;
+        if (!p || cells.has(p) || !queue.warmable(p)) continue;
         queue.markWarmed(p);
         want.push(p);
       }
@@ -816,8 +784,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
             // render buffer — not just the inner window — up to the 2560px
             // tier, which is both a wall of decodes and the wrong image for
             // a cell the ladder had deliberately put on the cheap rung.
-            const rung = assignedRung.get(p);
-            if (rung) setThumbMap(p, thumbSrcFor(p, rung === "cheap"));
+            const rung = cells.rungOf(p);
+            if (rung) cells.point(p, thumbSrcFor(p, rung === "cheap"));
           }
         });
         queue.settle(toGenerate);
@@ -892,7 +860,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     while (bgNeeded.length < SPECULATIVE_BATCH && bgCursor < props.paths.length) {
       const p = props.paths[bgCursor];
       bgCursor++;
-      if (p && !assignedRung.has(p) && !queue.hasFailed(p)) bgNeeded.push(p);
+      if (p && !cells.has(p) && !queue.hasFailed(p)) bgNeeded.push(p);
     }
     if (bgNeeded.length === 0) return;
     loop.warm(async () => {
@@ -1025,9 +993,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     const onViewerPath = (e: Event) => {
       const viewed = (e as CustomEvent<string | null>).detail;
       setPinnedPath(viewed ?? null);
-      if (!viewed || assignedRung.get(viewed) !== "cheap") return;
-      assignedRung.set(viewed, "full");
-      assignSrc(viewed, thumbSrcFor(viewed));
+      if (!viewed || cells.rungOf(viewed) !== "cheap") return;
+      cells.setRung(viewed, "full");
+      cells.assign(viewed, thumbSrcFor(viewed));
       loop.schedule();
     };
     window.addEventListener(VIEWER_PATH_EVENT, onViewerPath);
@@ -1065,22 +1033,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // (skipping cells that still had a rung) and won't fire again until the
   // visible range moves — wiping surviving cells here would blank the grid
   // until the next scroll (e.g. after deleting one image). Cells whose path
-  // survives keep their thumbMap URL and decoded <img>.
+  // survives keeps its URL and decoded <img>.
   createEffect(on(() => props.paths, (paths) => {
     pathIndex.reindex(paths);
 
-    const gone = pathIndex.absent(Object.keys(thumbMap), assignedRung.keys());
-    if (gone.size > 0) {
-      batch(() => {
-        for (const p of gone) setThumbMap(p, undefined as any);
-      });
-      for (const p of gone) {
-        assignedRung.delete(p);
-        swapper.cancel(p);
-        versions.forget(p);
-        clearAwaiting(p);
-      }
-    }
+    // Unlike an eviction, these paths are not coming back — an evicted cell
+    // keeps its version so a scroll back reuses the same URL.
+    for (const p of cells.prune(pathIndex.has)) versions.forget(p);
     pathIndex.pruneAbsent(jhPrecached);
     const pinned = untrack(pinnedPath);
     if (pinned && !pathIndex.has(pinned)) setPinnedPath(null);
@@ -1140,7 +1099,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                   >
                     <ThumbnailCell
                       path={path}
-                      thumbSrc={thumbMap[path] ?? null}
+                      thumbSrc={cells.srcOf(path)}
                       tier={thumbTier()}
                       freeSize={true}
                       durationSec={durationByPath().get(path) ?? null}
@@ -1154,7 +1113,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                         recordMeasuredAspect(path, w, h);
                         // A full-rung cell has painted — release its hold on
                         // the look-ahead.
-                        if (assignedRung.get(path) === "full") clearAwaiting(path);
+                        if (cells.rungOf(path) === "full") clearAwaiting(path);
                       }}
                     />
                   </div>

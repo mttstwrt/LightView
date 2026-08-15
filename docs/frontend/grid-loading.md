@@ -269,6 +269,8 @@ really has stopped, that timer expires a few tens of milliseconds later.
 | `pathIndex.ts` | path → position, and the pruning a changed item list forces |
 | `thumbQueue.ts` | queued / in-flight / failed / warmed, and the protocol between a 404 and the bytes arriving |
 | `fetchLoop.ts` | the two single-flight slots and the order one pass runs them in |
+| `cellSources.ts` | what each cell shows, which rung it shows it at, and the swapper that changes one without a flash |
+| `loadedUrls.ts` | which URLs have been decoded once, so a recycled cell does not re-fade |
 
 This is the established pattern: shared grid behavior lives in `lib/` as a
 factory function taking accessors, and the components stay presentational plus
@@ -298,6 +300,40 @@ membership test it guarded was already covered by the queued or in-flight set.
 Its one real effect was a bug: `onInvalidate` cleared the queue but not the
 coalesced set, so a path caught in between was blocked from re-queueing until
 the next pass.
+
+### What a third view has to write, and what it inherits
+
+The split is meant to be: **the primitives own the bookkeeping that fails
+silently; the view owns its geometry and its policy.**
+
+Inherited whole — a new view constructs these and does not reimplement them:
+`cellSources` (URL store, rung map, swapper, and their teardown),
+`thumbQueue`, `urlVersions`, `pathIndex`, `fetchLoop`, `thumbSwap`,
+`thumbProgress`, `loadPriority`, `galleryControls`, `wheelScroll`,
+`thumbRegeneration`.
+
+Written per view, because it *is* the view: the layout, the range calculation
+that turns a scroll position into rendered/full windows, `evict`'s notion of
+"far away", what `drain` batches and at which tier, and what it speculates on.
+Those arrive as callbacks precisely so two views can disagree about them.
+
+Two things a new view must get right, both of which fail quietly:
+
+- **`drain` must issue its batch through `loop.fetch`**, or the completion
+  re-arm has nothing to hang off and the queue falls back to the poll.
+- **Every loop callback must tolerate running before the view has laid out.**
+  The poll starts when the loop is constructed — before `onMount` for a
+  component-scope call — so `evict` sees an empty layout at least once. Both
+  grids return early on a zero-row layout.
+
+One primitive does **not** carry over unchanged, and it is worth knowing before
+starting the canvas: `loadPriority.ts` ranks against contiguous *index* ranges,
+which is what a reading-order scroller has. A spiral canvas shows an off-centre
+2D window — several disjoint index runs — and wants ranking by distance from the
+viewport centre. That generalization is deliberately not written yet, since its
+shape is a guess until a second kind of view exists; the natural move is to lift
+the zone→rank mapping into a parameter and keep the current function as the
+range-based case.
 
 **Verify changes here in a browser, not just with `tsc`.**
 [`build-and-verify.md`](../build-and-verify.md) describes driving the real SPA

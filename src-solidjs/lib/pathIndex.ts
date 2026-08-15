@@ -29,9 +29,6 @@ export interface PathIndex {
   has(path: string): boolean;
   /** Rebuild against a new list. Call before any pruning. */
   reindex(paths: string[]): void;
-  /** Paths drawn from `sources` that are no longer in the list, deduplicated —
-   *  the set a view must drop URLs, decodes and versions for. */
-  absent(...sources: Iterable<string>[]): Set<string>;
   /** Drop every absent key from each collection, in place. */
   pruneAbsent(...collections: PathKeyed[]): void;
 }
@@ -47,13 +44,6 @@ export function createPathIndex(): PathIndex {
     reindex(paths) {
       index.clear();
       for (let i = 0; i < paths.length; i++) index.set(paths[i], i);
-    },
-    absent(...sources) {
-      const gone = new Set<string>();
-      for (const source of sources) {
-        for (const path of source) if (!has(path)) gone.add(path);
-      }
-      return gone;
     },
     pruneAbsent(...collections) {
       for (const c of collections) {

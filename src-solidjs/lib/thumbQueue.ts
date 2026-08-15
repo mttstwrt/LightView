@@ -91,7 +91,13 @@ export function createThumbQueue<T = void>(): ThumbQueue<T> {
     },
     settle(paths, isFailed) {
       for (const p of paths) {
-        flying.delete(p);
+        // Only settle what this queue still owns. A batch outlives the item
+        // list it was issued against: `prune` can drop a path mid-flight
+        // because the file was deleted or filtered away, and marking it failed
+        // on return would resurrect a path that has left the gallery into a
+        // set nothing clears until the next prune — where it silently
+        // suppresses generation if the path ever comes back.
+        if (!flying.delete(p)) continue;
         if (isFailed?.(p)) failed.add(p);
       }
     },
