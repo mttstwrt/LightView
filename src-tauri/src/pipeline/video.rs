@@ -38,6 +38,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::thumbnailer::ThumbError;
+use crate::companion::schema::Location;
 
 /// Wall-clock ceiling for an `ffprobe` call.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -57,6 +58,10 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration: Option<f64>,
+    /// Where the clip was shot, when the container carries it. Decimal
+    /// degrees, WGS-84 — the same convention as the EXIF path, so both feed
+    /// `media_meta.gps_lat/gps_lon` without conversion.
+    pub location: Option<Location>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +177,82 @@ fn probe_uncached(path: &Path) -> Result<VideoInfo, ThumbError> {
     let duration = positive_number(stream.get("duration"))
         .or_else(|| positive_number(json.get("format").and_then(|f| f.get("duration"))));
 
-    Ok(VideoInfo { width, height, duration })
+    let location = json
+        .get("format")
+        .and_then(|f| f.get("tags"))
+        .and_then(location_from_tags);
+
+    Ok(VideoInfo { width, height, duration, location })
+}
+
+/// Pull a shooting location out of a container's format tags.
+///
+/// Phones spell the key several ways — the bare `location`, a language-suffixed
+/// `location-eng`, and Apple's `com.apple.quicktime.location.ISO6709` — so
+/// rather than enumerate vendor prefixes, every key *containing* "location" is
+/// a candidate and the first whose value actually parses wins.
+///
+/// That ordering matters: the loose key match also catches siblings like
+/// `com.apple.quicktime.location.accuracy.horizontal`, which is a bare number.
+/// Selecting on a successful parse rather than on the key rejects those without
+/// having to know their names, and makes the result independent of the order
+/// ffprobe happens to emit tags in.
+///
+/// This costs nothing extra to fetch: `probe_uncached` already asks for
+/// `-show_format`, so these tags were being parsed and discarded.
+fn location_from_tags(tags: &serde_json::Value) -> Option<Location> {
+    tags.as_object()?
+        .iter()
+        .filter(|(key, _)| key.to_ascii_lowercase().contains("location"))
+        .filter_map(|(_, value)| value.as_str())
+        .find_map(parse_iso6709)
+}
+
+/// Parse an ISO 6709 point into decimal degrees.
+///
+/// The forms in the wild are `+35.6897+139.6922/` and
+/// `+35.6897+139.6922+044.000/`, optionally followed by a CRS suffix after the
+/// solidus. Fields are self-delimiting: each begins with its own sign, which is
+/// what makes splitting on `+`/`-` correct rather than a hack.
+///
+/// Only the decimal-degree form is accepted. ISO 6709 also permits packed
+/// degrees-minutes (`+3540.00`), which no camera we have seen writes, and which
+/// would be silently wrong by a factor of sixty if misread — the latitude and
+/// longitude range checks below reject it rather than let it through.
+fn parse_iso6709(text: &str) -> Option<Location> {
+    // Anything after the solidus is a CRS name, not a coordinate.
+    let body = text.trim().split('/').next()?.trim();
+
+    let mut fields: Vec<&str> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (index, ch) in body.char_indices() {
+        if ch == '+' || ch == '-' {
+            if let Some(from) = start {
+                fields.push(&body[from..index]);
+            }
+            start = Some(index);
+        }
+    }
+    if let Some(from) = start {
+        fields.push(&body[from..]);
+    }
+
+    if fields.len() < 2 {
+        return None;
+    }
+    let lat: f64 = fields[0].parse().ok()?;
+    let lon: f64 = fields[1].parse().ok()?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    // A failed GPS lock is written as exactly zero by some encoders, the same
+    // convention the EXIF path already rejects.
+    if lat == 0.0 && lon == 0.0 {
+        return None;
+    }
+
+    let alt = fields.get(2).and_then(|field| field.parse::<f64>().ok());
+    Some(Location { lat, lon, alt })
 }
 
 /// ffprobe reports numbers as JSON strings ("12.345") in most writers but as
@@ -395,6 +475,82 @@ fn run(mut cmd: Command, timeout: Duration, label: &str) -> Result<Vec<u8>, Thum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_iso6709_with_and_without_altitude() {
+        // The two forms iPhones and Android phones actually write.
+        let flat = parse_iso6709("+35.6897+139.6922/").expect("lat/lon form");
+        assert!((flat.lat - 35.6897).abs() < 1e-9);
+        assert!((flat.lon - 139.6922).abs() < 1e-9);
+        assert_eq!(flat.alt, None);
+
+        let with_alt = parse_iso6709("+35.6897+139.6922+044.000/").expect("lat/lon/alt form");
+        assert_eq!(with_alt.alt, Some(44.0));
+    }
+
+    #[test]
+    fn parses_iso6709_southern_and_western_hemispheres() {
+        let loc = parse_iso6709("-33.8688-151.2093/").expect("negative signs delimit too");
+        assert!((loc.lat + 33.8688).abs() < 1e-9);
+        assert!((loc.lon + 151.2093).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ignores_a_crs_suffix() {
+        let loc = parse_iso6709("+40.7128-074.0060/CRSWGS_84").expect("suffix is not a field");
+        assert!((loc.lat - 40.7128).abs() < 1e-9);
+        assert!((loc.lon + 74.0060).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_packed_degrees_minutes_rather_than_misreading_it() {
+        // ISO 6709 permits +DDMM.MM, which would be sixty times wrong if read
+        // as decimal degrees. Out of latitude range, so it must not parse.
+        assert_eq!(parse_iso6709("+3540.00+13941.00/"), None);
+    }
+
+    #[test]
+    fn rejects_incomplete_and_failed_fixes() {
+        assert_eq!(parse_iso6709("+35.6897/"), None);
+        assert_eq!(parse_iso6709(""), None);
+        // A failed GPS lock, written as a literal zero point.
+        assert_eq!(parse_iso6709("+00.0000+000.0000/"), None);
+    }
+
+    #[test]
+    fn finds_the_location_tag_under_any_vendor_spelling() {
+        let apple = serde_json::json!({
+            "com.apple.quicktime.location.ISO6709": "+35.6897+139.6922+044.000/"
+        });
+        assert!(location_from_tags(&apple).is_some());
+
+        let bare = serde_json::json!({ "location": "+35.6897+139.6922/" });
+        assert!(location_from_tags(&bare).is_some());
+
+        let suffixed = serde_json::json!({ "location-eng": "+35.6897+139.6922/" });
+        assert!(location_from_tags(&suffixed).is_some());
+
+        let unrelated = serde_json::json!({ "encoder": "Lavf60.16.100" });
+        assert_eq!(location_from_tags(&unrelated), None);
+    }
+
+    #[test]
+    fn skips_location_keys_that_are_not_coordinates() {
+        // Apple writes an accuracy sibling next to the real coordinate. It
+        // matches the key filter, so only the parse can tell them apart.
+        let tags = serde_json::json!({
+            "com.apple.quicktime.location.accuracy.horizontal": "9.219410",
+            "com.apple.quicktime.location.ISO6709": "+35.6897+139.6922+044.000/",
+        });
+        let loc = location_from_tags(&tags).expect("the coordinate sibling should win");
+        assert!((loc.lat - 35.6897).abs() < 1e-9);
+
+        // ...and with no real coordinate present, nothing is invented.
+        let accuracy_only = serde_json::json!({
+            "com.apple.quicktime.location.accuracy.horizontal": "9.219410",
+        });
+        assert_eq!(location_from_tags(&accuracy_only), None);
+    }
 
     #[test]
     fn cover_dims_keeps_both_axes_at_or_above_target() {

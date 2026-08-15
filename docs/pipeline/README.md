@@ -51,6 +51,10 @@ for which tiers the idle worker should pre-warm, and the external
   scale filter, so the dimensions handed to the filter graph must be the
   display-matrix-corrected ones. A mismatch is what makes `.MOV` thumbnails
   come back sideways or fail outright.
+- *A probe with no location must not clear a stored one.* `VideoInfo::location`
+  is `None` both when a container carries no coordinates and when the tags could
+  not be parsed, so `store_video_meta` writes the GPS columns only when it has
+  something to write.
 - *Every `ffmpeg`/`ffprobe` invocation is timeout-bounded.* A wedged subprocess
   would otherwise hold a `thumb_pool` thread for the life of the process.
 

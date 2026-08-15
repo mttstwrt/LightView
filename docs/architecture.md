@@ -64,6 +64,13 @@ sidecar next to each media file. That file, not the database, is the record of
 user intent — tags, ratings, notes. The cache indexes it for query speed and
 can always be rebuilt from it.
 
+**[`geocode/`](geocode/README.md)** turns the GPS coordinates `pipeline/`
+extracted into country, region, and city names, so a filter query can be the
+word `Kyoto` rather than a bounding box. It is a pure lookup over an embedded
+gazetteer, depending on nothing else in the tree; `commands/gallery.rs` writes
+its output into companion files, because the name — unlike the coordinate — is
+not recoverable from the media file itself.
+
 **`provider/`** reads the gallery's files: a recursive scan at open, and
 whole-file reads for the viewer. It was a `FileProvider` trait plus a registry,
 sized for the SMB/SFTP/S3 backends that were never written; it is now the one
@@ -123,9 +130,13 @@ load-bearing:
    shadow the relocated history. See [`cache/`](cache/README.md).
 3. Scan the tree and populate `media_meta`. The grid can render from this alone
    — no thumbnail or tag work has happened yet.
-4. Re-index companion files whose mtime changed, rebuild `tag_counts`, and load
+4. Backfill EXIF GPS into `media_meta` for anything missing it, then
+   reverse-geocode those coordinates and write the resulting place names into
+   companion files — before the index pass below, so they land in the same
+   sweep. See [`geocode/`](geocode/README.md).
+5. Re-index companion files whose mtime changed, rebuild `tag_counts`, and load
    the autocomplete engine from it.
-5. Open the read-only connection pool, start the filesystem watcher, and start
+6. Open the read-only connection pool, start the filesystem watcher, and start
    the idle backfill worker.
 
 ## Data flow: a thumbnail reaching the screen
@@ -156,9 +167,9 @@ an eviction pass, rather than written through per request.
 
 The rule is that the domain modules do not know about their callers:
 
-- `cache/`, `companion/`, `filter/`, `sort/`, `autocomplete/`, `hardware/`,
-  `provider/`, and `util/` know nothing about Tauri, axum, or `AppState`. They
-  are ordinary libraries taking a connection or a struct.
+- `cache/`, `companion/`, `filter/`, `sort/`, `autocomplete/`, `geocode/`,
+  `hardware/`, `provider/`, and `util/` know nothing about Tauri, axum, or
+  `AppState`. They are ordinary libraries taking a connection or a struct.
 - `pipeline/`, `plugin/`, and `tagging/` sit one level up: they
   take `AppState` or pieces of it, but no HTTP or IPC types.
 - `commands/` and `http_server/` are the two adapters at the top. **Neither may

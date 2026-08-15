@@ -309,10 +309,11 @@ virtual folder hierarchy do not. There is no view-module API and there is not
 going to be one — [decision 0008](decisions/0008-no-view-module-api.md) records
 why, and what replaced it.
 
-**C1 first**: it finishes something already half-built and shipped, and an
-existing feature that misleads is worse than a missing one. Only then start new
-views. **C2 before C3** because the infinite canvas is the view actually wanted;
-the virtual folder view is a well-specified idea with no pressure behind it.
+**C1 and C4 first**, in either order: both finish something already shipped, and
+an existing feature that misleads is worse than a missing one — C1 offers a
+label you cannot see, C4 offers a tag you cannot use. Only then start new views.
+**C2 before C3** because the infinite canvas is the view actually wanted; the
+virtual folder view is a well-specified idea with no pressure behind it.
 
 ### C1. Colour labels stop half way
 
@@ -368,6 +369,46 @@ is *derived*, not curated: every node is a saved query over the existing index,
 which means no new tables, nothing to repair when files move or are deleted, and
 no second source of truth beside the companion files. Curated albums you drag
 files into were considered and set aside for that reason.
+
+### C4. A tag with a space in it cannot be filtered
+
+The filter tokenizer splits on whitespace and has no quoting, so no tag
+containing a space can be named by any query. It is not that such a query
+matches poorly — it fails outright: `beach trip` parses `beach` as a term,
+reaches `trip` with nothing left to do, and the whole expression is rejected as
+`Unexpected token: trip`.
+
+The storage layer has no such restriction, and nothing stops the two from
+diverging. `add_user_tag`, `add_user_tag_batch`, `rename_user_tag`, and
+`merge_user_tags` take the string verbatim; the three UI paths that call them
+(`ContextMenu`, `InfoPanel`, `SelectionBar`) only `.trim()`, so interior spaces
+pass straight through; and all four are in the `/api/invoke` allowlist, so a
+paired browser can do it too. The result is reachable by ordinary use: the tag
+is written to the sidecar, indexed, counted, and then **offered by
+autocomplete** — so a user who never types a quote still reaches the failure by
+clicking a suggestion, which returns a 500.
+
+Quoted strings in `filter::parser::tokenize` are the fix. The tokenizer already
+handles one context-sensitive character — `(` is grouping only when it starts a
+token, which is what keeps `hatsune_miku_(vocaloid)` intact — so a quote state
+belongs in the same loop. Two frontend spots move with it: `getCurrentToken` in
+`FilterBar.tsx` finds the current token with `/(\S+)$/` and would split inside a
+quoted phrase, and `insertSuggestion` must wrap a suggestion containing
+whitespace in quotes. That last line is what makes the fix invisible — the
+dropdown stops handing out queries that fail.
+
+Normalising tags to underscores on write was considered as the cheaper answer,
+and it does close the path most users take. It was not chosen as the whole fix
+because it silently rewrites what someone typed and cannot reach data written
+elsewhere: companion files are a wire format that other LightView installations
+read and write (see [`companion/`](companion/README.md)), so a sidecar carrying
+a space can always arrive from outside. Only quoting makes those tags
+addressable.
+
+This is independent of the location tags, which join words with underscores to
+match what the ML taggers already emit; that convention is right regardless and
+does not change here. See [`query/`](query/README.md), where the constraint is
+documented, and [`geocode/`](geocode/README.md).
 
 ---
 

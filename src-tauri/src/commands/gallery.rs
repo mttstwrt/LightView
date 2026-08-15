@@ -25,13 +25,13 @@
 //! `start_fs_watcher`.
 
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tauri::Emitter;
 
 use crate::cache::db::CacheDb;
-use crate::companion::schema::MediaType;
+use crate::companion::schema::{MediaType, PluginTagEntry};
 use crate::pipeline::exif;
 use crate::provider::local::LocalProvider;
 use crate::provider::FileEntry;
@@ -178,6 +178,140 @@ fn backfill_gps_meta(db: &CacheDb) -> Result<(), String> {
         extracted.len(),
         candidates.len()
     );
+    Ok(())
+}
+
+/// The companion `tags.plugins` key the location tags occupy, and therefore
+/// the `plugin.location` namespace they land in once indexed.
+///
+/// It reuses the plugin *storage* convention without being a plugin: a
+/// `PluginTagEntry` is a named, versioned tag bucket that can be replaced
+/// wholesale, which is exactly what a re-geocode against a newer dataset needs.
+/// Writing into `tags.auto` instead would work today but leaves nothing to
+/// distinguish our entries from any other automatic tagger's.
+const LOCATION_BUCKET: &str = "location";
+
+/// `gallery_meta` key holding the [`crate::geocode::TAGGER_VERSION`] that last
+/// wrote this gallery's location tags. It is what makes a re-tag possible at
+/// all: the per-file skip below asks only whether tags *exist*, so without a
+/// version to compare against, output written by an older build would never be
+/// revisited.
+const LOCATION_VERSION_KEY: &str = "location_tagger_version";
+
+/// Reverse-geocode every geotagged file that has no location tags yet and write
+/// the place names into its companion file.
+///
+/// The names go to disk, unlike the coordinates in `backfill_gps_meta` which
+/// stay in `media_meta`: a coordinate is already in the file's EXIF and any
+/// tool can read it, whereas "Kyoto" exists nowhere but here and would be lost
+/// with the cache. That is also what makes the gallery greppable without
+/// LightView.
+///
+/// Runs before `index_companions` so the sidecars written here are picked up in
+/// the same pass. The "already tagged" test reads `tag_index`, which reflects
+/// the *previous* open — so a gallery whose sidecars arrived already tagged
+/// (copied from another machine) is re-geocoded once and writes identical
+/// content, then settles. Reading every companion to avoid that would cost more
+/// than the one redundant pass.
+fn backfill_location_tags(db: &CacheDb) -> Result<(), String> {
+    let namespace = format!("plugin.{}", LOCATION_BUCKET);
+    let version = crate::geocode::TAGGER_VERSION;
+
+    // When the tagger version moves, every existing bucket was written by a
+    // build whose output we no longer agree with, so the "already tagged" skip
+    // has to be suspended for exactly one pass. Rewriting a bucket replaces it
+    // wholesale and bumps the companion's mtime, so the following index pass
+    // drops the old spellings from `tag_index` on its own.
+    let stored = db.get_gallery_meta(LOCATION_VERSION_KEY).ok().flatten();
+    let retag_all = stored.as_deref() != Some(version);
+    if retag_all && stored.is_some() {
+        log::info!(
+            "Location tagger version changed ({} → {}), re-tagging the gallery",
+            stored.as_deref().unwrap_or("none"),
+            version
+        );
+    }
+
+    let candidates: Vec<(String, f64, f64)> = {
+        let sql = if retag_all {
+            "SELECT m.path, m.gps_lat, m.gps_lon FROM media_meta m
+             WHERE m.gps_lat IS NOT NULL AND m.gps_lon IS NOT NULL"
+        } else {
+            "SELECT m.path, m.gps_lat, m.gps_lon FROM media_meta m
+             WHERE m.gps_lat IS NOT NULL AND m.gps_lon IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM tag_index ti
+                   WHERE ti.path = m.path AND ti.namespace = ?1
+               )"
+        };
+        let mut stmt = db.conn().prepare_cached(sql).map_err(|e| e.to_string())?;
+        let map_row = |row: &rusqlite::Row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?))
+        };
+        let rows = if retag_all {
+            stmt.query_map([], map_row)
+        } else {
+            stmt.query_map(rusqlite::params![&namespace], map_row)
+        }
+        .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if candidates.is_empty() {
+        // Still stamp the version: a gallery with no geotagged media is fully
+        // up to date, and leaving the key unset would re-run this every open.
+        let _ = db.set_gallery_meta(LOCATION_VERSION_KEY, version);
+        return Ok(());
+    }
+
+    log::info!("Reverse-geocoding {} geotagged files", candidates.len());
+
+    // The gazetteer builds on first lookup; whichever rayon worker gets there
+    // first pays for it and the rest block on the OnceLock. Sidecar writes are
+    // the real cost here — the lookup itself is a k-d tree probe.
+    let (written, failed) = candidates
+        .par_iter()
+        .map(|(path, lat, lon)| {
+            let Some(place) = crate::geocode::lookup(*lat, *lon) else {
+                return (0u64, 0u64);
+            };
+            let tags = place.tags();
+            if tags.is_empty() {
+                return (0, 0);
+            }
+            match crate::commands::tags::modify_companion(path, |companion| {
+                companion.tags.plugins.insert(
+                    LOCATION_BUCKET.to_string(),
+                    PluginTagEntry {
+                        version: version.to_string(),
+                        tags,
+                        extra: HashMap::new(),
+                    },
+                );
+            }) {
+                Ok(_) => (1, 0),
+                Err(e) => {
+                    log::warn!("Failed to write location tags for {}: {}", path, e);
+                    (0, 1)
+                }
+            }
+        })
+        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+
+    log::info!(
+        "Location tagging: {}/{} geotagged files resolved to a place",
+        written,
+        candidates.len()
+    );
+
+    // Only claim the gallery is at this version if nothing failed to write.
+    // A file whose sidecar could not be written still carries the previous
+    // version's tags, and stamping here would strand it there for good.
+    if failed == 0 {
+        let _ = db.set_gallery_meta(LOCATION_VERSION_KEY, version);
+    } else {
+        log::warn!("{} location tag writes failed; will retry on next open", failed);
+    }
     Ok(())
 }
 
@@ -859,6 +993,12 @@ pub async fn open_gallery_impl(
                 // gps_lat IS NULL, so later opens skip already-extracted files.
                 if let Err(e) = backfill_gps_meta(db) {
                     log::warn!("GPS backfill failed: {}", e);
+                }
+
+                // Turn those coordinates into place names in the companions,
+                // before the index pass below so they land in the same sweep.
+                if let Err(e) = backfill_location_tags(db) {
+                    log::warn!("Location tagging failed: {}", e);
                 }
 
                 // Re-index companions so tag_index/tag_counts reflect disk.

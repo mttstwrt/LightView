@@ -24,6 +24,7 @@ use tauri::Emitter;
 
 use crate::cache::thumbnails::ThumbTier;
 use crate::pipeline::thumbnailer::{self, ResizeFilter, ThumbFormat, STANDARD_THUMB_SIZE};
+use crate::pipeline::video::{self, VideoInfo};
 use crate::AppState;
 
 /// Thumbnail metadata returned over IPC. No pixel data — the frontend
@@ -89,11 +90,23 @@ fn store_source_dims(conn: &rusqlite::Connection, path: &str, width: u32, height
 /// Record video dimensions + duration from an ffprobe result. Unlike
 /// [`store_source_dims`] this overwrites: ffprobe is authoritative for videos,
 /// where the decoded frame can differ from the container's declared size.
-fn store_video_meta(conn: &rusqlite::Connection, path: &str, w: u32, h: u32, duration: Option<f64>) {
+fn store_video_meta(conn: &rusqlite::Connection, path: &str, info: &VideoInfo) {
     let _ = conn.execute(
         "UPDATE media_meta SET width = ?1, height = ?2, duration = ?3 WHERE path = ?4",
-        rusqlite::params![w, h, duration, path],
+        rusqlite::params![info.width, info.height, info.duration, path],
     );
+
+    // Only written when the container actually carried coordinates: a clip with
+    // no location tag must not clear GPS a previous pass established. This is
+    // the video counterpart to `commands::gallery::backfill_gps_meta`, which
+    // covers images only — between them every geotagged item reaches the same
+    // two columns, and from there the map view and the geocoder.
+    if let Some(location) = info.location {
+        let _ = conn.execute(
+            "UPDATE media_meta SET gps_lat = ?1, gps_lon = ?2 WHERE path = ?3",
+            rusqlite::params![location.lat, location.lon, path],
+        );
+    }
 }
 
 /// A generated Standard-tier thumbnail staged for its SQLite write. Shared by
@@ -706,8 +719,8 @@ pub async fn get_media_meta_impl(
 
 /// Extract video metadata via ffprobe and store it in the media_meta table.
 fn populate_video_metadata(conn: &rusqlite::Connection, path: &str) {
-    match thumbnailer::probe_video_metadata(Path::new(path)) {
-        Ok((w, h, duration)) => store_video_meta(conn, path, w, h, duration),
+    match video::probe(Path::new(path)) {
+        Ok(info) => store_video_meta(conn, path, &info),
         Err(e) => {
             log::debug!("Video metadata extraction failed for {}: {}", path, e);
         }
@@ -1187,7 +1200,7 @@ pub async fn generate_and_store_tier(
     // duration during sustained scroll-driven generation. Only probe when
     // duration is still missing so the (potentially 3) justified tiers don't
     // each spawn ffprobe for the same file.
-    let video_meta: Option<(u32, u32, Option<f64>)> = if thumb.media_type == "video" {
+    let video_meta: Option<VideoInfo> = if thumb.media_type == "video" {
         let needs_probe = {
             let db = state.cache_db.lock().await;
             let db = db.as_ref().ok_or("No gallery open")?;
@@ -1201,9 +1214,7 @@ pub async fn generate_and_store_tier(
         };
         if needs_probe {
             let p = path.to_string();
-            tokio::task::spawn_blocking(move || {
-                thumbnailer::probe_video_metadata(Path::new(&p)).ok()
-            })
+            tokio::task::spawn_blocking(move || video::probe(Path::new(&p)).ok())
             .await
             .ok()
             .flatten()
@@ -1246,8 +1257,8 @@ pub async fn generate_and_store_tier(
     }
 
     // ffprobe's numbers win over the decoded frame's, for either tier shape.
-    if let Some((w, h, duration)) = video_meta {
-        store_video_meta(db.conn(), path, w, h, duration);
+    if let Some(ref info) = video_meta {
+        store_video_meta(db.conn(), path, info);
     }
 
     // Enforce the tier budget here too, not just on the batch path. Serving a

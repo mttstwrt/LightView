@@ -25,6 +25,7 @@ pub mod cache;
 pub mod pipeline;
 pub mod plugin;
 pub mod filter;
+pub mod geocode;
 pub mod autocomplete;
 pub mod sort;
 pub mod hardware;

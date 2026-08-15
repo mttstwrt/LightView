@@ -29,6 +29,7 @@ server, web client, real browser — without a display.
 | [`pipeline/`](pipeline/README.md) | Thumbnail generation and serving: the tier ladder, the four entry points, coalescing, and the disk budget. |
 | [`query/`](query/README.md) | Turning a filter string into a set of paths, then ordering and grouping them. Also tag autocomplete. |
 | [`companion/`](companion/README.md) | The `.lightview` sidecar files that hold user metadata, and their relationship to the cache index. |
+| [`geocode/`](geocode/README.md) | Turning cached GPS coordinates into the country, region, and city names people type into the filter bar. |
 | [`remote/`](remote/README.md) | The axum HTTP server, device pairing, TLS, and the `/api/invoke` allowlist that bounds what a remote client may do. |
 | [`plugins/`](plugins/README.md) | The subprocess/NDJSON plugin protocol, what it can and cannot express today, and the path to a real extension host. |
 | [`duplicates/`](duplicates/README.md) | Perceptual-hash duplicate detection and the metadata-preserving merge. |
