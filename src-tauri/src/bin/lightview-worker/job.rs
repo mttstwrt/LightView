@@ -6,10 +6,15 @@
 //! semaphore on files-on-disk → results are mapped back to server paths and
 //! pushed in batches via `apply_plugin_tags`, with `update_tagging_job` as
 //! progress + heartbeat + cancellation back-channel.
+//!
+//! The files-on-disk bound is a sliding window, not a job size: a job of any
+//! length streams through it as permits recycle. What guarantees they recycle
+//! is [`is_stale`] — without it a single unanswered request permanently
+//! consumed a slot, and 64 of them stopped the job dead.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +31,11 @@ use crate::http::ServerClient;
 /// Max downloaded-but-not-yet-tagged files on disk. Backpressure for the
 /// downloader; the plugin's own stdin buffering is unbounded, so the request
 /// channel alone wouldn't bound disk usage.
+///
+/// This is a *window*, not a job size limit: permits are recycled as results
+/// land, so a job of any length streams through it. What used to make it read
+/// like a limit is that a permit could leak permanently — see
+/// [`is_stale`], which is what guarantees every permit comes back.
 const MAX_PENDING_FILES: usize = 64;
 /// Tag writes per `apply_plugin_tags` batch.
 const APPLY_BATCH: usize = 32;
@@ -34,17 +44,36 @@ const APPLY_BATCH: usize = 32;
 const HEARTBEAT_SECS: u64 = 10;
 /// Announce cadence (server worker TTL is 45s).
 const ANNOUNCE_SECS: u64 = 15;
-/// How long the plugin may sit on downloaded files without producing a single
-/// result before the job is failed instead of left hanging.
+/// How long the plugin may go without producing a single *matched* result
+/// before the job is failed instead of left hanging.
 ///
-/// Every unanswered file holds one of the `MAX_PENDING_FILES` disk slots; once
-/// they are all held the downloader blocks on the semaphore, the plugin stops
-/// receiving stdin lines, and no result ever arrives — while the heartbeat
-/// below keeps the server's stall timer fresh, so the job would otherwise show
-/// "running" forever with no error. Generous because a tagger's first run
-/// downloads and loads its model before the first result, which looks exactly
-/// the same from here.
+/// Generous because a tagger's first run downloads and loads its model before
+/// the first result, and from here that is indistinguishable from a wedge. This
+/// is the outer backstop; [`is_stale`] is what keeps an ordinary job moving.
+///
+/// Only results that matched a pending entry refresh this timer. Counting
+/// unmatched ones — a plugin echoing back a path we cannot key on — kept it
+/// permanently fresh in exactly the case it exists to catch.
 const NO_RESULT_STALL_SECS: u64 = 20 * 60;
+/// A downloaded file is abandoned once the plugin has answered this many
+/// *other* requests since it was sent.
+///
+/// Deliberately a count rather than a clock: a slow tagger legitimately leaves
+/// a file queued for a long time, so any wall-clock per-file deadline is either
+/// too tight for a CPU-only model or too loose to be useful. At most
+/// `MAX_PENDING_FILES` requests are ever outstanding, so watching twice that
+/// many *other* files get answered means this one was skipped — no plugin
+/// reorders across a window it cannot see.
+const STALE_AFTER_RESULTS: u64 = (MAX_PENDING_FILES * 2) as u64;
+/// A file outstanding this long while the plugin sits idle is abandoned too.
+///
+/// The count rule above cannot fire at the tail of a job: if the plugin skips
+/// the last few requests, no further results arrive to count. This clears them
+/// so the downloader's sender drops, the plugin sees EOF, and the job finishes
+/// instead of waiting out `NO_RESULT_STALL_SECS`. Only applies once the plugin
+/// has produced at least one result, so a first-run model load is never
+/// mistaken for it.
+const IDLE_RECLAIM_SECS: u64 = 5 * 60;
 
 /// Job snapshot as returned by `claim_tagging_job` (camelCase, flattened with
 /// the resolved path list).
@@ -179,6 +208,11 @@ async fn announce(
                 "workerId": config.worker_id,
                 "workerName": config.worker_name,
                 "plugins": plugins,
+                // So a server can tell a freshly built worker from the one that
+                // has been running since March — the other half of "what is
+                // actually running on that machine", the plugin's own
+                // api_version being the first.
+                "workerVersion": env!("CARGO_PKG_VERSION"),
             }),
         )
         .await
@@ -187,11 +221,41 @@ async fn announce(
 
 /// A downloaded file waiting for its plugin result. Holds the semaphore permit
 /// so disk usage stays bounded; dropped (releasing the permit) once the result
-/// lands and the temp file is deleted.
+/// lands and the temp file is deleted, or once [`is_stale`] gives up on it.
 struct Pending {
     server_path: String,
     temp_path: PathBuf,
+    sent_at: tokio::time::Instant,
+    /// Total matched results at the moment this file was handed to the plugin.
+    /// The difference against the running total is how many *other* files the
+    /// plugin has answered while this one waited.
+    results_when_sent: u64,
     _permit: OwnedSemaphorePermit,
+}
+
+/// Should a downloaded file that has not been answered be given up on?
+///
+/// This is the whole reason a job of any size can be started and walked away
+/// from. A plugin that skips a request, or answers with a path the worker
+/// cannot key on, used to strand that file's disk permit for the rest of the
+/// job; at `MAX_PENDING_FILES` stranded permits the downloader blocked forever
+/// and the job hung — which read as "batches larger than 64 fail". Giving up on
+/// the file instead costs one failed image and lets the window slide on, so the
+/// bound stays a window rather than becoming a ceiling.
+///
+/// Pure so the two rules can be tested without a plugin or a clock; see the
+/// constants for why each exists.
+fn is_stale(
+    results_since_sent: u64,
+    outstanding: Duration,
+    plugin_idle: Duration,
+    plugin_has_answered: bool,
+) -> bool {
+    if results_since_sent >= STALE_AFTER_RESULTS {
+        return true;
+    }
+    let idle_limit = Duration::from_secs(IDLE_RECLAIM_SECS);
+    plugin_has_answered && plugin_idle >= idle_limit && outstanding >= idle_limit
 }
 
 /// Key a temp file by its name rather than the full path we handed the plugin.
@@ -281,6 +345,9 @@ async fn drive_plugin(
     let pending: Arc<Mutex<HashMap<String, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
     // Files that never reached the plugin (download errors).
     let download_failed = Arc::new(AtomicUsize::new(0));
+    // Results matched back to a pending entry, shared with the downloader so
+    // each new entry records the count it started waiting at (see `is_stale`).
+    let results_matched = Arc::new(AtomicU64::new(0));
 
     let downloader = spawn_downloader(
         client,
@@ -290,6 +357,7 @@ async fn drive_plugin(
         req_tx,
         pending.clone(),
         download_failed.clone(),
+        results_matched.clone(),
     );
 
     let mut succeeded: usize = 0;
@@ -316,12 +384,17 @@ async fn drive_plugin(
                     break Outcome::Finished;
                 };
 
-                last_result = tokio::time::Instant::now();
-
                 let Some(item) = pending.lock().await.remove(&pending_key(&result.path)) else {
+                    // Not a result we can attribute to a file, so it must not
+                    // refresh `last_result` — an unmatched result is a symptom
+                    // of the wedge the timer exists to catch, not evidence of
+                    // progress. The file it was meant for ages out via
+                    // `is_stale`.
                     log::warn!("plugin result for unknown path: {}", result.path);
                     continue;
                 };
+                last_result = tokio::time::Instant::now();
+                results_matched.fetch_add(1, Ordering::Relaxed);
                 let _ = tokio::fs::remove_file(&item.temp_path).await;
 
                 if let Some(err) = result.error {
@@ -361,36 +434,59 @@ async fn drive_plugin(
                     }
                     continue; // push_batch already reported progress
                 }
-                // Files delivered to the plugin with nothing coming back is the
-                // signature of a wedge: a plugin that buffers stdin to EOF
-                // instead of streaming, or one that silently drops requests
-                // (each dropped request strands a disk slot, and once all
-                // MAX_PENDING_FILES are stranded the downloader blocks for
-                // good). It is indistinguishable from a very slow first model
-                // load, so warn early but only fail once it is truly hopeless —
-                // the alternative, left as-is, is a job that runs forever.
-                let pending_now = pending.lock().await.len();
-                if pending_now > 0 {
-                    let idle = last_result.elapsed();
-                    if idle >= Duration::from_secs(NO_RESULT_STALL_SECS) {
-                        break Outcome::Failed(format!(
-                            "plugin '{}' returned no result for {}s while holding {pending_now} \
-                             downloaded file(s) — the job cannot progress. Plugins must stream \
-                             results and answer every request (see docs/plugins/README.md).",
-                            job.plugin_name,
-                            idle.as_secs(),
-                        ));
-                    }
-                    if pending_now >= MAX_PENDING_FILES {
+                // Reclaim files the plugin is never going to answer for. Each
+                // one costs a failed image and returns its disk slot, so the
+                // window slides on instead of closing permanently — this is
+                // what lets a several-thousand-image job survive a plugin that
+                // silently drops the occasional request.
+                let idle = last_result.elapsed();
+                let matched = results_matched.load(Ordering::Relaxed);
+                let abandoned: Vec<Pending> = {
+                    let mut map = pending.lock().await;
+                    let keys: Vec<String> = map
+                        .iter()
+                        .filter(|(_, e)| {
+                            is_stale(
+                                matched.saturating_sub(e.results_when_sent),
+                                e.sent_at.elapsed(),
+                                idle,
+                                matched > 0,
+                            )
+                        })
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    keys.iter().filter_map(|k| map.remove(k)).collect()
+                };
+                if !abandoned.is_empty() {
+                    for item in &abandoned {
                         log::warn!(
-                            "job {}: all {MAX_PENDING_FILES} download slots held with no result \
-                             for {}s — plugin '{}' is not answering requests; failing the job \
-                             at {NO_RESULT_STALL_SECS}s",
-                            job.id,
-                            idle.as_secs(),
+                            "{}: plugin '{}' never answered — counting it failed and releasing \
+                             its slot (plugins must emit exactly one result per request; see \
+                             docs/plugins/README.md)",
+                            item.server_path,
                             job.plugin_name,
                         );
+                        let _ = tokio::fs::remove_file(&item.temp_path).await;
                     }
+                    failed += abandoned.len();
+                    // Dropping the entries here releases their permits, which
+                    // unblocks the downloader.
+                    drop(abandoned);
+                }
+
+                // Nothing matched for the whole stall window means the plugin
+                // is not working at all — a stdin-to-EOF buffering plugin, or
+                // one that died without closing stdout. Reclaiming slots cannot
+                // help that, so give up rather than march the rest of the job
+                // through timeouts one window at a time.
+                if idle >= Duration::from_secs(NO_RESULT_STALL_SECS) {
+                    break Outcome::Failed(format!(
+                        "plugin '{}' produced no usable result for {}s — the job cannot \
+                         progress. Plugins must stream results and answer every request \
+                         (see docs/plugins/README.md).",
+                        job.plugin_name,
+                        idle.as_secs(),
+                    ));
                 }
                 let total_failed = failed + download_failed.load(Ordering::Relaxed);
                 let update: Result<UpdateResult, _> = client.invoke(
@@ -452,8 +548,9 @@ async fn drive_plugin(
             Outcome::Cancelled
         }
         Outcome::Failed(e) => {
+            let explained = running.explain(e);
             running.kill().await;
-            Outcome::Failed(e)
+            Outcome::Failed(explained)
         }
     }
 }
@@ -505,6 +602,7 @@ fn spawn_downloader(
     req_tx: mpsc::Sender<PluginRequest>,
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     download_failed: Arc<AtomicUsize>,
+    results_matched: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     let client = client.clone();
     let fit_edge = config.fit_edge;
@@ -531,6 +629,8 @@ fn spawn_downloader(
                         Pending {
                             server_path,
                             temp_path: dest,
+                            sent_at: tokio::time::Instant::now(),
+                            results_when_sent: results_matched.load(Ordering::Relaxed),
                             _permit: permit,
                         },
                     );
@@ -552,4 +652,74 @@ fn spawn_downloader(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NEVER_IDLE: Duration = Duration::from_secs(0);
+
+    /// The common case: a slow plugin working through its queue in order. No
+    /// file is ever abandoned, however long it sits — this is the property a
+    /// wall-clock per-file deadline could not give us, and the reason a
+    /// CPU-only tagger on a long job does not shed images.
+    #[test]
+    fn a_slow_but_working_plugin_never_loses_a_file() {
+        for results_since_sent in 0..STALE_AFTER_RESULTS {
+            assert!(!is_stale(
+                results_since_sent,
+                Duration::from_secs(6 * 60 * 60),
+                NEVER_IDLE,
+                true
+            ));
+        }
+    }
+
+    /// A skipped request: the plugin keeps answering everything else, so the
+    /// count runs away while this file waits.
+    #[test]
+    fn a_file_the_plugin_overtook_is_abandoned() {
+        assert!(is_stale(
+            STALE_AFTER_RESULTS,
+            Duration::from_secs(1),
+            NEVER_IDLE,
+            true
+        ));
+    }
+
+    /// A first-run model download produces nothing for minutes while every
+    /// slot fills. Abandoning those files would fail the head of the job for
+    /// no reason, so the idle rule stays off until the plugin has answered
+    /// something; `NO_RESULT_STALL_SECS` is the only bound until then.
+    #[test]
+    fn a_model_load_is_not_mistaken_for_a_wedge() {
+        let long = Duration::from_secs(IDLE_RECLAIM_SECS * 4);
+        assert!(!is_stale(0, long, long, false));
+        // Same numbers, except the plugin has proven it can answer.
+        assert!(is_stale(0, long, long, true));
+    }
+
+    /// The tail of a job, where no further results can arrive to drive the
+    /// count rule: the plugin skipped the last few requests and went quiet.
+    #[test]
+    fn the_idle_rule_needs_both_clocks_past_the_limit() {
+        let over = Duration::from_secs(IDLE_RECLAIM_SECS);
+        let under = Duration::from_secs(IDLE_RECLAIM_SECS - 1);
+        assert!(is_stale(0, over, over, true));
+        // Just downloaded — the plugin has not had a chance at it yet.
+        assert!(!is_stale(0, under, over, true));
+        // Plugin answered something recently, so it is working, not wedged.
+        assert!(!is_stale(0, over, under, true));
+    }
+
+    /// A plugin echoing back a canonicalized path still identifies the file:
+    /// temp names are unique within a job, so the directory can be rewritten
+    /// freely.
+    #[test]
+    fn pending_key_ignores_the_directory() {
+        assert_eq!(pending_key("/tmp/lv/000007.webp"), "000007.webp");
+        assert_eq!(pending_key("/private/var/tmp/lv/000007.webp"), "000007.webp");
+        assert_eq!(pending_key("000007.webp"), "000007.webp");
+    }
 }

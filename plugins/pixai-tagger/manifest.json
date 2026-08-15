@@ -2,15 +2,21 @@
   "name": "pixai-tagger",
   "display_name": "PixAI Tagger v0.9",
   "version": "1.0.0",
+  "api_version": 1,
   "description": "Auto-tags images using the pixai-labs/pixai-tagger-v0.9 model (EVA02, ONNX build from deepghs). Outputs general and character tags across a 13,461-tag danbooru vocabulary.",
   "author": "LightView",
   "license": "Apache-2.0",
   "execution": {
     "type": "cli",
     "command": "{plugin_dir}/../.venv/bin/python",
-    "args": ["{plugin_dir}/pixai_tagger.py"]
+    "args": [
+      "{plugin_dir}/pixai_tagger.py"
+    ]
   },
-  "capabilities": ["read_image", "network_access"],
+  "capabilities": [
+    "read_image",
+    "network_access"
+  ],
   "tag_prefix": "pixai",
   "ui": {
     "settings_schema": null,

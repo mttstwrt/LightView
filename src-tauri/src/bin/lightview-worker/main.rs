@@ -11,6 +11,8 @@
 //! Usage:
 //!   lightview-worker pair --server https://<host>:<port> [--pin <code>] [--name <name>] [--yes] [--trust-new]
 //!   lightview-worker run  [--plugins-dir <dir>] [--fit <px>] [--poll <secs>]
+//!   lightview-worker install <path> [--plugins-dir <dir>]
+//!   lightview-worker plugins
 //!   lightview-worker status
 
 mod config;
@@ -18,10 +20,11 @@ mod http;
 mod job;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lightview_lib::plugin::manifest::PluginManifest;
+use lightview_lib::plugin::{check_api_version, RequestDelivery};
 
 use config::WorkerConfig;
 use job::LocalPlugin;
@@ -34,6 +37,8 @@ async fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("pair") => pair(&args[2..]).await,
         Some("run") => run(&args[2..]).await,
+        Some("install") => install(&args[2..]),
+        Some("plugins") => plugins_cmd(),
         Some("status") => status().await,
         Some("-h") | Some("--help") | Some("help") => {
             usage();
@@ -247,24 +252,38 @@ fn default_plugins_dir() -> PathBuf {
     lightview_lib::util::paths::data_dir().join("plugins")
 }
 
-fn load_plugins(dir: &PathBuf) -> Vec<LocalPlugin> {
+/// Load the installed plugins, separating the ones this host can actually run
+/// from the ones it must refuse and why.
+///
+/// The refusals matter more than the loads. A plugin written before the
+/// streaming protocol installs cleanly, runs fine in the desktop app, and then
+/// deadlocks a remote job the moment more than 64 images are in flight —
+/// silently, with no model ever loaded. Checking the declared `api_version` at
+/// startup converts that into one line before any job is claimed.
+fn load_plugins(dir: &Path) -> (Vec<LocalPlugin>, Vec<String>) {
     let mut plugins = Vec::new();
+    let mut refused = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return plugins;
+        return (plugins, refused);
     };
     for entry in entries.flatten() {
         let manifest_path = entry.path().join("manifest.json");
-        if manifest_path.exists() {
-            match PluginManifest::load(&manifest_path) {
-                Ok(manifest) => plugins.push(LocalPlugin {
+        if !manifest_path.exists() {
+            continue;
+        }
+        match PluginManifest::load(&manifest_path) {
+            Ok(manifest) => match check_api_version(&manifest, RequestDelivery::Incremental) {
+                Ok(()) => plugins.push(LocalPlugin {
                     manifest,
                     dir: entry.path(),
                 }),
-                Err(e) => log::warn!("skipping {}: {e}", manifest_path.display()),
-            }
+                Err(e) => refused.push(e),
+            },
+            Err(e) => refused.push(format!("{}: {e}", manifest_path.display())),
         }
     }
-    plugins
+    plugins.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+    (plugins, refused)
 }
 
 async fn run(raw: &[String]) -> ExitCode {
@@ -292,22 +311,31 @@ async fn run(raw: &[String]) -> ExitCode {
     }
 
     let dir = plugins_dir.unwrap_or_else(default_plugins_dir);
-    let plugins = load_plugins(&dir);
+    let (plugins, refused) = load_plugins(&dir);
+    for reason in &refused {
+        log::error!("not running: {reason}");
+    }
     if plugins.is_empty() {
         eprintln!(
-            "error: no plugins found under {} — install a plugin directory \
-             (with manifest.json) there, e.g. the repo's plugins/wd-tagger",
-            dir.display()
+            "error: no runnable plugins under {} — install one with \
+             `lightview-worker install <path-to-plugin-dir>`{}",
+            dir.display(),
+            if refused.is_empty() {
+                ""
+            } else {
+                " (see the errors above for the ones that were refused)"
+            }
         );
         return ExitCode::FAILURE;
     }
     log::info!(
-        "worker '{}' → {} with plugins: {}",
+        "worker '{}' v{} → {} with plugins: {}",
         cfg.worker_name,
+        env!("CARGO_PKG_VERSION"),
         cfg.server_url,
         plugins
             .iter()
-            .map(|p| p.manifest.name.as_str())
+            .map(|p| format!("{} v{}", p.manifest.name, p.manifest.version))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -316,6 +344,98 @@ async fn run(raw: &[String]) -> ExitCode {
     // run_loop only returns on unrecoverable setup errors (it retries
     // transport failures forever).
     ExitCode::FAILURE
+}
+
+// ---------------------------------------------------------------------------
+// install / plugins
+// ---------------------------------------------------------------------------
+
+/// Install or update a plugin from a source directory (or a bare `.py`).
+///
+/// Re-running it over the same source is how a plugin is *updated*: the install
+/// directory is replaced wholesale. This exists because `cp -r` left no way to
+/// tell a current copy from a year-old one, and the year-old one is what makes
+/// remote jobs hang.
+fn install(args: &[String]) -> ExitCode {
+    let mut source: Option<PathBuf> = None;
+    let mut dest: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--plugins-dir" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: --plugins-dir requires a value");
+                    return ExitCode::from(2);
+                };
+                dest = Some(PathBuf::from(v));
+                i += 2;
+            }
+            other if source.is_none() && !other.starts_with('-') => {
+                source = Some(PathBuf::from(other));
+                i += 1;
+            }
+            other => {
+                eprintln!("error: unknown argument: {other}\n");
+                usage();
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(source) = source else {
+        eprintln!("error: `install` requires a path to a plugin directory\n");
+        usage();
+        return ExitCode::from(2);
+    };
+    let dest = dest.unwrap_or_else(default_plugins_dir);
+
+    match lightview_lib::plugin::install::install_from_path(&source, &dest) {
+        Ok(info) => {
+            println!(
+                "Installed {} v{} (api_version {}) → {}",
+                info.name,
+                info.version,
+                info.api_version,
+                dest.join(&info.name).display()
+            );
+            // Installing succeeds for a plugin this host cannot run — the same
+            // directory may be shared with a desktop — so say so rather than
+            // let it be discovered at the first job.
+            if info.api_version == 0 {
+                eprintln!(
+                    "warning: it declares no api_version, so `run` will refuse it. Update the \
+                     plugin to stream its results and add \"api_version\": {} to manifest.json.",
+                    lightview_lib::plugin::PLUGIN_API_VERSION
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// List what is installed and whether this host will run it — the answer to
+/// "which build of the plugin is that machine actually on?"
+fn plugins_cmd() -> ExitCode {
+    let dir = default_plugins_dir();
+    let (usable, refused) = load_plugins(&dir);
+    println!("plugins dir: {}", dir.display());
+    if usable.is_empty() && refused.is_empty() {
+        println!("  (none installed)");
+        return ExitCode::SUCCESS;
+    }
+    for p in &usable {
+        println!(
+            "  {:<24} v{:<10} api {}  prefix '{}'",
+            p.manifest.name, p.manifest.version, p.manifest.api_version, p.manifest.tag_prefix
+        );
+    }
+    for reason in &refused {
+        println!("  REFUSED: {reason}");
+    }
+    ExitCode::SUCCESS
 }
 
 // ---------------------------------------------------------------------------
@@ -332,24 +452,28 @@ async fn status() -> ExitCode {
     };
     println!("server:      {}", cfg.server_url);
     println!("worker:      {} ({})", cfg.worker_name, cfg.worker_id);
+    println!("binary:      v{}", env!("CARGO_PKG_VERSION"));
     println!("cert pin:    {}", cfg.cert_sha256);
-    println!("fit edge:    {}", cfg.fit_edge);
+    println!("fit edge:    {} (a plugin's manifest may ask for less)", cfg.fit_edge);
 
     let dir = default_plugins_dir();
-    let plugins = load_plugins(&dir);
+    let (plugins, refused) = load_plugins(&dir);
     println!(
         "plugins:     {} ({})",
         plugins.len(),
         if plugins.is_empty() {
-            format!("none under {}", dir.display())
+            format!("none runnable under {}", dir.display())
         } else {
             plugins
                 .iter()
-                .map(|p| p.manifest.name.clone())
+                .map(|p| format!("{} v{}", p.manifest.name, p.manifest.version))
                 .collect::<Vec<_>>()
                 .join(", ")
         }
     );
+    for reason in &refused {
+        println!("  REFUSED: {reason}");
+    }
 
     match http::ServerClient::new(&cfg.server_url, &cfg.cookie, &cfg.cert_sha256) {
         Ok(client) => match client
@@ -398,12 +522,18 @@ fn usage() {
         "LightView tagging worker — runs ML tagger plugins for a remote LightView server\n\n\
          USAGE:\n  \
          lightview-worker pair --server https://<host>:<port> [--pin <code>] [--name <name>] [--yes] [--trust-new]\n  \
-         lightview-worker run  [--plugins-dir <dir>] [--fit <px>] [--poll <secs>]\n  \
+         lightview-worker run     [--plugins-dir <dir>] [--fit <px>] [--poll <secs>]\n  \
+         lightview-worker install <path> [--plugins-dir <dir>]\n  \
+         lightview-worker plugins\n  \
          lightview-worker status\n\n\
          COMMANDS:\n  \
-         pair    Trust the server's certificate (TOFU) and redeem a pairing PIN.\n          \
-                 --trust-new re-pins a rotated certificate, keeping the pairing.\n  \
-         run     Announce to the server and process tagging jobs until killed.\n  \
-         status  Print the local config/plugins and check server connectivity.\n"
+         pair     Trust the server's certificate (TOFU) and redeem a pairing PIN.\n           \
+                  --trust-new re-pins a rotated certificate, keeping the pairing.\n  \
+         run      Announce to the server and process tagging jobs until killed.\n  \
+         install  Copy a plugin directory (or .py) into the plugins dir. Run it\n           \
+                  again over the same source to update; the copy is replaced.\n  \
+         plugins  List installed plugins with their versions, and any this\n           \
+                  worker refuses to run.\n  \
+         status   Print the local config/plugins and check server connectivity.\n"
     );
 }

@@ -69,6 +69,7 @@ async fn run(state: AppState) {
             LOCAL_WORKER_ID.to_string(),
             worker_name.clone(),
             plugins.clone(),
+            Some(env!("CARGO_PKG_VERSION").to_string()),
             true,
         )
         .await
@@ -238,8 +239,9 @@ async fn drive_plugin(
             Outcome::Cancelled
         }
         Outcome::Failed(e) => {
+            let explained = running.explain(e);
             running.kill().await;
-            Outcome::Failed(e)
+            Outcome::Failed(explained)
         }
     }
 }

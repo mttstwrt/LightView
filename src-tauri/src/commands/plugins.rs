@@ -295,172 +295,18 @@ pub async fn run_plugin_batch(
     Ok(())
 }
 
-/// Install a plugin from a directory path.
-/// Copies the plugin directory (or a single Python file with auto-generated manifest)
-/// into the plugins config directory.
+/// Install (or update) a plugin from a directory or a bare `.py` script.
+///
+/// The copy itself lives in `plugin::install` so `lightview-worker` can run the
+/// same logic — a worker is the machine where hand-copying a plugin has
+/// actually cost debugging time. See that module for what it does beyond a
+/// recursive copy.
 #[tauri::command]
 pub async fn install_plugin(
     _state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<PluginInfo, String> {
-    let source = Path::new(&path);
-    if !source.exists() {
-        return Err(format!("Path does not exist: {}", path));
-    }
-
-    let dest_dir = plugin_dir();
-    std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-
-    if source.is_dir() {
-        let manifest_path = source.join("manifest.json");
-        if !manifest_path.exists() {
-            return Err("Plugin directory must contain a manifest.json".to_string());
-        }
-        let manifest = PluginManifest::load(&manifest_path).map_err(|e| e.to_string())?;
-        let target = dest_dir.join(&manifest.name);
-
-        copy_dir_filtered(source, &target, &|name: &str| {
-            name == ".venv" || name == "venv" || name == "__pycache__"
-        })
-        .map_err(|e| e.to_string())?;
-
-        rewrite_manifest_python(&target.join("manifest.json"), source)?;
-
-        Ok(PluginInfo {
-            name: manifest.name,
-            display_name: manifest.display_name,
-            version: manifest.version,
-            description: manifest.description,
-            tag_prefix: manifest.tag_prefix,
-        })
-    } else if source.extension().and_then(|e| e.to_str()) == Some("py") {
-        let stem = source
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("plugin");
-        let plugin_name = stem.replace('_', "-");
-        let target = dest_dir.join(&plugin_name);
-        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-
-        let dest_script = target.join(source.file_name().unwrap());
-        std::fs::copy(source, &dest_script).map_err(|e| e.to_string())?;
-
-        let source_dir = source.parent().unwrap_or(Path::new("."));
-        let req_source = source_dir.join("requirements.txt");
-        if req_source.exists() {
-            let _ = std::fs::copy(&req_source, target.join("requirements.txt"));
-        }
-
-        let python_command = detect_venv_python(source_dir)
-            .unwrap_or_else(|| "python3".to_string());
-
-        let script_name = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("plugin.py");
-        let manifest_json = serde_json::json!({
-            "name": plugin_name,
-            "display_name": plugin_name,
-            "version": "1.0.0",
-            "description": format!("Auto-installed plugin from {}", script_name),
-            "execution": {
-                "type": "cli",
-                "command": python_command,
-                "args": [format!("{{plugin_dir}}/{}", script_name)],
-            },
-            "capabilities": ["read_image"],
-            "tag_prefix": plugin_name,
-        });
-        let manifest_str =
-            serde_json::to_string_pretty(&manifest_json).map_err(|e| e.to_string())?;
-        std::fs::write(target.join("manifest.json"), &manifest_str)
-            .map_err(|e| e.to_string())?;
-
-        Ok(PluginInfo {
-            name: plugin_name.clone(),
-            display_name: plugin_name.clone(),
-            version: "1.0.0".to_string(),
-            description: format!("Auto-installed plugin from {}", script_name),
-            tag_prefix: plugin_name,
-        })
-    } else {
-        Err("Path must be a plugin directory (with manifest.json) or a .py file".to_string())
-    }
-}
-
-/// Look for a Python venv in `dir` and return the absolute path to its interpreter.
-/// NOTE: Don't canonicalize — Python venvs work via symlink location.
-fn detect_venv_python(dir: &Path) -> Option<String> {
-    let abs_dir = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(dir)
-    };
-    for venv_name in &[".venv", "venv"] {
-        let python = abs_dir.join(venv_name).join("bin").join("python");
-        if python.exists() {
-            return Some(python.display().to_string());
-        }
-    }
-    None
-}
-
-fn copy_dir_filtered(
-    src: &Path,
-    dst: &Path,
-    skip: &dyn Fn(&str) -> bool,
-) -> std::io::Result<()> {
-    if dst.exists() {
-        std::fs::remove_dir_all(dst)?;
-    }
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if skip(&name_str) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        let dest_path = dst.join(&name);
-        if file_type.is_dir() {
-            copy_dir_filtered(&entry.path(), &dest_path, skip)?;
-        } else if file_type.is_symlink() {
-            let link_target = std::fs::read_link(entry.path())?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&link_target, &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dest_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn rewrite_manifest_python(manifest_path: &Path, source_dir: &Path) -> Result<(), String> {
-    let text = std::fs::read_to_string(manifest_path).map_err(|e| e.to_string())?;
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| e.to_string())?;
-
-    let needs_rewrite = doc
-        .pointer("/execution/command")
-        .and_then(|v| v.as_str())
-        .map(|cmd| cmd.contains(".venv") || cmd.contains("venv"))
-        .unwrap_or(false);
-
-    if needs_rewrite {
-        if let Some(abs_python) = detect_venv_python(source_dir) {
-            if let Some(exec) = doc.get_mut("execution").and_then(|e| e.as_object_mut()) {
-                exec.insert(
-                    "command".to_string(),
-                    serde_json::Value::String(abs_python),
-                );
-            }
-            let out = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-            std::fs::write(manifest_path, out).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
+    crate::plugin::install::install_from_path(Path::new(&path), &plugin_dir())
 }
 
 // ---------------------------------------------------------------------------

@@ -88,14 +88,50 @@ pub fn find_plugin(plugin_dir: &Path, name: &str) -> Result<(PluginManifest, Pat
     Err(RunError::NotFound(name.to_string()))
 }
 
+/// Lines of plugin stderr kept for replay. Enough to carry a Python traceback
+/// plus the line that caused it; small enough that a chatty plugin's progress
+/// output cannot grow the host's memory over a long job.
+const STDERR_TAIL_LINES: usize = 40;
+
 /// A running plugin subprocess streaming results back to the host.
 pub struct RunningPlugin {
     /// Stream of results emitted by the plugin, in whatever order it chooses.
     pub results: mpsc::Receiver<PluginResult>,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     child: Child,
 }
 
 impl RunningPlugin {
+    /// The last few lines the plugin wrote to stderr.
+    ///
+    /// Plugin stderr is logged at debug, which is right for a tagger that
+    /// narrates every batch — but it means that at the default level the one
+    /// channel that explains a failure is invisible, and the most diagnostic
+    /// signal of all (the plugin saying *nothing*, because it is waiting for an
+    /// EOF that will not come) shows as an empty list here. Callers attach this
+    /// to the error they report, so a failed job explains itself without asking
+    /// the user to reproduce it at debug level.
+    pub fn stderr_tail(&self) -> Vec<String> {
+        self.stderr_tail
+            .lock()
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl RunningPlugin {
+    /// Attach the plugin's recent stderr to a failure message, so the reason
+    /// travels with the job instead of living only in a debug log nobody had
+    /// enabled. Silence is reported explicitly — for a plugin waiting on an EOF
+    /// that never comes, "wrote nothing to stderr" *is* the diagnosis.
+    pub fn explain(&self, error: String) -> String {
+        let tail = self.stderr_tail();
+        if tail.is_empty() {
+            return format!("{error} (the plugin wrote nothing to stderr)");
+        }
+        format!("{error}\nplugin stderr (last {} lines):\n{}", tail.len(), tail.join("\n"))
+    }
+
     /// Forcibly terminate the plugin process. Used for cancellation.
     pub async fn kill(mut self) {
         let _ = self.child.start_kill();
@@ -233,16 +269,31 @@ pub async fn run_plugin_stream_channel(
         }
     });
 
-    // Stderr task: log everything the plugin writes there.
+    // Stderr task: log everything the plugin writes there, and keep the tail
+    // so a failure can quote it (see `RunningPlugin::stderr_tail`).
     let plugin_name = manifest.name.clone();
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES),
+    ));
+    let tail_writer = stderr_tail.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             log::debug!("[{}] {}", plugin_name, line);
+            if let Ok(mut q) = tail_writer.lock() {
+                if q.len() == STDERR_TAIL_LINES {
+                    q.pop_front();
+                }
+                q.push_back(line);
+            }
         }
     });
 
-    Ok(RunningPlugin { results: rx, child })
+    Ok(RunningPlugin {
+        results: rx,
+        stderr_tail,
+        child,
+    })
 }
 
 /// Apply a plugin result to a companion file under the plugin's tag namespace.
