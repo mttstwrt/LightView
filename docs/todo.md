@@ -402,7 +402,14 @@ carries a `ThumbTier`), `fetchLoop.ts` (the two single-flight slots and the
 order one pass runs them in), and `cellSources.ts` (a cell's URL, its rung and
 its in-flight swap, which only make sense together). `markUrlLoaded` moved to
 `lib/loadedUrls.ts` on the way, so `lib/` no longer imports from a component.
-Net ~440 lines out of the two components.
+
+The two components lost 244 lines (2397 → 2153) and the new modules add 636, so
+the tree is *longer* than before. That is the expected shape and not a reason to
+be suspicious of the trade: what was duplicated is now written once, and most of
+the added bulk is the doc comments explaining why each piece is shaped the way
+it is — the invariants that used to live only in the two copies, where they
+disagreed. The win is single-sourcing and correct-by-construction teardown, not
+a smaller diff.
 
 One thing was deleted rather than moved: GalleryGrid's `coalescedPaths` set was
 redundant with the queued and in-flight sets on every path that reached it, and
