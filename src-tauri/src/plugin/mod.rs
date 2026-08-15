@@ -22,6 +22,7 @@
 //! `docs/plugins/README.md` and
 //! `docs/decisions/0006-plugins-are-ndjson-subprocesses.md`.
 
+pub mod input;
 pub mod install;
 pub mod manifest;
 pub mod runner;

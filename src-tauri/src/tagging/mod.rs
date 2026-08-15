@@ -634,9 +634,19 @@ pub async fn claim_job(
     }
 }
 
-/// Resolve a job target to the image paths the worker should tag. Videos and
-/// GIFs are excluded — the remote loop shouldn't ship them, and the image
-/// taggers can't use them anyway.
+/// Resolve a job target to the paths the worker should tag.
+///
+/// **The join against `media_meta` is a security boundary, not a filter.** A
+/// path target arrives from a paired device; intersecting it with the files
+/// this gallery has actually indexed is what stops a browser naming arbitrary
+/// filesystem paths for a worker to download. Narrow the media types if the
+/// need arises, but never drop the join.
+///
+/// It used to narrow to `media_type = 'image'`, which is why sending videos to
+/// a remote worker produced no tags and no error: with every candidate a video
+/// the resolved list came back empty, and the claim loop reads empty as
+/// "nothing left to tag" and marks the job Done. Frames are extracted host-side
+/// now (`plugin::input`), so a clip is as taggable as a still.
 async fn resolve_target(state: &AppState, target: &JobTarget) -> Result<Vec<String>, String> {
     let candidates = match target {
         JobTarget::Paths(paths) => paths.clone(),
@@ -649,17 +659,16 @@ async fn resolve_target(state: &AppState, target: &JobTarget) -> Result<Vec<Stri
     let db = db.as_ref().ok_or("No gallery open")?;
     let mut stmt = db
         .conn()
-        .prepare("SELECT path FROM media_meta WHERE media_type = 'image'")
+        .prepare("SELECT path FROM media_meta WHERE media_type IN ('image', 'video', 'gif')")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
-    let images: std::collections::HashSet<String> =
-        rows.filter_map(|r| r.ok()).collect();
+    let indexed: std::collections::HashSet<String> = rows.filter_map(|r| r.ok()).collect();
 
     Ok(candidates
         .into_iter()
-        .filter(|p| images.contains(p))
+        .filter(|p| indexed.contains(p))
         .collect())
 }
 

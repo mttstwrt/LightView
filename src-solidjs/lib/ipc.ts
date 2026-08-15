@@ -531,6 +531,9 @@ export interface WorkerStatus {
   workerId: string;
   workerName: string;
   plugins: PluginInfo[];
+  /** `lightview-worker` build this machine reports. Null for a worker old
+   *  enough to predate the field — which is itself the answer to how old. */
+  workerVersion: string | null;
   lastSeen: number;
   /** True for the in-process executor on the server host itself. */
   local: boolean;

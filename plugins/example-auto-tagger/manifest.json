@@ -17,6 +17,10 @@
     "read_image"
   ],
   "tag_prefix": "example",
+  "input": {
+    "max_edge": 512,
+    "video_frames": 5
+  },
   "ui": {
     "settings_schema": null,
     "context_menu_items": [

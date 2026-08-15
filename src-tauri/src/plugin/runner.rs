@@ -93,6 +93,23 @@ pub fn find_plugin(plugin_dir: &Path, name: &str) -> Result<(PluginManifest, Pat
 /// output cannot grow the host's memory over a long job.
 const STDERR_TAIL_LINES: usize = 40;
 
+/// Attach a plugin's recent stderr to a failure message, so the reason travels
+/// with the job instead of living only in a debug log nobody had enabled.
+///
+/// Silence is reported explicitly rather than omitted: for a plugin waiting on
+/// an EOF that will never come, "wrote nothing to stderr" *is* the diagnosis,
+/// and it is the one a reader would otherwise have to infer from an absence.
+pub fn describe_failure(error: String, stderr_tail: &[String]) -> String {
+    if stderr_tail.is_empty() {
+        return format!("{error} (the plugin wrote nothing to stderr)");
+    }
+    format!(
+        "{error}\nplugin stderr (last {} lines):\n{}",
+        stderr_tail.len(),
+        stderr_tail.join("\n")
+    )
+}
+
 /// A running plugin subprocess streaming results back to the host.
 pub struct RunningPlugin {
     /// Stream of results emitted by the plugin, in whatever order it chooses.
@@ -120,16 +137,11 @@ impl RunningPlugin {
 }
 
 impl RunningPlugin {
-    /// Attach the plugin's recent stderr to a failure message, so the reason
-    /// travels with the job instead of living only in a debug log nobody had
-    /// enabled. Silence is reported explicitly — for a plugin waiting on an EOF
-    /// that never comes, "wrote nothing to stderr" *is* the diagnosis.
+    /// Attach the plugin's recent stderr to a failure message. See
+    /// [`describe_failure`]; use that directly when the failure is only known
+    /// after [`Self::finish`] has consumed the handle.
     pub fn explain(&self, error: String) -> String {
-        let tail = self.stderr_tail();
-        if tail.is_empty() {
-            return format!("{error} (the plugin wrote nothing to stderr)");
-        }
-        format!("{error}\nplugin stderr (last {} lines):\n{}", tail.len(), tail.join("\n"))
+        describe_failure(error, &self.stderr_tail())
     }
 
     /// Forcibly terminate the plugin process. Used for cancellation.

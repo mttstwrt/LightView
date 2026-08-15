@@ -21,8 +21,10 @@ use tauri::Emitter;
 use crate::companion::reader;
 use crate::companion::schema::{CompanionFile, MediaType};
 use crate::companion::writer;
+use crate::plugin::input::{plan_parts, InputPolicy, LocalPart, MergedItem, PartTracker};
 use crate::plugin::manifest::PluginManifest;
 use crate::plugin::runner;
+use crate::plugin::RequestDelivery;
 use crate::AppState;
 
 // Canonical definition lives in `plugin` so the worker binary can reuse it;
@@ -65,10 +67,10 @@ fn get_or_create_companion(media_path: &Path) -> Result<CompanionFile, String> {
     }
 }
 
-/// Apply a single plugin result to disk and the tag index.
+/// Apply a single merged item to disk and the tag index.
 /// Returns (tags_added, success, error_message).
-async fn apply_result(
-    result: &runner::PluginResult,
+async fn apply_merged(
+    result: &MergedItem,
     manifest: &PluginManifest,
     cache_db: &Arc<tokio::sync::Mutex<Option<crate::cache::db::CacheDb>>>,
 ) -> (Vec<String>, bool, Option<String>) {
@@ -102,6 +104,13 @@ async fn apply_result(
     (result.tags.clone(), true, None)
 }
 
+/// Run a plugin on one file and wait for the answer.
+///
+/// The batch path's machinery would be overkill for a single item, but the
+/// *input* must be identical or the same clip would tag differently depending
+/// on whether one or two files were selected. So it prepares the same parts —
+/// bounded by `MAX_VIDEO_FRAMES`, hence safe to materialize up front — and
+/// merges them the same way.
 #[tauri::command]
 pub async fn run_plugin(
     state: tauri::State<'_, AppState>,
@@ -112,24 +121,60 @@ pub async fn run_plugin(
     let dir = plugin_dir();
     let (manifest, plugin_path) =
         runner::find_plugin(&dir, &plugin_name).map_err(|e| e.to_string())?;
+    crate::plugin::check_api_version(&manifest, RequestDelivery::UpFront)?;
+    if action != "tag" {
+        return Err(format!("unknown plugin action: {action}"));
+    }
 
-    let requests = vec![runner::PluginRequest {
-        action,
-        path: media_path.clone(),
-    }];
+    let policy = InputPolicy::for_manifest(&manifest);
+    let source = Path::new(&media_path);
+    let temp_dir = std::env::temp_dir()
+        .join("lightview-plugin")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    let mut requests = Vec::new();
+    for (i, part) in plan_parts(source, &policy).into_iter().enumerate() {
+        let prepared = crate::plugin::input::materialize_part(
+            source,
+            part,
+            &policy,
+            &temp_dir,
+            &format!("{i:04}"),
+        )?;
+        requests.push(runner::PluginRequest {
+            action: "tag".to_string(),
+            path: prepared
+                .unwrap_or_else(|| source.to_path_buf())
+                .to_string_lossy()
+                .to_string(),
+        });
+    }
+    let expected = requests.len();
 
     let mut running = runner::run_plugin_stream(&manifest, &plugin_path, requests)
         .await
         .map_err(|e| e.to_string())?;
 
-    let result = running
-        .results
-        .recv()
-        .await
-        .ok_or_else(|| "Plugin produced no output".to_string())?;
+    let mut parts = Vec::with_capacity(expected);
+    while parts.len() < expected {
+        match running.results.recv().await {
+            Some(r) => parts.push(r),
+            None => break,
+        }
+    }
+    let stderr_tail = running.stderr_tail();
     let _ = running.finish().await;
+    let _ = std::fs::remove_dir_all(&temp_dir);
 
-    let (tags_added, ok, err) = apply_result(&result, &manifest, &state.cache_db).await;
+    if parts.is_empty() {
+        return Err(runner::describe_failure(
+            "Plugin produced no output".to_string(),
+            &stderr_tail,
+        ));
+    }
+    let merged = crate::plugin::input::merge_parts(&media_path, parts);
+    let (tags_added, ok, err) = apply_merged(&merged, &manifest, &state.cache_db).await;
 
     // Refresh autocomplete since tag counts may have changed.
     let db = state.cache_db.lock().await;
@@ -141,7 +186,7 @@ pub async fn run_plugin(
     }
 
     Ok(PluginRunResult {
-        path: result.path,
+        path: merged.path,
         tags_added,
         success: ok,
         error: err,
@@ -173,10 +218,18 @@ pub async fn cancel_plugin_batch(state: tauri::State<'_, AppState>) -> Result<()
 
 /// Run a plugin on a batch of media files.
 ///
-/// Spawns one plugin subprocess, streams every path to it as NDJSON, and
-/// forwards each streamed result back to the frontend as a `plugin:progress`
-/// event. The plugin itself decides how to batch and parallelise. The host
-/// just applies results to companion files in arrival order.
+/// Spawns one plugin subprocess and streams requests to it as NDJSON,
+/// forwarding each merged result back to the frontend as a `plugin:progress`
+/// event. The plugin decides how to batch and parallelise internally; the host
+/// decides what it *receives* — see [`crate::plugin::input`], which scales
+/// stills to the size the manifest asked for and turns a video into several
+/// frames. This used to hand over raw paths and leave videos to the plugin,
+/// which is why each tagger carried its own copy of ffmpeg sampling; converging
+/// on one policy is the point, so that a plugin cannot behave differently
+/// depending on whether the job ran here, on the server, or on a worker.
+///
+/// Progress is counted in media items, not requests: a five-frame clip is one
+/// step of the progress bar.
 #[tauri::command]
 pub async fn run_plugin_batch(
     state: tauri::State<'_, AppState>,
@@ -190,38 +243,75 @@ pub async fn run_plugin_batch(
     let dir = plugin_dir();
     let (manifest, plugin_path) =
         runner::find_plugin(&dir, &plugin_name).map_err(|e| e.to_string())?;
+    // The desktop writes every request up front, so a pre-streaming plugin runs
+    // here as it always has; only a plugin built for a *newer* host is refused.
+    crate::plugin::check_api_version(&manifest, RequestDelivery::UpFront)?;
+    if action != "tag" {
+        return Err(format!("unknown plugin action: {action}"));
+    }
 
     log::info!("Plugin batch: {} files for {}", media_paths.len(), manifest.name);
 
     let cancelled = state.plugin_cancelled.clone();
     let cache_db = state.cache_db.clone();
     let autocomplete = state.autocomplete.clone();
+    let thumb_pool = state.thumb_pool.clone();
 
     tauri::async_runtime::spawn(async move {
         let total = media_paths.len();
-        let requests: Vec<runner::PluginRequest> = media_paths
-            .into_iter()
-            .map(|path| runner::PluginRequest {
-                action: action.clone(),
-                path,
-            })
-            .collect();
+        let policy = InputPolicy::for_manifest(&manifest);
+        let request_total: usize = media_paths
+            .iter()
+            .map(|p| plan_parts(Path::new(p), &policy).len())
+            .sum();
 
-        let mut running = match runner::run_plugin_stream(&manifest, &plugin_path, requests).await {
+        // Temp dir for prepared inputs. Empty unless the plugin asked for
+        // scaled stills or there are videos in the batch.
+        let temp_dir = std::env::temp_dir()
+            .join("lightview-plugin")
+            .join(uuid::Uuid::new_v4().to_string());
+        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+            log::error!("Plugin batch: cannot create temp dir: {e}");
+            let _ = app_handle.emit(
+                "plugin:done",
+                PluginDoneEvent { succeeded: 0, failed: total, cancelled: false },
+            );
+            return;
+        }
+
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel::<runner::PluginRequest>(8);
+        let mut running = match runner::run_plugin_stream_channel(
+            &manifest,
+            &plugin_path,
+            req_rx,
+            Some(request_total),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 log::error!("Failed to start plugin '{}': {}", manifest.name, e);
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 let _ = app_handle.emit(
                     "plugin:done",
-                    PluginDoneEvent {
-                        succeeded: 0,
-                        failed: total,
-                        cancelled: false,
-                    },
+                    PluginDoneEvent { succeeded: 0, failed: total, cancelled: false },
                 );
                 return;
             }
         };
+
+        let tracker: Arc<tokio::sync::Mutex<PartTracker<LocalPart>>> =
+            Arc::new(tokio::sync::Mutex::new(PartTracker::new()));
+        let prepare_failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let producer = crate::plugin::input::spawn_local_producer(
+            thumb_pool,
+            media_paths,
+            policy,
+            temp_dir.clone(),
+            req_tx,
+            tracker.clone(),
+            prepare_failed.clone(),
+        );
 
         let mut completed: usize = 0;
         let mut succeeded: usize = 0;
@@ -229,49 +319,75 @@ pub async fn run_plugin_batch(
         let mut was_cancelled = false;
 
         // Poll the cancellation flag on a timer so cancellation is responsive
-        // even when the plugin is mid-batch and producing no output.
+        // even when the plugin is mid-batch and producing no output. The same
+        // tick sweeps requests the plugin has abandoned, so a skipped file is
+        // reported rather than silently losing its tags.
         let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut last_result = tokio::time::Instant::now();
 
         loop {
+            let mut finished_items = Vec::new();
             tokio::select! {
                 maybe = running.results.recv() => {
-                    let Some(result) = maybe else { break; };
+                    let Some(result) = maybe else {
+                        let mut t = tracker.lock().await;
+                        let orphaned = t.drain_unanswered();
+                        finished_items = t.take_completed();
+                        drop(t);
+                        for part in orphaned {
+                            part.release().await;
+                        }
+                        emit_items(
+                            finished_items, &manifest, &cache_db, &app_handle,
+                            &mut completed, &mut succeeded, &mut failed, total,
+                        ).await;
+                        break;
+                    };
 
-                    completed += 1;
-                    let (tags_added, ok, err) =
-                        apply_result(&result, &manifest, &cache_db).await;
-                    if ok {
-                        succeeded += 1;
-                    } else {
-                        failed += 1;
-                    }
-
-                    let _ = app_handle.emit(
-                        "plugin:progress",
-                        PluginProgressEvent {
-                            completed,
-                            total,
-                            path: result.path.clone(),
-                            tags_added,
-                            success: ok,
-                            error: err,
-                        },
-                    );
+                    let mut t = tracker.lock().await;
+                    let Some(part) = t.result(result) else {
+                        drop(t);
+                        log::warn!("plugin result for unknown path");
+                        continue;
+                    };
+                    finished_items = t.take_completed();
+                    drop(t);
+                    last_result = tokio::time::Instant::now();
+                    part.release().await;
                 }
                 _ = tick.tick() => {
                     if cancelled.load(Ordering::Relaxed) {
                         was_cancelled = true;
                         break;
                     }
+                    let mut t = tracker.lock().await;
+                    let stale = t.take_stale(last_result.elapsed());
+                    if !stale.is_empty() {
+                        finished_items = t.take_completed();
+                    }
+                    drop(t);
+                    for (name, part) in stale {
+                        log::warn!("plugin '{}' never answered '{name}'", manifest.name);
+                        part.release().await;
+                    }
                 }
             }
+            emit_items(
+                finished_items, &manifest, &cache_db, &app_handle,
+                &mut completed, &mut succeeded, &mut failed, total,
+            ).await;
         }
+
+        producer.abort();
+        tracker.lock().await.drain_unanswered();
+        failed += prepare_failed.load(Ordering::Relaxed);
 
         if was_cancelled {
             running.kill().await;
         } else {
             let _ = running.finish().await;
         }
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
         // Rebuild tag counts once at the end.
         let db = cache_db.lock().await;
@@ -293,6 +409,40 @@ pub async fn run_plugin_batch(
     });
 
     Ok(())
+}
+
+/// Write each finished media item and report it to the frontend.
+#[allow(clippy::too_many_arguments)]
+async fn emit_items(
+    items: Vec<MergedItem>,
+    manifest: &PluginManifest,
+    cache_db: &Arc<tokio::sync::Mutex<Option<crate::cache::db::CacheDb>>>,
+    app_handle: &tauri::AppHandle,
+    completed: &mut usize,
+    succeeded: &mut usize,
+    failed: &mut usize,
+    total: usize,
+) {
+    for item in items {
+        *completed += 1;
+        let (tags_added, ok, err) = apply_merged(&item, manifest, cache_db).await;
+        if ok {
+            *succeeded += 1;
+        } else {
+            *failed += 1;
+        }
+        let _ = app_handle.emit(
+            "plugin:progress",
+            PluginProgressEvent {
+                completed: *completed,
+                total,
+                path: item.path,
+                tags_added,
+                success: ok,
+                error: err,
+            },
+        );
+    }
 }
 
 /// Install (or update) a plugin from a directory or a bare `.py` script.

@@ -131,15 +131,27 @@ pub async fn start(config: HttpConfig, app: AppState) -> std::io::Result<Running
     // in a single request (each file is buffered while being written).
     const MAX_UPLOAD_BYTES: usize = 512 * 1024 * 1024;
 
+    // `/api/invoke` bodies are small — except the ones that carry a selection.
+    // "Tag these" and the batch tag/rating commands send one absolute path per
+    // selected file, so the body scales with the library, and axum's 2 MB
+    // default cut that off around 25,000 paths. Selecting a whole gallery and
+    // walking away is exactly the case remote tagging is for, so raise it far
+    // enough that the limit is not what a user meets first. Still bounded:
+    // every one of these is parsed into memory.
+    const MAX_INVOKE_BYTES: usize = 32 * 1024 * 1024;
+
     let protected = Router::new()
         .route("/media/{*path}", get(routes::media))
         .route("/thumb/{tier}/{*path}", get(routes::thumb))
         .route("/gif-atlas/{tier}/{*path}", get(routes::gif_atlas))
         .route("/thumbhash/{*path}", get(routes::thumbhash))
-        .route("/api/invoke", post(api::invoke))
+        .route(
+            "/api/invoke",
+            post(api::invoke).layer(DefaultBodyLimit::max(MAX_INVOKE_BYTES)),
+        )
         .route("/api/events", get(routes::events))
-        // The body limit applies only to the upload route; the other data
-        // routes keep axum's small default.
+        // The remaining data routes keep axum's small default — they are GETs
+        // with no body at all.
         .route(
             "/api/upload",
             post(routes::upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),

@@ -16,14 +16,19 @@ Streaming protocol (newline-delimited JSON):
 The plugin streams: requests are consumed as they arrive and results are
 emitted as soon as each batch finishes. Hosts like lightview-worker bound
 their download pipeline on results, so buffering stdin to EOF would deadlock.
-Images are batched for parallel GPU inference; videos run one at a time
-(each has its own per-frame loop). The host advertises the expected request
-count in LIGHTVIEW_JOB_TOTAL for instance-pool sizing.
+The host advertises the expected request count in LIGHTVIEW_JOB_TOTAL for
+instance-pool sizing.
+
+Every request is a still, and the host guarantees it: manifest.json declares
+`api_version: 1` and an `input.max_edge`, so images arrive already scaled and
+a video arrives as several extracted frames whose results the host merges back
+into one. That is why there is no ffmpeg here any more — the sampling policy
+lived in four plugins that could silently disagree, and it belongs in the one
+place that can also do it without a subprocess per frame.
 """
 
 import ctypes
 import glob as _glob
-import io
 import json
 import math
 import queue
@@ -71,9 +76,6 @@ LABEL_FILENAME = "selected_tags.csv"
 
 GENERAL_THRESHOLD = 0.35
 CHARACTER_THRESHOLD = 0.85
-
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv"}
-VIDEO_FRAME_SAMPLES = 5
 
 # Kaomoji tags that should not have underscores replaced with spaces
 KAOMOJIS = {
@@ -127,52 +129,6 @@ def prepare_image(image, target_size):
     # RGB -> BGR (model expects BGR)
     arr = arr[:, :, ::-1]
     return np.expand_dims(arr, axis=0)
-
-
-def is_video(path):
-    return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
-
-
-def get_video_duration(path):
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=30, check=True,
-        )
-        return float(out.stdout.strip())
-    except (subprocess.SubprocessError, ValueError, FileNotFoundError):
-        return None
-
-
-def extract_frame(path, timestamp):
-    try:
-        proc = subprocess.run(
-            ["ffmpeg", "-loglevel", "error", "-ss", f"{timestamp:.3f}",
-             "-i", path, "-frames:v", "1", "-f", "image2pipe",
-             "-vcodec", "png", "-"],
-            capture_output=True, timeout=60,
-        )
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return None
-    if proc.returncode != 0 or not proc.stdout:
-        return None
-    try:
-        img = Image.open(io.BytesIO(proc.stdout))
-        img.load()
-        return img
-    except Exception:
-        return None
-
-
-def sample_video_timestamps(duration, n):
-    if duration < 1.0:
-        return [duration / 2.0]
-    start, end = duration * 0.05, duration * 0.95
-    if n <= 1:
-        return [(start + end) / 2.0]
-    step = (end - start) / (n - 1)
-    return [start + i * step for i in range(n)]
 
 
 class Tagger:
@@ -298,31 +254,6 @@ class Tagger:
                     results[idx] = self.predict_image(paths[idx])
 
         return results
-
-    def predict_video(self, path):
-        try:
-            duration = get_video_duration(path)
-            if not duration or duration <= 0:
-                return {"path": path, "tags": [], "error": "Could not determine video duration"}
-            timestamps = sample_video_timestamps(duration, VIDEO_FRAME_SAMPLES)
-            score_max = None
-            sampled = []
-            for t in timestamps:
-                frame = extract_frame(path, t)
-                if frame is None:
-                    continue
-                scores = self._infer_one(frame)
-                score_max = scores if score_max is None else np.maximum(score_max, scores)
-                sampled.append(t)
-            if not sampled:
-                return {"path": path, "tags": [], "error": "Failed to decode any frames"}
-            response = self._build_response(path, score_max)
-            response["meta"]["video_frames_sampled"] = len(sampled)
-            response["meta"]["video_frame_timestamps"] = [round(t, 2) for t in sampled]
-            return response
-        except Exception as e:
-            return {"path": path, "tags": [], "error": str(e)}
-
 
 _emit_lock = threading.Lock()
 
@@ -542,13 +473,9 @@ def run_workers(taggers, work_q, batch_size):
             if item is _EOF:
                 work_q.put(_EOF)  # release sibling workers
                 break
-            if is_video(item):
-                flush()  # a video interrupts batching; keep the GPU batch clean
-                emit(tagger.predict_video(item))
-            else:
-                buf.append(item)
-                if len(buf) >= batch_size:
-                    flush()
+            buf.append(item)
+            if len(buf) >= batch_size:
+                flush()
         flush()
 
     threads = [threading.Thread(target=worker, args=(t,), daemon=True) for t in taggers]

@@ -272,23 +272,36 @@ impl ServerClient {
         })
     }
 
-    /// Download one media file to `dest_dir`, named `<seq>.<ext>` with the
-    /// extension taken from the response Content-Type (fit downloads are
-    /// re-encoded server-side, so the original extension would lie). Returns
-    /// the written path.
+    /// Download one media file — or one frame of a clip — to `dest_dir`, named
+    /// `<seq>.<ext>` with the extension taken from the response Content-Type
+    /// (fit and frame downloads are re-encoded server-side, so the original
+    /// extension would lie). Returns the written path.
+    ///
+    /// `frame` is `(index, count)` and asks the server to extract that sample
+    /// point instead of serving the file. Videos are the reason this worker
+    /// needs no ffmpeg: `?fit=` cannot resize a clip, so without server-side
+    /// extraction a 64-file window would be tens of gigabytes.
     pub async fn download_media(
         &self,
         server_path: &str,
         fit_edge: u32,
+        frame: Option<(u32, u32)>,
         dest_dir: &Path,
         seq: usize,
     ) -> Result<std::path::PathBuf, String> {
         let rel = server_path.strip_prefix('/').unwrap_or(server_path);
         let encoded = encode_media_path(rel);
-        let query = if fit_edge > 0 {
-            format!("?fit={fit_edge}")
-        } else {
+        let mut params: Vec<String> = Vec::new();
+        if fit_edge > 0 {
+            params.push(format!("fit={fit_edge}"));
+        }
+        if let Some((index, count)) = frame {
+            params.push(format!("frame={index}&frames={count}"));
+        }
+        let query = if params.is_empty() {
             String::new()
+        } else {
+            format!("?{}", params.join("&"))
         };
         let resp = self
             .http

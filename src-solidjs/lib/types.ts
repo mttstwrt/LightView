@@ -212,6 +212,9 @@ export interface PluginInfo {
   name: string;
   display_name: string;
   version: string;
+  /** Host protocol version the plugin's manifest declares. `0` means it
+   *  predates the versioned protocol, which a remote worker refuses to run. */
+  api_version: number;
   description: string;
   tag_prefix: string;
 }
