@@ -376,7 +376,13 @@ pub fn encode_video_frame(
 /// here: a local part is a decode, not a network round trip, so a deep queue
 /// buys no latency and only costs temp space. Zero when nothing is
 /// materialized — see [`InputPolicy::materializes`].
-pub const MAX_LOCAL_PENDING: usize = 16;
+pub const MAX_LOCAL_PENDING: usize = 32;
+
+// An item's parts are all in flight together, so a window no larger than the
+// biggest item could be entirely consumed by one clip and deadlock waiting for
+// a slot it already holds. Kept as an assertion rather than a comment because
+// the two constants are edited for unrelated reasons.
+const _: () = assert!(MAX_VIDEO_FRAMES as usize * 2 <= MAX_LOCAL_PENDING);
 
 /// What a local driver must release once a part resolves.
 pub struct LocalPart {
@@ -417,9 +423,7 @@ pub fn spawn_local_producer(
     temp_dir: PathBuf,
     req_tx: tokio::sync::mpsc::Sender<super::runner::PluginRequest>,
     tracker: std::sync::Arc<tokio::sync::Mutex<PartTracker<LocalPart>>>,
-    failed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
-    use std::sync::atomic::Ordering;
     use tokio::sync::Semaphore;
 
     tokio::spawn(async move {
@@ -451,8 +455,11 @@ pub fn spawn_local_producer(
                     // asked for.
                     Ok(None) => source.clone(),
                     Err(e) => {
+                        // Resolving the part is the whole accounting: the item
+                        // completes as an error once its last part resolves,
+                        // and the driver counts it there. A separate counter
+                        // here would count the same file twice.
                         log::warn!("{path}: could not prepare input for the plugin: {e}");
-                        failed.fetch_add(1, Ordering::Relaxed);
                         tracker.lock().await.part_failed(item);
                         continue;
                     }
@@ -482,7 +489,10 @@ pub fn spawn_local_producer(
 }
 
 /// Run [`materialize_part`] on the thumbnail pool and await the answer.
-async fn prepare_on_pool(
+///
+/// Public because the single-file command needs it too: decoding a
+/// 60-megapixel original on a tokio worker thread would block the runtime.
+pub async fn prepare_on_pool(
     pool: &std::sync::Arc<rayon::ThreadPool>,
     source: &Path,
     part: Part,

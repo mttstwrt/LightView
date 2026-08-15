@@ -10,7 +10,7 @@
 //! ship code here. Opt-in by installing plugins server-side — with an empty
 //! plugins dir the executor never registers and the web UI never offers it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -174,7 +174,6 @@ async fn drive_prepared(
 
     let tracker: Arc<tokio::sync::Mutex<PartTracker<LocalPart>>> =
         Arc::new(tokio::sync::Mutex::new(PartTracker::new()));
-    let prepare_failed = Arc::new(AtomicUsize::new(0));
     let producer = spawn_local_producer(
         state.thumb_pool.clone(),
         paths,
@@ -182,7 +181,6 @@ async fn drive_prepared(
         temp_dir.to_path_buf(),
         req_tx,
         tracker.clone(),
-        prepare_failed.clone(),
     );
 
     let mut succeeded: usize = 0;
@@ -267,13 +265,12 @@ async fn drive_prepared(
                 }
                 collect(done, manifest, &mut batch, &mut failed);
 
-                let total_failed = failed + prepare_failed.load(Ordering::Relaxed);
                 match super::update_job(
                     state,
                     job_id.to_string(),
                     LOCAL_WORKER_ID.to_string(),
                     succeeded,
-                    total_failed,
+                    failed,
                 )
                 .await
                 {
@@ -287,7 +284,6 @@ async fn drive_prepared(
 
     producer.abort();
     tracker.lock().await.drain_unanswered();
-    failed += prepare_failed.load(Ordering::Relaxed);
 
     match outcome {
         Outcome::Finished => {

@@ -336,6 +336,18 @@ thousand photos and walk away" a supported thing to do: the window slides,
 misbehaviour costs one image at a time, and every remaining path to a permanent
 hang has a timer that actually evaluates.
 
+Measured against a headless server with a deliberately broken plugin. A
+200-image job with a well-behaved tagger finishes in under 4 s. The same job
+with a plugin that answers only *every other* request — 100 stranded slots
+against a 64-slot window, the configuration that used to hang forever — parks at
+64/200 as expected, reclaims all 64 slots on the idle rule at ~5 min, and
+completes at **100 tagged / 100 failed** in 331 s. A plugin that drops a single
+request needs no reclaim at all: the final drain catches it when the stream
+ends, and the job reports 199/1 in five seconds.
+
+So the worst realistic case costs one five-minute pause per window's worth of
+skips, and the common case costs nothing. What it never does is stop.
+
 ## Server-local execution (`tagging/local.rs`)
 
 The in-process executor gives small hosts the *option* of running taggers

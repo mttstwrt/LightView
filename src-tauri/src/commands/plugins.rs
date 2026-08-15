@@ -135,13 +135,15 @@ pub async fn run_plugin(
 
     let mut requests = Vec::new();
     for (i, part) in plan_parts(source, &policy).into_iter().enumerate() {
-        let prepared = crate::plugin::input::materialize_part(
+        let prepared = crate::plugin::input::prepare_on_pool(
+            &state.thumb_pool,
             source,
             part,
             &policy,
             &temp_dir,
             &format!("{i:04}"),
-        )?;
+        )
+        .await?;
         requests.push(runner::PluginRequest {
             action: "tag".to_string(),
             path: prepared
@@ -302,7 +304,6 @@ pub async fn run_plugin_batch(
 
         let tracker: Arc<tokio::sync::Mutex<PartTracker<LocalPart>>> =
             Arc::new(tokio::sync::Mutex::new(PartTracker::new()));
-        let prepare_failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let producer = crate::plugin::input::spawn_local_producer(
             thumb_pool,
             media_paths,
@@ -310,7 +311,6 @@ pub async fn run_plugin_batch(
             temp_dir.clone(),
             req_tx,
             tracker.clone(),
-            prepare_failed.clone(),
         );
 
         let mut completed: usize = 0;
@@ -380,7 +380,6 @@ pub async fn run_plugin_batch(
 
         producer.abort();
         tracker.lock().await.drain_unanswered();
-        failed += prepare_failed.load(Ordering::Relaxed);
 
         if was_cancelled {
             running.kill().await;
