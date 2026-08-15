@@ -180,14 +180,14 @@ fn rewrite_manifest_python(manifest_path: &Path, source_dir: &Path) -> Result<()
         .map(|cmd| cmd.contains(".venv") || cmd.contains("venv"))
         .unwrap_or(false);
 
-    if needs_rewrite {
-        if let Some(abs_python) = detect_venv_python(source_dir) {
-            if let Some(exec) = doc.get_mut("execution").and_then(|e| e.as_object_mut()) {
-                exec.insert("command".to_string(), serde_json::Value::String(abs_python));
-            }
-            let out = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-            std::fs::write(manifest_path, out).map_err(|e| e.to_string())?;
+    if needs_rewrite
+        && let Some(abs_python) = detect_venv_python(source_dir)
+    {
+        if let Some(exec) = doc.get_mut("execution").and_then(|e| e.as_object_mut()) {
+            exec.insert("command".to_string(), serde_json::Value::String(abs_python));
         }
+        let out = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+        std::fs::write(manifest_path, out).map_err(|e| e.to_string())?;
     }
 
     Ok(())

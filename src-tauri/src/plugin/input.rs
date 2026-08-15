@@ -310,10 +310,10 @@ pub fn materialize_part(
             // nothing — the common case for a phone-sized image and a
             // 448-pixel model is *not* this, but a folder of small images
             // should not pay a WebP encode each.
-            if let Some((w, h)) = thumbnailer::header_dimensions(source) {
-                if w.max(h) <= edge {
-                    return Ok(None);
-                }
+            if let Some((w, h)) = thumbnailer::header_dimensions(source)
+                && w.max(h) <= edge
+            {
+                return Ok(None);
             }
             let thumb = thumbnailer::generate_for_path_fit(
                 source,
