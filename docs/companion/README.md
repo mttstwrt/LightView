@@ -54,6 +54,15 @@ returns without interpreting.
 That namespacing is what the filter language's `user::`, `auto::`, and
 `plugin.<name>::` prefixes address — see [`query/`](../query/README.md).
 
+One `tags.plugins` bucket is written by the host rather than by a plugin:
+`location`, holding the place names [`geocode/`](../geocode/README.md) derives
+from the file's GPS coordinates. It reuses this container because a
+`PluginTagEntry` is exactly a named, versioned set of tags that a re-run
+replaces wholesale — which is what re-geocoding needs — and doing so kept the
+wire format unchanged. Note the asymmetry with `meta.core.location` below: the
+*coordinate* is already in the media file's own EXIF and is cached rather than
+duplicated here, while the *name* exists nowhere else and so is written to disk.
+
 `meta.core` holds the fields the app itself owns: `rating`, `date_rated`,
 `color_label`, `notes`, `media` (dimensions, duration, codec), and `location`
 (decimal degrees, WGS-84, optional altitude in metres).

@@ -25,13 +25,13 @@
 //! `start_fs_watcher`.
 
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tauri::Emitter;
 
 use crate::cache::db::CacheDb;
-use crate::companion::schema::MediaType;
+use crate::companion::schema::{MediaType, PluginTagEntry};
 use crate::pipeline::exif;
 use crate::provider::local::LocalProvider;
 use crate::provider::FileEntry;
@@ -176,6 +176,100 @@ fn backfill_gps_meta(db: &CacheDb) -> Result<(), String> {
     log::info!(
         "EXIF GPS backfill: {}/{} images had coordinates",
         extracted.len(),
+        candidates.len()
+    );
+    Ok(())
+}
+
+/// The companion `tags.plugins` key the location tags occupy, and therefore
+/// the `plugin.location` namespace they land in once indexed.
+///
+/// It reuses the plugin *storage* convention without being a plugin: a
+/// `PluginTagEntry` is a named, versioned tag bucket that can be replaced
+/// wholesale, which is exactly what a re-geocode against a newer dataset needs.
+/// Writing into `tags.auto` instead would work today but leaves nothing to
+/// distinguish our entries from any other automatic tagger's.
+const LOCATION_BUCKET: &str = "location";
+
+/// Reverse-geocode every geotagged file that has no location tags yet and write
+/// the place names into its companion file.
+///
+/// The names go to disk, unlike the coordinates in `backfill_gps_meta` which
+/// stay in `media_meta`: a coordinate is already in the file's EXIF and any
+/// tool can read it, whereas "Kyoto" exists nowhere but here and would be lost
+/// with the cache. That is also what makes the gallery greppable without
+/// LightView.
+///
+/// Runs before `index_companions` so the sidecars written here are picked up in
+/// the same pass. The "already tagged" test reads `tag_index`, which reflects
+/// the *previous* open — so a gallery whose sidecars arrived already tagged
+/// (copied from another machine) is re-geocoded once and writes identical
+/// content, then settles. Reading every companion to avoid that would cost more
+/// than the one redundant pass.
+fn backfill_location_tags(db: &CacheDb) -> Result<(), String> {
+    let namespace = format!("plugin.{}", LOCATION_BUCKET);
+
+    let candidates: Vec<(String, f64, f64)> = {
+        let mut stmt = db
+            .conn()
+            .prepare_cached(
+                "SELECT m.path, m.gps_lat, m.gps_lon FROM media_meta m
+                 WHERE m.gps_lat IS NOT NULL AND m.gps_lon IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM tag_index ti
+                       WHERE ti.path = m.path AND ti.namespace = ?1
+                   )",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![&namespace], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    log::info!("Reverse-geocoding {} geotagged files", candidates.len());
+
+    // The gazetteer builds on first lookup; whichever rayon worker gets there
+    // first pays for it and the rest block on the OnceLock. Sidecar writes are
+    // the real cost here — the lookup itself is a k-d tree probe.
+    let written: usize = candidates
+        .par_iter()
+        .map(|(path, lat, lon)| {
+            let Some(place) = crate::geocode::lookup(*lat, *lon) else {
+                return 0;
+            };
+            let tags = place.tags();
+            if tags.is_empty() {
+                return 0;
+            }
+            match crate::commands::tags::modify_companion(path, |companion| {
+                companion.tags.plugins.insert(
+                    LOCATION_BUCKET.to_string(),
+                    PluginTagEntry {
+                        version: crate::geocode::DATASET_VERSION.to_string(),
+                        tags,
+                        extra: HashMap::new(),
+                    },
+                );
+            }) {
+                Ok(_) => 1,
+                Err(e) => {
+                    log::warn!("Failed to write location tags for {}: {}", path, e);
+                    0
+                }
+            }
+        })
+        .sum();
+
+    log::info!(
+        "Location tagging: {}/{} geotagged files resolved to a place",
+        written,
         candidates.len()
     );
     Ok(())
@@ -859,6 +953,12 @@ pub async fn open_gallery_impl(
                 // gps_lat IS NULL, so later opens skip already-extracted files.
                 if let Err(e) = backfill_gps_meta(db) {
                     log::warn!("GPS backfill failed: {}", e);
+                }
+
+                // Turn those coordinates into place names in the companions,
+                // before the index pass below so they land in the same sweep.
+                if let Err(e) = backfill_location_tags(db) {
+                    log::warn!("Location tagging failed: {}", e);
                 }
 
                 // Re-index companions so tag_index/tag_counts reflect disk.

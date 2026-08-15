@@ -44,6 +44,10 @@ percent-encoding = "2"
 bytemuck = { version = "1", features = ["derive"] }
 libheif-rs = "2"
 kamadak-exif = "0.6"
+# Offline reverse geocoding (GeoNames cities1000, ~7.9 MB embedded in the
+# binary). Replaces a gazetteer download, a CSV parser, and a k-d tree we would
+# otherwise maintain ourselves; see src/geocode.
+reverse_geocoder = "4.1.1"
 thumbhash = "0.1"
 webp = "0.3"
 wgpu = { version = "29", optional = true }
