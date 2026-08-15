@@ -86,10 +86,16 @@ loopback-only instance of the same server purely so `<video>` elements have an
 `http://` URL to load from.
 
 **[`plugins/`](plugins/README.md)** (`plugin/`) spawns a plugin as a subprocess
-and exchanges NDJSON with it. **`tagging/`** is the queue that decides *where*
-that happens: in-process on the server, or on a paired `lightview-worker`
-running on a machine with a GPU. See
-[`remote/worker-tagging.md`](remote/worker-tagging.md).
+and exchanges NDJSON with it. It also decides what the plugin *receives*:
+`plugin/input.rs` scales a still to the size the manifest asked for, splits a
+video into sampled frames, and merges those frames' results back into one, so a
+plugin never handles video and behaves identically wherever it runs.
+`plugin/install.rs` is how a plugin gets into an install directory — shared by
+the desktop command and `lightview-worker install`, because a hand-copied plugin
+nobody updates is what produced the deadlock `api_version` now catches.
+**`tagging/`** is the queue that decides *where* execution happens: in-process
+on the server, or on a paired `lightview-worker` running on a machine with a
+GPU. See [`remote/worker-tagging.md`](remote/worker-tagging.md).
 
 **[`duplicates/`](duplicates/README.md)** spans `cache/duplicates.rs` and
 `commands/duplicates.rs`: perceptual hashing, grouping, and the merge that
@@ -239,6 +245,10 @@ Three binaries come out of `src-tauri/`:
 | `lightview` | the desktop app | GTK/WebKitGTK, and `dist/` at compile time |
 | `lightview-headless` | the same backend plus the HTTP server, no webview | nothing graphical |
 | `lightview-worker` | pairs to a server, claims tagging jobs, runs plugins locally | feature `worker` |
+
+`lightview-worker` is skipped by an ordinary build and by the Tauri bundle
+(`required-features`), so it is built and released explicitly — see
+[decision 0014](decisions/0014-ship-the-worker-with-the-release.md).
 
 `lightview-headless` exists so the entire remote surface can be exercised with
 `curl` and a real browser on a machine with no display. See

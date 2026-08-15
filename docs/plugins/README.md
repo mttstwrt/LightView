@@ -2,9 +2,11 @@
 
 [← docs index](../README.md) · [architecture](../architecture.md)
 
-**Responsible for:** the plugin manifest format, spawning a plugin as a
-subprocess, and the NDJSON protocol spoken over its stdin/stdout
-(`plugin/manifest.rs`, `plugin/runner.rs`, `commands/plugins.rs`).
+**Responsible for:** the plugin manifest format and its two versions; spawning
+a plugin as a subprocess and the NDJSON protocol spoken over its stdin/stdout;
+what a plugin receives (scaled stills, sampled video frames) and how several
+results become one; and installing a plugin into an install directory.
+`plugin/{manifest,runner,input,install}.rs` plus `commands/plugins.rs`.
 
 **Not responsible for:** deciding *where* a plugin runs. That is
 [`tagging/`](../remote/worker-tagging.md), which routes a job either to the
@@ -12,15 +14,28 @@ server's own in-process executor or to a paired `lightview-worker`. It is also
 not responsible for writing results: `apply_plugin_output` hands tags to
 [`companion/`](../companion/README.md), which owns the file format.
 
-**Depends on:** `companion/` and `util::paths` for the plugin directory.
-**Depended on by:** `tagging/`, `commands/plugins.rs`, and `lightview-worker`.
+**Depends on:** `companion/` for the tag namespace and media types,
+[`pipeline/`](../pipeline/README.md) for decode/resize and ffmpeg frame
+extraction, and `util::paths` for the plugin directory.
+**Depended on by:** `tagging/` (both executors), `commands/plugins.rs`,
+`http_server::routes` (the `?frame=` route), and `lightview-worker`.
+
+**Invariants callers must uphold.** Run a plugin only after
+`check_api_version` has passed for the delivery mode you are about to use — an
+undeclared plugin on an incremental host deadlocks by construction. Register a
+media item's full part count with `PartTracker` *before* producing any part, or
+an item whose first frame answers early will be finalized short. And every part
+must be resolved exactly once — by a result, a preparation failure, a staleness
+sweep, or the final drain — or its item never completes and its file silently
+loses its tags.
 
 The protocol shape — a subprocess and a line of JSON, rather than an embedded
 runtime — is [decision 0006](../decisions/0006-plugins-are-ndjson-subprocesses.md).
 The rest of this page is the honest inventory of what that protocol can express
 today and what a real extension host would need.
 
-**Status:** design discussion / roadmap. Nothing here is built yet.
+**Status:** sections 1 and 6 describe what exists; 2–5 are the analysis behind
+the direction, kept because it is what stops it being re-litigated.
 **Audience:** maintainers deciding how far to take LightView's plugin system.
 
 ---
@@ -28,47 +43,108 @@ today and what a real extension host would need.
 ## 1. What we actually have today
 
 Despite the "plugin-extensible" framing, the plugin system is, in practice, an
-**auto-tagger runner**. The full surface is two files — `src-tauri/src/plugin/manifest.rs`
-and `src-tauri/src/plugin/runner.rs` — plus the command wrappers in
-`src-tauri/src/commands/plugins.rs`.
+**auto-tagger runner**. The surface is `src-tauri/src/plugin/` — `manifest.rs`
+(the JSON a plugin declares itself with), `runner.rs` (the subprocess and the
+NDJSON), `input.rs` (what the plugin receives and how several results become
+one), `install.rs` (getting a plugin into an install directory) — plus the
+command wrappers in `src-tauri/src/commands/plugins.rs`.
 
-How it works:
+### The manifest
 
-- A plugin is a directory with a `manifest.json` (`name`, `execution`, `capabilities`,
-  `tag_prefix`, optional `ui`).
-- The host spawns the plugin as a **subprocess** and speaks a streaming NDJSON
-  protocol over stdin/stdout:
-  - Request line: `{"action": "tag", "path": "/abs/path/img.jpg"}`
-  - Result line: `{"path": "...", "tags": [...], "meta": {...}}` or `{"path": "...", "error": "..."}`
-  - **Plugins MUST emit results incrementally** — consume requests as they arrive
-    and emit each result as soon as it's ready, never buffer stdin to EOF before
-    tagging. Remote hosts (`lightview-worker`) keep only a bounded number of
-    downloaded files on disk and download more only as results come back, so an
-    EOF-buffering plugin deadlocks any job larger than that bound. For pool/batch
-    sizing decisions that used to need the full request list, the host advertises
-    the expected request count in the `LIGHTVIEW_JOB_TOTAL` env var.
-- `apply_plugin_output` writes the returned tags into the companion file under
-  `tags.plugins[tag_prefix]`, and any `meta` object under `meta.plugins[tag_prefix]`.
+A plugin is a directory with a `manifest.json`: `name`, `display_name`,
+`version`, `api_version`, `execution`, `capabilities`, `tag_prefix`, optional
+`input`, optional `ui`.
 
-What that means for extensibility:
+Two of those are versions and they answer different questions. `version` is the
+plugin's own, stamped into every companion file it writes. **`api_version` is
+the host contract it was built against**, and it selects behaviour rather than
+merely describing it — see
+[decision 0012](../decisions/0012-plugins-declare-the-contract-they-were-built-for.md).
 
-- **One verb.** The host only ever sends `action: "tag"`. The `action` field is
-  plumbed but never varies. `tag_prefix` is mandatory — the data model assumes the
-  plugin's output *is* tags.
-- **No UI extension.** `PluginUiConfig` has `settings_schema` and `context_menu_items`,
-  but `settings_schema` is unused and the only context action that resolves is "tag".
-  A plugin cannot add a view, a panel, a command, a filter operator, or a sort key.
-- **The "daemon" mode does not exist.** Older docs referenced a long-running daemon
-  plugin; there is no `daemon.rs`. Each run is a fresh subprocess (the plugin may batch
-  internally across the NDJSON stream, which is how the ML taggers amortize model load).
-- **`Wasm` execution is a stub.** `ExecutionConfig::Wasm` exists in the manifest enum
-  but `run_plugin_stream` returns `WasmNotSupported`.
-- **Capabilities are declarative, not enforced.** `ReadImage` / `NetworkAccess` are
-  advisory. There is no actual sandbox around the subprocess yet.
+| `api_version` | The plugin gets | The plugin must |
+|---|---|---|
+| `0` (absent) | original file paths, every request written up front | do its own video handling; may read stdin to EOF first |
+| `1` | stills scaled to `input.max_edge`; a video arrives as several extracted frames | consume requests as they arrive and answer every one |
 
-So the honest summary: **a capability-scoped (in intent), out-of-process, data-in /
-data-out tagging protocol.** That's a perfectly good shape — it just isn't a general
-extension host, and the docs shouldn't imply it is.
+A `0` plugin is refused by `lightview-worker`, where reading stdin to EOF is a
+guaranteed deadlock, and runs normally on the desktop, where it always has. A
+plugin declaring a version *newer* than the host is refused everywhere.
+
+`input` states what the plugin wants to receive: `max_edge` (longest edge for
+stills; `0` for the original, never upscaled) and `video_frames` (how many
+frames to sample from a clip; default 5, clamped to 16). A 448-pixel model that
+declares its size stops decoding 60-megapixel originals in Python, and stops
+pulling them across a network.
+
+### The protocol
+
+The host spawns the plugin as a **subprocess** and speaks streaming NDJSON over
+stdin/stdout:
+
+- Request line: `{"action": "tag", "path": "/abs/path/img.jpg"}`
+- Result line: `{"path": "...", "tags": [...], "meta": {...}}` or
+  `{"path": "...", "error": "..."}`
+- **Plugins MUST emit results incrementally** — consume requests as they arrive
+  and emit each result as soon as it is ready, never buffer stdin to EOF before
+  tagging. `LIGHTVIEW_JOB_TOTAL` carries the expected request count for
+  pool/batch sizing decisions that used to need the full request list.
+- **Exactly one result per request**, including an `error` result for anything
+  the plugin cannot process. A skipped request is not free: it holds a disk slot
+  in a remote worker's bounded window until the host gives up on it.
+
+`apply_plugin_output` writes the returned tags into the companion file under
+`tags.plugins[tag_prefix]`, and any `meta` object under `meta.plugins[prefix]`.
+
+### What a plugin does *not* see
+
+Under `api_version: 1`, the host decides the plugin's input and reassembles its
+output — `plugin/input.rs`, and
+[decision 0013](../decisions/0013-the-host-samples-video-frames.md):
+
+- A **video** never reaches a plugin. The host samples frames, sends them as
+  ordinary still requests, and merges the results: a union of the per-frame tag
+  sets, which is exact for thresholded scores, plus an argmax redone over the
+  per-frame `rating_scores` because a rating is one choice rather than a set.
+- A **still larger than `max_edge`** arrives already scaled.
+- A **single-part item passes through untouched** — same tags, same meta, same
+  order. Merging is for clips.
+
+All three drivers (`lightview-worker`, the server's in-process executor, the
+desktop's `run_plugin_batch`) share that machinery, so a plugin cannot behave
+differently depending on where a job happened to run.
+
+### Installing
+
+`plugin::install::install_from_path` copies a plugin directory (or wraps a bare
+`.py`) into an install root, replacing what was there — "update" is the same
+verb as "install". It skips virtualenvs and `__pycache__`, and rewrites a
+venv-relative interpreter to an absolute one, which is what the bundled ML
+taggers need. Reachable from the desktop's `install_plugin` command and from
+`lightview-worker install`; `lightview-worker plugins` lists what is installed,
+with versions and any the worker refuses.
+
+### What that means for extensibility
+
+- **One verb.** The host only ever sends `action: "tag"`. `tag_prefix` is
+  mandatory — the data model assumes the plugin's output *is* tags. The class of
+  plugin that does not fit is designed in
+  [`findings-and-ui.md`](findings-and-ui.md).
+- **No UI extension.** `PluginUiConfig` has `settings_schema` and
+  `context_menu_items`, but `settings_schema` is unused and the only context
+  action that resolves is "tag". A plugin cannot add a view, a panel, a command,
+  a filter operator, or a sort key.
+- **The "daemon" mode does not exist.** Older docs referenced a long-running
+  daemon plugin; there is no `daemon.rs`. Each run is a fresh subprocess (the
+  plugin may batch internally across the NDJSON stream, which is how the ML
+  taggers amortize model load).
+- **`Wasm` execution is a stub.** `ExecutionConfig::Wasm` exists in the manifest
+  enum but `run_plugin_stream` returns `WasmNotSupported`.
+- **Capabilities are declarative, not enforced.** `ReadImage` / `NetworkAccess`
+  are advisory. There is no actual sandbox around the subprocess yet.
+
+So the honest summary: **a capability-scoped (in intent), out-of-process,
+data-in / data-out tagging protocol.** That's a perfectly good shape — it just
+isn't a general extension host, and the docs shouldn't imply it is.
 
 ---
 
@@ -231,9 +307,21 @@ panels, forms and actions as JSON in the manifest — `settings_schema` made rea
 — and the host renders them in Solid. Track C's sandboxed iframe remains the
 fallback for displays a schema cannot express, but it is not the default
 mechanism: it is a versioned message protocol and a plugin lifecycle to
-maintain forever, and the motivating case (naming recognised faces) does not
-need one. That case needs a *host* surface for naming and merging
-plugin-emitted clusters, which any grouping plugin can feed.
+maintain forever, and the motivating cases do not need one. Those cases —
+naming recognised faces, and confirming which of several candidates is an
+image's original source — both need a *host* surface where a person resolves
+what a plugin found, which any plugin emitting such findings can feed. The
+shape of that is designed in [`findings-and-ui.md`](findings-and-ui.md).
+
+**Plugins declare the host contract they were built for.** `api_version` in the
+manifest, and it is not documentation: it selects what the plugin receives, and
+it is what lets the host change that without breaking a plugin copied into an
+install directory a year ago. See
+[decision 0012](../decisions/0012-plugins-declare-the-contract-they-were-built-for.md).
+
+**Videos are the host's problem, not the plugin's.** The host samples frames and
+merges the results, so `is_video`/`predict_video`/ffmpeg left every bundled
+tagger. See [decision 0013](../decisions/0013-the-host-samples-video-frames.md).
 
 **New views are built native, and there is no view-module API.** Superseded
 what this paragraph used to say ("waits for a second consumer") — see
@@ -264,3 +352,13 @@ deliberate, separate project to schedule only if third-party views become a real
 
 Docs to keep in sync when any of this lands: `README.md` (Plugins section + opening
 tagline) and `CLAUDE.md` (the `plugin/` module row and the Plugin-system design note).
+
+## 8. Plugin output that is not tags
+
+The one verb is the real limit, and the plugins that hit it are not exotic:
+recognising faces and finding an image's original source both produce
+*candidates for a person to confirm* rather than facts. That needs a result kind
+that is not a tag, a host screen to resolve it on, and a way for the verdict to
+reach the plugin's next run. Designed in
+[`findings-and-ui.md`](findings-and-ui.md); tracked as A7 in
+[`../todo.md`](../todo.md).

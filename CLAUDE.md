@@ -155,8 +155,11 @@ plugins on a capable machine against a headless server. The dependency-free
 ```bash
 cd src-tauri && cargo build --bin lightview-worker --features worker
 
-# Worker-local plugin install (data dir is exe-relative: target/debug/data/)
-mkdir -p target/debug/data/plugins && cp -r ../plugins/example-auto-tagger target/debug/data/plugins/
+# Worker-local plugin install (data dir is exe-relative: target/debug/data/).
+# `install` replaces the copy, so re-running it is how a plugin is updated —
+# `cp -r` is what left workers on year-old plugins nothing ever refreshed.
+./target/debug/lightview-worker install ../plugins/example-auto-tagger
+./target/debug/lightview-worker plugins       # versions, and anything refused
 
 # Pair the worker (TOFU-pins the server cert; PIN from lightview-headless pair).
 # NOTE: pairings live in the gallery's cache.db — a new test gallery needs a re-pair.
@@ -166,35 +169,51 @@ mkdir -p target/debug/data/plugins && cp -r ../plugins/example-auto-tagger targe
 # Enqueue from a paired "browser" device; watch `tagging-job` /
 # `tagging-workers` SSE events on /api/events, then confirm nothing is left:
 curl -sk --cookie "$COOKIE" -X POST https://localhost:8799/api/invoke -H 'Content-Type: application/json' \
-  -d '{"command":"enqueue_tagging_job","args":{"pluginName":"example-image-tagger","filter":"type:image AND NOT has::plugin.example"}}'
+  -d '{"command":"enqueue_tagging_job","args":{"pluginName":"example-image-tagger","filter":"NOT has::plugin.example"}}'
 curl -sk --cookie "$COOKIE" -X POST https://localhost:8799/api/invoke -H 'Content-Type: application/json' \
   -d '{"command":"apply_filter","args":{"query":"NOT has::plugin.example"}}'   # → []
 ```
 
-**Remote jobs hang at exactly 64 images.** The worker keeps a bounded number
-of downloaded files on disk (`MAX_PENDING_FILES`, a `Semaphore(64)`), and a
-permit is released only when *that file's* result is matched back in the
-`pending` map. So a plugin that skips a request, or answers with a path the
-worker can't match (canonicalizing under a symlinked `TMPDIR` is enough),
-leaks a slot each time — at 64 the downloader blocks forever, the plugin stops
-receiving stdin, and no result ever arrives. Jobs under ~64 images finish
-normally, which makes it read as "large batches fail." It is also *silent*:
-the worker's heartbeat refreshes `updated_at` whether or not anything is being
-tagged, so the 90 s stall reaper stays satisfied and the job shows `running`
-forever. Mitigations, all three needed: `pending` is keyed on the temp file
-name rather than the full path; the worker fails the job after 20 min with no
-result; and the server tracks `progressed_at` separately from `updated_at` and
-fails a job that goes 30 min without its counts moving. Grep the worker log for
-`plugin result for unknown path`. **First check the installed plugin is
-current** — taggers predating `1eaa7ed` read stdin to EOF before loading their
-model, which deadlocks past 64 by construction and is the common cause; the
-tell is that no VRAM is ever allocated. Nothing updates a plugin copied into
-`data_dir()/plugins`, so a rebuilt worker can still be running a year-old
-script. Neither timeout is watertight either — the
-worker's silence timer is refreshed by results it could not match, and the
-server's no-progress deadline is only checked in `reap()`, which the heartbeat
-path never calls; see [`docs/todo.md`](docs/todo.md). Full contract in
+**The 64-file window, and why jobs used to hang at exactly 64 images.** The
+worker keeps a bounded number of downloaded files on disk (`MAX_PENDING_FILES`,
+a `Semaphore(64)`), and a permit is released only when *that request's* result
+is matched back. A plugin that skips a request, or answers with a path the
+worker can't key on (canonicalizing under a symlinked `TMPDIR` is enough), used
+to leak a slot each time — at 64 the downloader blocked forever, the plugin
+stopped receiving stdin, and no result ever arrived. Jobs under ~64 images
+finished normally, so it read as "large batches fail", and it was *silent*: the
+heartbeat refreshes `updated_at` whether or not anything is being tagged.
+
+Fixed, and the window is now genuinely a window — select thousands and walk
+away. `PartTracker::take_stale` abandons a request once the plugin has answered
+128 *other* requests since it was sent (a count, not a clock, so a slow CPU-only
+tagger never sheds images), or once both it and the plugin have been idle five
+minutes (which clears a job's tail, where no further results arrive to drive the
+count). Each costs one failed image and returns its slot. The two timers that
+were supposed to catch this now actually can: the worker's 20-minute silence
+timer is refreshed only by results that *matched*, and `update_job` reaps before
+applying the heartbeat, which is the only traffic a wedged job produces.
+
+A plugin declaring no `api_version` predates the streaming contract and is
+**refused at worker startup** — that is the common cause gone, since taggers
+before `1eaa7ed` read stdin to EOF before loading their model and deadlock past
+64 by construction (the tell was that no VRAM is ever allocated). Install and
+update with `lightview-worker install`, and check what a machine is on with
+`lightview-worker plugins`; the plugin's `api_version` and the worker's binary
+version both ride along in the announce and show in the web UI. Grep the worker
+log for `plugin result for unknown path`. Full contract in
 [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md).
+
+**Videos are the host's job, not the plugin's.** `plugin/input.rs` splits a clip
+into `input.video_frames` samples, sends them as ordinary still requests, and
+merges the results — a union of the per-frame tag sets, plus a redone argmax for
+`rating:` (a union would give a clip up to five ratings). A remote worker gets
+its frames from `GET /media/<path>?fit=<edge>&frame=i&frames=n`, so it needs no
+ffmpeg. Before this, `resolve_target` intersected candidates with
+`media_type = 'image'` and a video job resolved to an empty list, which the
+claim loop reads as "nothing to do" and marks **Done** — tagging videos remotely
+reported success and did nothing, for a year. If clips come back untagged, check
+that resolve filter first.
 
 Notes: the *server itself* also runs jobs when plugins are installed in **its**
 `data_dir()/plugins` (same `target/debug/data/plugins/` when server and worker
@@ -230,7 +249,7 @@ buffer stdin to EOF) — see [`docs/remote/worker-tagging.md`](docs/remote/worke
 | `sort/` | Sorting + grouping: `sorter`, `grouper`, `timeline` |
 | `autocomplete/` | In-memory tag autocomplete engine |
 | `geocode/` | Offline reverse geocoding: cached GPS coordinates → country/region/city names, written into companion files as `plugin.location` tags so `Japan` and `Kyoto` work as bare filter words. See [`docs/geocode/`](docs/geocode/README.md). |
-| `plugin/` | External plugin system: `manifest` (JSON) + `runner`. Spawns a plugin subprocess and exchanges NDJSON over stdin/stdout. Currently implements a single verb — image → tags — so in practice it's an auto-tagger runner, not a general extension host. See [`docs/plugins/`](docs/plugins/README.md). |
+| `plugin/` | External plugin system: `manifest` (JSON, including the `api_version` the plugin was built against) + `runner` (subprocess + NDJSON) + `input` (what the plugin receives: stills scaled to the declared edge, videos split into sampled frames, results merged back) + `install`. Currently implements a single verb — image → tags — so in practice it's an auto-tagger runner, not a general extension host. See [`docs/plugins/`](docs/plugins/README.md). |
 | `tagging/` | Remote-tagging job queue + worker registry (in-memory). Web clients enqueue jobs over `/api/invoke` (optionally pinned to one worker); a paired `lightview-worker` (bin, feature `worker`) claims them, runs the plugin on its own machine, and pushes tags back via `apply_plugin_tags`. `tagging/local.rs` is the in-process executor: the server registers itself as worker `local-server` and runs its own installed plugins directly (opt-in by installing plugins server-side). Job/worker changes stream to web clients as `tagging-job`/`tagging-workers` SSE events. See [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md). |
 | `hardware/` | Hardware detection (storage type, CPU, RAM, GPU) — drives adaptive performance tuning |
 | `util/` | Helpers: `paths` (data dir), `hash`, `fs_watch` |

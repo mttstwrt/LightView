@@ -385,18 +385,30 @@ namespace. The bundled `plugins/` folder includes several ML auto-taggers (WD, C
 PixAI) plus a minimal `example-auto-tagger` that documents the protocol. Plugins can be
 installed, listed, run on a single file, or run as a cancellable batch.
 
+A manifest declares two versions: the plugin's own, and `api_version` — the host
+contract it was written against. That is what lets the host change what a plugin
+receives without breaking a copy installed long ago, and it is enforced rather than
+advisory. Under the current contract the host prepares the input: stills arrive scaled
+to the `input.max_edge` the plugin asked for, and a **video arrives as several extracted
+frames** whose results the host merges, so no plugin needs ffmpeg or a sampling policy
+of its own.
+
 > **Scope today:** the host implements exactly one plugin verb — *image → tags* — so
 > every plugin is in practice an auto-tagger. Plugins cannot yet add views, panels,
 > commands, or other UI, and the built-in grid / justified / map views are native, not
 > plugins. A design for broadening this into real extensibility (more plugin verbs,
 > per-gallery enablement, and a sandboxed view surface) lives in
-> [`docs/plugins/`](docs/plugins/README.md).
+> [`docs/plugins/`](docs/plugins/README.md), and the specific case of plugin output
+> that *isn't* tags — recognising faces, finding an image's original source — in
+> [`docs/plugins/findings-and-ui.md`](docs/plugins/findings-and-ui.md).
 
 **Remote tagging (headless servers):** a server too weak for ML taggers never runs
 plugins itself. Instead, run `lightview-worker` on a capable machine: it pairs with the
-server like any device, and the web UI's *Run Plugin* / *Tag All Untagged* actions
-enqueue jobs that the worker claims — pulling image bytes over HTTPS, running the
-plugin locally, and pushing tags back. Progress streams live to every connected web
+server like any device (`lightview-worker install <plugin-dir>` puts a plugin on it),
+and the web UI's *Run Plugin* / *Tag All Untagged* actions enqueue jobs that the worker
+claims — pulling image bytes over HTTPS, running the plugin locally, and pushing tags
+back. Videos work too: the server extracts and scales the frames, so the worker needs
+no ffmpeg and a clip costs a few hundred KB rather than the whole file. Progress streams live to every connected web
 client. The server never executes code on a remote device's behalf. See
 [`docs/remote/worker-tagging.md`](docs/remote/worker-tagging.md).
 
@@ -530,7 +542,7 @@ src-tauri/        Rust backend (Tauri)
     filter/       Filter query language: ast → parser → evaluator
     sort/         Sorting, grouping, timeline
     autocomplete/ In-memory tag autocomplete
-    plugin/       External plugin system (manifest, runner, daemon)
+    plugin/       External plugin system (manifest, runner, input preparation, install)
     hardware/     Hardware detection → adaptive performance tuning
     http_server/  Local axum server: video, GIF atlas, remote LAN access, uploads
     util/         paths, hashing, fs watching

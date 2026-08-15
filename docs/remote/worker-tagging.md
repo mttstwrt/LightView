@@ -3,7 +3,8 @@
 [← docs index](../README.md) · [remote](README.md)
 
 **Status:** implemented (2026-07-07; server-local execution, job pinning and
-the plugin streaming contract added 2026-07-08).
+the plugin streaming contract added 2026-07-08; host-side input preparation,
+video support and the self-healing file window added 2026-08-15).
 **Problem:** the headless server (e.g. an Intel N100) can't run ML taggers, and
 remote clients must never execute code on the server. The web client should
 still be able to trigger and monitor tagging.
@@ -51,7 +52,7 @@ still be able to trigger and monitor tagging.
 - **In-memory queue, no persistence.** Tag writes are idempotent
   (`apply_plugin_output` replaces the prefix's tag list), and the flagship
   "tag all untagged" job targets the filter
-  `type:image AND NOT has::plugin.<prefix>` resolved at *claim time* — so a
+  `NOT has::plugin.<prefix>` resolved at *claim time* — so a
   server restart loses only the queue entry, and re-enqueueing resumes exactly
   where it stopped. Persistence would buy one saved click at the cost of a
   cache.db schema and cross-restart stale-claim semantics.
@@ -96,11 +97,32 @@ pub struct TaggingJob {            // serialized camelCase
 pub struct WorkerEntry { worker_id, worker_name, plugins: Vec<PluginInfo>, last_seen, busy_job, local: bool }
 ```
 
+```rust
+pub struct WorkerEntry {
+    worker_id, worker_name, plugins: Vec<PluginInfo>,
+    worker_version: Option<String>,   // the binary the machine is running
+    last_seen, local: bool,
+}
+```
+
 Constants: worker TTL **45 s** (worker announces every 15 s), job stall
 **90 s** (worker updates at least every 10 s), no-progress **30 min**, last
 **50** finished jobs retained. Stalled running jobs are requeued lazily inside
-claim/status calls — the worker's poll makes this run constantly, so there is
-no reaper task.
+announce/claim/enqueue/status **and heartbeat** calls, so there is no reaper
+task.
+
+The heartbeat is on that list because of the one case where nothing else is: a
+worker inside a running job stops announcing and stops claiming, so during
+exactly the wedge `JOB_NO_PROGRESS_SECS` exists to catch, the heartbeat is the
+only traffic arriving. Leaving it out meant the deadline was never evaluated
+for the jobs that needed it.
+
+**Versions travel with the announce.** `PluginInfo` carries the plugin's
+`api_version` and the worker reports its own binary version, both surfaced in
+the web UI's worker list. "What is that machine actually running?" used to be
+unanswerable, which is how a rebuilt worker binary next to a year-old plugin
+copy survived as a configuration —
+[decision 0012](../decisions/0012-plugins-declare-the-contract-they-were-built-for.md).
 
 **Liveness and progress are separate clocks, deliberately.** The heartbeat
 refreshes `updated_at` unconditionally — it proves the worker *process* is
@@ -133,7 +155,7 @@ results are camelCase.
 | Command | Args → Result | Notes |
 |---|---|---|
 | `worker_announce` | `{workerId, workerName, plugins}` → `{}` | registers/refreshes registry entry; broadcasts `tagging-workers`; the reserved id `local-server` is rejected so a remote device can't impersonate the in-process executor |
-| `claim_tagging_job` | `{workerId, pluginNames}` → `TaggingJob \| null` | oldest queued job the worker can run, **with resolved `paths`**; skips jobs pinned to another worker; filter targets run `apply_filter_impl` at claim, restricted to `media_type = 'image'`; sets Running; requeues stalled jobs first |
+| `claim_tagging_job` | `{workerId, pluginNames}` → `TaggingJob \| null` | oldest queued job the worker can run, **with resolved `paths`**; skips jobs pinned to another worker; filter targets run `apply_filter_impl` at claim, intersected with the gallery's indexed images, videos and GIFs; sets Running; requeues stalled jobs first |
 | `update_tagging_job` | `{jobId, workerId, completed, failed}` → `{cancelled: bool}` | progress + heartbeat; unknown job also returns `cancelled: true` (covers server restart / pruned job) |
 | `complete_tagging_job` | `{jobId, workerId, succeeded, failed}` → `{}` | |
 | `fail_tagging_job` | `{jobId, workerId, error}` → `{}` | |
@@ -141,6 +163,7 @@ results are camelCase.
 | `cancel_tagging_job` | `{jobId}` → `{}` | queued → cancelled immediately; running → worker learns on next update and kills the plugin |
 | `get_tagging_status` | `{}` → `{workers, jobs}` | web UI sync / re-sync after SSE lag |
 
+`worker_announce` also accepts an optional `workerVersion`.
 `update`/`complete`/`fail` verify `workerId == claimed_by` — an integrity
 guard against a second worker stomping a job, not a security boundary (all
 paired devices are equally trusted today; per-device scopes are future work).
@@ -175,7 +198,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 - **CLI:**
   `pair --server https://host:8787 [--pin N] [--name X] [--yes] [--trust-new]`
-  · `run [--plugins-dir <dir>] [--fit 1024] [--poll 3]` · `status`.
+  · `run [--plugins-dir <dir>] [--fit 1024] [--poll 3]`
+  · `install <path> [--plugins-dir <dir>]` · `plugins` · `status`.
+  `install` is how a plugin gets here — re-running it over the same source is
+  the update, since the install directory is replaced. `plugins` lists what is
+  installed with versions, and any the worker refuses to run. Released
+  alongside the headless server
+  ([decision 0014](../decisions/0014-ship-the-worker-with-the-release.md)), so
+  a stale worker binary has something to be stale *against*.
   The PIN is minted host-side with the existing `lightview-headless pair`;
   the worker redeems it at `POST /pair/redeem` with
   `device_name: "worker:<name>"` and stores the cookie.
@@ -187,27 +217,55 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 - **Config:** `data_dir()/worker.toml` (exe-relative, mode 0600):
   `server_url, cookie, cert_sha256, worker_id, worker_name, fit_edge, poll_secs`.
 - **Plugins:** the same `data_dir()/plugins/*/manifest.json` scan the desktop
-  uses (shared `scan_plugins()`).
+  uses (shared `scan_plugins()`), then `check_api_version` against
+  `RequestDelivery::Incremental`. A plugin declaring no `api_version` predates
+  the streaming contract and is **refused at startup** with a message naming it
+  and the fix, rather than tagging 64 images and hanging.
 - **Job loop** (one job at a time):
   1. Background task announces every 15 s.
   2. Poll `claim_tagging_job` every `poll_secs`.
   3. On a job: spawn **one plugin subprocess for the whole job** via
      `runner::run_plugin_stream_channel` (so e.g. wd-tagger loads its model
      once), created in a per-job temp dir.
-  4. Downloader task: `GET /media/<encoded path>?fit=1024` per item (WebP;
-     PIL sniffs content so extension doesn't matter; HEIC arrives transcoded),
-     bounded by a `Semaphore(64)` on files-on-disk; feeds temp paths into the
-     plugin's request channel; download failure counts as failed and skips.
-     The client sets a 60 s **idle-read** timeout (resets on every byte, so a
-     big slow download is fine) — without it a stalled connection parks the
-     downloader forever while the job loop keeps heartbeating.
-  5. Result loop: map temp → server path, batch 32 →
+  4. Downloader task: one request per still, `input.video_frames` per clip.
+     `GET /media/<encoded path>?fit=<edge>` for a still and
+     `…?fit=<edge>&frame=i&frames=n` for a frame (WebP; PIL sniffs content so
+     extension doesn't matter; HEIC arrives transcoded). `<edge>` is the
+     plugin's declared `input.max_edge`, falling back to the worker's `--fit`
+     when the manifest says nothing. Bounded by a `Semaphore(64)` on
+     files-on-disk; feeds temp paths into the plugin's request channel;
+     download failure resolves that part as failed. The client sets a 60 s
+     **idle-read** timeout (resets on every byte, so a big slow download is
+     fine) — without it a stalled connection parks the downloader forever while
+     the job loop keeps heartbeating.
+  5. Result loop: `PartTracker` maps each result back to its media item and
+     merges an item's parts once all have resolved; batch 32 →
      `apply_plugin_tags` → `update_tagging_job`; delete temp files as results
      land. A 10 s tick sends a pure-heartbeat update (first-run model
-     downloads can take minutes before any result).
+     downloads can take minutes before any result) and sweeps abandoned
+     requests. Progress counts **media items**, not requests: a five-frame clip
+     is one unit of the job total.
   6. `{cancelled: true}` → kill the plugin, wipe the temp dir, resume polling.
      Stream end → flush + `complete_tagging_job`. Errors →
      `fail_tagging_job` + exponential backoff, keep looping.
+
+## What the plugin receives
+
+Not the file. Under `api_version: 1` the host decides a plugin's input, and the
+worker's downloader is one of three implementations of the same policy
+(`plugin/input.rs`; the other two are the in-process executor and the desktop's
+batch command):
+
+- A **still** is fetched at the plugin's declared `input.max_edge`, so a
+  448-pixel model never pulls a 60-megapixel original across the LAN.
+- A **video** becomes `input.video_frames` requests, each fetched from
+  `?frame=i&frames=n`, which the *server* extracts and encodes. That is why the
+  worker needs no ffmpeg. Shipping the clip whole was the alternative and was
+  rejected: `?fit=` cannot resize a video, so 64 files on disk would be tens of
+  gigabytes rather than a few hundred KB each.
+- The host merges an item's parts back into one tag write — a union of the
+  per-frame tag sets, plus a redone argmax for `rating:`. See
+  [decision 0013](../decisions/0013-the-host-samples-video-frames.md).
 
 ## Plugin streaming contract
 
@@ -223,43 +281,60 @@ and `plugin/runner.rs`:
   as it's ready**. The bundled taggers use a stdin-reader thread feeding a
   bounded queue, with worker threads that flush partial batches whenever the
   queue runs dry.
-- The host exports **`LIGHTVIEW_JOB_TOTAL`** (expected request count) to the
-  plugin subprocess, replacing the read-to-EOF sizing pattern.
+- The host exports **`LIGHTVIEW_JOB_TOTAL`** (expected *request* count, so a
+  clip counts as its frames) to the plugin subprocess, replacing the
+  read-to-EOF sizing pattern.
 - Plugins **must emit exactly one result per request** — including a
   `{"path": ..., "tags": [], "error": ...}` line for anything they can't
-  process. Silently skipping a request is not free: each one strands a
-  disk slot for the rest of the job (see below).
-- The worker can't reliably distinguish a buffering plugin from a slow first
-  run (model downloads), so it warns as soon as the bound is full with no
-  results and only fails the job after **20 min** of total silence
-  (`NO_RESULT_STALL_SECS`). Left unbounded, that state is a permanent hang.
-  **This bound is not yet watertight** — see
-  [`../todo.md`](../todo.md). The worker's silence timer is refreshed before a
-  result is matched against `pending`, so unmatched results (case 2 below) keep
-  it alive forever; and the server's `JOB_NO_PROGRESS_SECS` deadline is only
-  evaluated inside `reap()`, which `update_job` does not call, so a heartbeating
-  worker on a wedged job never reaches it either.
+  process.
+- A plugin that claims none of this — no `api_version` in its manifest — is
+  **refused at worker startup**. That is the enforcement the rules above lacked
+  for a year, and the reason a stale copy can no longer produce a silent hang.
 
-### Disk slots are released by matching results, not by count
+## The file window is a window, not a job size
 
-Each downloaded file holds one of the 64 semaphore permits until *its* result
-comes back and the entry is removed from the worker's `pending` map. Two ways
-a permit leaks, both of which stall the job permanently once 64 accumulate —
-the downloader blocks on `acquire_owned()`, the plugin stops receiving stdin
-lines, and no result ever arrives again:
+Each request in flight holds one of the 64 semaphore permits until its result
+comes back. Two ways a permit used to leak, both of which stalled the job
+permanently once 64 accumulated — the downloader blocks on `acquire_owned()`,
+the plugin stops receiving stdin lines, and no result ever arrives again:
 
-1. **The plugin never answers a request** (see the rule above).
-2. **The plugin answers with a path the worker can't match.** This is easy to
-   hit by accident: a plugin that canonicalizes its input (`os.path.realpath`)
-   under a symlinked `TMPDIR` echoes back a different string for the same
-   file. `pending` is therefore keyed on the temp **file name** — `<seq>.<ext>`,
-   unique within a job — not the full path handed to the plugin, so
-   directory-level rewriting is harmless. A result that still doesn't match
-   logs `plugin result for unknown path`.
+1. **The plugin never answers a request.**
+2. **The plugin answers with a path the worker can't match.** Easy to hit by
+   accident: a plugin that canonicalizes its input (`os.path.realpath`) under a
+   symlinked `TMPDIR` echoes back a different string for the same file. Requests
+   are therefore keyed on the temp **file name** — unique within a job — not the
+   full path handed to the plugin, so directory-level rewriting is harmless. A
+   result that still doesn't match logs `plugin result for unknown path`.
 
-Because the failure only bites once 64 slots are gone, jobs under ~64 images
-complete normally and larger ones hang — a confusing signature worth
-recognizing. Watch for `plugin result for unknown path` in the worker log.
+Because it only bit once 64 slots were gone, jobs under ~64 images completed
+normally and larger ones hung — which read as "batches over 64 fail" and is why
+this looked like a size limit rather than a leak.
+
+**Permits now always come back.** `PartTracker::take_stale` abandons a request
+once either rule fires, costing one failed image and returning its slot:
+
+- **The plugin has answered `STALE_AFTER_RESULTS` (128) *other* requests since
+  this one was sent.** A count, not a clock, deliberately: a slow CPU-only
+  tagger legitimately leaves a file queued for a long time, so any wall-clock
+  per-file deadline is either too tight for it or too loose to be useful. At
+  most 64 requests are outstanding at once, so watching twice that many others
+  get answered means this one was skipped.
+- **Both the request and the plugin have been idle for `IDLE_RECLAIM` (5 min).**
+  The count rule cannot fire at the *tail* of a job, where no further results
+  arrive to count. This clears it, the sender drops, the plugin sees EOF, and
+  the job finishes. It only applies once the plugin has answered something, so a
+  first-run model download — minutes of silence with every slot full — is never
+  mistaken for a wedge.
+
+`NO_RESULT_STALL_SECS` (20 min) remains the outer backstop for a plugin that is
+not working at all, and it is refreshed **only by results that matched**.
+Counting unmatched ones kept it permanently fresh in exactly the case it exists
+to catch.
+
+Together with the server-side heartbeat reap, that is what makes "select several
+thousand photos and walk away" a supported thing to do: the window slides,
+misbehaviour costs one image at a time, and every remaining path to a permanent
+hang has a timer that actually evaluates.
 
 ## Server-local execution (`tagging/local.rs`)
 
@@ -274,10 +349,15 @@ a desktop host serving remote access. It is the same queue protocol as
   stays out of the registry entirely. Otherwise it announces as
   `local-server` / "Server (<hostname>)" with `local: true` (the announce
   doubles as the TTL keep-alive) and claims jobs in a poll loop.
-- Jobs run via `runner::run_plugin_stream` on the original file paths — no
-  downloads, no temp files. Results batch (32) into
-  `apply_plugin_tags_impl` directly; a 10 s heartbeat flushes partial
-  batches and picks up cancellation, mirroring the worker binary.
+- Jobs run through the same `plugin::input` preparation the worker uses — no
+  downloads, but not "hand over the original" either: a still larger than the
+  plugin's declared `input.max_edge` is decoded and scaled on the shared
+  thumbnail pool, and a video is split into frames the same way. That is the
+  half of the input policy that used to be missing, and it is why a server-local
+  run of a 448-pixel model no longer decodes 60-megapixel files in Python.
+  Results batch (32) into `apply_plugin_tags_impl` directly; a 10 s heartbeat
+  flushes partial batches, picks up cancellation and sweeps abandoned requests,
+  mirroring the worker binary.
 - Remote devices cannot announce as `local-server` (rejected in the API
   dispatch), and the executor never runs anything a remote device sent —
   only manifests already installed on the server's disk.
@@ -303,8 +383,10 @@ a desktop host serving remote access. It is the same queue protocol as
   the command list ([`frontend/chrome.md`](../frontend/chrome.md)) — connected
   workers (the in-process executor gets a `server` badge), per-action
   "Tag untagged"
-  (`filter: "type:image AND NOT has::plugin.<tagPrefix>"`, pinned when the
-  action is), job list with cancel, and a no-worker hint. The panel's desktop
+  (`filter: "NOT has::plugin.<tagPrefix>"`, pinned when the action is), job list
+  with cancel, and a no-worker hint. No `type:image` clause: the host samples
+  frames from videos now, and leaving it would have kept excluding them after
+  the backend stopped. Each worker row shows its reported binary version. The panel's desktop
   body is the installed-plugin list instead; the two never coexist.
 
 ## Testing without ML
@@ -314,7 +396,11 @@ a desktop host serving remote access. It is the same queue protocol as
 enqueue via curl, assert `tagging-job` SSE transitions, companions gaining
 `tags.plugins.example`, `apply_filter "NOT has::plugin.example"` → `[]`,
 idempotent re-enqueue (claim resolves 0 paths → completes instantly), and
-mid-run cancel killing the plugin. See the headless recipe in `CLAUDE.md`.
+mid-run cancel killing the plugin. Put an `.mp4` in the gallery too: a clip's
+companion should gain one merged entry with `video_frames_sampled` in its meta,
+which is the difference between "videos are tagged" and "videos are silently
+skipped" — the failure this loop shipped with for a year. See the headless
+recipe in `CLAUDE.md`.
 
 ## Future work (out of scope here)
 
