@@ -168,7 +168,10 @@ pub struct CoreMeta {
 
 /// GPS coordinates extracted from EXIF (or video container) metadata.
 /// Decimal degrees, WGS-84. Altitude in metres above sea level when present.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// `PartialEq` is derived so `VideoInfo` can keep its own — comparing two
+/// coordinates is exact float equality, which is what "did the probe return the
+/// same thing?" means here; it is not a proximity test.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Location {
     pub lat: f64,
     pub lon: f64,

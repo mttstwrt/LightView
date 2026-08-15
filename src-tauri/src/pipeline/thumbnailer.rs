@@ -948,14 +948,6 @@ fn generate_video_thumbnail(path: &Path, filter: ResizeFilter, format: ThumbForm
     }
 }
 
-/// Probe video metadata: (width, height, duration_seconds). Dimensions are
-/// display-oriented — a phone clip recorded sideways reports the portrait size
-/// a player shows, not the landscape size it was encoded at.
-pub fn probe_video_metadata(path: &Path) -> Result<(u32, u32, Option<f64>), ThumbError> {
-    let info = video::probe(path)?;
-    Ok((info.width, info.height, info.duration))
-}
-
 /// Grey placeholder fallback when ffmpeg is unavailable.
 fn generate_video_placeholder(path: &Path, format: ThumbFormat, thumb_w: u32, thumb_h: u32) -> Result<ThumbResult, ThumbError> {
     let pixel_count = (thumb_w * thumb_h) as usize;
