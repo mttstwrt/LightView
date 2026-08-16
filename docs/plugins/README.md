@@ -170,7 +170,7 @@ from. They want different lifecycles, different security models, and different A
 
 ---
 
-## 3. Should the built-in views (grid / justified / map) become plugins?
+## 3. Should the built-in views (grid / justified / canvas / map) become plugins?
 
 **Recommendation: no.** Keep them native. The reasoning:
 

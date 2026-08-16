@@ -8,8 +8,8 @@ web page served to a phone or laptop over the LAN. Almost every non-obvious
 decision below follows from that, or from the fact that WebKitGTK decodes
 images on the main thread.
 
-**Responsible for:** all rendering and interaction — the two grids, the
-full-resolution viewer, the top bar and its menus, the panels (tags,
+**Responsible for:** all rendering and interaction — the two grids and the
+canvas, the full-resolution viewer, the top bar and its menus, the panels (tags,
 duplicates, trash, auto-tagging, map), and the pairing/password flows. Also the client-side
 caches: the service worker, the boot snapshot, and the in-memory viewer cache.
 
@@ -30,8 +30,8 @@ step with the Rust serde structs on the other side.
 | Path | What lives there |
 |---|---|
 | `stores/` | Global signals: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore`, `capabilitiesStore`, `uploadStore`, `thumbnailProgressStore` |
-| `lib/` | The non-visual machinery: `ipc`, `runtime`, `types`, `scrollHost` (the gallery scrolls an element, not the document — see [`grid-loading.md`](grid-loading.md)), plus the grid primitives both grids share |
-| `components/gallery/` | `GalleryGrid`, `JustifiedGrid`, `ThumbnailCell`, `SelectionBar` |
+| `lib/` | The non-visual machinery: `ipc`, `runtime`, `types`, `scrollHost` (the gallery scrolls an element, not the document — see [`grid-loading.md`](grid-loading.md)), plus the loading primitives the grids and the canvas share |
+| `components/gallery/` | `GalleryGrid`, `JustifiedGrid`, `CanvasView` (see [`canvas.md`](canvas.md)), `ThumbnailCell`, `SelectionBar` |
 | `components/viewer/` | `MediaViewer`, `VideoPlayer`, `InfoPanel` |
 | `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `CommandMenu`, `ViewSwitcher`, `SettingsMenu`, `TitleBar` — how these divide between things you do and things you set is [`chrome.md`](chrome.md) |
 | `components/auth/` | `PairApp`, `PasswordModal` — the web-only bootstrap flows |
@@ -41,8 +41,8 @@ step with the Rust serde structs on the other side.
 
 ### Views are native, and the expensive one is split out
 
-The five views — square grid, justified grid, map, and the two unbuilt ones —
-are ordinary components, wired directly in `App.tsx`. There is no view
+The five views — square grid, justified grid, canvas, map, and the one unbuilt
+one — are ordinary components, wired directly in `App.tsx`. There is no view
 registry or module API, and [decision 0008](../decisions/0008-no-view-module-api.md)
 records why: the thing an API was wanted for is that an unused view should cost
 nothing, and that is a bundling question. Per-gallery enablement (`views.rs`,
@@ -55,6 +55,12 @@ browsed in the grids never fetches it, and a gallery with the map disabled never
 even triggers the import. Every other view sits on machinery the main bundle
 carries regardless — splitting them would save single-digit kilobytes. Split the
 next view that brings its own renderer; measure first.
+
+The canvas is the measurement that confirms this rather than an exception to
+it: adding a whole third view moved `main.js` from 291.82 kB to 313.83 kB
+(90.87 → 98.58 kB gzip). Under 8 kB gzipped for a view is well below what a
+lazy boundary is worth, and it is that small precisely because the view is
+almost all policy over primitives the bundle already carried.
 
 ### Reading the build output
 
@@ -130,16 +136,16 @@ transport-specific failure stays invisible. Log it, at least once.
 
 ## Invariants
 
-**Grid cells are keyed by path, never by index.** Both grids render with a
+**Cells are keyed by path, never by index.** All three item views render with a
 path-keyed `<For>`, so a cell that stays on screen across a scroll keeps its
 exact DOM node and `<img src>` and the webview never re-decodes it. An
 index-keyed `<Index>` rewrites every slot's `src` as the window shifts, which is
 what caused per-row scroll flicker.
 
 **Prune per-path state surgically, never wholesale.** When `props.paths`
-changes, both grids drop only the paths that actually disappeared. The
+changes, a view drops only the paths that actually disappeared. The
 URL-assignment effect has already run for that update and will not fire again
-until the visible range moves, so wiping surviving cells blanks the grid until
+until the visible range moves, so wiping surviving cells blanks the view until
 the next scroll — visible as the whole grid going grey after deleting one image.
 
 **A cell's URL, its rung, and its in-flight swap are one unit.** They live
@@ -152,8 +158,8 @@ whole tail; they never hold the three structures themselves.
 
 **Speculation is never free.** Landing-zone warms, look-ahead precache, and
 background crawls all land on the same bounded rayon pool as the cells the user
-is looking at. Both grids gate speculation behind "nothing the viewport is
-waiting on is outstanding", and both use a much smaller batch for speculation
+is looking at. Every view gates speculation behind "nothing the viewport is
+waiting on is outstanding", and uses a much smaller batch for speculation
 than for the visible drain, because nothing can preempt a batch once issued —
 the batch size *is* the worst-case delay before a scroll onto cold cells can get
 CPU back. Measured: enabling background precache at high zoom in `JustifiedGrid`
@@ -226,8 +232,10 @@ should not be edited away either.
 ## Verifying a change
 
 `tsc --noEmit` catches type drift against `lib/types.ts`, which is most of what
-goes wrong at the boundary. It cannot cover the grids at all — scroll windows,
-tier selection, eviction, and decode timing are all runtime behaviour.
+goes wrong at the boundary. It cannot cover the item views at all — scroll
+windows, tier selection, eviction, and decode timing are all runtime behaviour.
+The one exception is `lib/spiralLayout.ts`, which is pure arithmetic and can be
+compiled and exercised on its own; see [`canvas.md`](canvas.md).
 [`build-and-verify.md`](../build-and-verify.md) describes driving the real SPA
 against `lightview-headless` in headless Chromium, which is the only way to see
 those paths execute.

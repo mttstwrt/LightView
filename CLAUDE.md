@@ -77,8 +77,8 @@ cp "$G/red.jpg" "$G/new.jpg"                               # watcher → broadca
 # worker pre-warms. Host config, so it is not writable from a paired browser;
 # with no desktop app this subcommand is the only way to reach it. Safe against
 # the running server (WAL), which picks the change up within a few seconds.
-./target/debug/lightview-headless views "$G"                    # show
-./target/debug/lightview-headless views "$G" justified,map      # square grid off
+./target/debug/lightview-headless views "$G"                       # show
+./target/debug/lightview-headless views "$G" justified,canvas,map  # square grid off
 ```
 
 Notes: the watcher only catches changes made *after* startup (a restart
@@ -261,7 +261,7 @@ buffer stdin to EOF) — see [`docs/remote/worker-tagging.md`](docs/remote/worke
 | `stores/` | SolidJS signals for global state: `galleryStore`, `viewerStore`, `settingsStore`, `filterStore`, `tagStore`, `pluginStore`, `taggingStore` (remote-tagging workers/jobs, web), `uploadStore`, `thumbnailProgressStore` |
 | `lib/ipc.ts` | All Tauri `invoke()` calls — the single IPC boundary |
 | `lib/types.ts` | Shared TypeScript types |
-| `components/gallery/` | Grid views: `GalleryGrid`, `ThumbnailCell`, `SelectionBar` |
+| `components/gallery/` | Item views: `GalleryGrid`, `JustifiedGrid`, `CanvasView` (a spiral on a pannable surface — [`docs/frontend/canvas.md`](docs/frontend/canvas.md)), plus `ThumbnailCell` and `SelectionBar` |
 | `components/viewer/` | Full-resolution `MediaViewer` |
 | `components/topbar/` | `TopBar`, `FilterBar`, `SortMenu`, `CommandMenu` (the one list of things you *do*, as a desktop dropdown and a mobile sheet), `ViewSwitcher`, `SettingsMenu` (configuration only) — see [`docs/frontend/chrome.md`](docs/frontend/chrome.md) |
 | `components/debug/` | `DebugOverlay`, `Sparkline`, `DevtoolsApp` |

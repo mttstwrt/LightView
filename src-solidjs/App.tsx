@@ -34,6 +34,7 @@ import { openGallery, getBootState, getSortedItems, getRecentGalleries, removeRe
 import { setFilterQuery, refreshFilteredItems } from "./stores/filterStore";
 import { GalleryGrid } from "./components/gallery/GalleryGrid";
 import { JustifiedGrid } from "./components/gallery/JustifiedGrid";
+import { CanvasView } from "./components/gallery/CanvasView";
 // Split out of the main bundle, not merely deferred: leaflet plus its CSS is
 // 153 kB of a 445 kB build — a third of it — and a gallery browsed only in the
 // grids never needs a byte of it. Every other view reuses machinery the main
@@ -269,7 +270,11 @@ export function App() {
 
   // "Start at bottom" — open the grid at its end rather than its start.
   createOpenAtBottom({
-    enabled: () => settings().display.start_at_bottom,
+    // Not on the canvas, which has no bottom to start at: the foot of that
+    // surface is the empty corner of the outermost ring, and pinning there
+    // would fight the view's own opening move — the centre, where the top of
+    // the sort is.
+    enabled: () => settings().display.start_at_bottom && viewMode() !== "canvas",
     galleryKey: galleryPath,
     contentHeight: galleryContentHeight,
   });
@@ -277,6 +282,11 @@ export function App() {
   // On mobile the settings panel is a full-screen page, so skip rendering the
   // gallery content behind it entirely.
   const contentHidden = () => isMobile() && settingsOpen();
+
+  // The views that browse the item list inside the app's own scroller — the
+  // two grids and the canvas — as opposed to the map, which owns its
+  // container, its scrolling and its selection model.
+  const scrollingView = () => viewMode() !== "map";
 
   // Scrollbar sort indicators, computed on demand and cached per
   // (items, sortField).
@@ -700,14 +710,27 @@ export function App() {
             Being positioned also makes this the grids' `offsetParent`, so their
             `offsetTop` measurements share an origin with `scrollTop`. See
             lib/scrollHost.ts. */}
-        <Show when={(viewMode() === "grid" || viewMode() === "justified") && !contentHidden()}>
+        <Show when={scrollingView() && !contentHidden()}>
           <div
             ref={(el) => {
               setScrollHost(el);
               onCleanup(() => setScrollHost(null));
             }}
-            class="hide-scrollbar fixed inset-0 overflow-y-auto overflow-x-hidden"
-            style={{ "overscroll-behavior-y": "contain" }}
+            class="hide-scrollbar fixed inset-0 overflow-y-auto"
+            classList={{
+              // The canvas is the one view that scrolls sideways as well. Same
+              // element either way, so switching views does not re-register
+              // the host or lose the subscriptions bound to it.
+              "overflow-x-auto": viewMode() === "canvas",
+              "overflow-x-hidden": viewMode() !== "canvas",
+            }}
+            style={{
+              "overscroll-behavior-y": "contain",
+              // Only where there is something to overscroll: on the grids this
+              // would take the browser's horizontal swipe-back gesture away
+              // for nothing in return.
+              "overscroll-behavior-x": viewMode() === "canvas" ? "contain" : undefined,
+            }}
           >
           <Show when={viewMode() === "grid"}>
             <GalleryGrid
@@ -750,18 +773,44 @@ export function App() {
               onContentHeight={setGalleryContentHeight}
             />
           </Show>
+          <Show when={viewMode() === "canvas"}>
+            <CanvasView
+              paths={displayPaths()}
+              aspects={aspectByPath()}
+              onItemClick={(index) => {
+                clearSelection();
+                openViewer(index);
+              }}
+              onItemSelect={(path) => toggleSelection(path)}
+              onDragSelect={(paths) => setSelectedPaths(new Set(paths))}
+              onBackgroundClick={clearSelection}
+              selectedPaths={selectedPaths()}
+              selectionMode={selectionMode()}
+              onItemContextMenu={(e, path, index) => {
+                setContextMenu({ x: e.clientX, y: e.clientY, path, index });
+              }}
+              loading={loading()}
+            />
+          </Show>
           </div>
           {/* Outside the host on purpose. It is `fixed`, so a fixed element's
               scroll chain is the viewport either way — being inside would not
               give a touch on the rail anything to pan, and it would put an
               overlay inside the scroller for no gain. The 10px rail is
               therefore a strip that jumps on a tap and does not pan on a swipe,
-              which is how a scrollbar behaves everywhere else. */}
-          <ScrollBar
-            contentHeight={galleryContentHeight()}
-            indicators={scrollIndicators()}
-            getThumbLabel={thumbLabel}
-          />
+              which is how a scrollbar behaves everywhere else.
+
+              Not on the canvas: the bar maps one scroll offset onto a position
+              in the sort, and on a spiral that position is two coordinates and
+              a ring, not a fraction of a height. Its date markers would be
+              wrong rather than merely unhelpful. */}
+          <Show when={viewMode() !== "canvas"}>
+            <ScrollBar
+              contentHeight={galleryContentHeight()}
+              indicators={scrollIndicators()}
+              getThumbLabel={thumbLabel}
+            />
+          </Show>
           {/* Also shown at zero selected while selection mode is on — it's the
               mode's only exit, and the empty count tells the user the taps are
               landing somewhere. */}

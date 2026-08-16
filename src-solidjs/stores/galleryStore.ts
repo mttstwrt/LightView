@@ -102,27 +102,30 @@ const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
 // button and every tap toggles a cell instead of opening the viewer.
 const [selectionMode, setSelectionMode] = createSignal(false);
 
-// View mode: grid (uniform squares), justified (aspect-preserving rows), or
-// map (geographic browsing).
-export type ViewMode = "grid" | "justified" | "map";
+// View mode: grid (uniform squares), justified (aspect-preserving rows),
+// canvas (a spiral on a pannable surface), or map (geographic browsing).
+export type ViewMode = "grid" | "justified" | "canvas" | "map";
 
 /** The views, in switcher order, with the labels every switcher uses. One
  *  table rather than a literal per call site: the top bar, the mobile settings
- *  panel and the desktop enable/disable list all render the same three. */
+ *  panel and the desktop enable/disable list all render the same list. */
 export const VIEW_CHOICES: { mode: ViewMode; label: string; title: string }[] = [
   { mode: "grid", label: "Grid", title: "Uniform square grid" },
   { mode: "justified", label: "Justified", title: "Aspect-preserving rows" },
+  { mode: "canvas", label: "Canvas", title: "A spiral outward from the top of the sort" },
   { mode: "map", label: "Map", title: "Geographic map" },
 ];
+
+/** Every view, in switcher order. The names must match the Rust `views::View`
+ *  strings — that is the wire format `get_enabled_views` speaks. */
+const ALL_VIEWS: ViewMode[] = VIEW_CHOICES.map((v) => v.mode);
 
 // Persist the chosen layout per client so the last-used view is restored on the
 // next open (localStorage — per browser/device, matching per-client settings).
 const VIEW_MODE_PREF = "viewMode";
 const savedViewMode = loadPref<ViewMode>(VIEW_MODE_PREF);
 const [viewMode, setViewModeRaw] = createSignal<ViewMode>(
-  savedViewMode === "grid" || savedViewMode === "justified" || savedViewMode === "map"
-    ? savedViewMode
-    : "grid",
+  savedViewMode && ALL_VIEWS.includes(savedViewMode) ? savedViewMode : "grid",
 );
 const setViewMode = ((value) => {
   const next = setViewModeRaw(value as any);
@@ -133,10 +136,9 @@ const setViewMode = ((value) => {
 // Which views the *gallery* offers, as opposed to which one this client last
 // used. A view the gallery has turned off generates no thumbnails for its tier
 // (see the Rust `views` module), so offering it in the switcher would show a
-// grid that has to decode the whole library on the spot. Optimistically all
-// three until the backend answers — the same reasoning as capabilitiesStore's
+// grid that has to decode the whole library on the spot. Optimistically all of
+// them until the backend answers — the same reasoning as capabilitiesStore's
 // baseline: assuming none makes the switcher flash empty.
-const ALL_VIEWS: ViewMode[] = ["grid", "justified", "map"];
 const [enabledViews, setEnabledViewsRaw] = createSignal<ViewMode[]>(ALL_VIEWS);
 
 /** Apply the gallery's enabled-view list, falling back to a view that exists

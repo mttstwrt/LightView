@@ -200,9 +200,11 @@ warmed, rather than whatever the table scan happened upon.
 
 Whichever the gallery's *enabled views* ask for — `views::prewarm_tiers`, read
 fresh each poll so toggling a view takes effect at the next cycle rather than at
-the next gallery open. Grid asks for `m`, justified asks for `j`, and map asks
-for nothing: it draws one micro thumbnail per cluster, a few dozen images that
-generate on demand faster than a backlog pass would reach them.
+the next gallery open. Grid asks for `m`; justified and the canvas both ask for
+`j`, since the canvas fits aspect-preserving cells into square slots and so
+wants the same tier rather than one of its own; and map asks for nothing: it
+draws one micro thumbnail per cluster, a few dozen images that generate on
+demand faster than a backlog pass would reach them.
 
 This used to be an unconditional `[Standard, Justified]`, so a gallery browsed
 only in the justified layout still paid the full square-tier cost — gigabytes on

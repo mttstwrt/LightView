@@ -13,7 +13,7 @@
 
 import { Show, For, createSignal, createEffect } from "solid-js";
 import { Dynamic } from "solid-js/web";
-import { GridViewIcon, JustifiedViewIcon, MapViewIcon, type Icon } from "./icons";
+import { CanvasViewIcon, GridViewIcon, JustifiedViewIcon, MapViewIcon, type Icon } from "./icons";
 import {
   viewMode,
   setViewMode,
@@ -25,6 +25,7 @@ import {
 const VIEW_ICONS: Record<ViewMode, Icon> = {
   grid: GridViewIcon,
   justified: JustifiedViewIcon,
+  canvas: CanvasViewIcon,
   map: MapViewIcon,
 };
 

@@ -137,6 +137,15 @@ export const JustifiedViewIcon: Icon = (props) => (
   </Stroke>
 );
 
+// Boxes stepping outward around a centre one — the spiral, not a grid.
+export const CanvasViewIcon: Icon = (props) => (
+  <Stroke size={props.size}>
+    <rect x="9.5" y="9.5" width="5" height="5" rx="1" />
+    <path d="M17 12.5V7H7v10h6" />
+    <path d="M20 15V4H4v16h11" />
+  </Stroke>
+);
+
 export const MapViewIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <path d="M9 3L3 5.5v15L9 18l6 3 6-2.5v-15L15 6z" />

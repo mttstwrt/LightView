@@ -11,9 +11,10 @@ paragraph says why that order and not another. The groups are near-independent �
 nothing in *Frontend structure* waits on *Remote tagging* — so they can largely
 be worked in parallel. The one cross-group dependency was D1 before C2 —
 building the infinite canvas before the two grids were de-duplicated would have
-made it a third copy of their loading machinery — and D1 has landed, so C2 is
-free to start. Ids (`A1`, `B2`, …) are stable references; they encode position
-within a group, not global priority.
+made it a third copy of their loading machinery — and both have now landed, in
+that order, which is what made the canvas mostly policy. Ids (`A1`, `B2`, …)
+are stable references; they encode position within a group, not global
+priority.
 
 Group A is now mostly closed: A1–A5 have landed and A6's blocking half with
 them, leaving one deferred move and one large design. B, C and E are where the
@@ -242,16 +243,16 @@ the class.
 
 ## C. Views and browsing
 
-Five views, all native: the two grids and the map exist, the canvas and the
-virtual folder hierarchy do not. There is no view-module API and there is not
+Five views, all native: the two grids, the canvas and the map exist; the
+virtual folder hierarchy does not. There is no view-module API and there is not
 going to be one — [decision 0008](decisions/0008-no-view-module-api.md) records
 why, and what replaced it.
 
 **C1 and C4 first**, in either order: both finish something already shipped, and
 an existing feature that misleads is worse than a missing one — C1 offers a
-label you cannot see, C4 offers a tag you cannot use. Only then start new views.
-**C2 before C3** because the infinite canvas is the view actually wanted; the
-virtual folder view is a well-specified idea with no pressure behind it.
+label you cannot see, C4 offers a tag you cannot use. C2 has landed; C3 is a
+well-specified idea with no pressure behind it, which is why it was scheduled
+after the canvas and is still where the group ends.
 
 ### C1. Colour labels stop half way
 
@@ -266,38 +267,44 @@ not having it.
 Ordering needs a defined sequence — labels are a fixed list, so sort on that
 list's index rather than the stored string, with unlabelled items last.
 
-### C2. The infinite scrolling canvas
+### ~~C2. The infinite scrolling canvas~~ — done
 
-The top of the current sort in the centre, later items spiralling outward,
-reusing the aspect-preserving justified tiers so it costs no new thumbnails.
+`components/gallery/CanvasView.tsx`, on the geometry in `lib/spiralLayout.ts`.
+The top of the current sort sits in the centre and later items spiral outward,
+on the aspect-preserving justified tiers, so it costs no new thumbnails —
+`views.rs` maps the canvas to `ThumbTier::Justified` and a gallery that already
+offers the justified grid pre-warms nothing extra for it.
+[`frontend/canvas.md`](frontend/canvas.md) describes what exists;
+[decision 0016](decisions/0016-a-square-spiral-on-a-lattice.md) records why the
+spiral is a square lattice rather than one of the two better-looking
+arrangements.
 
-A native view, like the other four. The view-module API this item used to be
-about is settled and not happening — see
-[decision 0008](decisions/0008-no-view-module-api.md). The short version: the
-thing an API was wanted for was "a view you never use costs nothing", and that
-is a bundling question, not a contract question. Per-gallery enablement
-(`views.rs`) plus a dynamic `import()` on the views that are actually expensive
-delivers it with no public surface at all — the map, the only view carrying its
-own rendering library, is 153 kB of a 445 kB bundle and is already split out;
-the canvas and [C3](#c3-a-virtual-folder-view) reuse machinery the main bundle
-carries regardless, so splitting them would save single-digit kilobytes.
+The prediction this entry made held. The canvas consumes the D1 primitives
+without modifying any of them and supplies only its layout, range calculation,
+`evict`, `drain` and `speculate` — and `loadPriority.ts` was the one that had
+to change, in exactly the way described: the zone→rank mapping is now a
+parameter (`pickByRank`) and the old function is the range-based case both
+grids still call.
 
-What the canvas *does* need is shared implementation, which the frontend already
-has a pattern for: behaviour lives in `lib/` as factory functions taking
-accessors (`scrollDynamics.ts`, `loadPriority.ts`, `thumbSwap.ts`, …), each
-component keeping its own policy. That is now true of the loading machine as
-well — [D1](#d1-250300-duplicated-lines-between-the-two-grids--done) extracted
-`urlVersions`, `pathIndex`, `thumbQueue`, `fetchLoop` and `cellSources` — so the
-canvas is the first view that can consume it rather than a third copy of it. It
-supplies its own layout, range calculation, `evict`, `drain` and `speculate`
-against spiral geometry; everything else it inherits.
+Three things it did not anticipate, all of them in the *scroll* layer rather
+than the loading one, because a canvas pans in two dimensions and every shared
+primitive assumed one:
 
-One thing it will have to change rather than reuse: `loadPriority.ts` ranks
-against contiguous *index* ranges, which is what a reading-order scroller has. A
-spiral shows an off-centre 2D window — several disjoint index runs — and wants
-ranking by distance from the viewport centre. Lift the zone→rank mapping into a
-parameter and keep the current function as the range-based case.
-[`grid-loading.md`](frontend/grid-loading.md) has the full inherit/write split.
+- `scrollHost`, `scrollDynamics` and `wheelScroll` each grew a second axis.
+  None is a branch or an option: the grids' host cannot scroll sideways, so the
+  horizontal term is zero there and every one of them computes exactly what it
+  computed before.
+- Look-ahead grows quadratically. A border of *k* cells around the viewport is
+  not *k* rows, so the buffers are small integers and the resolution ladder
+  carries the depth instead.
+- A zoom is not a scroll offset. Cell size scales the whole surface, so
+  changing it without converting the anchored point through lattice
+  coordinates throws the viewport across the spiral.
+
+The bundling half of [decision 0008](decisions/0008-no-view-module-api.md) came
+out as predicted, and is now measured rather than reasoned: a whole third view
+cost 22 kB raw / 7.7 kB gzipped of `main.js`, far below what a lazy boundary
+would be worth.
 
 ### C3. A virtual folder view
 
@@ -355,10 +362,10 @@ documented, and [`geocode/`](geocode/README.md).
 **D1 is done**, and with it the orchestration half of D2 — the two were the same
 code, which is why they were scheduled together.
 [`grid-loading.md`](frontend/grid-loading.md) now describes the four extracted
-primitives and how the grids stay different through them, and
-[C2](#c2-the-infinite-scrolling-canvas) is unblocked: the infinite canvas can
-consume `createFetchLoop` / `createThumbQueue` rather than become a third copy
-of them.
+primitives and how the grids stay different through them. It paid off where it
+was supposed to: [C2](#c2-the-infinite-scrolling-canvas--done) consumed
+`createFetchLoop` / `createThumbQueue` and the rest unmodified rather than
+becoming a third copy of them.
 
 **D2 is now one item, and it needs a measurement before code.** What is left of
 it is the decode-worker pool, whose case is strongest on the platform this

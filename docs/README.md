@@ -43,6 +43,8 @@ Deeper topics that outgrew their subsystem page:
   worker protocol that let a capable machine run taggers for a weak server.
 - [`frontend/grid-loading.md`](frontend/grid-loading.md) — the machinery both
   grids use to stream thumbnails into a virtual scroller.
+- [`frontend/canvas.md`](frontend/canvas.md) — the spiral canvas: its geometry,
+  what it inherits from that machinery, and the two axes it pans in.
 - [`frontend/chrome.md`](frontend/chrome.md) — the planned split between
   commands and settings, and the space they compete for on a phone.
 - [`plugins/findings-and-ui.md`](plugins/findings-and-ui.md) — the plugins the
@@ -72,6 +74,7 @@ answer to "why not the obvious thing?" is longer than a sentence.
 - [0013 — The host samples video frames; plugins only ever see stills](decisions/0013-the-host-samples-video-frames.md)
 - [0014 — Ship `lightview-worker` with the release](decisions/0014-ship-the-worker-with-the-release.md)
 - [0015 — Plugin UI is a fixed set of host-drawn shapes, not a declared layout](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
+- [0016 — The canvas spirals on a square lattice](decisions/0016-a-square-spiral-on-a-lattice.md)
 
 ## Open work
 

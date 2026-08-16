@@ -1,13 +1,18 @@
 # The two grids
 
-[← docs index](../README.md) · [frontend](README.md)
+[← docs index](../README.md) · [frontend](README.md) · [the canvas](canvas.md)
 
 `GalleryGrid` (fixed square cells) and `JustifiedGrid` (aspect-preserving rows)
-are the two views of a gallery. They solve the same problem — stream thumbnails
-into a virtual scroller without burying the main thread — and they have
-converged on the same architecture without yet being one component. The
+are the two scrolling views of a gallery. They solve the same problem — stream
+thumbnails into a virtual scroller without burying the main thread — and they
+have converged on the same architecture without yet being one component. The
 two-window shape at the centre of it is
 [decision 0007](../decisions/0007-two-zone-render-window.md).
+
+The primitives below are shared with a third view that is not a scroller at
+all: [the canvas](canvas.md) constructs the same ones and supplies its own
+geometry. Where this page says "both grids" it means the two components; where
+it describes a primitive, that description holds for three callers.
 
 ## The shared architecture
 
@@ -164,9 +169,11 @@ into the thumb mid-gesture made the thumb chase the finger and visibly jitter.
 ### The scroll host
 
 The gallery scrolls an element, not the document. `App` renders a fixed,
-full-viewport `overflow-y: auto` container around the two grids and registers it
-with [`lib/scrollHost.ts`](../../src-solidjs/lib/scrollHost.ts), which everything
-else reads instead of touching `window.scrollY`.
+full-viewport `overflow-y: auto` container around the item views and registers
+it with [`lib/scrollHost.ts`](../../src-solidjs/lib/scrollHost.ts), which
+everything else reads instead of touching `window.scrollY`. It is one element
+across a view switch — the canvas only turns `overflow-x` on — so switching
+views never re-registers the host or drops the subscriptions bound to it.
 
 The reason is iOS. Its scroll indicator is drawn over the page, it is
 interactive, and it cannot be styled away on the *document* scroller —
@@ -257,8 +264,8 @@ really has stopped, that timer expires a few tens of milliseconds later.
 
 | Module | What it owns |
 |---|---|
-| `scrollDynamics.ts` | velocity/direction tracking, the WebKitGTK decode gate, fling-landing projection, the adaptive ahead-buffer |
-| `loadPriority.ts` | `pickByPriority` — drain-time ranking and stale-entry reporting |
+| `scrollDynamics.ts` | velocity (over both axes) and direction tracking, the WebKitGTK decode gate, fling-landing projection, the adaptive ahead-buffer |
+| `loadPriority.ts` | `pickByRank` — drain-time ranking and stale-entry reporting — plus `pickByPriority`, its index-range case |
 | `thumbSwap.ts` | off-DOM decode-then-swap for tier upgrades on cells already showing an image |
 | `thumbProgress.ts` | the "Generating N / M" counter |
 | `galleryControls.ts` | Ctrl/Cmd-drag range select, click handling, edge-scroll while dragging |
@@ -303,8 +310,10 @@ the next pass.
 
 ### What a third view has to write, and what it inherits
 
-The split is meant to be: **the primitives own the bookkeeping that fails
-silently; the view owns its geometry and its policy.**
+The split is: **the primitives own the bookkeeping that fails silently; the
+view owns its geometry and its policy.** It was written as a proposal and has
+since been used once — [the canvas](canvas.md) is the third view, and it
+constructs every primitive below without modifying any of them.
 
 Inherited whole — a new view constructs these and does not reimplement them:
 `cellSources` (URL store, rung map, swapper, and their teardown),
@@ -326,14 +335,20 @@ Two things a new view must get right, both of which fail quietly:
   component-scope call — so `evict` sees an empty layout at least once. Both
   grids return early on a zero-row layout.
 
-One primitive does **not** carry over unchanged, and it is worth knowing before
-starting the canvas: `loadPriority.ts` ranks against contiguous *index* ranges,
-which is what a reading-order scroller has. A spiral canvas shows an off-centre
-2D window — several disjoint index runs — and wants ranking by distance from the
-viewport centre. That generalization is deliberately not written yet, since its
-shape is a guess until a second kind of view exists; the natural move is to lift
-the zone→rank mapping into a parameter and keep the current function as the
-range-based case.
+One primitive did **not** carry over unchanged, and it is the one this section
+predicted: `loadPriority.ts` ranked against contiguous *index* ranges, which is
+what a reading-order scroller has. The canvas shows an off-centre 2D window —
+several disjoint index runs — and wants ranking by distance from the viewport
+centre, so the range ranker would have called most of its screen stale and
+dropped it from the queue.
+
+The move was the one proposed here: the zone→rank mapping is now a parameter
+(`pickByRank`), and `pickByPriority` is the range-based case, unchanged in
+behaviour, that both grids still call. Nothing else needed touching. The three
+that *were* generalized are all in the scroll layer rather than the loading
+one — `scrollHost`, `scrollDynamics` and `wheelScroll` grew a second axis,
+each a no-op on a host that cannot scroll sideways. See
+[`canvas.md`](canvas.md).
 
 **Verify changes here in a browser, not just with `tsc`.**
 [`build-and-verify.md`](../build-and-verify.md) describes driving the real SPA

@@ -14,7 +14,8 @@ in the Rust process; the UI is a webview that talks to it over IPC.
 
 ## Features at a glance
 
-- **Grid, justified, and map views** of any local folder
+- **Grid, justified, canvas, and map views** of any local folder — the canvas
+  spirals the current sort outward from its centre on one pannable surface
 - **Full-resolution viewer** with keyboard navigation, ratings, tags, and an info panel
 - **Thumbnail cache** in SQLite, hardware-adaptive, with optional **GPU** acceleration
 - **Filter query language** over tags, ratings, dates, dimensions, media type, and color labels
@@ -125,14 +126,14 @@ lightview-headless pair /path/to/gallery
 
 # Show which layouts this gallery offers, then turn the square grid off
 lightview-headless views /path/to/gallery
-lightview-headless views /path/to/gallery justified,map
+lightview-headless views /path/to/gallery justified,canvas,map
 ```
 
 | Command | Purpose |
 |---|---|
 | `serve <gallery-path> [--port <n>]` | Open the gallery and serve it on `0.0.0.0:<port>` (default `8787`) with per-device cookie auth |
 | `pair <gallery-path>` | Create a single-use PIN (stored in the gallery's `cache.db`) and print it; redeem it at `http://<host>:<port>/pair` on the device |
-| `views <gallery-path> [<list>]` | Show the enabled views, or set them from a comma-separated list of `grid`, `justified`, `map` |
+| `views <gallery-path> [<list>]` | Show the enabled views, or set them from a comma-separated list of `grid`, `justified`, `canvas`, `map` |
 | `-h` / `--help` | Usage |
 
 `pair` and `views` act on a gallery a server is already serving, and must be
@@ -395,7 +396,7 @@ of its own.
 
 > **Scope today:** the host implements exactly one plugin verb — *image → tags* — so
 > every plugin is in practice an auto-tagger. Plugins cannot yet add views, panels,
-> commands, or other UI, and the built-in grid / justified / map views are native, not
+> commands, or other UI, and the built-in grid / justified / canvas / map views are native, not
 > plugins. A design for broadening this into real extensibility (more plugin verbs,
 > per-gallery enablement, and a sandboxed view surface) lives in
 > [`docs/plugins/`](docs/plugins/README.md), and the specific case of plugin output
@@ -447,7 +448,7 @@ what it does.
 | `video_autoplay_max_seconds` | `30` | Max video duration eligible for grid autoplay (s) |
 | `scroll_blur` | `false` | Blur thumbnails while scrolling fast |
 | `map_dark_mode` | `true` | Use the dark map tiles in the map view |
-| `justified_high_detail` | `true` | Serve a 1600px tier in the justified view when zoomed, instead of upscaling the 512px tier (generated only for visible cells) |
+| `justified_high_detail` | `true` | Serve a higher tier in the justified and canvas views when zoomed, instead of upscaling the 512px tier (generated only for visible cells) |
 
 ### Performance
 

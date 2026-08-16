@@ -33,17 +33,20 @@ pub enum View {
     Grid,
     /// Aspect-preserving justified rows.
     Justified,
+    /// A pannable 2D surface, the sort spiralling outward from its centre.
+    Canvas,
     /// Geographic map.
     Map,
 }
 
 impl View {
-    pub const ALL: [View; 3] = [View::Grid, View::Justified, View::Map];
+    pub const ALL: [View; 4] = [View::Grid, View::Justified, View::Canvas, View::Map];
 
     pub fn as_str(self) -> &'static str {
         match self {
             View::Grid => "grid",
             View::Justified => "justified",
+            View::Canvas => "canvas",
             View::Map => "map",
         }
     }
@@ -56,10 +59,16 @@ impl View {
     /// already there. `None` means the view needs no backfill: the map draws
     /// one micro thumbnail per cluster, a few dozen images that generate on
     /// demand faster than a backlog pass would reach them.
+    ///
+    /// The canvas shares the justified tier rather than asking for one of its
+    /// own. Its cells are aspect-preserved, which is exactly what that tier
+    /// stores, so a gallery offering both views pre-warms one set of
+    /// thumbnails and the canvas costs nothing to enable next to the justified
+    /// grid.
     fn prewarm_tier(self) -> Option<ThumbTier> {
         match self {
             View::Grid => Some(ThumbTier::Standard),
-            View::Justified => Some(ThumbTier::Justified),
+            View::Justified | View::Canvas => Some(ThumbTier::Justified),
             View::Map => None,
         }
     }
@@ -138,6 +147,16 @@ mod tests {
         let (_dir, db) = open_db();
         set_enabled(db.conn(), &[View::Justified, View::Map]).unwrap();
         assert_eq!(enabled(db.conn()), vec![View::Justified, View::Map]);
+        assert_eq!(prewarm_tiers(db.conn()), vec![ThumbTier::Justified]);
+    }
+
+    #[test]
+    fn canvas_rides_on_the_justified_tier() {
+        let (_dir, db) = open_db();
+        set_enabled(db.conn(), &[View::Canvas]).unwrap();
+        assert_eq!(prewarm_tiers(db.conn()), vec![ThumbTier::Justified]);
+        // And enabling it alongside the justified grid asks for no second pass.
+        set_enabled(db.conn(), &[View::Justified, View::Canvas]).unwrap();
         assert_eq!(prewarm_tiers(db.conn()), vec![ThumbTier::Justified]);
     }
 
