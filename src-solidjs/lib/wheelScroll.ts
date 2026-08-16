@@ -15,9 +15,16 @@
 // Both grids need exactly this, differing only in their row height and what
 // Ctrl+wheel means (resize thumbnails vs. change the target row height), so
 // those are the two hooks the caller supplies.
+//
+// The horizontal axis is handled the same way, for the canvas. It is not an
+// option: `maxScrollX()` is 0 on a host that cannot scroll sideways, so the x
+// target is pinned at 0 there and the axis never writes. It has to be here
+// rather than left to the browser, because this handler calls
+// `preventDefault()` on every wheel event it sees — a canvas that did not
+// carry x would swallow every trackpad sideways swipe and pan nowhere.
 
 import { wheelPxPerUnit } from "./wheel";
-import { maxScroll, scrollToY, scrollTop } from "./scrollHost";
+import { maxScroll, maxScrollX, scrollLeft, scrollToX, scrollToY, scrollTop } from "./scrollHost";
 
 /** Fraction of the remaining distance covered per frame. */
 const DECAY = 0.8;
@@ -51,21 +58,32 @@ export interface WheelScroll {
 export function createWheelScroll(opts: WheelScrollOptions): WheelScroll {
   let targetY = 0; // absolute scroll target (float)
   let currentY = 0; // our float view of scrollY, immune to engine rounding
+  let targetX = 0;
+  let currentX = 0;
   let animating = false;
   let rafId = 0;
 
   const drain = () => {
-    const diff = targetY - currentY;
-    if (Math.abs(diff) < SETTLE) {
+    const diffY = targetY - currentY;
+    const diffX = targetX - currentX;
+    // Skipped entirely on a vertical-only host, where neither can leave 0 — no
+    // per-frame write of a `scrollLeft` that is already 0. Read before the
+    // assignments below, so the frame that lands back on x = 0 still writes it.
+    const movesX = targetX !== 0 || currentX !== 0;
+    if (Math.abs(diffY) < SETTLE && Math.abs(diffX) < SETTLE) {
       currentY = targetY;
+      currentX = targetX;
       scrollToY(Math.round(targetY));
+      if (movesX) scrollToX(Math.round(targetX));
       animating = false;
       rafId = 0;
       opts.onSettle();
       return;
     }
-    currentY += diff * (1 - DECAY);
+    currentY += diffY * (1 - DECAY);
+    currentX += diffX * (1 - DECAY);
     scrollToY(Math.round(currentY));
+    if (movesX) scrollToX(Math.round(currentX));
     rafId = requestAnimationFrame(drain);
   };
 
@@ -79,12 +97,20 @@ export function createWheelScroll(opts: WheelScrollOptions): WheelScroll {
     // pick up any scrollbar drag / keyboard scroll that happened between
     // gestures. While animating we keep accumulating into targetY.
     if (!animating) {
-      currentY = scrollTop();
-      targetY = scrollTop();
+      currentY = targetY = scrollTop();
+      currentX = targetX = scrollLeft();
       animating = true;
     }
-    const deltaPx = e.deltaY * wheelPxPerUnit(e, opts.rowHeight());
-    targetY = Math.max(0, Math.min(maxScroll(), targetY + deltaPx));
+    const px = wheelPxPerUnit(e, opts.rowHeight());
+    // Shift+wheel is how a plain mouse asks for a sideways scroll. Some
+    // engines already report it as deltaX and some do not, so honour whichever
+    // arrived rather than assuming: doubling it would scroll twice as far on
+    // the engines that do the conversion themselves.
+    const sideways = e.shiftKey && e.deltaX === 0;
+    const dx = (sideways ? e.deltaY : e.deltaX) * px;
+    const dy = (sideways ? 0 : e.deltaY) * px;
+    targetY = Math.max(0, Math.min(maxScroll(), targetY + dy));
+    targetX = Math.max(0, Math.min(maxScrollX(), targetX + dx));
     if (!rafId) rafId = requestAnimationFrame(drain);
   };
 

@@ -3,7 +3,14 @@
 import { createSignal, untrack, type Accessor } from "solid-js";
 import { isTauri } from "./runtime";
 import { ewmaImageLoadMs } from "./perfMonitor";
-import { maxScroll, onScrollHost, scrollTop, viewportHeight } from "./scrollHost";
+import {
+  maxScroll,
+  maxScrollX,
+  onScrollHost,
+  scrollLeft,
+  scrollTop,
+  viewportHeight,
+} from "./scrollHost";
 
 // ---------------------------------------------------------------------------
 // Shared scroll dynamics for the virtualized grid views.
@@ -20,6 +27,16 @@ import { maxScroll, onScrollHost, scrollTop, viewportHeight } from "./scrollHost
 // decode async off-thread, so the gate never engages there — new cells load
 // while the scroll is still moving, which is what keeps the virtual-scroll
 // buffer useful on touch flings (docs/decisions/0007-two-zone-render-window.md).
+//
+// Velocity is the speed of the viewport over the surface, in whatever
+// directions that surface can move: the per-frame delta is the distance
+// travelled in two dimensions, not the change in `scrollTop`. On the grids'
+// host, which cannot scroll sideways, the horizontal term is always zero and
+// this is exactly the old number — but the canvas pans in both axes, and
+// measuring only the vertical component there would report a fast sideways
+// fling as a standstill and hand it a full-resolution window per frame.
+// `direction` stays vertical, with `directionX` beside it, because the two
+// grids ask "up or down" and mean it.
 // ---------------------------------------------------------------------------
 
 // Decode-work rate above which the gate engages, in decoded pixels per second
@@ -157,7 +174,7 @@ export function markScrollBarReleased() {
 export interface ScrollFrame {
   /** Current scroll offset of the gallery's scroller. */
   y: number;
-  /** Absolute scroll delta (px) since the previous frame. */
+  /** Distance (px) travelled since the previous frame, over both axes. */
   dy: number;
   /** Scroll speed (px/s). */
   velocity: number;
@@ -173,10 +190,14 @@ export interface ScrollFrame {
 }
 
 export interface ScrollDynamics {
-  /** Scroll speed (px/s); 0 once no scroll frame has arrived recently. */
+  /** Speed (px/s) of the viewport over the surface, counting both axes; 0 once
+   *  no scroll frame has arrived recently. */
   velocity: () => number;
-  /** Last scroll direction: 1 = down, -1 = up. */
+  /** Last vertical direction: 1 = down, -1 = up. */
   direction: () => 1 | -1;
+  /** Last horizontal direction: 1 = right, -1 = left. Always 1 on a host that
+   *  cannot scroll sideways, where nothing reads it. */
+  directionX: () => 1 | -1;
   /**
    * Reactive: true while src assignment should be deferred to protect the
    * webview's main-thread decoding. Always false outside WebKitGTK.
@@ -203,8 +224,17 @@ export interface ScrollDynamics {
    * scrollY + signed velocity × FLING_PROJECTION_S, clamped to the document's
    * scroll range. Equals the current scrollY when not scrolling. Drives
    * landing-zone thumbnail warming during flings.
+   *
+   * `velocity()` is the two-axis speed, so on a surface panning diagonally
+   * each axis is projected by the *whole* speed rather than by its own
+   * component. That overshoots a diagonal fling's landing point by up to √2,
+   * which the warm window's ± one viewport of slack absorbs; splitting the
+   * speed per axis would need a velocity vector, and nothing has yet wanted
+   * one badly enough to carry it.
    */
   projectedLandingY: () => number;
+  /** The same projection along x, for a view that pans in both axes. */
+  projectedLandingX: () => number;
   /**
    * Rows to render ahead of the scroll direction: `base` plus however many
    * rows the current velocity covers in one measured image-load round-trip
@@ -242,9 +272,11 @@ export function createScrollDynamics(opts: {
   const setSettled = setRested;
 
   let lastY = scrollTop();
+  let lastX = scrollLeft();
   let lastTs = performance.now();
   let vel = 0;
   let dir: 1 | -1 = 1;
+  let dirX: 1 | -1 = 1;
   let rafId = 0;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
   let settleDebounce: ReturnType<typeof setTimeout> | undefined;
@@ -258,6 +290,11 @@ export function createScrollDynamics(opts: {
   const projectedLandingY = () => {
     const projected = scrollTop() + dir * velocity() * FLING_PROJECTION_S;
     return Math.max(0, Math.min(maxScroll(), projected));
+  };
+
+  const projectedLandingX = () => {
+    const projected = scrollLeft() + dirX * velocity() * FLING_PROJECTION_S;
+    return Math.max(0, Math.min(maxScrollX(), projected));
   };
 
   const bufferAheadRows = (base: number, max: number) => {
@@ -313,11 +350,21 @@ export function createScrollDynamics(opts: {
     if (rafId) return;
     rafId = requestAnimationFrame((now) => {
       const y = scrollTop();
+      const x = scrollLeft();
       const dt = (now - lastTs) / 1000;
-      const dy = Math.abs(y - lastY);
+      // Distance travelled, not vertical displacement — see the header. On a
+      // host that cannot scroll sideways `x` never moves and this is `|Δy|`.
+      const dy = Math.hypot(y - lastY, x - lastX);
       vel = dt > 0 ? dy / dt : 0;
-      dir = y >= lastY ? 1 : -1;
+      // A frame that did not move an axis keeps that axis's last direction,
+      // rather than reporting "forwards" by default: on a pure sideways pan
+      // the vertical direction is stale but meaningless, while flipping it to
+      // 1 every frame would tell the grids' buffer to face the wrong way the
+      // moment a diagonal fling straightened out.
+      if (y !== lastY) dir = y > lastY ? 1 : -1;
+      if (x !== lastX) dirX = x > lastX ? 1 : -1;
       lastY = y;
+      lastX = x;
       lastTs = now;
 
       if (isTauri()) {
@@ -366,8 +413,10 @@ export function createScrollDynamics(opts: {
   return {
     velocity,
     direction: () => dir,
+    directionX: () => dirX,
     warping,
     projectedLandingY,
+    projectedLandingX,
     bufferAheadRows,
     decodeGate,
     settled,

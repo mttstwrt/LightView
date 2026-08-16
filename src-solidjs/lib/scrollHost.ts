@@ -20,6 +20,12 @@
 // The host must be `position: relative` — `recalcRange` in both grids measures
 // its content with `offsetTop`, which is relative to the nearest positioned
 // ancestor, and that has to be the same origin `scrollTop` counts from.
+//
+// Both axes are readable, because one view scrolls in both. The grids' host is
+// `overflow-x: hidden`, so `scrollLeft()` is 0 and `maxScrollX()` is 0 there
+// and every horizontal read degenerates to today's behaviour without a branch;
+// the canvas registers a host that scrolls in two dimensions and the same
+// functions describe it. Nothing needs to know which kind it has.
 
 import { createSignal } from "solid-js";
 
@@ -47,10 +53,16 @@ export function setScrollHost(el: HTMLElement | null): void {
 /** The registered scroll host, or null when the window is the scroller. */
 export const scrollHost = hostEl;
 
-/** Current scroll offset. */
+/** Current vertical scroll offset. */
 export function scrollTop(): number {
   const el = hostEl();
   return el ? el.scrollTop : window.scrollY;
+}
+
+/** Current horizontal scroll offset. 0 on a host that cannot scroll sideways. */
+export function scrollLeft(): number {
+  const el = hostEl();
+  return el ? el.scrollLeft : window.scrollX;
 }
 
 /** Height of the visible area. */
@@ -59,15 +71,32 @@ export function viewportHeight(): number {
   return el ? el.clientHeight : window.innerHeight;
 }
 
+/** Width of the visible area. */
+export function viewportWidth(): number {
+  const el = hostEl();
+  return el ? el.clientWidth : window.innerWidth;
+}
+
 /** Full scrollable height of the content. */
 export function scrollHeight(): number {
   const el = hostEl();
   return el ? el.scrollHeight : document.documentElement.scrollHeight;
 }
 
-/** Largest valid scroll offset. */
+/** Full scrollable width of the content. */
+export function scrollWidth(): number {
+  const el = hostEl();
+  return el ? el.scrollWidth : document.documentElement.scrollWidth;
+}
+
+/** Largest valid vertical scroll offset. */
 export function maxScroll(): number {
   return Math.max(0, scrollHeight() - viewportHeight());
+}
+
+/** Largest valid horizontal scroll offset; 0 unless the host scrolls sideways. */
+export function maxScrollX(): number {
+  return Math.max(0, scrollWidth() - viewportWidth());
 }
 
 /** Jump to `y`, clamped to the scrollable range. */
@@ -75,7 +104,15 @@ export function scrollToY(y: number): void {
   const clamped = Math.max(0, Math.min(y, maxScroll()));
   const el = hostEl();
   if (el) el.scrollTop = clamped;
-  else window.scrollTo(0, clamped);
+  else window.scrollTo(window.scrollX, clamped);
+}
+
+/** Jump to `x`, clamped to the scrollable range. */
+export function scrollToX(x: number): void {
+  const clamped = Math.max(0, Math.min(x, maxScrollX()));
+  const el = hostEl();
+  if (el) el.scrollLeft = clamped;
+  else window.scrollTo(clamped, window.scrollY);
 }
 
 /**
