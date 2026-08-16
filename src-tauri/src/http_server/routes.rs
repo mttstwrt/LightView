@@ -54,9 +54,16 @@ const FIT_MAX_EDGE: u32 = 4096;
 /// Query string for `GET /media`. `fit=<px>` requests an aspect-preserving
 /// resize to that longest edge (native raster stills only) instead of the full
 /// file — so the webview decodes a cell-sized image off its main thread.
+///
+/// `frame=<i>&frames=<n>` asks for the i-th of n evenly spaced frames of a
+/// video, as a still. That exists for remote tagging: a worker has no ffmpeg
+/// and `?fit=` cannot resize a clip, so without it a job would ship whole
+/// videos across the LAN. See [`crate::plugin::input`].
 #[derive(Debug, Deserialize)]
 pub struct MediaQuery {
     fit: Option<u32>,
+    frame: Option<u32>,
+    frames: Option<u32>,
 }
 
 /// Image extensions the resize pipeline (`image` crate) decodes directly, so a
@@ -95,6 +102,18 @@ pub async fn media(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+
+    // `?frame=` serves one sample point of a clip as a still. Checked before
+    // `?fit=`, which the same request carries to say how large the frame should
+    // be, and which `is_fit_resizable` would reject for a video extension.
+    if let Some(index) = query.frame {
+        if MediaType::from_extension(&ext) == Some(MediaType::Video) {
+            let count = query.frames.unwrap_or(1).max(1);
+            let edge = query.fit.unwrap_or(0).min(FIT_MAX_EDGE);
+            return serve_video_frame(&state, &path, index, count, edge, &headers).await;
+        }
+        return error(StatusCode::BAD_REQUEST);
+    }
 
     // `?fit=<edge>` serves an aspect-preserving resize of a native raster still
     // to the cell's longest edge: the justified grid uses this in place of the
@@ -300,6 +319,85 @@ async fn serve_fit_image(
                     .to_lowercase(),
             );
             serve_image(path, mime, &HeaderMap::new()).await
+        }
+    }
+}
+
+/// Serves one evenly spaced frame of a video as a WebP still.
+///
+/// Exists for remote tagging, and deliberately not for the grid: the thumbnail
+/// tiers already cover "a picture of this clip", and this route answers the
+/// different question of "the i-th of n samples across it", which only a tagger
+/// asks. Extraction is ffmpeg, so it runs on the shared thumbnail pool for the
+/// same reason every other decode does — one clip that makes ffmpeg spin must
+/// not oversubscribe the CPU during a scroll burst.
+///
+/// Uncached on our side. A tagging job visits each clip once, so a cache would
+/// hold frames nothing will ask for again; the ETag still lets a retried
+/// download revalidate for free.
+async fn serve_video_frame(
+    state: &ServerState,
+    path: &str,
+    index: u32,
+    count: u32,
+    edge: u32,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let etag = match tokio::fs::metadata(path).await {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(format!(
+                "\"frame-{}-{}-{}-{}-{}\"",
+                mtime,
+                meta.len(),
+                index,
+                count,
+                edge
+            ))
+        }
+        Err(_) => return error(StatusCode::NOT_FOUND),
+    };
+    if let Some(etag) = &etag {
+        if if_none_match(headers, etag) {
+            return not_modified(etag, "public, max-age=3600");
+        }
+    }
+
+    let src = path.to_string();
+    let pool = state.app.thumb_pool.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pool.spawn(move || {
+        let res =
+            crate::plugin::input::encode_video_frame(std::path::Path::new(&src), index, count, edge);
+        let _ = tx.send(res);
+    });
+
+    match rx.await {
+        Ok(Ok(data)) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/webp")
+                .header(header::CONTENT_LENGTH, data.len().to_string())
+                .header(header::CACHE_CONTROL, "public, max-age=3600");
+            if let Some(etag) = &etag {
+                builder = builder.header(header::ETAG, etag);
+            }
+            builder.body(Body::from(data)).unwrap()
+        }
+        // No fallback to the whole file here, unlike `?fit=`: the caller is a
+        // tagging worker with a bounded disk budget that asked for a frame
+        // precisely so it would not receive a video. A 404 costs that clip one
+        // failed frame, which the merge tolerates.
+        other => {
+            if let Ok(Err(e)) = other {
+                log::warn!("frame {index}/{count} extraction failed for {path}: {e}");
+            }
+            error(StatusCode::NOT_FOUND)
         }
     }
 }

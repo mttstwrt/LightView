@@ -2,16 +2,26 @@
   "name": "camie-tagger",
   "display_name": "Camie Tagger v2",
   "version": "1.0.0",
+  "api_version": 1,
   "description": "Auto-tags images using the Camais03/camie-tagger-v2 model (143M-param ViT with cross-attention refinement, ONNX). Outputs general, character, copyright, artist, meta, year, and rating tags across a 70,527-tag vocabulary.",
   "author": "LightView",
   "license": "GPL-3.0",
   "execution": {
     "type": "cli",
     "command": "{plugin_dir}/../.venv/bin/python",
-    "args": ["{plugin_dir}/camie_tagger.py"]
+    "args": [
+      "{plugin_dir}/camie_tagger.py"
+    ]
   },
-  "capabilities": ["read_image", "network_access"],
+  "capabilities": [
+    "read_image",
+    "network_access"
+  ],
   "tag_prefix": "camie",
+  "input": {
+    "max_edge": 1024,
+    "video_frames": 5
+  },
   "ui": {
     "settings_schema": null,
     "context_menu_items": [

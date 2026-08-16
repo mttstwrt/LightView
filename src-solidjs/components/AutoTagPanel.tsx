@@ -220,7 +220,10 @@ function RemoteTagging() {
       trackQueuedJob(
         await enqueueTaggingJob(
           pluginName,
-          { filter: `type:image AND NOT has::plugin.${tagPrefix}` },
+          // No `type:image`: the host samples frames from videos now, so
+          // restricting this to stills would keep excluding them after the
+          // backend stopped doing so.
+          { filter: `NOT has::plugin.${tagPrefix}` },
           workerId,
         ),
       );
@@ -265,6 +268,11 @@ function RemoteTagging() {
                 <span class="text-neutral-400">{worker.workerName}</span>
                 <Show when={worker.local}>
                   <span class="px-1 py-px rounded bg-neutral-800 text-[9px] text-neutral-400">server</span>
+                </Show>
+                {/* Which build that machine is on — the question a stale
+                    worker binary or a stale plugin copy makes you ask. */}
+                <Show when={worker.workerVersion}>
+                  <span class="text-neutral-600">v{worker.workerVersion}</span>
                 </Show>
                 <span>{worker.busyJobId ? "tagging…" : "idle"}</span>
               </div>

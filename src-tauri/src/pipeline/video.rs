@@ -320,7 +320,28 @@ pub struct Frame {
 /// the JPEG decoder matches its DCT scaling: both axes are kept at or above it
 /// (never upscaling), so a subsequent square centre-crop still has full detail
 /// to work with.
+///
+/// The thumbnail pipeline's entry point: it wants *a* frame and does not care
+/// which. Callers that do — tagging samples several across the clip — use
+/// [`extract_frame_at`].
 pub fn extract_frame(path: &Path, target_edge: u32) -> Result<Frame, ThumbError> {
+    extract_frame_at(path, target_edge, None)
+}
+
+/// Extract the frame at `at` seconds, or a representative one when `at` is
+/// `None`.
+///
+/// Seeking is best-effort by design. `-ss` lands on the nearest decodable
+/// point, and a timestamp past a clip's real end (durations in container
+/// metadata are routinely a little long) yields nothing at all — so a failed
+/// seek falls back to the start of the clip rather than failing the caller. For
+/// tagging that is the right trade: a duplicate frame costs one redundant
+/// inference, while an error costs the whole file its tags.
+pub fn extract_frame_at(
+    path: &Path,
+    target_edge: u32,
+    at: Option<f64>,
+) -> Result<Frame, ThumbError> {
     if !ffmpeg_available() {
         return Err(ThumbError::Decode("ffmpeg not available".to_string()));
     }
@@ -329,10 +350,12 @@ pub fn extract_frame(path: &Path, target_edge: u32) -> Result<Frame, ThumbError>
     let (w, h) = cover_dims(info.width, info.height, target_edge);
     let expected = (w as usize) * (h as usize) * 4;
 
-    // Seek a second in first: the opening frames of a clip are routinely black
-    // or mid-exposure-ramp. Clips shorter than that (and streams that can't
-    // key-seek there) produce nothing, so retry from the very start.
-    let rgba = match run_frame(path, Some("1"), w, h, expected) {
+    // Default seek is a second in: the opening frames of a clip are routinely
+    // black or mid-exposure-ramp. Clips shorter than that (and streams that
+    // can't key-seek there) produce nothing, so retry from the very start.
+    let seek = at.map(|t| format!("{:.3}", t.max(0.0)));
+    let first = seek.as_deref().unwrap_or("1");
+    let rgba = match run_frame(path, Some(first), w, h, expected) {
         Ok(bytes) => bytes,
         Err(_) => run_frame(path, None, w, h, expected)?,
     };
@@ -344,6 +367,31 @@ pub fn extract_frame(path: &Path, target_edge: u32) -> Result<Frame, ThumbError>
         src_width: info.width,
         src_height: info.height,
     })
+}
+
+/// Evenly spaced sample timestamps across the middle 90% of a clip.
+///
+/// Reproduces the sampling the bundled taggers each did for themselves before
+/// frame extraction moved into the host, so converging on one implementation
+/// changed no output: the ends are trimmed because titles, fades and black
+/// leader cluster there, and a single-sample request takes the midpoint.
+///
+/// `duration` is what `probe` reported, which for a variable-frame-rate phone
+/// clip can overshoot the last decodable frame; [`extract_frame_at`] absorbs
+/// that rather than this function guessing a safety margin.
+pub fn sample_timestamps(duration: f64, count: u32) -> Vec<f64> {
+    if !(duration > 0.0) || count == 0 {
+        return Vec::new();
+    }
+    if duration < 1.0 {
+        return vec![duration / 2.0];
+    }
+    let (start, end) = (duration * 0.05, duration * 0.95);
+    if count == 1 {
+        return vec![(start + end) / 2.0];
+    }
+    let step = (end - start) / ((count - 1) as f64);
+    (0..count).map(|i| start + step * (i as f64)).collect()
 }
 
 /// Scale factor that keeps *both* axes at or above `target_edge`, never
@@ -645,6 +693,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// The sampling the bundled taggers used to do themselves. Getting this
+    /// wrong would silently change every video's tags on the day host-side
+    /// extraction landed, which is the one thing the move had to avoid.
+    #[test]
+    fn sample_timestamps_match_the_taggers_they_replaced() {
+        let ts = sample_timestamps(100.0, 5);
+        assert_eq!(ts.len(), 5);
+        assert!((ts[0] - 5.0).abs() < 1e-9, "{ts:?}");
+        assert!((ts[4] - 95.0).abs() < 1e-9, "{ts:?}");
+        // Evenly spaced across the trimmed span.
+        for pair in ts.windows(2) {
+            assert!((pair[1] - pair[0] - 22.5).abs() < 1e-9, "{ts:?}");
+        }
+        // One sample is the midpoint of the trimmed span, not of the clip.
+        assert_eq!(sample_timestamps(100.0, 1), vec![50.0]);
+        // A clip too short to trim meaningfully gets its midpoint.
+        assert_eq!(sample_timestamps(0.5, 5), vec![0.25]);
+        // Nothing to sample.
+        assert!(sample_timestamps(0.0, 5).is_empty());
+        assert!(sample_timestamps(10.0, 0).is_empty());
     }
 
     #[test]

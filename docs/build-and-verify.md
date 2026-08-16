@@ -55,6 +55,27 @@ self-contained server binary. A rebuilt frontend does *not* need a Rust rebuild
 to take effect in a debug build — rust-embed reads from disk there — but the
 directory has to exist when the crate is first compiled.
 
+## The worker binary is not built by anything else
+
+`cargo tauri build` produces no `lightview-worker`, and that is not a failure:
+the bin declares `required-features = ["worker"]`, so Cargo skips it unless the
+feature is on, and the Tauri bundle only carries the app's own binary.
+
+```bash
+# development
+cd src-tauri && cargo build --bin lightview-worker --features worker
+
+# what the release job builds — no GPU stack, no webview
+cargo build --release --no-default-features --features custom-protocol,worker \
+  --bin lightview-worker
+```
+
+`release.yml` builds and uploads it beside the headless server, so there is a
+published build to compare a running worker against — see
+[decision 0014](decisions/0014-ship-the-worker-with-the-release.md). The quiet
+failure this prevents is someone debugging a months-old worker against a current
+server; the worker now reports its version on announce, and the web UI shows it.
+
 ## Current state of the quality gates
 
 `AGENTS.md` lists `cargo fmt --check` and `cargo clippy --all-targets

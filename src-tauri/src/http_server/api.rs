@@ -422,6 +422,10 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
                 worker_id: String,
                 worker_name: String,
                 plugins: Vec<plugins::PluginInfo>,
+                /// Absent from workers built before the field existed, which
+                /// is itself the answer to "how old is that binary".
+                #[serde(default)]
+                worker_version: Option<String>,
             }
             let a: A = parse(args)?;
             // The in-process executor's id is reserved — a remote device must
@@ -432,8 +436,15 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
                     a.worker_id
                 )));
             }
-            ok(crate::tagging::announce_worker(app, a.worker_id, a.worker_name, a.plugins, false)
-                .await)
+            ok(crate::tagging::announce_worker(
+                app,
+                a.worker_id,
+                a.worker_name,
+                a.plugins,
+                a.worker_version,
+                false,
+            )
+            .await)
         }
 
         "claim_tagging_job" => {

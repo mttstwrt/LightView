@@ -2,16 +2,26 @@
   "name": "wd-tagger",
   "display_name": "WD Eva02 Large Tagger v3",
   "version": "1.0.0",
+  "api_version": 1,
   "description": "Auto-tags images using the SmilingWolf/wd-eva02-large-tagger-v3 model. Outputs general, character, and rating tags.",
   "author": "LightView",
   "license": "MIT",
   "execution": {
     "type": "cli",
     "command": "{plugin_dir}/../.venv/bin/python",
-    "args": ["{plugin_dir}/wd_tagger.py"]
+    "args": [
+      "{plugin_dir}/wd_tagger.py"
+    ]
   },
-  "capabilities": ["read_image", "network_access"],
+  "capabilities": [
+    "read_image",
+    "network_access"
+  ],
   "tag_prefix": "wd",
+  "input": {
+    "max_edge": 1024,
+    "video_frames": 5
+  },
   "ui": {
     "settings_schema": null,
     "context_menu_items": [

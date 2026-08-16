@@ -109,6 +109,10 @@ pub struct WorkerEntry {
     pub worker_id: String,
     pub worker_name: String,
     pub plugins: Vec<PluginInfo>,
+    /// `lightview-worker` build the machine is running, when it says. `None`
+    /// means a worker predating the field — itself a useful answer, since it
+    /// means the binary is at least as old as this line.
+    pub worker_version: Option<String>,
     pub last_seen: i64,
     /// True for the in-process executor running on the server host itself.
     pub local: bool,
@@ -121,6 +125,10 @@ pub struct WorkerStatus {
     pub worker_id: String,
     pub worker_name: String,
     pub plugins: Vec<PluginInfo>,
+    /// Binary version the worker reports, so "which build is that machine
+    /// actually running?" is answerable from the web UI rather than by
+    /// walking over to it.
+    pub worker_version: Option<String>,
     pub last_seen: i64,
     /// True for the in-process executor running on the server host itself.
     pub local: bool,
@@ -176,8 +184,14 @@ pub struct ReapOutcome {
 
 impl TaggingState {
     /// Drop expired workers and requeue stalled running jobs. Called lazily
-    /// from every claim/status read — the worker's poll cadence makes this run
-    /// constantly, so there is no background reaper task.
+    /// from every announce, claim, enqueue, status read **and heartbeat**, so
+    /// there is no background reaper task.
+    ///
+    /// The heartbeat is on that list because of the one case where nothing else
+    /// is: a worker inside a running job stops announcing and stops claiming,
+    /// so during exactly the wedge `JOB_NO_PROGRESS_SECS` exists to catch, the
+    /// heartbeat is the only traffic arriving. Leaving it out meant the
+    /// deadline was never evaluated for a job that needed it.
     pub fn reap(&mut self, now: i64) -> ReapOutcome {
         let mut out = ReapOutcome::default();
 
@@ -231,14 +245,18 @@ impl TaggingState {
         worker_id: String,
         worker_name: String,
         plugins: Vec<PluginInfo>,
+        worker_version: Option<String>,
         local: bool,
         now: i64,
     ) -> bool {
         match self.workers.get_mut(&worker_id) {
             Some(entry) => {
-                let changed = entry.worker_name != worker_name || entry.plugins != plugins;
+                let changed = entry.worker_name != worker_name
+                    || entry.plugins != plugins
+                    || entry.worker_version != worker_version;
                 entry.worker_name = worker_name;
                 entry.plugins = plugins;
+                entry.worker_version = worker_version;
                 entry.local = local;
                 entry.last_seen = now;
                 changed
@@ -250,6 +268,7 @@ impl TaggingState {
                         worker_id,
                         worker_name,
                         plugins,
+                        worker_version,
                         last_seen: now,
                         local,
                     },
@@ -450,6 +469,7 @@ impl TaggingState {
                 worker_id: w.worker_id.clone(),
                 worker_name: w.worker_name.clone(),
                 plugins: w.plugins.clone(),
+                worker_version: w.worker_version.clone(),
                 last_seen: w.last_seen,
                 local: w.local,
                 busy_job_id: self
@@ -504,12 +524,13 @@ pub async fn announce_worker(
     worker_id: String,
     worker_name: String,
     plugins: Vec<PluginInfo>,
+    worker_version: Option<String>,
     local: bool,
 ) -> Result<(), String> {
     let now = now_secs();
     let mut tagging = state.tagging.lock().await;
     let reaped = tagging.reap(now);
-    let changed = tagging.announce(worker_id, worker_name, plugins, local, now);
+    let changed = tagging.announce(worker_id, worker_name, plugins, worker_version, local, now);
     // Fold the announce into the reap broadcast so at most one workers
     // snapshot goes out.
     let outcome = ReapOutcome {
@@ -613,9 +634,19 @@ pub async fn claim_job(
     }
 }
 
-/// Resolve a job target to the image paths the worker should tag. Videos and
-/// GIFs are excluded — the remote loop shouldn't ship them, and the image
-/// taggers can't use them anyway.
+/// Resolve a job target to the paths the worker should tag.
+///
+/// **The join against `media_meta` is a security boundary, not a filter.** A
+/// path target arrives from a paired device; intersecting it with the files
+/// this gallery has actually indexed is what stops a browser naming arbitrary
+/// filesystem paths for a worker to download. Narrow the media types if the
+/// need arises, but never drop the join.
+///
+/// It used to narrow to `media_type = 'image'`, which is why sending videos to
+/// a remote worker produced no tags and no error: with every candidate a video
+/// the resolved list came back empty, and the claim loop reads empty as
+/// "nothing left to tag" and marks the job Done. Frames are extracted host-side
+/// now (`plugin::input`), so a clip is as taggable as a still.
 async fn resolve_target(state: &AppState, target: &JobTarget) -> Result<Vec<String>, String> {
     let candidates = match target {
         JobTarget::Paths(paths) => paths.clone(),
@@ -628,17 +659,16 @@ async fn resolve_target(state: &AppState, target: &JobTarget) -> Result<Vec<Stri
     let db = db.as_ref().ok_or("No gallery open")?;
     let mut stmt = db
         .conn()
-        .prepare("SELECT path FROM media_meta WHERE media_type = 'image'")
+        .prepare("SELECT path FROM media_meta WHERE media_type IN ('image', 'video', 'gif')")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
-    let images: std::collections::HashSet<String> =
-        rows.filter_map(|r| r.ok()).collect();
+    let indexed: std::collections::HashSet<String> = rows.filter_map(|r| r.ok()).collect();
 
     Ok(candidates
         .into_iter()
-        .filter(|p| images.contains(p))
+        .filter(|p| indexed.contains(p))
         .collect())
 }
 
@@ -651,6 +681,15 @@ pub async fn update_job(
 ) -> Result<UpdateResult, String> {
     let now = now_secs();
     let mut tagging = state.tagging.lock().await;
+    // Reap *before* applying the update. A worker inside a running job stops
+    // announcing and claiming, so during exactly the situation
+    // `JOB_NO_PROGRESS_SECS` exists for, the heartbeat is the only traffic the
+    // server sees — if it skipped the reaper the deadline would never be
+    // evaluated and a wedged job would stay Running forever. Reaping first also
+    // means this call observes the job's failure and answers `cancelled: true`,
+    // which is how the worker learns to let go.
+    let reaped = tagging.reap(now);
+    broadcast_reap(state, &tagging, reaped);
     let (result, changed) = tagging.update(&job_id, &worker_id, completed, failed, now);
     if let Some(job) = changed {
         broadcast(state, TaggingSseEvent::Job(job));
@@ -740,6 +779,7 @@ mod tests {
             name: name.to_string(),
             display_name: format!("{name} (display)"),
             version: "1.0.0".to_string(),
+            api_version: crate::plugin::PLUGIN_API_VERSION,
             description: String::new(),
             tag_prefix: name.to_string(),
         }
@@ -747,7 +787,7 @@ mod tests {
 
     fn state_with_worker(now: i64) -> TaggingState {
         let mut s = TaggingState::default();
-        s.announce("w1".into(), "worker-one".into(), vec![plugin("tagger")], false, now);
+        s.announce("w1".into(), "worker-one".into(), vec![plugin("tagger")], None, false, now);
         s
     }
 
@@ -791,7 +831,7 @@ mod tests {
     #[test]
     fn claim_order_is_fifo_and_respects_plugin_match() {
         let mut s = state_with_worker(100);
-        s.announce("w2".into(), "worker-two".into(), vec![plugin("other")], false, 100);
+        s.announce("w2".into(), "worker-two".into(), vec![plugin("other")], None, false, 100);
         let a = s.enqueue("tagger", JobTarget::Filter("q1".into()), None, 100).unwrap();
         let b = s.enqueue("other", JobTarget::Filter("q2".into()), None, 101).unwrap();
         let c = s.enqueue("tagger", JobTarget::Filter("q3".into()), None, 102).unwrap();
@@ -930,11 +970,11 @@ mod tests {
     #[test]
     fn workers_expire_by_ttl_and_announce_dedupes_broadcasts() {
         let mut s = TaggingState::default();
-        assert!(s.announce("w1".into(), "n".into(), vec![plugin("t")], false, 100));
+        assert!(s.announce("w1".into(), "n".into(), vec![plugin("t")], None, false, 100));
         // Pure heartbeat: nothing visible changed.
-        assert!(!s.announce("w1".into(), "n".into(), vec![plugin("t")], false, 110));
+        assert!(!s.announce("w1".into(), "n".into(), vec![plugin("t")], None, false, 110));
         // Plugin list changed.
-        assert!(s.announce("w1".into(), "n".into(), vec![], false, 120));
+        assert!(s.announce("w1".into(), "n".into(), vec![], None, false, 120));
 
         let out = s.reap(120 + WORKER_TTL_SECS - 1);
         assert!(!out.workers_changed);
@@ -960,7 +1000,7 @@ mod tests {
     #[test]
     fn pinned_jobs_only_claimable_by_their_worker() {
         let mut s = state_with_worker(100);
-        s.announce("w2".into(), "worker-two".into(), vec![plugin("tagger")], false, 100);
+        s.announce("w2".into(), "worker-two".into(), vec![plugin("tagger")], None, false, 100);
         let pinned = s
             .enqueue(
                 "tagger",
@@ -991,7 +1031,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("unknown or disconnected worker"));
         // Live worker that doesn't offer the plugin.
-        s.announce("w2".into(), "worker-two".into(), vec![plugin("other")], false, 100);
+        s.announce("w2".into(), "worker-two".into(), vec![plugin("other")], None, false, 100);
         let err = s
             .enqueue(
                 "tagger",
@@ -1006,8 +1046,8 @@ mod tests {
     #[test]
     fn local_flag_surfaces_in_worker_status() {
         let mut s = TaggingState::default();
-        s.announce("local-server".into(), "Server".into(), vec![plugin("t")], true, 100);
-        s.announce("w1".into(), "remote".into(), vec![plugin("t")], false, 100);
+        s.announce("local-server".into(), "Server".into(), vec![plugin("t")], None, true, 100);
+        s.announce("w1".into(), "remote".into(), vec![plugin("t")], None, false, 100);
         let statuses = s.worker_statuses();
         let local = statuses.iter().find(|w| w.worker_id == "local-server").unwrap();
         let remote = statuses.iter().find(|w| w.worker_id == "w1").unwrap();

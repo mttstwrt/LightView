@@ -6,13 +6,23 @@
 //! semaphore on files-on-disk → results are mapped back to server paths and
 //! pushed in batches via `apply_plugin_tags`, with `update_tagging_job` as
 //! progress + heartbeat + cancellation back-channel.
+//!
+//! The files-on-disk bound is a sliding window, not a job size: a job of any
+//! length streams through it as permits recycle. What guarantees they recycle
+//! is `plugin::input::is_stale` — without it a single unanswered request
+//! permanently consumed a slot, and 64 of them stopped the job dead.
+//!
+//! What the plugin actually receives is `plugin::input`'s decision, not this
+//! module's: stills arrive scaled to the edge the manifest asked for, and a
+//! video arrives as several extracted frames whose results are merged back into
+//! one. The server does the extraction, so the worker needs no ffmpeg and a
+//! clip costs a few hundred KB instead of the whole file.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use lightview_lib::plugin::input::{plan_parts, InputPolicy, MergedItem, Part, PartTracker};
 use lightview_lib::plugin::manifest::PluginManifest;
 use lightview_lib::plugin::runner::{self, PluginRequest};
 use lightview_lib::plugin::PluginInfo;
@@ -26,6 +36,11 @@ use crate::http::ServerClient;
 /// Max downloaded-but-not-yet-tagged files on disk. Backpressure for the
 /// downloader; the plugin's own stdin buffering is unbounded, so the request
 /// channel alone wouldn't bound disk usage.
+///
+/// This is a *window*, not a job size limit: permits are recycled as results
+/// land, so a job of any length streams through it. What used to make it read
+/// like a limit is that a permit could leak permanently — see
+/// `plugin::input::is_stale`, which is what guarantees every permit comes back.
 const MAX_PENDING_FILES: usize = 64;
 /// Tag writes per `apply_plugin_tags` batch.
 const APPLY_BATCH: usize = 32;
@@ -34,16 +49,17 @@ const APPLY_BATCH: usize = 32;
 const HEARTBEAT_SECS: u64 = 10;
 /// Announce cadence (server worker TTL is 45s).
 const ANNOUNCE_SECS: u64 = 15;
-/// How long the plugin may sit on downloaded files without producing a single
-/// result before the job is failed instead of left hanging.
+/// How long the plugin may go without producing a single *matched* result
+/// before the job is failed instead of left hanging.
 ///
-/// Every unanswered file holds one of the `MAX_PENDING_FILES` disk slots; once
-/// they are all held the downloader blocks on the semaphore, the plugin stops
-/// receiving stdin lines, and no result ever arrives — while the heartbeat
-/// below keeps the server's stall timer fresh, so the job would otherwise show
-/// "running" forever with no error. Generous because a tagger's first run
-/// downloads and loads its model before the first result, which looks exactly
-/// the same from here.
+/// Generous because a tagger's first run downloads and loads its model before
+/// the first result, and from here that is indistinguishable from a wedge. This
+/// is the outer backstop; `plugin::input::is_stale` is what keeps an ordinary
+/// job moving.
+///
+/// Only results that matched a pending entry refresh this timer. Counting
+/// unmatched ones — a plugin echoing back a path we cannot key on — kept it
+/// permanently fresh in exactly the case it exists to catch.
 const NO_RESULT_STALL_SECS: u64 = 20 * 60;
 
 /// Job snapshot as returned by `claim_tagging_job` (camelCase, flattened with
@@ -179,32 +195,29 @@ async fn announce(
                 "workerId": config.worker_id,
                 "workerName": config.worker_name,
                 "plugins": plugins,
+                // So a server can tell a freshly built worker from the one that
+                // has been running since March — the other half of "what is
+                // actually running on that machine", the plugin's own
+                // api_version being the first.
+                "workerVersion": env!("CARGO_PKG_VERSION"),
             }),
         )
         .await
         .map(|_| ())
 }
 
-/// A downloaded file waiting for its plugin result. Holds the semaphore permit
-/// so disk usage stays bounded; dropped (releasing the permit) once the result
-/// lands and the temp file is deleted.
-struct Pending {
-    server_path: String,
+
+/// What one in-flight request holds until its result comes back: the temp file
+/// to delete and the disk slot to return.
+struct RemotePart {
     temp_path: PathBuf,
     _permit: OwnedSemaphorePermit,
 }
 
-/// Key a temp file by its name rather than the full path we handed the plugin.
-/// Temp names are `<seq>.<ext>`, unique within a job, so this still identifies
-/// the file exactly — but it survives a plugin that echoes back a canonicalized
-/// or relative form of its input (a symlinked temp dir is enough to change it).
-/// An unmatched result would otherwise strand its `Pending` entry, and with it
-/// a disk slot, for the rest of the job.
-fn pending_key(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+impl RemotePart {
+    async fn release(self) {
+        let _ = tokio::fs::remove_file(&self.temp_path).await;
+    }
 }
 
 enum Outcome {
@@ -257,6 +270,14 @@ async fn execute_job(
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// Progress counters, in *media items* rather than requests — one clip is one
+/// item however many frames it took.
+#[derive(Default)]
+struct Counts {
+    succeeded: usize,
+    failed: usize,
+}
+
 async fn drive_plugin(
     client: &ServerClient,
     config: &WorkerConfig,
@@ -264,12 +285,20 @@ async fn drive_plugin(
     job: &ClaimedJob,
     temp_dir: &Path,
 ) -> Outcome {
+    // The worker refuses api_version 0 at startup, so this is always
+    // `Prepared` — but reading it from the manifest rather than assuming keeps
+    // the three drivers agreeing on one source of truth.
+    let policy = InputPolicy::for_manifest(&plugin.manifest);
+
     let (req_tx, req_rx) = mpsc::channel::<PluginRequest>(8);
+    // The total the plugin is told is requests, not items: it sizes buffers
+    // with it, and a five-frame clip really is five inferences.
+    let request_total = job.paths.iter().map(|p| plan_parts(Path::new(p), &policy).len()).sum();
     let mut running = match runner::run_plugin_stream_channel(
         &plugin.manifest,
         &plugin.dir,
         req_rx,
-        Some(job.total),
+        Some(request_total),
     )
     .await
     {
@@ -277,23 +306,18 @@ async fn drive_plugin(
         Err(e) => return Outcome::Failed(format!("failed to start plugin: {e}")),
     };
 
-    // temp file name (see `pending_key`) → origin server path + disk permit.
-    let pending: Arc<Mutex<HashMap<String, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Files that never reached the plugin (download errors).
-    let download_failed = Arc::new(AtomicUsize::new(0));
-
+    let tracker: Arc<Mutex<PartTracker<RemotePart>>> = Arc::new(Mutex::new(PartTracker::new()));
     let downloader = spawn_downloader(
         client,
         config,
         job,
         temp_dir,
         req_tx,
-        pending.clone(),
-        download_failed.clone(),
+        tracker.clone(),
+        policy.clone(),
     );
 
-    let mut succeeded: usize = 0;
-    let mut failed: usize = 0;
+    let mut counts = Counts::default();
     let mut batch: Vec<serde_json::Value> = Vec::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     heartbeat.reset(); // don't fire immediately
@@ -305,42 +329,48 @@ async fn drive_plugin(
         tokio::select! {
             maybe = running.results.recv() => {
                 let Some(result) = maybe else {
-                    // Plugin exited (stdin EOF after the last download).
+                    // Plugin exited (stdin EOF after the last download). Give
+                    // up on anything it never answered so those files are
+                    // reported rather than silently dropped.
+                    let mut t = tracker.lock().await;
+                    let orphaned = t.drain_unanswered();
+                    let done = t.take_completed();
+                    drop(t);
+                    for part in orphaned {
+                        part.release().await;
+                    }
+                    collect(done, plugin, &mut batch, &mut counts);
                     if !batch.is_empty() {
-                        match push_batch(client, config, job, &mut batch, &mut succeeded, &mut failed, &download_failed).await {
-                            Ok(cancelled) if cancelled => break Outcome::Cancelled,
-                            Ok(_) => {}
+                        match push_batch(client, config, job, &mut batch, &mut counts).await {
+                            Ok(true) => break Outcome::Cancelled,
+                            Ok(false) => {}
                             Err(e) => break Outcome::Failed(e),
                         }
                     }
                     break Outcome::Finished;
                 };
 
-                last_result = tokio::time::Instant::now();
-
-                let Some(item) = pending.lock().await.remove(&pending_key(&result.path)) else {
-                    log::warn!("plugin result for unknown path: {}", result.path);
+                let mut t = tracker.lock().await;
+                let Some(part) = t.result(result) else {
+                    // Not a result we can attribute to a file, so it must not
+                    // refresh `last_result` — an unmatched result is a symptom
+                    // of the wedge the timer exists to catch, not evidence of
+                    // progress. The file it was meant for ages out instead.
+                    drop(t);
+                    log::warn!("job {}: plugin result for unknown path", job.id);
                     continue;
                 };
-                let _ = tokio::fs::remove_file(&item.temp_path).await;
+                let done = t.take_completed();
+                drop(t);
 
-                if let Some(err) = result.error {
-                    log::debug!("{}: plugin error: {err}", item.server_path);
-                    failed += 1;
-                } else {
-                    batch.push(json!({
-                        "path": item.server_path,
-                        "tagPrefix": plugin.manifest.tag_prefix,
-                        "version": plugin.manifest.version,
-                        "tags": result.tags,
-                        "meta": result.meta,
-                    }));
-                }
+                last_result = tokio::time::Instant::now();
+                part.release().await;
+                collect(done, plugin, &mut batch, &mut counts);
 
                 if batch.len() >= APPLY_BATCH {
-                    match push_batch(client, config, job, &mut batch, &mut succeeded, &mut failed, &download_failed).await {
-                        Ok(cancelled) if cancelled => break Outcome::Cancelled,
-                        Ok(_) => {}
+                    match push_batch(client, config, job, &mut batch, &mut counts).await {
+                        Ok(true) => break Outcome::Cancelled,
+                        Ok(false) => {}
                         Err(e) => break Outcome::Failed(e),
                     }
                 }
@@ -354,52 +384,60 @@ async fn drive_plugin(
                 // tagger's first run, which may download models for minutes
                 // before producing any result.
                 if !batch.is_empty() {
-                    match push_batch(client, config, job, &mut batch, &mut succeeded, &mut failed, &download_failed).await {
-                        Ok(cancelled) if cancelled => break Outcome::Cancelled,
-                        Ok(_) => {}
+                    match push_batch(client, config, job, &mut batch, &mut counts).await {
+                        Ok(true) => break Outcome::Cancelled,
+                        Ok(false) => {}
                         Err(e) => break Outcome::Failed(e),
                     }
                     continue; // push_batch already reported progress
                 }
-                // Files delivered to the plugin with nothing coming back is the
-                // signature of a wedge: a plugin that buffers stdin to EOF
-                // instead of streaming, or one that silently drops requests
-                // (each dropped request strands a disk slot, and once all
-                // MAX_PENDING_FILES are stranded the downloader blocks for
-                // good). It is indistinguishable from a very slow first model
-                // load, so warn early but only fail once it is truly hopeless —
-                // the alternative, left as-is, is a job that runs forever.
-                let pending_now = pending.lock().await.len();
-                if pending_now > 0 {
-                    let idle = last_result.elapsed();
-                    if idle >= Duration::from_secs(NO_RESULT_STALL_SECS) {
-                        break Outcome::Failed(format!(
-                            "plugin '{}' returned no result for {}s while holding {pending_now} \
-                             downloaded file(s) — the job cannot progress. Plugins must stream \
-                             results and answer every request (see docs/plugins/README.md).",
-                            job.plugin_name,
-                            idle.as_secs(),
-                        ));
-                    }
-                    if pending_now >= MAX_PENDING_FILES {
-                        log::warn!(
-                            "job {}: all {MAX_PENDING_FILES} download slots held with no result \
-                             for {}s — plugin '{}' is not answering requests; failing the job \
-                             at {NO_RESULT_STALL_SECS}s",
-                            job.id,
-                            idle.as_secs(),
-                            job.plugin_name,
-                        );
-                    }
+
+                // Reclaim requests the plugin is never going to answer. Each
+                // one costs a failed image and returns its disk slot, so the
+                // window slides on instead of closing permanently — this is
+                // what lets a several-thousand-image job survive a plugin that
+                // silently drops the occasional request.
+                let idle = last_result.elapsed();
+                let mut t = tracker.lock().await;
+                let stale = t.take_stale(idle);
+                let done = t.take_completed();
+                let in_flight = t.in_flight_count();
+                drop(t);
+                for (name, part) in stale {
+                    log::warn!(
+                        "job {}: plugin '{}' never answered request '{name}' — counting it \
+                         failed and releasing its slot (plugins must emit exactly one result \
+                         per request; see docs/plugins/README.md)",
+                        job.id,
+                        job.plugin_name,
+                    );
+                    part.release().await;
                 }
-                let total_failed = failed + download_failed.load(Ordering::Relaxed);
+                collect(done, plugin, &mut batch, &mut counts);
+
+                // Nothing matched for the whole stall window means the plugin
+                // is not working at all — a stdin-to-EOF buffering plugin, or
+                // one that died without closing stdout. Reclaiming slots cannot
+                // help that, so give up rather than march the rest of the job
+                // through timeouts one window at a time.
+                if idle >= Duration::from_secs(NO_RESULT_STALL_SECS) && in_flight > 0 {
+                    break Outcome::Failed(format!(
+                        "plugin '{}' produced no usable result for {}s while holding \
+                         {in_flight} request(s) — the job cannot progress. Plugins must \
+                         stream results and answer every request \
+                         (see docs/plugins/README.md).",
+                        job.plugin_name,
+                        idle.as_secs(),
+                    ));
+                }
+
                 let update: Result<UpdateResult, _> = client.invoke(
                     "update_tagging_job",
                     json!({
                         "jobId": job.id,
                         "workerId": config.worker_id,
-                        "completed": succeeded,
-                        "failed": total_failed,
+                        "completed": counts.succeeded,
+                        "failed": counts.failed,
                     }),
                 ).await;
                 match update {
@@ -412,26 +450,34 @@ async fn drive_plugin(
     };
 
     downloader.abort();
-    // Drop pending permits/paths before removing the temp dir.
-    pending.lock().await.clear();
+    // Drop any permits/temp paths still held before removing the temp dir.
+    tracker.lock().await.drain_unanswered();
 
     match outcome {
         Outcome::Finished => {
-            let total_failed = failed + download_failed.load(Ordering::Relaxed);
             // Plugin exit status only matters if it died without doing the
             // work — a clean stream that tagged everything is a success even
-            // if the process exits nonzero.
+            // if the process exits nonzero. Capture the stderr tail first:
+            // `finish` consumes the handle, and a plugin that died on startup
+            // has said why only there.
+            let stderr_tail = running.stderr_tail();
             if let Err(e) = running.finish().await {
-                if succeeded == 0 {
-                    return Outcome::Failed(format!("plugin failed: {e}"));
+                if counts.succeeded == 0 {
+                    return Outcome::Failed(runner::describe_failure(
+                        format!("plugin failed: {e}"),
+                        &stderr_tail,
+                    ));
                 }
-                log::warn!("plugin exited abnormally after {succeeded} results: {e}");
+                log::warn!(
+                    "plugin exited abnormally after {} results: {e}",
+                    counts.succeeded
+                );
             }
             log::info!(
                 "job {} done: {} tagged, {} failed",
                 job.id,
-                succeeded,
-                total_failed
+                counts.succeeded,
+                counts.failed
             );
             let _ = client
                 .invoke::<serde_json::Value>(
@@ -439,8 +485,8 @@ async fn drive_plugin(
                     json!({
                         "jobId": job.id,
                         "workerId": config.worker_id,
-                        "succeeded": succeeded,
-                        "failed": total_failed,
+                        "succeeded": counts.succeeded,
+                        "failed": counts.failed,
                     }),
                 )
                 .await;
@@ -452,9 +498,35 @@ async fn drive_plugin(
             Outcome::Cancelled
         }
         Outcome::Failed(e) => {
+            let explained = running.explain(e);
             running.kill().await;
-            Outcome::Failed(e)
+            Outcome::Failed(explained)
         }
+    }
+}
+
+/// Turn finished media items into tag writes, counting the ones that produced
+/// nothing. One item is one unit of job progress, whether it took one request
+/// or five frames' worth.
+fn collect(
+    done: Vec<MergedItem>,
+    plugin: &LocalPlugin,
+    batch: &mut Vec<serde_json::Value>,
+    counts: &mut Counts,
+) {
+    for item in done {
+        if let Some(err) = item.error {
+            log::debug!("{}: {err}", item.path);
+            counts.failed += 1;
+            continue;
+        }
+        batch.push(json!({
+            "path": item.path,
+            "tagPrefix": plugin.manifest.tag_prefix,
+            "version": plugin.manifest.version,
+            "tags": item.tags,
+            "meta": item.meta,
+        }));
     }
 }
 
@@ -465,20 +537,18 @@ async fn push_batch(
     config: &WorkerConfig,
     job: &ClaimedJob,
     batch: &mut Vec<serde_json::Value>,
-    succeeded: &mut usize,
-    failed: &mut usize,
-    download_failed: &AtomicUsize,
+    counts: &mut Counts,
 ) -> Result<bool, String> {
     let entries = std::mem::take(batch);
     let applied: ApplyResult = client
         .invoke("apply_plugin_tags", json!({ "entries": entries }))
         .await
         .map_err(|e| format!("apply_plugin_tags failed: {e}"))?;
-    *succeeded += applied.succeeded.len();
+    counts.succeeded += applied.succeeded.len();
     for f in &applied.failed {
         log::warn!("{}: server rejected tags: {}", f.path, f.error);
     }
-    *failed += applied.failed.len();
+    counts.failed += applied.failed.len();
 
     let update: UpdateResult = client
         .invoke(
@@ -486,8 +556,8 @@ async fn push_batch(
             json!({
                 "jobId": job.id,
                 "workerId": config.worker_id,
-                "completed": *succeeded,
-                "failed": *failed + download_failed.load(Ordering::Relaxed),
+                "completed": counts.succeeded,
+                "failed": counts.failed,
             }),
         )
         .await
@@ -495,59 +565,84 @@ async fn push_batch(
     Ok(update.cancelled)
 }
 
-/// Stream the job's images to disk and into the plugin's request channel.
-/// Ends (dropping the sender → plugin stdin EOF) after the last path.
+/// Stream the job's media to disk and into the plugin's request channel.
+///
+/// One media file becomes one request for a still and `video_frames` requests
+/// for a clip: the server extracts and scales each frame, so the worker needs
+/// no ffmpeg and a clip costs a few hundred KB rather than the whole file. The
+/// still edge and the frame count both come from the plugin's manifest, so a
+/// 448-pixel model never pulls a 60-megapixel original across the network.
+///
+/// Ends (dropping the sender → plugin stdin EOF) after the last part.
 fn spawn_downloader(
     client: &ServerClient,
     config: &WorkerConfig,
     job: &ClaimedJob,
     temp_dir: &Path,
     req_tx: mpsc::Sender<PluginRequest>,
-    pending: Arc<Mutex<HashMap<String, Pending>>>,
-    download_failed: Arc<AtomicUsize>,
+    tracker: Arc<Mutex<PartTracker<RemotePart>>>,
+    policy: InputPolicy,
 ) -> tokio::task::JoinHandle<()> {
     let client = client.clone();
-    let fit_edge = config.fit_edge;
+    // A plugin that states the edge it wants wins over the worker's own
+    // setting: the config value is a fallback for plugins that say nothing,
+    // not a cap on what a plugin may ask for.
+    let fit_edge = match policy.max_edge() {
+        0 => config.fit_edge,
+        edge => edge,
+    };
     let paths = job.paths.clone();
     let temp_dir = temp_dir.to_path_buf();
 
     tokio::spawn(async move {
         let disk_slots = Arc::new(Semaphore::new(MAX_PENDING_FILES));
-        for (seq, server_path) in paths.into_iter().enumerate() {
-            // Wait for a free slot — result handling releases permits as it
-            // deletes processed temp files.
-            let Ok(permit) = disk_slots.clone().acquire_owned().await else {
-                return;
-            };
-            match client
-                .download_media(&server_path, fit_edge, &temp_dir, seq)
+        let mut seq: usize = 0;
+        for server_path in paths {
+            let parts = plan_parts(Path::new(&server_path), &policy);
+            let item = tracker
+                .lock()
                 .await
-            {
-                Ok(dest) => {
-                    let temp_path = dest.to_string_lossy().to_string();
-                    let key = pending_key(&temp_path);
-                    pending.lock().await.insert(
-                        key.clone(),
-                        Pending {
-                            server_path,
-                            temp_path: dest,
-                            _permit: permit,
-                        },
-                    );
-                    let request = PluginRequest {
-                        action: "tag".to_string(),
-                        path: temp_path,
-                    };
-                    if req_tx.send(request).await.is_err() {
-                        // Plugin died; the result loop will surface it.
-                        pending.lock().await.remove(&key);
-                        return;
+                .begin_item(server_path.clone(), parts.len());
+
+            for part in parts {
+                seq += 1;
+                // Wait for a free slot — result handling releases permits as it
+                // deletes processed temp files.
+                let Ok(permit) = disk_slots.clone().acquire_owned().await else {
+                    return;
+                };
+                let frame = match part {
+                    Part::Whole => None,
+                    Part::Frame { index, count } => Some((index, count)),
+                };
+                match client
+                    .download_media(&server_path, fit_edge, frame, &temp_dir, seq)
+                    .await
+                {
+                    Ok(dest) => {
+                        let request_path = dest.to_string_lossy().to_string();
+                        tracker.lock().await.sent(
+                            item,
+                            &request_path,
+                            RemotePart {
+                                temp_path: dest,
+                                _permit: permit,
+                            },
+                        );
+                        let request = PluginRequest {
+                            action: "tag".to_string(),
+                            path: request_path,
+                        };
+                        if req_tx.send(request).await.is_err() {
+                            // Plugin died; the result loop will surface it.
+                            return;
+                        }
                     }
-                }
-                Err(e) => {
-                    log::warn!("{server_path}: download failed: {e}");
-                    download_failed.fetch_add(1, Ordering::Relaxed);
-                    drop(permit);
+                    Err(e) => {
+                        log::warn!("{server_path}: download failed: {e}");
+                        tracker.lock().await.part_failed(item);
+                        drop(permit);
+                    }
                 }
             }
         }

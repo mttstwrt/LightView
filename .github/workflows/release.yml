@@ -157,9 +157,31 @@ jobs:
           cp -r dist "$stage"/dist
           tar -czf "$stage.tar.gz" "$stage"
 
-      - name: Upload headless to release
+      # --- Standalone tagging worker (feature-gated bin) ---
+      # Shipped rather than left as a documented `cargo build` step: the whole
+      # failure this binary keeps producing is someone running a months-old
+      # copy against a current server, and telling people to build it
+      # themselves guarantees no two machines are on the same one. It carries
+      # neither the GPU feature nor a webview — it downloads prepared frames
+      # from the server and shells out to a plugin.
+      - name: Build worker binary
+        run: >
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+          --no-default-features --features custom-protocol,worker
+          --bin lightview-worker
+
+      - name: Package worker
+        run: |
+          stage="lightview-worker-${{ github.ref_name }}-${{ runner.os }}"
+          mkdir "$stage"
+          cp src-tauri/target/release/lightview-worker "$stage"/
+          tar -czf "$stage.tar.gz" "$stage"
+
+      - name: Upload headless + worker to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: true
-          files: lightview-headless-*.tar.gz
+          files: |
+            lightview-headless-*.tar.gz
+            lightview-worker-*.tar.gz

@@ -45,6 +45,9 @@ Deeper topics that outgrew their subsystem page:
   grids use to stream thumbnails into a virtual scroller.
 - [`frontend/chrome.md`](frontend/chrome.md) — the planned split between
   commands and settings, and the space they compete for on a phone.
+- [`plugins/findings-and-ui.md`](plugins/findings-and-ui.md) — the plugins the
+  one-verb protocol cannot express (recognising faces, finding an image's
+  source), the three-shape contract they get, and the screens that resolve it.
 
 ## Decisions
 
@@ -64,6 +67,11 @@ answer to "why not the obvious thing?" is longer than a sentence.
 - [0008 — No view-module API; enablement plus code-splitting instead](decisions/0008-no-view-module-api.md)
 - [0009 — Three kinds of chrome: commands, panels, and configuration](decisions/0009-commands-panels-and-configuration.md)
 - [0010 — Re-arm the thumbnail drain on completion, not widen it](decisions/0010-re-arm-the-drain-not-widen-it.md)
+- [0011 — Location names are companion tags, written by the host](decisions/0011-location-names-are-companion-tags.md)
+- [0012 — Plugins declare the host contract they were built for](decisions/0012-plugins-declare-the-contract-they-were-built-for.md)
+- [0013 — The host samples video frames; plugins only ever see stills](decisions/0013-the-host-samples-video-frames.md)
+- [0014 — Ship `lightview-worker` with the release](decisions/0014-ship-the-worker-with-the-release.md)
+- [0015 — Plugin UI is a fixed set of host-drawn shapes, not a declared layout](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
 
 ## Open work
 

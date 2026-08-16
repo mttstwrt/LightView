@@ -598,6 +598,39 @@ pub fn generate_for_path_fit(
     })
 }
 
+/// Resize already-decoded RGBA into a `max_edge` box and encode it.
+///
+/// The tail of [`generate_for_path_fit`] for callers that produced their own
+/// pixels — a video frame lifted at a chosen timestamp, which no path-based
+/// entry point can express. Never upscales, same as the path version.
+pub fn fit_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    max_edge: u32,
+    filter: ResizeFilter,
+    format: ThumbFormat,
+) -> Result<Vec<u8>, ThumbError> {
+    if width == 0 || height == 0 {
+        return Err(ThumbError::Decode("Zero source dimensions".to_string()));
+    }
+    let (tw, th) = fit_dims(width, height, max_edge);
+    let resized = resize_rgba(width, height, rgba, tw, th, filter)?;
+    match format {
+        ThumbFormat::Jpeg => encode_output(&rgba_to_rgb(&resized), tw, th, format),
+        ThumbFormat::Webp => encode_output(&resized, tw, th, format),
+    }
+}
+
+/// Pixel dimensions from an image's header, without decoding it.
+///
+/// `None` for anything the `image` crate cannot parse from a header — HEIC,
+/// AVIF, RAW, video. Callers use this to skip work that would be a no-op, so
+/// "don't know" must degrade to doing the work, never to skipping it.
+pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(path).ok()
+}
+
 /// Media type inferred from a path's extension (None for non-media files).
 fn media_type_for_path(path: &Path) -> Option<MediaType> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");

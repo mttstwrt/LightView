@@ -21,8 +21,10 @@ use tauri::Emitter;
 use crate::companion::reader;
 use crate::companion::schema::{CompanionFile, MediaType};
 use crate::companion::writer;
+use crate::plugin::input::{plan_parts, InputPolicy, LocalPart, MergedItem, PartTracker};
 use crate::plugin::manifest::PluginManifest;
 use crate::plugin::runner;
+use crate::plugin::RequestDelivery;
 use crate::AppState;
 
 // Canonical definition lives in `plugin` so the worker binary can reuse it;
@@ -65,10 +67,10 @@ fn get_or_create_companion(media_path: &Path) -> Result<CompanionFile, String> {
     }
 }
 
-/// Apply a single plugin result to disk and the tag index.
+/// Apply a single merged item to disk and the tag index.
 /// Returns (tags_added, success, error_message).
-async fn apply_result(
-    result: &runner::PluginResult,
+async fn apply_merged(
+    result: &MergedItem,
     manifest: &PluginManifest,
     cache_db: &Arc<tokio::sync::Mutex<Option<crate::cache::db::CacheDb>>>,
 ) -> (Vec<String>, bool, Option<String>) {
@@ -102,6 +104,13 @@ async fn apply_result(
     (result.tags.clone(), true, None)
 }
 
+/// Run a plugin on one file and wait for the answer.
+///
+/// The batch path's machinery would be overkill for a single item, but the
+/// *input* must be identical or the same clip would tag differently depending
+/// on whether one or two files were selected. So it prepares the same parts —
+/// bounded by `MAX_VIDEO_FRAMES`, hence safe to materialize up front — and
+/// merges them the same way.
 #[tauri::command]
 pub async fn run_plugin(
     state: tauri::State<'_, AppState>,
@@ -112,24 +121,62 @@ pub async fn run_plugin(
     let dir = plugin_dir();
     let (manifest, plugin_path) =
         runner::find_plugin(&dir, &plugin_name).map_err(|e| e.to_string())?;
+    crate::plugin::check_api_version(&manifest, RequestDelivery::UpFront)?;
+    if action != "tag" {
+        return Err(format!("unknown plugin action: {action}"));
+    }
 
-    let requests = vec![runner::PluginRequest {
-        action,
-        path: media_path.clone(),
-    }];
+    let policy = InputPolicy::for_manifest(&manifest);
+    let source = Path::new(&media_path);
+    let temp_dir = std::env::temp_dir()
+        .join("lightview-plugin")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    let mut requests = Vec::new();
+    for (i, part) in plan_parts(source, &policy).into_iter().enumerate() {
+        let prepared = crate::plugin::input::prepare_on_pool(
+            &state.thumb_pool,
+            source,
+            part,
+            &policy,
+            &temp_dir,
+            &format!("{i:04}"),
+        )
+        .await?;
+        requests.push(runner::PluginRequest {
+            action: "tag".to_string(),
+            path: prepared
+                .unwrap_or_else(|| source.to_path_buf())
+                .to_string_lossy()
+                .to_string(),
+        });
+    }
+    let expected = requests.len();
 
     let mut running = runner::run_plugin_stream(&manifest, &plugin_path, requests)
         .await
         .map_err(|e| e.to_string())?;
 
-    let result = running
-        .results
-        .recv()
-        .await
-        .ok_or_else(|| "Plugin produced no output".to_string())?;
+    let mut parts = Vec::with_capacity(expected);
+    while parts.len() < expected {
+        match running.results.recv().await {
+            Some(r) => parts.push(r),
+            None => break,
+        }
+    }
+    let stderr_tail = running.stderr_tail();
     let _ = running.finish().await;
+    let _ = std::fs::remove_dir_all(&temp_dir);
 
-    let (tags_added, ok, err) = apply_result(&result, &manifest, &state.cache_db).await;
+    if parts.is_empty() {
+        return Err(runner::describe_failure(
+            "Plugin produced no output".to_string(),
+            &stderr_tail,
+        ));
+    }
+    let merged = crate::plugin::input::merge_parts(&media_path, parts);
+    let (tags_added, ok, err) = apply_merged(&merged, &manifest, &state.cache_db).await;
 
     // Refresh autocomplete since tag counts may have changed.
     let db = state.cache_db.lock().await;
@@ -141,7 +188,7 @@ pub async fn run_plugin(
     }
 
     Ok(PluginRunResult {
-        path: result.path,
+        path: merged.path,
         tags_added,
         success: ok,
         error: err,
@@ -173,10 +220,18 @@ pub async fn cancel_plugin_batch(state: tauri::State<'_, AppState>) -> Result<()
 
 /// Run a plugin on a batch of media files.
 ///
-/// Spawns one plugin subprocess, streams every path to it as NDJSON, and
-/// forwards each streamed result back to the frontend as a `plugin:progress`
-/// event. The plugin itself decides how to batch and parallelise. The host
-/// just applies results to companion files in arrival order.
+/// Spawns one plugin subprocess and streams requests to it as NDJSON,
+/// forwarding each merged result back to the frontend as a `plugin:progress`
+/// event. The plugin decides how to batch and parallelise internally; the host
+/// decides what it *receives* — see [`crate::plugin::input`], which scales
+/// stills to the size the manifest asked for and turns a video into several
+/// frames. This used to hand over raw paths and leave videos to the plugin,
+/// which is why each tagger carried its own copy of ffmpeg sampling; converging
+/// on one policy is the point, so that a plugin cannot behave differently
+/// depending on whether the job ran here, on the server, or on a worker.
+///
+/// Progress is counted in media items, not requests: a five-frame clip is one
+/// step of the progress bar.
 #[tauri::command]
 pub async fn run_plugin_batch(
     state: tauri::State<'_, AppState>,
@@ -190,38 +245,73 @@ pub async fn run_plugin_batch(
     let dir = plugin_dir();
     let (manifest, plugin_path) =
         runner::find_plugin(&dir, &plugin_name).map_err(|e| e.to_string())?;
+    // The desktop writes every request up front, so a pre-streaming plugin runs
+    // here as it always has; only a plugin built for a *newer* host is refused.
+    crate::plugin::check_api_version(&manifest, RequestDelivery::UpFront)?;
+    if action != "tag" {
+        return Err(format!("unknown plugin action: {action}"));
+    }
 
     log::info!("Plugin batch: {} files for {}", media_paths.len(), manifest.name);
 
     let cancelled = state.plugin_cancelled.clone();
     let cache_db = state.cache_db.clone();
     let autocomplete = state.autocomplete.clone();
+    let thumb_pool = state.thumb_pool.clone();
 
     tauri::async_runtime::spawn(async move {
         let total = media_paths.len();
-        let requests: Vec<runner::PluginRequest> = media_paths
-            .into_iter()
-            .map(|path| runner::PluginRequest {
-                action: action.clone(),
-                path,
-            })
-            .collect();
+        let policy = InputPolicy::for_manifest(&manifest);
+        let request_total: usize = media_paths
+            .iter()
+            .map(|p| plan_parts(Path::new(p), &policy).len())
+            .sum();
 
-        let mut running = match runner::run_plugin_stream(&manifest, &plugin_path, requests).await {
+        // Temp dir for prepared inputs. Empty unless the plugin asked for
+        // scaled stills or there are videos in the batch.
+        let temp_dir = std::env::temp_dir()
+            .join("lightview-plugin")
+            .join(uuid::Uuid::new_v4().to_string());
+        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+            log::error!("Plugin batch: cannot create temp dir: {e}");
+            let _ = app_handle.emit(
+                "plugin:done",
+                PluginDoneEvent { succeeded: 0, failed: total, cancelled: false },
+            );
+            return;
+        }
+
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel::<runner::PluginRequest>(8);
+        let mut running = match runner::run_plugin_stream_channel(
+            &manifest,
+            &plugin_path,
+            req_rx,
+            Some(request_total),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 log::error!("Failed to start plugin '{}': {}", manifest.name, e);
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 let _ = app_handle.emit(
                     "plugin:done",
-                    PluginDoneEvent {
-                        succeeded: 0,
-                        failed: total,
-                        cancelled: false,
-                    },
+                    PluginDoneEvent { succeeded: 0, failed: total, cancelled: false },
                 );
                 return;
             }
         };
+
+        let tracker: Arc<tokio::sync::Mutex<PartTracker<LocalPart>>> =
+            Arc::new(tokio::sync::Mutex::new(PartTracker::new()));
+        let producer = crate::plugin::input::spawn_local_producer(
+            thumb_pool,
+            media_paths,
+            policy,
+            temp_dir.clone(),
+            req_tx,
+            tracker.clone(),
+        );
 
         let mut completed: usize = 0;
         let mut succeeded: usize = 0;
@@ -229,49 +319,74 @@ pub async fn run_plugin_batch(
         let mut was_cancelled = false;
 
         // Poll the cancellation flag on a timer so cancellation is responsive
-        // even when the plugin is mid-batch and producing no output.
+        // even when the plugin is mid-batch and producing no output. The same
+        // tick sweeps requests the plugin has abandoned, so a skipped file is
+        // reported rather than silently losing its tags.
         let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut last_result = tokio::time::Instant::now();
 
         loop {
+            let mut finished_items = Vec::new();
             tokio::select! {
                 maybe = running.results.recv() => {
-                    let Some(result) = maybe else { break; };
+                    let Some(result) = maybe else {
+                        let mut t = tracker.lock().await;
+                        let orphaned = t.drain_unanswered();
+                        finished_items = t.take_completed();
+                        drop(t);
+                        for part in orphaned {
+                            part.release().await;
+                        }
+                        emit_items(
+                            finished_items, &manifest, &cache_db, &app_handle,
+                            &mut completed, &mut succeeded, &mut failed, total,
+                        ).await;
+                        break;
+                    };
 
-                    completed += 1;
-                    let (tags_added, ok, err) =
-                        apply_result(&result, &manifest, &cache_db).await;
-                    if ok {
-                        succeeded += 1;
-                    } else {
-                        failed += 1;
-                    }
-
-                    let _ = app_handle.emit(
-                        "plugin:progress",
-                        PluginProgressEvent {
-                            completed,
-                            total,
-                            path: result.path.clone(),
-                            tags_added,
-                            success: ok,
-                            error: err,
-                        },
-                    );
+                    let mut t = tracker.lock().await;
+                    let Some(part) = t.result(result) else {
+                        drop(t);
+                        log::warn!("plugin result for unknown path");
+                        continue;
+                    };
+                    finished_items = t.take_completed();
+                    drop(t);
+                    last_result = tokio::time::Instant::now();
+                    part.release().await;
                 }
                 _ = tick.tick() => {
                     if cancelled.load(Ordering::Relaxed) {
                         was_cancelled = true;
                         break;
                     }
+                    let mut t = tracker.lock().await;
+                    let stale = t.take_stale(last_result.elapsed());
+                    if !stale.is_empty() {
+                        finished_items = t.take_completed();
+                    }
+                    drop(t);
+                    for (name, part) in stale {
+                        log::warn!("plugin '{}' never answered '{name}'", manifest.name);
+                        part.release().await;
+                    }
                 }
             }
+            emit_items(
+                finished_items, &manifest, &cache_db, &app_handle,
+                &mut completed, &mut succeeded, &mut failed, total,
+            ).await;
         }
+
+        producer.abort();
+        tracker.lock().await.drain_unanswered();
 
         if was_cancelled {
             running.kill().await;
         } else {
             let _ = running.finish().await;
         }
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
         // Rebuild tag counts once at the end.
         let db = cache_db.lock().await;
@@ -295,172 +410,52 @@ pub async fn run_plugin_batch(
     Ok(())
 }
 
-/// Install a plugin from a directory path.
-/// Copies the plugin directory (or a single Python file with auto-generated manifest)
-/// into the plugins config directory.
+/// Write each finished media item and report it to the frontend.
+#[allow(clippy::too_many_arguments)]
+async fn emit_items(
+    items: Vec<MergedItem>,
+    manifest: &PluginManifest,
+    cache_db: &Arc<tokio::sync::Mutex<Option<crate::cache::db::CacheDb>>>,
+    app_handle: &tauri::AppHandle,
+    completed: &mut usize,
+    succeeded: &mut usize,
+    failed: &mut usize,
+    total: usize,
+) {
+    for item in items {
+        *completed += 1;
+        let (tags_added, ok, err) = apply_merged(&item, manifest, cache_db).await;
+        if ok {
+            *succeeded += 1;
+        } else {
+            *failed += 1;
+        }
+        let _ = app_handle.emit(
+            "plugin:progress",
+            PluginProgressEvent {
+                completed: *completed,
+                total,
+                path: item.path,
+                tags_added,
+                success: ok,
+                error: err,
+            },
+        );
+    }
+}
+
+/// Install (or update) a plugin from a directory or a bare `.py` script.
+///
+/// The copy itself lives in `plugin::install` so `lightview-worker` can run the
+/// same logic — a worker is the machine where hand-copying a plugin has
+/// actually cost debugging time. See that module for what it does beyond a
+/// recursive copy.
 #[tauri::command]
 pub async fn install_plugin(
     _state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<PluginInfo, String> {
-    let source = Path::new(&path);
-    if !source.exists() {
-        return Err(format!("Path does not exist: {}", path));
-    }
-
-    let dest_dir = plugin_dir();
-    std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-
-    if source.is_dir() {
-        let manifest_path = source.join("manifest.json");
-        if !manifest_path.exists() {
-            return Err("Plugin directory must contain a manifest.json".to_string());
-        }
-        let manifest = PluginManifest::load(&manifest_path).map_err(|e| e.to_string())?;
-        let target = dest_dir.join(&manifest.name);
-
-        copy_dir_filtered(source, &target, &|name: &str| {
-            name == ".venv" || name == "venv" || name == "__pycache__"
-        })
-        .map_err(|e| e.to_string())?;
-
-        rewrite_manifest_python(&target.join("manifest.json"), source)?;
-
-        Ok(PluginInfo {
-            name: manifest.name,
-            display_name: manifest.display_name,
-            version: manifest.version,
-            description: manifest.description,
-            tag_prefix: manifest.tag_prefix,
-        })
-    } else if source.extension().and_then(|e| e.to_str()) == Some("py") {
-        let stem = source
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("plugin");
-        let plugin_name = stem.replace('_', "-");
-        let target = dest_dir.join(&plugin_name);
-        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-
-        let dest_script = target.join(source.file_name().unwrap());
-        std::fs::copy(source, &dest_script).map_err(|e| e.to_string())?;
-
-        let source_dir = source.parent().unwrap_or(Path::new("."));
-        let req_source = source_dir.join("requirements.txt");
-        if req_source.exists() {
-            let _ = std::fs::copy(&req_source, target.join("requirements.txt"));
-        }
-
-        let python_command = detect_venv_python(source_dir)
-            .unwrap_or_else(|| "python3".to_string());
-
-        let script_name = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("plugin.py");
-        let manifest_json = serde_json::json!({
-            "name": plugin_name,
-            "display_name": plugin_name,
-            "version": "1.0.0",
-            "description": format!("Auto-installed plugin from {}", script_name),
-            "execution": {
-                "type": "cli",
-                "command": python_command,
-                "args": [format!("{{plugin_dir}}/{}", script_name)],
-            },
-            "capabilities": ["read_image"],
-            "tag_prefix": plugin_name,
-        });
-        let manifest_str =
-            serde_json::to_string_pretty(&manifest_json).map_err(|e| e.to_string())?;
-        std::fs::write(target.join("manifest.json"), &manifest_str)
-            .map_err(|e| e.to_string())?;
-
-        Ok(PluginInfo {
-            name: plugin_name.clone(),
-            display_name: plugin_name.clone(),
-            version: "1.0.0".to_string(),
-            description: format!("Auto-installed plugin from {}", script_name),
-            tag_prefix: plugin_name,
-        })
-    } else {
-        Err("Path must be a plugin directory (with manifest.json) or a .py file".to_string())
-    }
-}
-
-/// Look for a Python venv in `dir` and return the absolute path to its interpreter.
-/// NOTE: Don't canonicalize — Python venvs work via symlink location.
-fn detect_venv_python(dir: &Path) -> Option<String> {
-    let abs_dir = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(dir)
-    };
-    for venv_name in &[".venv", "venv"] {
-        let python = abs_dir.join(venv_name).join("bin").join("python");
-        if python.exists() {
-            return Some(python.display().to_string());
-        }
-    }
-    None
-}
-
-fn copy_dir_filtered(
-    src: &Path,
-    dst: &Path,
-    skip: &dyn Fn(&str) -> bool,
-) -> std::io::Result<()> {
-    if dst.exists() {
-        std::fs::remove_dir_all(dst)?;
-    }
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if skip(&name_str) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        let dest_path = dst.join(&name);
-        if file_type.is_dir() {
-            copy_dir_filtered(&entry.path(), &dest_path, skip)?;
-        } else if file_type.is_symlink() {
-            let link_target = std::fs::read_link(entry.path())?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&link_target, &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dest_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn rewrite_manifest_python(manifest_path: &Path, source_dir: &Path) -> Result<(), String> {
-    let text = std::fs::read_to_string(manifest_path).map_err(|e| e.to_string())?;
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| e.to_string())?;
-
-    let needs_rewrite = doc
-        .pointer("/execution/command")
-        .and_then(|v| v.as_str())
-        .map(|cmd| cmd.contains(".venv") || cmd.contains("venv"))
-        .unwrap_or(false);
-
-    if needs_rewrite {
-        if let Some(abs_python) = detect_venv_python(source_dir) {
-            if let Some(exec) = doc.get_mut("execution").and_then(|e| e.as_object_mut()) {
-                exec.insert(
-                    "command".to_string(),
-                    serde_json::Value::String(abs_python),
-                );
-            }
-            let out = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-            std::fs::write(manifest_path, out).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
+    crate::plugin::install::install_from_path(Path::new(&path), &plugin_dir())
 }
 
 // ---------------------------------------------------------------------------
