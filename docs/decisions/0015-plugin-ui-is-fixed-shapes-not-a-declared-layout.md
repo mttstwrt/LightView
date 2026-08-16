@@ -2,6 +2,13 @@
 
 [← docs index](../README.md) · [plugins](../plugins/README.md) · [findings and UI](../plugins/findings-and-ui.md)
 
+> **Superseded by [0016](0016-plugin-findings-are-host-owned-kinds.md).** The
+> shapes were reviewed against their two motivating plugins before being built
+> and served neither: `label` is not what a face cluster needs, and `choice`
+> cannot express the action a source candidate exists for. Findings are now
+> host-owned *kinds* with native surfaces. The rejections of a declared layout
+> schema and of a sandboxed iframe recorded below still stand.
+
 ## Context
 
 Two planned plugins produce output the tag protocol cannot carry: a face

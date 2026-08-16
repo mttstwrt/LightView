@@ -302,16 +302,21 @@ so a gallery browsed only in the justified layout stops paying for square
 tiers. This is the whole near-term answer to "the square grid costs gigabytes I
 don't need" and it requires no plugin machinery.
 
-**Plugin UI is host-rendered and declarative, not an iframe.** Plugins describe
-panels, forms and actions as JSON in the manifest — `settings_schema` made real
-— and the host renders them in Solid. Track C's sandboxed iframe remains the
-fallback for displays a schema cannot express, but it is not the default
+**Plugin UI is host-owned and native, not an iframe and not a declared layout.**
+A plugin emits *findings* — structured data it noticed that is not yet a fact —
+tagged with a **kind** the host understands, and the host draws a surface built
+for that kind in Solid. Track C's sandboxed iframe remains the fallback for a
+display no native surface should be written for, but it is not the default
 mechanism: it is a versioned message protocol and a plugin lifecycle to
 maintain forever, and the motivating cases do not need one. Those cases —
 naming recognised faces, and confirming which of several candidates is an
 image's original source — both need a *host* surface where a person resolves
-what a plugin found, which any plugin emitting such findings can feed. The
-shape of that is designed in [`findings-and-ui.md`](findings-and-ui.md).
+what a plugin found, which any plugin emitting that kind can feed.
+`settings_schema` is the one place a schema really is rendered generically,
+because a configuration form is a bounded artefact in a way a review UI is not.
+All of it is designed in [`findings-and-ui.md`](findings-and-ui.md); the
+reasoning is [decision 0016](../decisions/0016-plugin-findings-are-host-owned-kinds.md),
+which supersedes [0015](../decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md).
 
 **Plugins declare the host contract they were built for.** `api_version` in the
 manifest, and it is not documentation: it selects what the plugin receives, and

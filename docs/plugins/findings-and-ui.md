@@ -41,24 +41,27 @@ a fact.
 
 ---
 
-## 2. Three shapes, fixed by the host
+## 2. Kinds the host understands
 
-A finding declares a **kind** (the plugin's word for what it is, which the host
-never interprets) and takes one of three **shapes** (the host's vocabulary,
-which selects the interaction):
+A finding declares a **kind**, and the host *interprets* it. A kind is a
+semantic contract — a typed payload, and a surface built for that payload. The
+host knows two:
 
-| Shape | The question | Answer | Motivating case |
+| Kind | What the plugin found | What a person decides | Surface |
 |---|---|---|---|
-| `choice` | which of these, if any? | one option id, or none | image source candidates |
-| `confirm` | is this true? | yes / no | "this is AI-generated" |
-| `label` | what is this called? | a string | naming a face cluster |
+| `source` | ranked external candidates for one file | which one is it, if any — and whether to take a better copy | candidate list in the info panel → [source dialog](#7-the-source-dialog) |
+| `face-cluster` | a set of files it believes are one person | who this is; whether the cluster is right | `FacesPanel`, beside `DuplicatesPanel` |
 
-The host owns every pixel. A plugin supplies content — a title, options, a
-detail table of key→string, tags an option implies — and never layout. Adding a
-fourth shape is a host release, and that is the trade: see
-[decision 0015](../decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md).
+This is the reverse of the earlier design, where the host never interpreted a
+kind and a generic *shape* selected the interaction. That guaranteed generic
+output: a renderer told only "this is a pick-one" cannot know that a source
+candidate wants its resolution compared against the local file. Adding a kind is
+a host release, and that is the trade — see
+[decision 0016](../decisions/0016-plugin-findings-are-host-owned-kinds.md),
+which supersedes
+[0015](../decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md).
 
-Shapes are declared in the **manifest**, not in results, so the host knows a
+Kinds are declared in the **manifest**, not in results, so the host knows a
 plugin's whole UI surface before running it:
 
 ```json
@@ -66,56 +69,78 @@ plugin's whole UI surface before running it:
   "settings_schema": { … },
   "context_menu_items": [ … ],
   "findings": [
-    { "kind": "source", "shape": "choice", "title": "Original source" }
+    { "kind": "source", "title": "Original source" }
   ]
 }
 ```
 
-A result carrying a `kind` the manifest never declared is dropped with a log
-line. That is deliberate: it keeps "what can this plugin ask me?" answerable
-from the manifest alone, which is what makes the filter chip and the plugin list
-possible before any job has run.
+A plugin declaring a kind the host does not know is **refused at install**, with
+a message naming the kind — the same treatment as an unsupported `api_version`
+([0012](../decisions/0012-plugins-declare-the-contract-they-were-built-for.md)),
+and for the same reason: a plugin whose output nothing can render must say so at
+install time rather than run to completion and produce silence. A result
+carrying a kind the *manifest* never declared is dropped with a log line, which
+keeps "what can this plugin ask me?" answerable from the manifest alone.
 
 ## 3. What a plugin emits
 
 `findings` sits alongside `tags` in an ordinary result line — additive, so a
-plugin can tag and find in the same pass, or do only one:
+plugin can tag and find in the same pass, or do only one. The `data` object is
+typed by the kind:
 
 ```json
 {"path": "/g/a.jpg", "tags": [], "findings": [
   {"kind": "source",
    "id": "src:9f2a",
-   "options": [
+   "data": {"candidates": [
      {"id": "danbooru:5512",
       "label": "Danbooru #5512",
-      "detail": {"Artist": "kantoku", "Posted": "2019-04-02", "Match": "98%"},
+      "site": "Danbooru",
       "url": "https://danbooru.donmai.us/posts/5512",
+      "file_url": "https://danbooru.donmai.us/data/5512.png",
       "thumb": "https://danbooru.donmai.us/preview/5512.jpg",
+      "width": 4096, "height": 4096, "bytes": 8241664,
+      "similarity": 0.98,
+      "detail": {"Artist": "kantoku", "Posted": "2019-04-02"},
       "tags": ["source:danbooru", "artist:kantoku"]}
-   ]}
+   ]}}
 ]}
 ```
 
 `id` is the plugin's own stable key for this finding, so a re-run can be matched
-against a previous verdict. `confirm` findings carry `detail` and `tags` but no
-`options`; `label` findings carry neither.
+against a previous verdict.
+
+The typed fields are the point of the exercise, and each one buys a specific
+piece of the UI: `width`/`height`/`bytes` are what let the dialog say *"4096²,
+7.9 MB — yours is 1024², 412 KB"* and enable the replace action only when the
+candidate is genuinely better; `similarity` is what sorts and what greys out a
+weak match; `file_url` is the image itself as distinct from the page a person
+would visit, and its absence is what makes a candidate confirm-only. `detail`
+survives from the old design as a free-form key→string table, because the
+per-site trivia a plugin wants to show — circle, character, upload date — is
+genuinely open-ended and is display-only.
+
+A `face-cluster` finding is keyed to a cluster rather than a file, and its
+payload is the member list plus per-face crop rectangles. Its storage is the
+`plugin_groups` question in [§8](#8-faces-a-cluster-is-not-a-file), and it is
+not in the first build.
 
 **Where a confirmed answer goes, and why it is not the plugin's tag
 namespace.** `apply_plugin_output` replaces `tags.plugins[prefix].tags`
 wholesale on every run — that is what makes re-tagging idempotent, and it means
 anything written there is erased by the next job. So a confirmation writes:
 
-- the option's `tags` into **`tags.user`**. The user affirmed them; they are
-  indexed and filterable the moment they land, they survive re-tagging, and they
-  are removable through the tag UI like any other user tag.
-- the chosen option (minus its thumbnail URL) into
+- the chosen candidate's `tags` into **`tags.user`**. The user affirmed them;
+  they are indexed and filterable the moment they land, they survive
+  re-tagging, and they are removable through the tag UI like any other user tag.
+- the candidate itself (minus its thumbnail and file URLs) into
   **`meta.plugins[<prefix>].<kind>`**, which is already
   `HashMap<String, Value>` and needs no schema change. That is where provenance
   lives: which plugin found it, which candidate won, what the score was.
 
-For `label`, the typed value becomes the tag `<kind>:<value>` with spaces
-underscored — `person:alice` — by host convention rather than a template
-language in the manifest.
+A name given to a `face-cluster` follows the same rule from the other end: it
+becomes the tag `person:alice` on every member's companion, with spaces
+underscored, by host convention rather than a template language in the manifest.
 
 **No companion schema bump.** Both destinations already exist. That is a
 deliberate constraint on the design, not a lucky accident: the companion is a
@@ -153,43 +178,42 @@ version. Filtering the grid to `pending::plugin.source-finder` and arrow-keying
 through the viewer *is* a review queue, built out of parts that already exist,
 already virtualize, and already work on a phone.
 
-## 6. The screens
+## 6. Where findings appear
 
-### Findings in the info panel
+### The info panel, for per-file kinds
 
 The viewer's info panel — side panel on desktop, bottom sheet on touch — gains a
-**Findings** section under Tags. One block per unresolved finding:
+**Findings** section under Tags. One block per unresolved finding on this file:
 
 ```
-┌─ Original source ──────────────── source-finder ─┐
-│                                                   │
-│  ○ ▣  Danbooru #5512                              │
-│       Artist  kantoku                             │
-│       Posted  2 Apr 2019                          │
-│       Match   98%                          ↗ open │
-│                                                   │
-│  ○ ▣  Pixiv 74123456                              │
-│       Artist  かんとく                             │
-│       Match   91%                          ↗ open │
-│                                                   │
-│         [ Confirm ]      [ None of these ]        │
-└───────────────────────────────────────────────────┘
+┌─ Original source ──────────── source-finder ─┐
+│                                              │
+│ ○ ▣  Danbooru #5512         4096²   98%   ↗  │
+│ ○ ▣  Pixiv 74123456         2048²   91%   ↗  │
+│                                              │
+│     [ Review… ]         [ None of these ]    │
+└──────────────────────────────────────────────┘
 ```
 
-- **`choice`** is a radio list. Each row: an optional 48 px thumbnail, the
-  label, a two-column detail grid, and `url` as an external link. **Confirm**
-  enables once a row is selected; **None of these** records a rejection.
-- **`confirm`** is the detail grid plus **Yes** / **No**.
-- **`label`** is a text input with autocomplete over existing `<kind>:` tags,
-  plus **Save** / **Skip**.
+The block is deliberately a *summary and an entry point*, not the whole
+interaction. Confirming the obvious case without leaving the viewer is what
+makes a long queue bearable, so the rows are selectable and `Enter` confirms the
+selected one outright; **Review…** opens the [source dialog](#7-the-source-dialog)
+for everything else — comparing the actual pixels, and taking a better copy.
 
 Once answered the block collapses to one line — `Original source · Danbooru
 #5512` — with a change affordance, so a mistake is one click from being undone
 rather than requiring a re-run.
 
-Keyboard, because the whole point is answering many in a row: `1`–`9` select an
-option, `Enter` confirms, `N` rejects, and the viewer's existing arrow keys move
-to the next file. That combination is the queue.
+Keyboard, because the whole point is answering many in a row: `1`–`9` select a
+candidate, `Enter` confirms, `N` rejects, `R` opens the dialog, and the viewer's
+existing arrow keys move to the next file. That combination is the queue, and it
+is why [§5](#5-finding-the-work-pending)'s filter needs no dedicated panel to go
+with it.
+
+Kinds that are not per-file get no info-panel block; they get their own panel,
+because there is no single file to hang them on. That is the whole of the faces
+problem — see [§8](#8-faces-a-cluster-is-not-a-file).
 
 ### Noticing there is work
 
@@ -203,7 +227,7 @@ no new notification surface; it reuses the filter bar as the navigation.
 A per-plugin section in `SettingsMenu`, rendered from `settings_schema` — the
 field that has parsed since the beginning and never rendered. The supported
 types are deliberately few, and expanding them is a host change like a new
-shape: `string`, `number` (with `min`/`max`), `boolean`, `enum` (select), and
+kind: `string`, `number` (with `min`/`max`), `boolean`, `enum` (select), and
 `string[]` (tag-style list).
 
 Values are stored per gallery in `gallery_meta` under
@@ -216,14 +240,109 @@ gets them in the `claim_tagging_job` response and passes them through.
 This is also the concrete form of the plugins page's Track A: settings are
 per-gallery, plugin *code* stays global.
 
-## 7. Closing the loop
+## 7. The source dialog
+
+Its own dialog, not a `MergeDialog` variant. The two problems rhyme — a better
+copy exists, keep the metadata, discard the loser — but a merge participant is a
+local file with a companion, an mtime and a `media_meta` row, while a candidate
+is a URL with dimensions attached. Making one impersonate the other constrains
+both to whichever intersection stays true, for a saving that is layout only. The
+reuse that pays sits a layer below and is untouched: `modify_companion`,
+`reindex_tags_for_file` and `trash_files_impl` are the same primitives
+`merge_duplicates` composes, so a source replacement and a duplicate merge write
+a companion identically.
+
+```
+┌─ Original source ──────────────────────────────────────────── source-finder ─┐
+│                                                                              │
+│  YOURS                              CANDIDATE  ‹ 1 of 3 ›                    │
+│  ┌────────────┐                     ┌────────────┐                           │
+│  │            │                     │            │   Danbooru #5512     98%  │
+│  │            │                     │            │   Artist   kantoku        │
+│  └────────────┘                     └────────────┘   Posted   2 Apr 2019     │
+│  1024 × 1024                        4096 × 4096                    ↗ open    │
+│  412 KB · JPEG                      7.9 MB · PNG                             │
+│                                     ▲ 4× resolution                          │
+│                                                                              │
+│  Tags this adds:   source:danbooru   artist:kantoku                          │
+│                                                                              │
+│  [ Confirm only ]  [ Download & keep both ]  [ Download & replace ]  [ ✕ ]   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Three outcomes, and they are separated because they carry very different risk:
+
+- **Confirm only** records the verdict. The candidate's `tags` go to
+  `tags.user`, the chosen candidate (minus thumbnail and file URLs) to
+  `meta.plugins[<prefix>].source`. No bytes move. This is the common case and
+  the only one the first build strictly needs.
+- **Download & keep both** records the same verdict, then fetches `file_url`
+  next to the original, names it from the original plus a suffix, and copies the
+  companion across so the new file arrives with the same tags and rating. The
+  fs-watcher indexes it like any other new file. The pair will usually then show
+  up in the duplicate finder, which is correct — the user asked for two copies.
+- **Download & replace** does the same, then trashes the original through
+  `trash_files_impl`. Behind the `delete` capability, exactly like
+  `merge_duplicates`, because it ends in a trash call.
+
+The comparison is the reason the dialog exists, so it has to be honest about a
+few things a naive version gets wrong. A candidate is only *better* if it is
+larger in both dimensions — a re-crop at higher resolution is not an upgrade of
+this file, and the replace action is disabled with the reason shown when the
+aspect ratio differs by more than a rounding error. Dimensions and byte count
+come from the plugin and are therefore claims, not facts; they are checked
+against the fetched bytes before anything is trashed, and a mismatch aborts with
+the original untouched. The fetch is bounded in size and decoded before it is
+kept, so a URL that turns out to serve an HTML error page or a 900 MB file fails
+cleanly.
+
+**Fetching is the host's, and it is addressed by id.** The command takes a
+finding id and a candidate id and reads the URL from `plugin_findings`
+host-side; it never accepts a URL from the caller, because a paired browser that
+could name one would make the host an open proxy for its network — the shape
+[decision 0005](../decisions/0005-remote-invoke-is-an-allowlist.md) exists to
+prevent. This is also the host's first outbound HTTP request: `reqwest` is
+behind the `worker` feature today and geocoding is deliberately offline, so
+enabling it in the default build is a real cost, recorded in
+[decision 0016](../decisions/0016-plugin-findings-are-host-owned-kinds.md)
+along with why the plugin does not do the download instead.
+
+## 8. Faces: a cluster is not a file
+
+Everything above assumes a finding belongs to one file. A face cluster does not:
+its identity is the thing being named, and it spans files. That is why it needs
+its own panel rather than a text input in the info panel, and it is why it is
+scheduled after `source` rather than beside it.
+
+The state is genuinely new. A `plugin_groups` table holds the cluster, its
+members, and the name once given; the name is *also* written to each member's
+companion as an ordinary `person:alice` user tag, so the answer survives a cache
+wipe and travels with the files — the same division of labour as
+[§4](#4-where-the-state-lives), where the cache holds scaffolding and the
+companion holds the record.
+
+`FacesPanel` sits beside `DuplicatesPanel` and borrows its structure, because
+the interaction is the same one: a list of machine-proposed groups, a contact
+sheet per group, and per-group actions. Name a cluster; merge two clusters that
+are the same person; split out a face that does not belong; reject a cluster
+entirely, which is `not_duplicates` again under another name.
+
+The question to answer before building it is what a re-run does to a cluster the
+user already named. Re-clustering from scratch discards names; never
+re-clustering means new photos of Alice are never recognised. The likely answer
+is that a named cluster becomes a *labelled anchor* the next run assigns against
+rather than a group it may reshape, which turns naming into training data and is
+the behaviour the `known` field in [§9](#9-closing-the-loop) exists to carry.
+That wants a real corpus before it is settled.
+
+## 9. Closing the loop
 
 A request line gains an optional `known` object carrying prior verdicts for that
 file, keyed by finding kind:
 
 ```json
 {"action": "tag", "path": "/tmp/lv/000007.webp",
- "known": {"source": {"status": "confirmed", "option": "danbooru:5512"}}}
+ "known": {"source": {"status": "confirmed", "candidate": "danbooru:5512"}}}
 ```
 
 Without this a re-run re-asks everything the user already answered, which makes
@@ -234,7 +353,7 @@ faces to a person it now knows by name.
 `status` is `confirmed` or `rejected`. A plugin that ignores the field is
 unaffected, which is why this is additive.
 
-## 8. Protocol version
+## 10. Protocol version
 
 This is **`api_version: 2`**. Every individual addition is additive and
 ignorable — `findings` in a result, `known` in a request, settings in the
@@ -245,41 +364,59 @@ them, and *silently doing nothing* is the failure
 introduced the version to prevent. A version 2 plugin on a version 1 host is
 refused with a message instead.
 
-## 9. Build order
+The same argument covers kinds within version 2: a host that does not know a
+declared kind refuses the plugin by name at install rather than accepting it and
+dropping every finding it produces.
+
+## 11. Build order
+
+The first three steps are independent of any particular kind, which is the point
+of the split in [decision 0016](../decisions/0016-plugin-findings-are-host-owned-kinds.md)
+— the lifecycle is built once and every kind lands on top of it.
 
 1. **Settings form.** No findings involved: `settings_schema` rendering,
    per-gallery storage, the env var, and the worker passing it through. Small,
    independently useful, and it exercises manifest-declared UI with none of the
    state questions.
-2. **Findings backend.** Manifest declaration, the `findings` result field, the
-   two cache tables, `pending::`, and the confirm/reject commands. All of it
-   drivable from `curl` against `lightview-headless`, so it is testable before
-   any UI exists.
-3. **The info-panel section.** Three shapes, keyboard handling, the collapsed
-   summary. `choice` is the only one the source plugin exercises; the other two
-   are a few dozen lines each and skipping them would invite a redesign.
-4. **`known` on the request line**, and the source plugin itself.
+2. **Findings backend.** Manifest declaration and the kind registry, the
+   `findings` result field, the two cache tables, `pending::`, and the
+   confirm/reject commands. All of it drivable from `curl` against
+   `lightview-headless`, so it is testable before any UI exists.
+3. **The info-panel section**, confirm and reject only, plus keyboard handling
+   and the collapsed summary. At this point the loop closes end to end without
+   any bytes moving.
+4. **The source dialog**, and with it the host's HTTP fetch, the size and decode
+   bounds, and the two download actions. This is the step that adds `reqwest` to
+   the default build, and keeping it separate means steps 1–3 can land without
+   it.
+5. **`known` on the request line**, and the source plugin itself.
 
-## 10. Deliberately not in this
+Faces follow as their own project: `plugin_groups`, `FacesPanel`, and the
+re-run-reshaping answer in [§8](#8-faces-a-cluster-is-not-a-file).
 
-- **A dedicated review panel.** The filter plus the viewer covers it. Build the
-  panel when answering findings in bulk is a real chore and it is clear what the
-  chore actually is — an unused `DuplicatesPanel` clone would be worse than
-  nothing.
-- **Cross-file groups (faces).** A cluster's identity cannot live in any one
-  companion, so it is genuinely new state: a `plugin_groups` table, a merge and
-  rename surface, and an answer to what happens when a re-run reshapes a cluster
-  the user already named. The source case has no such problem, which is why it
-  goes first. The `label` shape exists so the face case is additive when it
-  comes, not a redesign.
-- **A declared layout schema** — [decision 0015](../decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md).
+## 12. Deliberately not in this
+
+- **A generic review panel.** The filter plus the viewer covers the per-file
+  kinds. `FacesPanel` is not this — it is a surface for one kind that has no
+  per-file home.
+- **The three generic shapes** — `choice`, `confirm`, `label` — as a fallback
+  for plugins that do not merit their own kind. Designed, deliberately unbuilt,
+  and the trigger is a third-party plugin population; see
+  [decision 0016](../decisions/0016-plugin-findings-are-host-owned-kinds.md).
+- **A declared layout schema** — [decision 0015](../decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md),
+  whose rejection of it survives being superseded on everything else.
 - **The sandboxed iframe** ([`README.md`](README.md) Track C). Still the
-  fallback for a display a schema genuinely cannot describe. Neither motivating
-  case needs one.
+  fallback for a display a native surface genuinely should not be written for.
+  Neither motivating case needs one.
 - **Plugin-added views, filters or sort keys.** Core stays native
   ([decision 0008](../decisions/0008-no-view-module-api.md)).
+- **EXIF rewriting on a downloaded source.** The candidate arrives with whatever
+  metadata the remote site embedded, and the
+  [duplicates EXIF boundary](../duplicates/README.md#the-exif-boundary) applies
+  unchanged: anything expressible in the companion transfers, anything requiring
+  a re-encode does not.
 
-## 11. Open questions worth resolving during the build
+## 13. Open questions worth resolving during the build
 
 - **Do rejections expire?** Remembering every "no" forever is what stops a
   plugin re-offering the same wrong candidate; it is also unbounded growth
@@ -288,6 +425,13 @@ refused with a message instead.
 - **What happens to a confirmation when the file is edited?** A confirmed source
   survives in `tags.user`, which is correct for a crop and wrong for a replaced
   file. The duplicate merge path has the same question and answers it by hand.
-- **Whether `choice` needs multi-select.** "Which of these people are in this
-  photo?" is a plausible fourth question and is `choice` with a checkbox. Not
-  speculating on it until something asks.
+- **What a downloaded source is named, and whether the original's name is the
+  one worth keeping.** "Keep both" needs a suffix; "replace" has a choice
+  between inheriting the original's filename — which keeps every path-keyed
+  cache row and companion valid — and taking the remote one, which is more
+  honest about provenance and invalidates all of it. Inheriting is almost
+  certainly right, and it is worth confirming against F1 in
+  [`todo.md`](../todo.md) before it is written.
+- **Whether a confirmed source should be re-checked.** A site can gain a higher
+  resolution version years later. Re-asking is cheap for the plugin and annoying
+  for the person, so any re-check wants to be explicit rather than automatic.

@@ -164,9 +164,11 @@ ML plugins today.
 **Designed and settled; not built.**
 [`plugins/findings-and-ui.md`](plugins/findings-and-ui.md) is the spec —
 wire format, storage, screens and build order — and
-[decision 0015](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
-records why the UI is a fixed vocabulary rather than a declared layout. This
-entry is the summary and what is left open.
+[decision 0016](decisions/0016-plugin-findings-are-host-owned-kinds.md) records
+why a finding's *kind* is host-owned with a native surface, rather than a
+generic vocabulary of widgets ([0015](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md),
+superseded: reviewed against its two motivating plugins before being built, it
+served neither). This entry is the summary and what is left open.
 
 Two plugins the current protocol cannot express, wanting the same three things.
 Recognising faces: the plugin emits a cluster, and nothing can tell it that
@@ -178,16 +180,21 @@ to reach the plugin's next run or it re-asks forever.
 
 What was decided:
 
-- **Three host-drawn shapes** — `choice`, `confirm`, `label` — declared in the
-  manifest, content supplied per result. The host owns all layout; a fourth
-  shape is a host release. A general renderer is the thing to extract on the
-  third real case, not the first.
-- **No new review panel, and no companion schema bump.** A `pending::plugin.<name>`
-  filter term plus a Findings section in the viewer's info panel *is* the queue,
-  built from parts that already virtualize and already work on a phone. A
-  confirmation writes the option's tags to `tags.user` (indexed, filterable,
-  survives re-tagging, removable like any user tag) and the provenance to
-  `meta.plugins[prefix]` — both destinations already exist.
+- **Generalise the lifecycle, specialise the presentation.** The plumbing —
+  findings in a result line, the cache tables, `pending::`, verdicts, `known` —
+  is built once and is domain-neutral. Above it, each **kind** the host knows
+  gets a surface written for it: `source` a dedicated compare-and-replace
+  dialog, `face-cluster` a `FacesPanel` beside `DuplicatesPanel`. A plugin
+  declaring an unknown kind is refused at install. The generic widget
+  vocabulary is designed and deliberately unbuilt, for a third-party plugin
+  population that does not exist yet.
+- **No new review panel for per-file kinds, and no companion schema bump.** A
+  `pending::plugin.<name>` filter term plus a Findings section in the viewer's
+  info panel *is* the queue, built from parts that already virtualize and
+  already work on a phone. A confirmation writes the candidate's tags to
+  `tags.user` (indexed, filterable, survives re-tagging, removable like any user
+  tag) and the provenance to `meta.plugins[prefix]` — both destinations already
+  exist.
 - **Pending findings and rejections live in the cache DB**, following the
   `not_duplicates` precedent: regenerable scaffolding, not user edits. The
   confirmation in the companion is the durable record.
@@ -199,15 +206,23 @@ What was decided:
   them, and silently doing nothing is the failure the version exists to prevent.
 
 Build order is settings form → findings backend (drivable from `curl` before any
-UI exists) → the info-panel section → `known` verdicts and the source plugin.
+UI exists) → the info-panel section, confirm and reject only → the source dialog
+and the host's first outbound fetch → `known` verdicts and the source plugin.
+Steps one to three are kind-agnostic, which is the payoff of the split.
 
-Deliberately deferred: a dedicated review panel (build it when bulk review is a
-real chore and it is clear what the chore is), and **cross-file groups**. A face
-cluster's identity cannot live in any one companion, so it needs a
-`plugin_groups` table, a merge/rename surface, and an answer to what happens
-when a re-run reshapes a cluster the user already named. The source case has
-none of that, which is why it goes first; the `label` shape exists so faces are
-additive when they come.
+Two costs worth knowing before starting. **Downloading a better copy makes the
+host an HTTP client** — `reqwest` is behind the `worker` feature today and
+geocoding is deliberately offline — which is why it is isolated in step four,
+and why the fetch is addressed by finding and candidate id rather than by a URL
+the caller supplies. **Replacing a file ends in a trash call**, so it sits behind
+the same `delete` capability as `merge_duplicates`.
+
+Deliberately deferred: **cross-file groups**. A face cluster's identity cannot
+live in any one companion, so it needs a `plugin_groups` table, a merge/rename
+surface, and an answer to what happens when a re-run reshapes a cluster the user
+already named — likely that a named cluster becomes an anchor the next run
+assigns against rather than a group it may reshape. The source case has none of
+that, which is why it goes first.
 
 ## B. Thumbnails, cache, and serving
 
