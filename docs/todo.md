@@ -31,8 +31,8 @@ not to be small at all once its premise was checked against the code.
 
 **Mostly done.** A1–A5 have landed, and A6's protocol half with them. What is
 left is one deliberate deferral (moving the ML taggers out of this repository)
-and one large design (plugin output that is not tags). The chain the original
-ordering described — you could not tell what a worker was running, a job that
+and one designed-but-unbuilt item (A7, plugin output that is not tags). The
+chain the original ordering described — you could not tell what a worker was running, a job that
 went wrong hung forever, and videos silently produced nothing — is closed.
 
 Three decisions came out of it and are the place to start if you need the
@@ -161,32 +161,53 @@ ML plugins today.
 
 ### A7. Plugin-driven UI, and naming what a plugin found
 
-**Designed, not built** — [`plugins/findings-and-ui.md`](plugins/findings-and-ui.md)
-is the page; this entry is the summary and the scheduling.
+**Designed and settled; not built.**
+[`plugins/findings-and-ui.md`](plugins/findings-and-ui.md) is the spec —
+wire format, storage, screens and build order — and
+[decision 0015](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
+records why the UI is a fixed vocabulary rather than a declared layout. This
+entry is the summary and what is left open.
 
-Two plugins the current protocol cannot express, and they want the same three
-things. Recognising faces: the plugin can emit a cluster, but nothing can tell
-it that cluster is a particular person's. Finding an image's original source: a
+Two plugins the current protocol cannot express, wanting the same three things.
+Recognising faces: the plugin emits a cluster, and nothing can tell it that
+cluster is a particular person's. Finding an image's original source: a
 reverse-search plugin returns ranked *candidates* — URLs, sites, artists,
-similarity scores — of which one or none is right, and only a person can say
-which. Neither output is a tag, both need somewhere for a person to resolve
-them, and in both cases the verdict has to reach the plugin's next run or it
-re-asks forever.
+similarity scores — of which one or none is right. Neither output is a tag, both
+need somewhere for a person to resolve them, and in both cases the verdict has
+to reach the plugin's next run or it re-asks forever.
 
-The direction is unchanged and now has a shape: host-rendered and declarative,
-with a **finding** as a result kind alongside tags, and a host review surface
-that any plugin emitting findings can feed. Plugin-supplied HTML in a sandboxed
-iframe ([`plugins/`](plugins/README.md) Track C) stays the fallback for displays
-a schema genuinely cannot describe; neither motivating case needs one.
+What was decided:
 
-Findings must not go through `tags.plugins[prefix]` — that is a list of strings
-the tag index reads and the filter language queries, and forcing candidate URLs
-through it would make every one autocomplete-able. It is a companion-schema
-addition with a migration.
+- **Three host-drawn shapes** — `choice`, `confirm`, `label` — declared in the
+  manifest, content supplied per result. The host owns all layout; a fourth
+  shape is a host release. A general renderer is the thing to extract on the
+  third real case, not the first.
+- **No new review panel, and no companion schema bump.** A `pending::plugin.<name>`
+  filter term plus a Findings section in the viewer's info panel *is* the queue,
+  built from parts that already virtualize and already work on a phone. A
+  confirmation writes the option's tags to `tags.user` (indexed, filterable,
+  survives re-tagging, removable like any user tag) and the provenance to
+  `meta.plugins[prefix]` — both destinations already exist.
+- **Pending findings and rejections live in the cache DB**, following the
+  `not_duplicates` precedent: regenerable scaffolding, not user edits. The
+  confirmation in the companion is the durable record.
+- **`settings_schema` ships in the same pass**, as a per-gallery configuration
+  form reaching the plugin through `LIGHTVIEW_PLUGIN_SETTINGS` in its
+  environment — no protocol change, the same mechanism as `LIGHTVIEW_JOB_TOTAL`.
+- **`api_version: 2`**, not because any addition breaks a version 1 plugin —
+  none do — but because a plugin declaring findings needs a host that renders
+  them, and silently doing nothing is the failure the version exists to prevent.
 
-The source case is the better one to build first: a face cluster spans many
-files, so its identity cannot live in any one companion, and that is genuinely
-new state. The source case has no such problem.
+Build order is settings form → findings backend (drivable from `curl` before any
+UI exists) → the info-panel section → `known` verdicts and the source plugin.
+
+Deliberately deferred: a dedicated review panel (build it when bulk review is a
+real chore and it is clear what the chore is), and **cross-file groups**. A face
+cluster's identity cannot live in any one companion, so it needs a
+`plugin_groups` table, a merge/rename surface, and an answer to what happens
+when a re-run reshapes a cluster the user already named. The source case has
+none of that, which is why it goes first; the `label` shape exists so faces are
+additive when they come.
 
 ## B. Thumbnails, cache, and serving
 

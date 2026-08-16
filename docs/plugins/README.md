@@ -359,6 +359,16 @@ The one verb is the real limit, and the plugins that hit it are not exotic:
 recognising faces and finding an image's original source both produce
 *candidates for a person to confirm* rather than facts. That needs a result kind
 that is not a tag, a host screen to resolve it on, and a way for the verdict to
-reach the plugin's next run. Designed in
-[`findings-and-ui.md`](findings-and-ui.md); tracked as A7 in
-[`../todo.md`](../todo.md).
+reach the plugin's next run.
+
+[`findings-and-ui.md`](findings-and-ui.md) is the design, and it is settled
+enough to build from. The short version: a **finding** takes one of three
+host-drawn shapes (`choice`, `confirm`, `label`) declared in the manifest; it is
+resolved in the viewer's info panel, reached by a new `pending::plugin.<name>`
+filter rather than a dedicated queue; a confirmed answer becomes an ordinary
+`tags.user` entry plus provenance in `meta.plugins`, so no companion schema
+change is needed; and prior verdicts ride back to the plugin on its next
+request so it stops re-asking. `settings_schema` is rendered in the same pass as
+a per-gallery configuration form — the one place a real schema *is* interpreted
+generically, and [decision 0015](../decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
+is why it is the exception. Tracked as A7 in [`../todo.md`](../todo.md).

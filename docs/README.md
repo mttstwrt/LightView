@@ -47,7 +47,7 @@ Deeper topics that outgrew their subsystem page:
   commands and settings, and the space they compete for on a phone.
 - [`plugins/findings-and-ui.md`](plugins/findings-and-ui.md) — the plugins the
   one-verb protocol cannot express (recognising faces, finding an image's
-  source) and the findings/review contract they need.
+  source), the three-shape contract they get, and the screens that resolve it.
 
 ## Decisions
 
@@ -71,6 +71,7 @@ answer to "why not the obvious thing?" is longer than a sentence.
 - [0012 — Plugins declare the host contract they were built for](decisions/0012-plugins-declare-the-contract-they-were-built-for.md)
 - [0013 — The host samples video frames; plugins only ever see stills](decisions/0013-the-host-samples-video-frames.md)
 - [0014 — Ship `lightview-worker` with the release](decisions/0014-ship-the-worker-with-the-release.md)
+- [0015 — Plugin UI is a fixed set of host-drawn shapes, not a declared layout](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
 
 ## Open work
 
