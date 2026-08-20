@@ -33,102 +33,128 @@
 
 These are ordered. When they conflict, the earlier one wins.
 
-### 1. Simplest thing that works
+### 1. Plan before you build
 
-The simplest solution that satisfies the requirement is the correct solution.
-Complexity must be earned by a demonstrated need, not an anticipated one.
+Thinking is cheap in a plan and expensive once it's code — catch a wrong
+assumption or a bad approach before anything is written, not after.
 
-- Prefer a function to a class, a class to a hierarchy, a hierarchy to a framework.
-- Do not add abstraction layers, interfaces, or plugin points that have exactly one
-  implementation. Write the concrete thing. Extract the abstraction on the second
-  real use case, not the first hypothetical one.
-- Do not add configuration options, feature flags, or parameters that were not asked
-  for. Every knob is a permanent maintenance surface and a combinatorial test case.
-- Do not add error handling for conditions that cannot occur, defensive checks for
-  invariants the type system already guarantees, or retry logic where there is no
-  transient failure mode.
-- Prefer the standard library. Prefer an existing dependency to a new one. Justify any
-  new dependency in terms of what it removes.
-- Deleting code is a valid and preferred solution. If a change makes existing code
-  unreachable, remove it in the same change; do not leave it commented out.
+**No code changes without a written, approved plan.** No size exception —
+depth scales with the change instead: a typo fix might be one sentence, a new
+subsystem a paragraph per section. A short plan is the rule working, not a
+workaround.
 
-If you believe a more complex approach is warranted, state the specific requirement
-that forces it before writing the code. If you cannot name the requirement, use the
-simple version.
+**Record the plan** in chat if nothing about the change would trigger the
+update rules in principle 5 (no new or changed subsystem, interface, or data
+flow). Otherwise record it as `docs/_planning/<slug>/requirements.md` and
+`design.md` (layout in principle 5). Either way, answer in writing before
+presenting for approval:
 
-### 2. Performance is a design property, not a pass at the end
+- **Approach** — what you're going to do.
+- **Alternatives** — what else could work, and why each one lost.
+- **Impact** — what this touches, what could break, what depends on it.
+- **Assumptions** — what you're taking on faith, and what happens if it's wrong.
 
-Think about cost at the level where it matters — algorithmic complexity, allocation
-patterns, I/O and syscall boundaries, data layout and locality, work done per
-iteration of a hot loop. Get these right the first time; they are expensive to change.
+**Review it — independently when you can.** A subagent or fresh session scoped
+to just the plan catches what self-review won't; use one if available.
+Otherwise review it yourself, adversarially. Fix what you find.
 
-Do not micro-optimize. Do not restructure readable code for speculative gains, and do
-not trade clarity for performance without a measurement showing the trade is real.
-Unmeasured optimization is complexity without justification and violates principle 1.
+**Get explicit approval** before creating `tasks.md` or touching code. Revise
+and re-present on feedback — silence isn't approval.
 
-When a fast path genuinely requires complexity, isolate it: keep the complex code in
-one clearly marked place behind a simple interface, with a comment explaining the
-measurement that motivated it.
+**Disclose every departure** from the approved plan when you report progress.
+Stop and get approval if a departure leaves any of the four questions above
+without a confident answer.
 
-### 3. Comments explain why
+**On completion**, fold what's durable into the permanent docs (principle 5)
+and delete `docs/_planning/<slug>/`, if one exists. Git history is the record
+of what was tried.
 
-Comments carry the information that is not recoverable from the code itself.
+### 2. Simplest thing that works
 
-- Explain rationale, constraints, and rejected alternatives — not mechanics. If a
-  comment restates what the line does, delete it.
-- Document non-obvious decisions: why this algorithm, why this ordering, why this
-  buffer size, why this apparent inefficiency is deliberate.
-- Document invariants, assumptions about caller behavior, and units/frames/coordinate
-  conventions on anything numeric.
-- Flag anything surprising. If a future reader would be tempted to "fix" the code,
-  say why it is that way.
-- Every module gets a module-level doc comment stating its purpose and boundaries.
-  This is where per-file explanation lives — not in `docs/`.
+Complexity must be earned by a demonstrated need, not an anticipated one. The
+simplest solution that satisfies the requirement is correct.
 
-### 4. Keep the docs current
+- One function beats a class; one class beats a hierarchy; a hierarchy beats a
+  framework.
+- No abstraction, interface, or plugin point for a single implementation — write
+  the concrete thing, and extract the abstraction on the second real use case.
+- No config option, flag, or parameter that wasn't asked for. Every knob is a
+  permanent maintenance surface and a test case.
+- No error handling for conditions that can't occur, no defensive checks for
+  invariants the type system already guarantees, no retries without a transient
+  failure mode.
+- Standard library over a new dependency; an existing dependency over a new one.
+  Justify any addition by what it removes.
+- Deletion is a valid fix. If a change orphans code, remove it in the same change
+  — don't comment it out.
 
-`docs/` is a set of linked markdown pages describing how the system works and why.
-It is part of every change, not a follow-up.
+Complexity needs a named requirement. If you can't name the one that forces it,
+write the simple version.
+
+### 3. Performance is a design property, not a pass at the end
+
+Think about cost where it's expensive to change later: algorithmic complexity,
+allocation patterns, I/O and syscall boundaries, data layout, work per iteration
+of a hot loop. Get these right the first time.
+
+Don't micro-optimize, don't restructure readable code for speculative gains, and
+don't trade clarity for performance without a measurement showing the trade is
+real — unmeasured optimization is complexity without justification (principle 2).
+
+When a fast path needs complexity, isolate it: one clearly marked place, behind a
+simple interface, with a comment naming the measurement that motivated it.
+
+### 4. Comments explain why
+
+A comment carries what the code can't recover on its own.
+
+- Rationale, constraints, and rejected alternatives — not mechanics. If a comment
+  restates the line below it, delete it.
+- Non-obvious decisions: why this algorithm, this ordering, this buffer size,
+  this apparent inefficiency.
+- Invariants, caller assumptions, and units/frames/coordinate conventions on
+  anything numeric.
+- Anything surprising — if a future reader would be tempted to "fix" it, say why
+  it's that way.
+- Every module gets a doc comment stating its purpose and boundaries. That's
+  where per-file explanation lives, not `docs/`.
+
+### 5. Keep the docs current
+
+`docs/` describes how the system works now, and why. It's part of every change,
+not a follow-up.
 
 **Layout**
 
 ```
 docs/
-  README.md              entry point; map of the docs with links to each subsystem
-  architecture.md        component map, data flow, dependency direction
-  decisions/
-    0001-<slug>.md       one decision per file, numbered, append-only
+  README.md              entry point; links to every subsystem
+  architecture.md         component map, data flow, dependency direction
+  _planning/<slug>/       active feature plans (principle 1); not part of this tree
   <subsystem>/
-    README.md            subsystem overview
-    <topic>.md           only when a topic outgrows the README
+    README.md             subsystem overview
+    <topic>.md             only when a topic outgrows the README
 ```
 
-**Granularity.** Pages describe subsystems, not files. Create a subsystem directory
-when a component has its own responsibility and interface; do not create a page per
-source file. Split a topic into its own page only when it is long enough that it
-would dominate the subsystem README. Per-file explanation belongs in module doc
-comments (principle 3).
+**Granularity.** Pages describe subsystems, not files. Give a component its own
+directory when it has its own responsibility and interface — not one page per
+source file. Split a topic out of a README only when it would otherwise dominate
+it. Per-file explanation belongs in module doc comments (principle 4).
 
-**Every subsystem README covers:** what it is responsible for, what it explicitly is
-not responsible for, its public interface, what it depends on, what depends on it,
-and the invariants callers must uphold. State dependencies by name rather than
-relying on directory nesting to imply them.
+**Every subsystem README covers:** responsibility, explicit non-responsibility,
+public interface, dependencies (named, not implied by nesting), dependents, and
+the invariants callers must uphold.
 
-**Linking.** Use relative markdown links. Every page links back to `docs/README.md`
-and to the subsystems it names. `architecture.md` and each subsystem README are hubs;
-no page should be reachable only by browsing the filesystem.
+**Linking.** Relative markdown links only. Every page links back to
+`docs/README.md` and to the subsystems it names — nothing should be reachable
+only by browsing the filesystem.
 
-**Decisions.** When a choice has alternatives worth recording, add
-`docs/decisions/NNNN-<slug>.md` with: context, options considered, the choice, and
-the consequences. Decision files are never edited after the fact. If a decision is
-reversed, write a new one and add a superseding link to the old.
+**Update rules.** In the same change:
+- add, remove, rename, or move a subsystem → update `architecture.md` and its
+  links
+- change a data flow, interface contract, or file/wire format → update the
+  subsystem READMEs on both sides
+- code contradicts what the docs say → fix the docs
 
-**Update rules.** In the same change, whenever you:
-- add, remove, rename, or move a subsystem — update `architecture.md` and fix links
-- change a data flow, interface contract, or file/wire format — update the affected
-  subsystem READMEs on both sides of the boundary
-- make a decision with real alternatives — add a decision file
-- write code that contradicts something the docs currently state — fix the docs
-
-Prose over bullet fragments. Do not paste code that will drift; link to it and explain
-the shape. If a change makes a doc wrong, fixing it is not optional and not deferred.
+Prose over bullet fragments. Link to code instead of pasting it — it will drift.
+An outdated doc is a bug; fix it in the same change that caused it.
