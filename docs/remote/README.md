@@ -129,6 +129,16 @@ on **every thumbnail request** — a deliberately slow hash there would be a
 self-inflicted denial of service. Comparison is length-checked and
 constant-time.
 
+The same "every thumbnail request" argument bounds what else `auth_layer` may
+do. It holds the gallery's single writer connection while it verifies, so
+anything it writes there is serialized against every other database user,
+including the read-only pool the thumbnail route uses precisely to stay out of
+that queue. `last_seen` was written unconditionally and is therefore now
+rate-limited to one write per `devices::TOUCH_INTERVAL_SECS` per device: a
+scroll burst is hundreds of requests, and the value is only ever read to render
+"last seen" in the device list. Anything added to this layer should be measured
+against the same yardstick.
+
 Enrollment goes through a short-lived `remote_pairing` row, redeemed once:
 either a 6-digit PIN (typed by hand) or a 32-byte hex token (embedded in a QR
 code). The PIN is safe *because* of the 10-minute TTL and single-use

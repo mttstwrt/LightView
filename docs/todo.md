@@ -218,7 +218,8 @@ has made the `?fit=` route hot — every remote tagging job now pulls every imag
 through it at the plugin's declared edge, and concurrent taggers repeat the same
 decode. It also absorbs the one half of A4 that was left undone. **B2 next**, a user-visible
 staleness bug. **B3 last** — a latent hazard with no current symptom, safe to
-do at any point.
+do at any point. **B4** is independent of all three and wants a measurement
+before code, so it waits on someone with a phone and a large gallery.
 
 ### B1. The `?fit=` resize route has no coalescer *(small)*
 
@@ -237,6 +238,32 @@ thumbnails until something else asks for them.
 two of them adjacent `u32`s (`width`, `height`). Transposing them at a call site
 would compile and store a wrong aspect ratio. A small `ThumbRow` struct removes
 the class.
+
+### B4. `auth_layer` holds the writer connection on every request
+
+The remote thumbnail route reads through `thumb_protocol_db`, a pool of
+read-only connections, specifically so a scroll burst fans out instead of
+queueing behind the single writer. Then `auth_layer` runs in front of it and
+takes that writer lock anyway — `cookie_name`, `verify_cookie`,
+`get_password_hash` and `get_inactivity_secs` are four `SELECT`s under
+`cache_db.lock()`, per request, and the request mix on the web client is
+overwhelmingly `/thumb`. The pool's concurrency is therefore bounded by a
+mutex the pool exists to avoid.
+
+The write that used to sit there as well — `touch_device` bumping `last_seen` —
+is now rate-limited to one per `TOUCH_INTERVAL_SECS` per device, which removes
+the part that actually contends for the WAL. What is left is four cheap reads
+holding an exclusive lock, and that is where the guessing starts: they are
+microseconds each, so whether the serialization is measurable at all depends on
+how deep the request queue gets on a real phone against a real gallery. Get that
+number before writing code.
+
+If it turns out to matter, the shape is already there: authentication reads
+nothing the read-only pool cannot serve, so it can move to `thumb_protocol_db`
+and take the writer only for the rate-limited touch. The reason not to do that
+blind is that it splits one consistent snapshot into two connections for a
+security decision, which is a trade worth making against a measurement and not
+against a hunch.
 
 ---
 

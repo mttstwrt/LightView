@@ -172,10 +172,14 @@ fn main() {
 
     env_logger::init();
 
+    // Only the dialog plugin is registered. `shell` and `fs` were registered
+    // too, and nothing on either side of the IPC boundary ever called them —
+    // the frontend picks folders through `dialog`, reads media through the
+    // `lightview://` protocol, and does every file operation as a command. The
+    // capability file granted them `shell:allow-execute` and read access to the
+    // whole filesystem (`fs:scope` `**`) for that.
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .register_asynchronous_uri_scheme_protocol(
             "lightview",
             |ctx, request, responder: UriSchemeResponder| {
@@ -328,7 +332,6 @@ fn main() {
 
             // Filter commands
             commands::filter::apply_filter,
-            commands::filter::clear_filter,
 
             // Geo commands
             commands::geo::get_geo_points,

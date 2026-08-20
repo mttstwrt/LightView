@@ -161,20 +161,16 @@ pub async fn move_files(
     if !succeeded.is_empty() {
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
-            let conn = db.conn();
-            for (old_path, new_path) in &succeeded {
-                if dest_in_gallery {
-                    // Every path-keyed table follows the file, thumbnail tiers
-                    // included — see `path_keyed_tables`.
-                    for table in crate::cache::db::path_keyed_tables() {
-                        let _ = conn.execute(
-                            &format!("UPDATE OR REPLACE {table} SET path = ?1 WHERE path = ?2"),
-                            rusqlite::params![new_path, old_path],
-                        );
-                    }
-                } else {
-                    db.remove_media_rows(old_path);
-                }
+            // `dest_in_gallery` is a property of the destination, not of any
+            // one file, so the choice is made once for the batch. Inside the
+            // loop it also re-decided — and re-issued the SQL — per file.
+            if dest_in_gallery {
+                // Every path-keyed table follows the file, thumbnail tiers
+                // included — see `path_keyed_tables`.
+                db.rename_media_rows_batch(&succeeded);
+            } else {
+                let gone: Vec<&str> = succeeded.iter().map(|(old, _)| old.as_str()).collect();
+                db.remove_media_rows_batch(&gone);
             }
             let _ = db.rebuild_tag_counts();
         }

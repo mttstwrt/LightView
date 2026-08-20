@@ -391,8 +391,6 @@ export const deleteUserTags = (tags: string[]) =>
 export const applyFilter = (query: string) =>
   invoke<string[]>("apply_filter", { query });
 
-export const clearFilter = () => invoke<string[]>("clear_filter");
-
 // ---------------------------------------------------------------------------
 // Geo / map view
 // ---------------------------------------------------------------------------

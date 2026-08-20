@@ -152,8 +152,9 @@ pub async fn static_cache_control(request: axum::extract::Request, next: Next) -
 ///   4. If a gallery password is set and the device has been silent for
 ///      longer than the inactivity window, return 401 with
 ///      `WWW-Authenticate: LV-Password` so the client knows to prompt.
-///   5. Touch `last_seen` and pass, re-issuing the cookie under this
-///      gallery's name if it arrived under the legacy one.
+///   5. Touch `last_seen` (at most once per `TOUCH_INTERVAL_SECS`) and pass,
+///      re-issuing the cookie under this gallery's name if it arrived under
+///      the legacy one.
 pub async fn auth_layer(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -194,8 +195,10 @@ pub async fn auth_layer(
         let now = now_secs();
         let stale = password_set && (now - device.last_auth_at) > inactivity;
 
-        if !stale {
-            // Bump last_seen on every authenticated request. Cheap write.
+        // Refresh `last_seen`, but not on every request: this is the single
+        // writer connection, and the thumbnail routes behind this layer issue
+        // hundreds of requests per scroll burst. See `TOUCH_INTERVAL_SECS`.
+        if !stale && now - device.last_seen >= devices::TOUCH_INTERVAL_SECS {
             let _ = devices::touch_device(conn, &device.id);
         }
 

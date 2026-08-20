@@ -10,9 +10,7 @@ import {
   refreshFilteredItems,
   clearAllFilters,
 } from "../../stores/filterStore";
-import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
-import { sortField, sortOrder, subSortField, subSortOrder, groupBy } from "../../stores/settingsStore";
-import { autocompleteTags, clearFilter, getSortedItems } from "../../lib/ipc";
+import { autocompleteTags } from "../../lib/ipc";
 
 interface FilterBarProps {
   onInputRef?: (el: HTMLInputElement) => void;
@@ -158,14 +156,13 @@ export function FilterBar(props: FilterBarProps) {
 
   const applyCurrentFilter = refreshFilteredItems;
 
+  // Clearing is just "no filter", so it goes through the same refresh every
+  // other filter change uses: with an empty query it asks the backend for the
+  // unfiltered sort directly. The old shape fetched every path in the gallery
+  // first and then discarded the list.
   const handleClear = async () => {
     clearAllFilters();
-    try {
-      await clearFilter();
-      const sorted = await getSortedItems(sortField(), sortOrder(), groupBy(), undefined, subSortField(), subSortOrder());
-      setSortedItems(sorted.items);
-      setDisplayPaths(sorted.items.map((item) => item.path));
-    } catch {}
+    await refreshFilteredItems();
   };
 
   const handleSetRatingFilter = async (value: number) => {

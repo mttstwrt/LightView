@@ -164,8 +164,6 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(filter::apply_filter_impl(app, a.query).await)
         }
 
-        "clear_filter" => ok(filter::clear_filter_impl(app).await),
-
         "get_media_meta" => {
             #[derive(Deserialize)]
             struct A {

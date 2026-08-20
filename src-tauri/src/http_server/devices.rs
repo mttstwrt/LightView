@@ -100,7 +100,21 @@ pub struct RedeemedDevice {
 pub struct AuthenticatedDevice {
     pub id: String,
     pub last_auth_at: i64,
+    /// Carried out of the verification query so the auth path can decide
+    /// whether [`touch_device`] is worth a write. See [`TOUCH_INTERVAL_SECS`].
+    pub last_seen: i64,
 }
+
+/// How stale `last_seen` may get before the auth path refreshes it.
+///
+/// It used to be written on *every* authenticated request, and a remote
+/// client's request mix is overwhelmingly `/thumb`: one scroll burst is
+/// hundreds of them, each taking the single writer connection for an `UPDATE`
+/// nothing reads at finer than human granularity — it surfaces as "last seen"
+/// in the device list. Those writes also serialize against the read-only
+/// connection pool the thumbnail route exists to use. A minute of slack turns a
+/// burst into at most one write and leaves the displayed value indistinguishable.
+pub const TOUCH_INTERVAL_SECS: i64 = 60;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -305,17 +319,17 @@ pub fn delete_device(conn: &Connection, device_id: &str) -> Result<(), AuthError
 /// success. The caller is responsible for any inactivity check.
 pub fn verify_cookie(conn: &Connection, cookie: &str) -> Option<AuthenticatedDevice> {
     let (id, secret) = cookie.split_once('.')?;
-    let row: Option<(String, Option<i64>, i64)> = conn
+    let row: Option<(String, Option<i64>, i64, i64)> = conn
         .query_row(
-            "SELECT token_hash, revoked_at, last_auth_at
+            "SELECT token_hash, revoked_at, last_auth_at, last_seen
              FROM remote_devices WHERE id = ?1",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .ok()
         .flatten();
-    let (token_hash, revoked_at, last_auth_at) = row?;
+    let (token_hash, revoked_at, last_auth_at, last_seen) = row?;
     if revoked_at.is_some() {
         return None;
     }
@@ -325,10 +339,12 @@ pub fn verify_cookie(conn: &Connection, cookie: &str) -> Option<AuthenticatedDev
     Some(AuthenticatedDevice {
         id: id.to_string(),
         last_auth_at,
+        last_seen,
     })
 }
 
-/// Bump `last_seen` to now. Called on every authenticated request.
+/// Bump `last_seen` to now. Called from the auth path, rate-limited by
+/// [`TOUCH_INTERVAL_SECS`].
 pub fn touch_device(conn: &Connection, device_id: &str) -> Result<(), AuthError> {
     conn.execute(
         "UPDATE remote_devices SET last_seen = ?1 WHERE id = ?2",

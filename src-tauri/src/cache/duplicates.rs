@@ -162,14 +162,31 @@ impl CacheDb {
             .filter_map(|r| r.ok())
             .collect();
 
-        let excluded_pairs: std::collections::HashSet<(String, String)> = {
+        // Dismissed pairs, translated to positions in `entries` up front. The
+        // pair loop below is the one quadratic loop in the tree, and probing a
+        // set keyed by paths meant building an owned `(String, String)` for
+        // every near-match just to ask whether it had been dismissed — two
+        // allocations and a string comparison per candidate, to answer "no"
+        // almost every time. Indices make it two integers and no allocation.
+        // Pairs naming a file with no perceptual hash simply have no position
+        // and drop out here, where they could never have matched anyway.
+        let position: std::collections::HashMap<&str, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (path, _))| (path.as_str(), i))
+            .collect();
+        let excluded_pairs: std::collections::HashSet<(usize, usize)> = {
             let mut not_dup_stmt = self
                 .conn()
                 .prepare("SELECT path_a, path_b FROM not_duplicates")?;
-            not_dup_stmt
+            let rows = not_dup_stmt
                 .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect()
+                .filter_map(|r| r.ok());
+            rows.filter_map(|(a, b)| {
+                let (a, b) = (*position.get(a.as_str())?, *position.get(b.as_str())?);
+                Some((a.min(b), a.max(b)))
+            })
+            .collect()
         };
 
         // Union-Find for grouping
@@ -197,12 +214,8 @@ impl CacheDb {
         for i in 0..n {
             for j in (i + 1)..n {
                 if hamming_distance(entries[i].1, entries[j].1) <= threshold {
-                    let (a, b) = if entries[i].0 < entries[j].0 {
-                        (&entries[i].0, &entries[j].0)
-                    } else {
-                        (&entries[j].0, &entries[i].0)
-                    };
-                    if excluded_pairs.contains(&(a.clone(), b.clone())) {
+                    // `i < j` by construction, matching how the set was keyed.
+                    if excluded_pairs.contains(&(i, j)) {
                         continue;
                     }
                     union(&mut parent, i, j);

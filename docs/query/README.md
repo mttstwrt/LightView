@@ -113,6 +113,14 @@ it is the record of intent rather than the query surface.
 compiles to `IS NULL` and binds no parameter. "Which of these have I not triaged
 yet?" is the question a colour workflow actually asks.
 
+`apply_filter` returns bare paths and takes no `DISTINCT`: `media_meta.path` is
+the primary key and tag terms are correlated `EXISTS` subqueries rather than
+joins, so a row cannot be produced twice. There is also no "clear the filter"
+command, and deliberately so — clearing is the *absence* of a path list, which
+`get_sorted_items` already expresses as `filter_paths: None`. A command that
+returned every path so the caller could hand them all back read the whole table
+and serialized the entire gallery as JSON to arrive at the same rows.
+
 There was once a second, in-memory evaluator that walked companion files
 directly, and it was the only thing that could have honoured a colour label
 before the column existed. Nothing ever called it. Keeping a parallel
@@ -146,6 +154,16 @@ the group key changes. It never re-sorts, so a grouping that disagrees with the
 sort field produces fragmented headers rather than a reordered list — grouping
 describes the order, it does not impose one.
 
+The key a time grouping compares is a `(year, month, day)` triple, not the
+rendered label, and the distinction is the cost of the pass. Formatting is the
+expensive half — a `strftime` and a `String` per call — and a gallery of a
+hundred thousand items holds a few hundred distinct periods at most, so deciding
+the split on labels meant formatting every item to discover that nearly all of
+them belonged to the group already open. The label is now produced once per
+group. The two must stay in step: a key and its label are one-to-one per
+granularity, and both spell a missing or unrepresentable timestamp "Unknown
+date", which is what keeps those items grouped together.
+
 The scrollbar's date markers are *not* computed here. There was a
 `compute_timeline` that emitted an entry per month boundary and converted item
 positions to row indices, but the frontend had independently grown its own
@@ -159,6 +177,14 @@ question.
 `AutocompleteEngine` holds every unique tag in memory — about 300 KB at 5,000
 tags, so there is no cache-eviction story to tell. It is refreshed from
 `tag_counts` at gallery open and after any tag write.
+
+It holds each tag's lowercase form alongside it, computed at refresh. That is
+the traffic ratio made explicit: the vocabulary changes when someone edits a
+tag, and is scanned in full on every keystroke in the filter bar, so folding
+case per query meant thousands of allocations to answer one character with a
+value that had not changed since the last write. For the same reason the
+per-query map borrows its keys from the vocabulary instead of copying them —
+only the tags that survive to become suggestions are ever cloned.
 
 Matching is a four-tier score: exact, prefix, substring, then subsequence
 (fuzzy). Results are deduplicated *across* namespaces, summing counts and

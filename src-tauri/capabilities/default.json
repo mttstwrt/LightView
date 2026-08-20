@@ -4,12 +4,8 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "shell:allow-open",
-    "shell:allow-execute",
     "dialog:allow-open",
     "dialog:default",
-    "fs:default",
-    "fs:allow-read",
     "core:window:allow-is-decorated",
     "core:window:allow-set-decorations",
     "core:window:allow-set-fullscreen",
@@ -19,12 +15,6 @@
     "core:window:allow-is-maximized",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
-    "core:window:allow-start-resize-dragging",
-    {
-      "identifier": "fs:scope",
-      "allow": [
-        { "path": "**" }
-      ]
-    }
+    "core:window:allow-start-resize-dragging"
   ]
 }

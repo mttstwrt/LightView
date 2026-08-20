@@ -184,9 +184,7 @@ pub async fn trash_files_impl(
     if !succeeded.is_empty() {
         let db = state.cache_db.lock().await;
         if let Some(db) = db.as_ref() {
-            for path in &succeeded {
-                db.remove_media_rows(path);
-            }
+            db.remove_media_rows_batch(&succeeded);
             let _ = db.rebuild_tag_counts();
         }
     }

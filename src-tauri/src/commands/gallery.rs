@@ -840,9 +840,7 @@ pub fn start_fs_watcher(
 
                 // Remove deleted files
                 if !removed.is_empty() {
-                    for path_str in &removed {
-                        db.remove_media_rows(path_str);
-                    }
+                    db.remove_media_rows_batch(&removed);
                     let _ = db.rebuild_tag_counts();
                 }
             }

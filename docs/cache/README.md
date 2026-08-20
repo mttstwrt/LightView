@@ -59,6 +59,16 @@ no longer exists and can never be reached again.
 is deliberately outside the list: its paths live in `path_a`/`path_b`, so
 callers handle it separately.
 
+**Bulk callers use the batch forms**, `remove_media_rows_batch` and
+`rename_media_rows_batch`, and the reason is the connection rather than the SQL.
+Every path-keyed sweep is twelve statements, and outside a transaction each one
+auto-commits — so trashing a thousand-file selection was twelve thousand WAL
+commits with the gallery's single writer held for all of them. The batch forms
+open one transaction and iterate tables on the outside, so a statement is
+prepared once for the whole batch instead of once per file. A loop calling the
+single-path form is still correct; it is just the shape that made a large
+selection feel like a hang.
+
 **Adding a tier is a schema change *and* a maintenance change.** Add the
 variant to `ThumbTier`, add it to `ThumbTier::ALL`, and add its `CREATE TABLE`
 migration. `ALL` then propagates it to `path_keyed_tables()`,
