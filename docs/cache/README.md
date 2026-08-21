@@ -69,6 +69,19 @@ prepared once for the whole batch instead of once per file. A loop calling the
 single-path form is still correct; it is just the shape that made a large
 selection feel like a hang.
 
+**More than one statement means a transaction.** The point above is a specific
+case of the rule, and the rule is worth stating because nothing in the types
+enforces it: SQLite in autocommit mode commits *per statement*, so any function
+issuing a variable number of writes pays a WAL commit for each one while holding
+the writer. `reindex_tags_for_file` (one delete plus a row per tag, called in a
+loop by every tagging path) and `touch_accessed` (one update per buffered access
+mark, up to twenty thousand in a drained batch) both open their own. Where a
+caller has already opened one — `reindex_gallery` wraps its whole walk, the way
+`index_companions` always has — the inner attempt fails, because SQLite has no
+nested transactions, and the statements simply join the outer one. That is why
+those functions treat a failed `unchecked_transaction()` as "someone else owns
+the commit" rather than as an error.
+
 **Adding a tier is a schema change *and* a maintenance change.** Add the
 variant to `ThumbTier`, add it to `ThumbTier::ALL`, and add its `CREATE TABLE`
 migration. `ALL` then propagates it to `path_keyed_tables()`,

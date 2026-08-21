@@ -333,10 +333,21 @@ pub fn touch_accessed(
         "UPDATE {} SET accessed_at = strftime('%s','now') WHERE path = ?1",
         tier.table()
     );
-    let mut stmt = conn.prepare_cached(&sql)?;
-    for path in paths {
-        stmt.execute(rusqlite::params![path])?;
+    // One transaction, for the same reason the eviction pass below is
+    // rate-limited: `paths` is a drained buffer, not a single mark. It is
+    // bounded by `MAX_PENDING_TIER_ACCESSES` (20,000), and the case that
+    // reaches that bound is browsing zoomed-in over already-cached tiles —
+    // nothing is generated, so nothing flushes, and the marks pile up until
+    // one write drains all of them at once. Un-transacted that is 20,000
+    // auto-commits with the writer lock held.
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(&sql)?;
+        for path in paths {
+            stmt.execute(rusqlite::params![path])?;
+        }
     }
+    tx.commit()?;
     Ok(())
 }
 

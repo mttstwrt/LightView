@@ -71,9 +71,8 @@ pub fn parse_filter(input: &str) -> Result<FilterExpr, ParseError> {
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let chars: Vec<char> = input.chars().collect();
 
-    for (_i, &ch) in chars.iter().enumerate() {
+    for ch in input.chars() {
         match ch {
             '(' => {
                 // Only treat as grouping when it starts a new token
@@ -122,7 +121,7 @@ type ParseResult<'a> = Result<(FilterExpr, &'a [String]), ParseError>;
 
 fn parse_or<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     let (mut left, mut rest) = parse_and(tokens)?;
-    while !rest.is_empty() && rest[0].to_uppercase() == "OR" {
+    while !rest.is_empty() && rest[0].eq_ignore_ascii_case("OR") {
         let (right, r) = parse_and(&rest[1..])?;
         left = FilterExpr::Or {
             left: Box::new(left),
@@ -135,7 +134,7 @@ fn parse_or<'a>(tokens: &'a [String]) -> ParseResult<'a> {
 
 fn parse_and<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     let (mut left, mut rest) = parse_not(tokens)?;
-    while !rest.is_empty() && rest[0].to_uppercase() == "AND" {
+    while !rest.is_empty() && rest[0].eq_ignore_ascii_case("AND") {
         let (right, r) = parse_not(&rest[1..])?;
         left = FilterExpr::And {
             left: Box::new(left),
@@ -150,7 +149,7 @@ fn parse_not<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     if tokens.is_empty() {
         return Err(ParseError::UnexpectedEnd);
     }
-    if tokens[0].to_uppercase() == "NOT" {
+    if tokens[0].eq_ignore_ascii_case("NOT") {
         let (expr, rest) = parse_atom(&tokens[1..])?;
         Ok((FilterExpr::Not { expr: Box::new(expr) }, rest))
     } else {
