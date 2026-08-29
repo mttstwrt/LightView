@@ -391,8 +391,6 @@ export const deleteUserTags = (tags: string[]) =>
 export const applyFilter = (query: string) =>
   invoke<string[]>("apply_filter", { query });
 
-export const clearFilter = () => invoke<string[]>("clear_filter");
-
 // ---------------------------------------------------------------------------
 // Geo / map view
 // ---------------------------------------------------------------------------
@@ -965,9 +963,6 @@ export const recordView = (path: string) =>
 export interface PerfSnapshot {
   disk_read_bytes: number;
   disk_write_bytes: number;
-  cached_thumbnails: number;
-  cache_size_bytes: number;
-  thumb_pool_active_threads: number;
 }
 
 export const getPerfSnapshot = () =>

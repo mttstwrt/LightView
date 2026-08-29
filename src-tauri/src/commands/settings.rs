@@ -529,6 +529,14 @@ pub async fn reindex_gallery(
     let db = state.cache_db.lock().await;
     let db = db.as_ref().ok_or("No gallery open")?;
 
+    // One transaction for the clear and every re-index below, matching what
+    // `index_companions` does at gallery open and for the same reason: without
+    // it each statement auto-commits, and a full re-index is one delete plus a
+    // row per tag for every companion in the library. It also means a re-index
+    // is never observable half-applied — the tag index goes from the old
+    // contents straight to the new ones.
+    let tx = db.conn().unchecked_transaction().map_err(|e| e.to_string())?;
+
     // Clear existing index
     db.clear_tag_index().map_err(|e| e.to_string())?;
 
@@ -582,6 +590,8 @@ pub async fn reindex_gallery(
             }
         }
     }
+
+    tx.commit().map_err(|e| e.to_string())?;
 
     // Rebuild counts
     db.rebuild_tag_counts().map_err(|e| e.to_string())?;
@@ -797,20 +807,26 @@ pub async fn get_gallery_default_filter(
     get_gallery_default_filter_impl(&state).await
 }
 
-/// Lightweight performance snapshot for the debug overlay.
-/// Reads /proc/self/io for disk bandwidth and queries cache stats.
+/// Disk bandwidth for the debug overlay's sparklines, from `/proc/self/io`.
+///
+/// Deliberately touches no database. It used to also report a thumbnail count
+/// and the summed size of every cached blob, which meant
+/// `SELECT COUNT(*), SUM(LENGTH(thumbnail)) FROM thumbnails` — a full scan of
+/// the largest table in the cache — under the gallery's single writer lock,
+/// **once per second** for as long as the overlay was open. Nothing read
+/// either number: `perfMonitor.sampleTick` consumes the two byte counters and
+/// discards the rest. So the one tool you would open to investigate a slow
+/// gallery was itself stalling every other database user, and its own disk
+/// figures included the scan it was causing.
+///
+/// The thumbnail count still exists where it is cheap and actually displayed:
+/// `get_debug_info` reads it once, when the hardware tab is opened.
 #[derive(Debug, Serialize)]
 pub struct PerfSnapshot {
     /// Bytes read from disk since process start (from /proc/self/io).
     pub disk_read_bytes: u64,
     /// Bytes written to disk since process start (from /proc/self/io).
     pub disk_write_bytes: u64,
-    /// Number of cached thumbnails in SQLite.
-    pub cached_thumbnails: u64,
-    /// Total byte size of cached thumbnail data.
-    pub cache_size_bytes: u64,
-    /// Current rayon thread pool active thread count (approximate).
-    pub thumb_pool_active_threads: usize,
 }
 
 /// Read /proc/self/io counters (Linux-only, returns 0 on other platforms).
@@ -834,32 +850,11 @@ fn read_proc_io() -> (u64, u64) {
 }
 
 #[tauri::command]
-pub async fn get_perf_snapshot(
-    state: tauri::State<'_, AppState>,
-) -> Result<PerfSnapshot, String> {
+pub async fn get_perf_snapshot() -> Result<PerfSnapshot, String> {
     let (disk_read_bytes, disk_write_bytes) = read_proc_io();
-
-    let (cached_thumbnails, cache_size_bytes) = {
-        let db = state.cache_db.lock().await;
-        if let Some(db) = db.as_ref() {
-            let count: u64 = db.conn()
-                .query_row("SELECT COUNT(*) FROM thumbnails", [], |row| row.get(0))
-                .unwrap_or(0);
-            let size: u64 = db.conn()
-                .query_row("SELECT COALESCE(SUM(LENGTH(thumbnail)), 0) FROM thumbnails", [], |row| row.get(0))
-                .unwrap_or(0);
-            (count, size)
-        } else {
-            (0, 0)
-        }
-    };
-
     Ok(PerfSnapshot {
         disk_read_bytes,
         disk_write_bytes,
-        cached_thumbnails,
-        cache_size_bytes,
-        thumb_pool_active_threads: state.hardware.thumbnail_threads(),
     })
 }
 

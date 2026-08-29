@@ -79,6 +79,19 @@ stable nor descriptive. Two artifacts that look alarming and are not:
 production builds; the shipped bundle contains no instrumentation. Checked, for
 the same reason.
 
+The overlay's *runtime* cost is gated the same way its bundle cost is, and that
+gating is load-bearing rather than tidy. `perfMonitor` returns early from
+`invoke` unless monitoring is active, which is what keeps it from
+`JSON.stringify`-ing the argument and result of every IPC call — on a large
+gallery `get_sorted_items` alone would serialize the whole item list a second
+time purely to measure its length. The backend half had the same shape and had
+lost it: `get_perf_snapshot` was summing `LENGTH(thumbnail)` across the entire
+`thumbnails` table once a second, under the writer lock, to fill fields
+`sampleTick` never read. A diagnostic that stalls the thing it measures reports
+its own interference, so the fields are gone and the command touches no
+database. The thumbnail count survives in `get_debug_info`, which runs once when
+the hardware tab is opened and actually displays it.
+
 ## The IPC boundary
 
 `lib/ipc.ts` exports one typed function per backend command. Internally it picks

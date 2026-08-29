@@ -32,10 +32,26 @@ pub struct TagSuggestion {
     pub score: i64,
 }
 
+/// One tag of the vocabulary, with the lowercase form the matcher compares
+/// against already computed.
+///
+/// Lowercasing belongs here rather than in [`AutocompleteEngine::query`]
+/// because of the traffic ratio: the vocabulary is reloaded only when tags are
+/// edited, and matched on every keystroke in the filter bar. Doing it per query
+/// meant one `String` allocation per tag per keystroke — five thousand of them
+/// to answer one character — recomputing a value that had not changed since the
+/// last reload.
+struct Entry {
+    namespace: String,
+    tag: String,
+    tag_lower: String,
+    count: u32,
+}
+
 /// In-memory autocomplete engine that holds all unique tags for fast fuzzy matching.
 /// At ~5,000 unique tags this uses ~300 KB — trivially small.
 pub struct AutocompleteEngine {
-    tags: Arc<RwLock<Vec<TagCount>>>,
+    tags: Arc<RwLock<Vec<Entry>>>,
 }
 
 impl AutocompleteEngine {
@@ -47,8 +63,17 @@ impl AutocompleteEngine {
 
     /// Reload the tag cache from the database.
     pub async fn refresh(&self, tag_counts: Vec<TagCount>) {
+        let prepared = tag_counts
+            .into_iter()
+            .map(|tc| Entry {
+                tag_lower: tc.tag.to_lowercase(),
+                namespace: tc.namespace,
+                tag: tc.tag,
+                count: tc.count,
+            })
+            .collect();
         let mut tags = self.tags.write().await;
-        *tags = tag_counts;
+        *tags = prepared;
     }
 
     /// Query tags with fuzzy substring matching.
@@ -68,14 +93,16 @@ impl AutocompleteEngine {
         // Deduplicate tags across namespaces, summing counts and keeping
         // the best score. Tags are namespace-agnostic in autocomplete;
         // users can narrow with the namespace::tag syntax if needed.
-        let mut merged: HashMap<String, (u32, i64)> = HashMap::new();
+        // Keys borrow from the vocabulary rather than owning a copy: the read
+        // guard outlives the map, and only the tags that survive to become
+        // suggestions ever need an owned `String`.
+        let mut merged: HashMap<&str, (u32, i64)> = HashMap::new();
         for e in tags.iter() {
-            if namespace.map_or(false, |ns| e.namespace != ns) {
+            if namespace.is_some_and(|ns| e.namespace != ns) {
                 continue;
             }
-            let tag_lower = e.tag.to_lowercase();
-            if let Some(score) = fuzzy_score(&tag_lower, &input_lower) {
-                let entry = merged.entry(e.tag.clone()).or_insert((0, 0));
+            if let Some(score) = fuzzy_score(&e.tag_lower, &input_lower) {
+                let entry = merged.entry(e.tag.as_str()).or_insert((0, 0));
                 entry.0 += e.count;
                 if score > entry.1 {
                     entry.1 = score;
@@ -87,7 +114,7 @@ impl AutocompleteEngine {
             .into_iter()
             .map(|(tag, (count, score))| TagSuggestion {
                 namespace: String::new(),
-                tag,
+                tag: tag.to_string(),
                 count,
                 score,
             })
@@ -97,18 +124,17 @@ impl AutocompleteEngine {
         // These use a special namespace marker "_namespace" so the frontend
         // can distinguish them from regular tag suggestions.
         if namespace.is_none() {
-            let ns_names = self.unique_namespaces(&tags);
-            for ns in &ns_names {
+            for ns in unique_namespaces(&tags) {
                 if let Some(score) = fuzzy_score(&ns.to_lowercase(), &input_lower) {
                     // Count how many tags exist in this namespace
                     let ns_count: u32 = tags
                         .iter()
-                        .filter(|e| e.namespace == *ns)
+                        .filter(|e| e.namespace == ns)
                         .map(|e| e.count)
                         .sum();
                     results.push(TagSuggestion {
                         namespace: "_namespace".to_string(),
-                        tag: ns.clone(),
+                        tag: ns.to_string(),
                         count: ns_count,
                         score: score + 50, // Boost namespace suggestions slightly
                     });
@@ -126,22 +152,25 @@ impl AutocompleteEngine {
         results
     }
 
-    /// Extract unique namespace names from the tag cache.
-    fn unique_namespaces(&self, tags: &[TagCount]) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut names = Vec::new();
-        for tc in tags {
-            if seen.insert(tc.namespace.clone()) {
-                names.push(tc.namespace.clone());
-            }
-        }
-        names
-    }
-
     /// Get the total number of unique tags in the cache.
     pub async fn tag_count(&self) -> usize {
         self.tags.read().await.len()
     }
+}
+
+/// Distinct namespace names, in the order they first appear in the vocabulary.
+/// Borrowed rather than cloned: there are a handful of namespaces and thousands
+/// of tags, so cloning every row's name just to probe a `HashSet` was one more
+/// allocation per tag per keystroke.
+fn unique_namespaces(tags: &[Entry]) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for e in tags {
+        if seen.insert(e.namespace.as_str()) {
+            names.push(e.namespace.as_str());
+        }
+    }
+    names
 }
 
 /// Simple fuzzy scoring: prefix match > contains > no match.

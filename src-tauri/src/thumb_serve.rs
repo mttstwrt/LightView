@@ -11,7 +11,7 @@ use crate::cache::thumbnails::ThumbTier;
 use crate::commands;
 use crate::AppState;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Maximum number of decoded ThumbHash PNGs to keep cached. Each entry is tiny
 /// (a ~32px PNG, a few hundred bytes), so even at capacity this is well under a
@@ -27,15 +27,15 @@ const THUMBHASH_PNG_CACHE_CAP: usize = 4096;
 /// pool is swapped so it can't grow across sessions.
 #[derive(Default)]
 pub struct ThumbhashPngCache {
-    inner: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    inner: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl ThumbhashPngCache {
-    fn get(&self, path: &str) -> Option<Arc<Vec<u8>>> {
+    fn get(&self, path: &str) -> Option<Vec<u8>> {
         self.inner.lock().unwrap().get(path).cloned()
     }
 
-    fn insert(&self, path: String, png: Arc<Vec<u8>>) {
+    fn insert(&self, path: String, png: Vec<u8>) {
         let mut map = self.inner.lock().unwrap();
         if map.len() >= THUMBHASH_PNG_CACHE_CAP {
             map.clear();
@@ -171,7 +171,7 @@ pub enum ThumbhashOutcome {
 /// Read the ~25-byte ThumbHash blob for a path and decode it into a tiny PNG.
 pub fn render_thumbhash_png(state: &AppState, path: &str) -> ThumbhashOutcome {
     if let Some(png) = state.thumbhash_png_cache.get(path) {
-        return ThumbhashOutcome::Png(png.as_ref().clone());
+        return ThumbhashOutcome::Png(png);
     }
 
     let pool = {
@@ -208,9 +208,7 @@ pub fn render_thumbhash_png(state: &AppState, path: &str) -> ThumbhashOutcome {
     }
 
     let bytes = png.into_inner();
-    state
-        .thumbhash_png_cache
-        .insert(path.to_string(), Arc::new(bytes.clone()));
+    state.thumbhash_png_cache.insert(path.to_string(), bytes.clone());
     ThumbhashOutcome::Png(bytes)
 }
 

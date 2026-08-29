@@ -575,6 +575,78 @@ impl CacheDb {
         );
     }
 
+    /// Drop every path-keyed row for each of `paths`, in one transaction.
+    ///
+    /// Bulk is the normal case — trashing a selection, the watcher reconciling
+    /// an external delete, a move out of the gallery — and calling
+    /// [`Self::remove_media_rows`] in a loop made each of its twelve `DELETE`s
+    /// its own implicit transaction: a thousand-file selection cost twelve
+    /// thousand WAL commits, with the whole gallery's writer connection held
+    /// throughout. Iterating tables on the *outside* also builds and prepares
+    /// each statement once for the batch rather than once per file.
+    ///
+    /// Best-effort per statement, like the single-path version: a table that
+    /// fails to delete leaves a row the next re-index clears, and is not a
+    /// reason to abandon the rest of the batch.
+    pub fn remove_media_rows_batch<S: AsRef<str>>(&self, paths: &[S]) {
+        if paths.is_empty() {
+            return;
+        }
+        let Ok(tx) = self.conn.unchecked_transaction() else {
+            for path in paths {
+                self.remove_media_rows(path.as_ref());
+            }
+            return;
+        };
+        for table in path_keyed_tables() {
+            let Ok(mut stmt) = tx.prepare_cached(&format!("DELETE FROM {table} WHERE path = ?1"))
+            else {
+                continue;
+            };
+            for path in paths {
+                let _ = stmt.execute(rusqlite::params![path.as_ref()]);
+            }
+        }
+        if let Ok(mut stmt) =
+            tx.prepare_cached("DELETE FROM not_duplicates WHERE path_a = ?1 OR path_b = ?1")
+        {
+            for path in paths {
+                let _ = stmt.execute(rusqlite::params![path.as_ref()]);
+            }
+        }
+        let _ = tx.commit();
+    }
+
+    /// Repoint every path-keyed row from `from` to `to` for each pair, in one
+    /// transaction. Used when files move *within* the gallery, so thumbnails,
+    /// tags, ratings and view history follow the file instead of being
+    /// regenerated at the new path.
+    ///
+    /// `UPDATE OR REPLACE` because a bare row may already exist at the
+    /// destination — the moved row carries the accumulated history and wins.
+    /// Batched for the reason [`Self::remove_media_rows_batch`] gives; this was
+    /// eleven separate auto-committed `UPDATE`s per file, written out at the
+    /// call site.
+    pub fn rename_media_rows_batch(&self, moves: &[(String, String)]) {
+        if moves.is_empty() {
+            return;
+        }
+        let Ok(tx) = self.conn.unchecked_transaction() else {
+            return;
+        };
+        for table in path_keyed_tables() {
+            let Ok(mut stmt) = tx
+                .prepare_cached(&format!("UPDATE OR REPLACE {table} SET path = ?1 WHERE path = ?2"))
+            else {
+                continue;
+            };
+            for (from, to) in moves {
+                let _ = stmt.execute(rusqlite::params![to, from]);
+            }
+        }
+        let _ = tx.commit();
+    }
+
     /// Rewrite the gallery-root prefix of every path-keyed row after a gallery
     /// directory moves (new mount point, renamed folder, copied to another
     /// machine). Carries thumbnails, ratings, view history, tag index, file
@@ -805,6 +877,90 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM not_duplicates", [], |r| r.get(0))
             .unwrap();
         assert_eq!(pairs, 1);
+    }
+
+    /// The batch form must sweep exactly what the single-path form does — it
+    /// is the one every bulk caller now uses, so a table it forgets is a blob
+    /// leak that only shows up under a large selection.
+    #[test]
+    fn remove_media_rows_batch_matches_the_single_path_sweep() {
+        let (_tmp, db) = open_db();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO media_meta (path, file_size, media_type) VALUES
+                     ('/g/a.jpg', 1, 'image'), ('/g/b.jpg', 1, 'image'), ('/g/keep.jpg', 1, 'image');
+                 INSERT INTO tag_index (path, namespace, tag) VALUES
+                     ('/g/a.jpg', 'user', 'cat'), ('/g/b.jpg', 'user', 'dog'),
+                     ('/g/keep.jpg', 'user', 'fox');
+                 INSERT INTO index_state (path, companion_mtime) VALUES
+                     ('/g/a.jpg', 1), ('/g/b.jpg', 2), ('/g/keep.jpg', 3);
+                 INSERT INTO gif_atlas (path, tier, mtime, frame_count, frame_w, frame_h, cols, delays, atlas)
+                     VALUES ('/g/a.jpg', 'm', 1, 1, 8, 8, 1, '100', x'00'),
+                            ('/g/b.jpg', 'm', 1, 1, 8, 8, 1, '100', x'00'),
+                            ('/g/keep.jpg', 'm', 1, 1, 8, 8, 1, '100', x'00');
+                 INSERT INTO not_duplicates (path_a, path_b) VALUES
+                     ('/g/a.jpg', '/g/keep.jpg'), ('/g/keep.jpg', '/g/other.jpg');",
+            )
+            .unwrap();
+        for path in ["/g/a.jpg", "/g/b.jpg", "/g/keep.jpg"] {
+            for tier in ThumbTier::ALL {
+                db.conn()
+                    .execute(
+                        &format!(
+                            "INSERT INTO {} (path, media_type, mtime, width, height, thumbnail)
+                             VALUES ('{path}', 'image', 1, 8, 8, x'00')",
+                            tier.table()
+                        ),
+                        [],
+                    )
+                    .unwrap();
+            }
+        }
+
+        db.remove_media_rows_batch(&["/g/a.jpg", "/g/b.jpg"]);
+
+        for table in path_keyed_tables() {
+            let left: Vec<String> = db
+                .conn()
+                .prepare(&format!("SELECT path FROM {table} ORDER BY path"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(left, ["/g/keep.jpg"], "{table} swept wrongly");
+        }
+        // Only the pair naming a removed file goes.
+        let pairs: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM not_duplicates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pairs, 1);
+    }
+
+    /// A move inside the gallery carries every path-keyed row to the new path
+    /// rather than regenerating it there.
+    #[test]
+    fn rename_media_rows_batch_carries_rows_to_the_new_path() {
+        let (_tmp, db) = open_db();
+        db.conn()
+            .execute(
+                "INSERT INTO media_meta (path, file_size, media_type, rating)
+                 VALUES ('/g/a.jpg', 1, 'image', 4)",
+                [],
+            )
+            .unwrap();
+
+        db.rename_media_rows_batch(&[("/g/a.jpg".to_string(), "/g/sub/a.jpg".to_string())]);
+
+        let (path, rating): (String, Option<u8>) = db
+            .conn()
+            .query_row("SELECT path, rating FROM media_meta", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(path, "/g/sub/a.jpg");
+        assert_eq!(rating, Some(4), "history must follow the file");
     }
 
     #[test]

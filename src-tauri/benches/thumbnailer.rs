@@ -89,6 +89,38 @@ fn bench_png_thumbnail(c: &mut Criterion) {
     group.finish();
 }
 
+/// WebP output from a JPEG source — the shape of the `Large` tier, and the one
+/// combination where the RGB→RGBA conversion sits between the decode and the
+/// resize rather than after it. The existing groups all ask for JPEG output, so
+/// nothing measured this path.
+fn bench_webp_thumbnail(c: &mut Criterion) {
+    let mut group = c.benchmark_group("webp_thumbnail");
+
+    for &(w, h) in &[(4000u32, 3000u32), (6000, 4000)] {
+        let (_dir, path) = create_test_jpeg(w, h);
+        for edge in [512u32, 1024] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{}x{}/edge{}", w, h, edge), "webp"),
+                &(&path, edge),
+                |b, (path, edge)| {
+                    b.iter(|| {
+                        thumbnailer::generate_image_thumbnail(
+                            black_box(path),
+                            ResizeFilter::Lanczos3,
+                            ThumbFormat::Webp,
+                            *edge,
+                            *edge,
+                        )
+                        .expect("thumbnail generation")
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_decode_image(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_image");
 
@@ -156,6 +188,7 @@ criterion_group!(
     benches,
     bench_jpeg_thumbnail,
     bench_png_thumbnail,
+    bench_webp_thumbnail,
     bench_decode_image,
     bench_pixel_convert,
     bench_resize_filters,

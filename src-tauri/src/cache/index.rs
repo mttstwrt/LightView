@@ -17,6 +17,18 @@ impl CacheDb {
         path: &str,
         companion: &CompanionFile,
     ) -> Result<(), CacheError> {
+        // One transaction for the delete plus every insert. Outside one, each
+        // of those statements auto-commits, so re-indexing a file carrying
+        // twenty tags cost twenty-one WAL commits — and the callers that
+        // matter are loops: renaming a tag rewrites every file that carries
+        // it, and `reindex_gallery` walks the whole library.
+        //
+        // `None` when a caller already has a transaction open on this
+        // connection (nesting is an error, not a nested scope). The statements
+        // then run inside the caller's, which is what that caller wanted; the
+        // only cost is that this function no longer decides when they commit.
+        let tx = self.conn().unchecked_transaction().ok();
+
         // Replace rather than merge: a companion is the whole truth for a
         // path, so a tag removed there must disappear here too.
         self.conn().execute(
@@ -24,12 +36,18 @@ impl CacheDb {
             rusqlite::params![path],
         )?;
 
-        let mut stmt = self.conn().prepare_cached(
-            "INSERT OR IGNORE INTO tag_index (path, namespace, tag) VALUES (?1, ?2, ?3)",
-        )?;
+        {
+            let mut stmt = self.conn().prepare_cached(
+                "INSERT OR IGNORE INTO tag_index (path, namespace, tag) VALUES (?1, ?2, ?3)",
+            )?;
 
-        for (namespace, tag) in companion.all_tags() {
-            stmt.execute(rusqlite::params![path, namespace, tag])?;
+            for (namespace, tag) in companion.all_tags() {
+                stmt.execute(rusqlite::params![path, namespace, tag])?;
+            }
+        }
+
+        if let Some(tx) = tx {
+            tx.commit()?;
         }
 
         // `index_state` is deliberately *not* stamped here. The caller knows

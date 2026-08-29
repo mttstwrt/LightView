@@ -250,9 +250,6 @@ let prevSampleTime = 0;
 type PerfSnapshot = {
   disk_read_bytes: number;
   disk_write_bytes: number;
-  cached_thumbnails: number;
-  cache_size_bytes: number;
-  thumb_pool_active_threads: number;
 };
 
 let fetchSnapshot: (() => Promise<PerfSnapshot>) | null = null;

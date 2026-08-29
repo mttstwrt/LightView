@@ -4,6 +4,13 @@
 //! rows because sorting is a separate command that takes the list as an
 //! argument — keeping them apart means changing the sort does not re-run the
 //! filter.
+//!
+//! There is deliberately no "clear the filter" command. Clearing is the absence
+//! of a path list, not a different list: `get_sorted_items` with
+//! `filter_paths: None` reads `media_meta` in sort order directly. A command
+//! that returned every path so the caller could pass them all back was one
+//! full-table read and one JSON array of the whole gallery per clear, to end up
+//! at the same rows.
 
 use crate::filter::evaluator;
 use crate::filter::parser;
@@ -31,10 +38,11 @@ pub async fn apply_filter_impl(
     let mut params = Vec::new();
     let where_clause = evaluator::to_sql(&expr, &mut params);
 
-    let sql = format!(
-        "SELECT DISTINCT m.path FROM media_meta m WHERE {}",
-        where_clause
-    );
+    // No DISTINCT: `m.path` is the primary key and tag terms compile to
+    // correlated `EXISTS` subqueries rather than joins, so a row can be
+    // produced at most once. Asking for it anyway buys a dedup pass over the
+    // whole result for a guarantee the schema already gives.
+    let sql = format!("SELECT m.path FROM media_meta m WHERE {}", where_clause);
 
     let mut stmt = db.conn().prepare(&sql).map_err(|e| e.to_string())?;
 
@@ -44,37 +52,6 @@ pub async fn apply_filter_impl(
 
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row.map_err(|e| e.to_string())?);
-    }
-
-    Ok(result)
-}
-
-/// Clear the active filter (returns all media paths).
-#[tauri::command]
-pub async fn clear_filter(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
-    clear_filter_impl(&state).await
-}
-
-pub async fn clear_filter_impl(
-    state: &AppState,
-) -> Result<Vec<String>, String> {
-    let db = state.cache_db.lock().await;
-    let db = db.as_ref().ok_or("No gallery open")?;
-
-    let mut stmt = db
-        .conn()
-        .prepare("SELECT path FROM media_meta ORDER BY date_taken DESC")
-        .map_err(|e| e.to_string())?;
-
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
 
     let mut result = Vec::new();

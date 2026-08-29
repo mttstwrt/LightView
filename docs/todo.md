@@ -30,8 +30,9 @@ not to be small at all once its premise was checked against the code.
 ## A. Remote tagging and plugins
 
 **Mostly done.** A1–A5 have landed, and A6's protocol half with them. What is
-left is one deliberate deferral (moving the ML taggers out of this repository)
-and one designed-but-unbuilt item (A7, plugin output that is not tags). The
+left is one deliberate deferral (moving the ML taggers out of this repository),
+one designed-but-unbuilt item (A7, plugin output that is not tags), and one
+scaling problem found by reading rather than by anyone complaining (A8). The
 chain the original ordering described — you could not tell what a worker was running, a job that
 went wrong hung forever, and videos silently produced nothing — is closed.
 
@@ -209,6 +210,37 @@ when a re-run reshapes a cluster the user already named. The source case has
 none of that, which is why it goes first; the `label` shape exists so faces are
 additive when they come.
 
+### A8. A tagging job rebuilds the whole tag-count table every 32 files
+
+`apply_plugin_tags_impl` ends with `rebuild_tag_counts()` plus an autocomplete
+refresh, and both workers call it once per `APPLY_BATCH` — 32 files. The rebuild
+is `DELETE FROM tag_counts` followed by a `GROUP BY` over all of `tag_index`, so
+its cost scales with the *library*, not with the batch, and it runs under the
+single writer connection.
+
+The ratio is what makes it bad rather than merely wasteful. On a 5,000-image
+gallery carrying thirty tags each, a rebuild scans 150,000 rows and the whole
+job pays a few seconds of it — invisible. On a 100,000-image library the scan is
+3,000,000 rows and there are ~3,000 batches, so a full re-tag spends a long time
+doing nothing but recomputing counts, with the grid queued behind it the entire
+time. Nobody has reported this; it is the shape of the code, and it wants a
+measurement on a real library before anything is built.
+
+Note the contrast with `rename_user_tag`, which rebuilds wholesale *for good
+reason* and says so: one rename touches every file carrying the tag, so the
+deltas a `GROUP BY` computes are exactly the deltas you would have nudged. That
+argument does not transfer to a 32-file batch.
+
+Three options, none obviously right. Rebuilding once at job completion is the
+smallest change but leaves counts and autocomplete stale for the length of the
+job, and `apply_plugin_tags` is a command that knows nothing about jobs.
+Nudging incrementally needs an old-vs-new diff per file, since a write replaces
+a plugin's whole bucket rather than adding to it. Throttling to at most one
+rebuild every few seconds is the crudest and probably the cheapest to get right.
+Whichever wins deserves a decision file, because the losing options are real.
+
+---
+
 ## B. Thumbnails, cache, and serving
 
 Three independent items with no dependency between them, so the order is by
@@ -218,7 +250,9 @@ has made the `?fit=` route hot — every remote tagging job now pulls every imag
 through it at the plugin's declared edge, and concurrent taggers repeat the same
 decode. It also absorbs the one half of A4 that was left undone. **B2 next**, a user-visible
 staleness bug. **B3 last** — a latent hazard with no current symptom, safe to
-do at any point.
+do at any point. **B4** and **B5** are independent of all three and both want a
+measurement before code — B4 on a phone against a large gallery, B5 on the
+benchmark that now covers its path.
 
 ### B1. The `?fit=` resize route has no coalescer *(small)*
 
@@ -237,6 +271,57 @@ thumbnails until something else asks for them.
 two of them adjacent `u32`s (`width`, `height`). Transposing them at a call site
 would compile and store a wrong aspect ratio. A small `ThumbRow` struct removes
 the class.
+
+### B4. `auth_layer` holds the writer connection on every request
+
+The remote thumbnail route reads through `thumb_protocol_db`, a pool of
+read-only connections, specifically so a scroll burst fans out instead of
+queueing behind the single writer. Then `auth_layer` runs in front of it and
+takes that writer lock anyway — `cookie_name`, `verify_cookie`,
+`get_password_hash` and `get_inactivity_secs` are four `SELECT`s under
+`cache_db.lock()`, per request, and the request mix on the web client is
+overwhelmingly `/thumb`. The pool's concurrency is therefore bounded by a
+mutex the pool exists to avoid.
+
+The write that used to sit there as well — `touch_device` bumping `last_seen` —
+is now rate-limited to one per `TOUCH_INTERVAL_SECS` per device, which removes
+the part that actually contends for the WAL. What is left is four cheap reads
+holding an exclusive lock, and that is where the guessing starts: they are
+microseconds each, so whether the serialization is measurable at all depends on
+how deep the request queue gets on a real phone against a real gallery. Get that
+number before writing code.
+
+If it turns out to matter, the shape is already there: authentication reads
+nothing the read-only pool cannot serve, so it can move to `thumb_protocol_db`
+and take the writer only for the rate-limited touch. The reason not to do that
+blind is that it splits one consistent snapshot into two connections for a
+security decision, which is a trade worth making against a measurement and not
+against a hunch.
+
+### B5. `crop_resize_encode` converts pixel layout before the resize
+
+Two of its four `(format, source layout)` combinations run a whole-buffer
+channel conversion and *then* resize: `rgb_to_rgba` for WebP output from an RGB
+decode (the `Large` and `Preview` tiers, fed by every JPEG and PNG), and
+`rgba_to_rgb` for JPEG output from an RGBA decode (HEIC and video into the
+standard tier). Converting the resized output instead would touch the thumbnail
+rather than the intermediate — for a 1024 px tier that is roughly a quarter the
+pixels and a quarter the allocation.
+
+`generate_for_path_fit` already has the resize-then-convert shape, so this is a
+consistency gap as much as a cost, and the transform is output-identical either
+way: a constant alpha channel is unchanged by convolution, and stripping alpha
+commutes with a resize that never weighted by it.
+
+What is missing is the number. `benches/thumbnailer.rs` now has a
+`webp_thumbnail` group covering the JPEG→WebP path, which nothing measured
+before — every other group asks for JPEG output, so the conversion in question
+never ran under a benchmark. `bench_pixel_convert` measures the conversion
+functions in isolation and says they are fast; what it cannot say is what
+fraction of a tier generation they are. Run `cargo bench --bench thumbnailer --
+webp_thumbnail`, make the change, run it again, and keep it only if the
+difference is real — the build is a full LTO release and takes a while, which is
+the only reason this is written down rather than done.
 
 ---
 
