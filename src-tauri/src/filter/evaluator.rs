@@ -261,10 +261,12 @@ mod tests {
         let expr = parse_filter("Fuji").unwrap();
         let mut params = Vec::new();
         let sql = to_sql(&expr, &mut params);
-        assert_eq!(
-            sql,
-            "(EXISTS (SELECT 1 FROM tag_index ti WHERE ti.path = m.path AND ti.tag = ?1) OR              ((m.filename IS NOT NULL AND instr(lower(m.filename), ?2) > 0) OR              (m.description IS NOT NULL AND instr(lower(m.description), ?3) > 0)))"
-        );
+        // Composed rather than written out, so the assertion cannot drift from
+        // the arms above on whitespace alone.
+        let tag = "EXISTS (SELECT 1 FROM tag_index ti WHERE ti.path = m.path AND ti.tag = ?1)";
+        let name = "(m.filename IS NOT NULL AND instr(lower(m.filename), ?2) > 0)";
+        let desc = "(m.description IS NOT NULL AND instr(lower(m.description), ?3) > 0)";
+        assert_eq!(sql, format!("({tag} OR ({name} OR {desc}))"));
         // The tag keeps the spelling it was given (tag matching is exact); the
         // text needles are folded once, here, rather than per row.
         assert_eq!(

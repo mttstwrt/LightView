@@ -948,18 +948,15 @@ mod tests {
 
     #[test]
     fn test_tag_with_parens_in_expression() {
-        // Tag with parens combined with boolean operators.
+        // Tag with parens combined with boolean operators. Each operand is a
+        // bare word, so each is the three-term expansion — what this test is
+        // about is that the tokenizer kept the in-tag parens out of the
+        // grouping syntax.
         let expr = parse_filter("hatsune_miku_(vocaloid) AND 1girl").unwrap();
         match &expr {
             FilterExpr::And { left, right } => {
-                match left.as_ref() {
-                    FilterExpr::Tag { value, .. } => assert_eq!(value, "hatsune_miku_(vocaloid)"),
-                    _ => panic!("Expected Tag on left"),
-                }
-                match right.as_ref() {
-                    FilterExpr::Tag { value, .. } => assert_eq!(value, "1girl"),
-                    _ => panic!("Expected Tag on right"),
-                }
+                bare_word_parts(left, "hatsune_miku_(vocaloid)");
+                bare_word_parts(right, "1girl");
             }
             _ => panic!("Expected And, got {:?}", expr),
         }
