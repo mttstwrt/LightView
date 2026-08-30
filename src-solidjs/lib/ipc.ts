@@ -302,6 +302,7 @@ export const getMediaMeta = (path: string) =>
     duration_seconds: number | null;
     rating: number | null;
     last_rated: number | null;
+    description: string | null;
   } | null>("get_media_meta", { path });
 
 // ---------------------------------------------------------------------------
@@ -344,6 +345,13 @@ export const setColorLabelBatch = (paths: string[], label: string | null) =>
 
 export const setNotes = (path: string, notes: string | null) =>
   invoke<void>("set_notes", { path, notes });
+
+/** A prose description of the media, searchable by `desc:` and by bare words.
+ *  Distinct from notes: notes are the owner's private remarks, a description
+ *  says what the file shows. `null` (or blank) clears it. */
+export const setDescription = (path: string, description: string | null) =>
+  invoke<void>("set_description", { path, description });
+
 
 export const addUserTagBatch = (paths: string[], tag: string) =>
   invoke<number>("add_user_tag_batch", { paths, tag });
@@ -689,6 +697,7 @@ export interface MergeCandidate {
   rating: number | null;
   color_label: string | null;
   notes: string | null;
+  description: string | null;
   companion_location: MergeGps | null;
   exif_location: MergeGps | null;
 }
@@ -700,6 +709,7 @@ export interface MergePlan {
   rating: number | null;
   color_label: string | null;
   notes: string | null;
+  description: string | null;
   location: MergeGps | null;
   set_mtime: number | null;
 }

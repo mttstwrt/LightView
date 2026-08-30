@@ -10,11 +10,16 @@
 //! inclusive range they name: `date=2024` is all of 2024. Four-digit years are
 //! required rather than inferred, because guessing the century for `24-01-01`
 //! silently produces the wrong range.
+//!
+//! A bare word is expanded *here*, into `tag OR filename OR description`, so
+//! the tree the evaluator walks says exactly what the word matches. The
+//! alternative — one leaf that the evaluator quietly compiles into three
+//! predicates — would make `NOT fuji` a second place to get De Morgan right.
 
 use chrono::NaiveDate;
 
 use crate::companion::schema::MediaType;
-use crate::filter::ast::{CompareOp, DateField, FilterExpr, NumericField, TagNamespace};
+use crate::filter::ast::{CompareOp, DateField, FilterExpr, NumericField, TagNamespace, TextField};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -32,12 +37,17 @@ pub enum ParseError {
     InvalidDate(String),
     #[error("Invalid numeric filter: {0}")]
     InvalidNumeric(String),
+    #[error("Empty {0} filter — nothing to match")]
+    EmptyText(String),
 }
 
 /// Parse a filter query string into a FilterExpr.
 ///
 /// Syntax examples:
-///   vacation                                    → search all namespaces
+///   vacation                                    → tag in any namespace, or the
+///                                                 filename or description
+///   name:fuji                                   → filename substring
+///   desc:sunset                                 → description substring
 ///   user::vacation                              → specific namespace
 ///   plugin.face-recognition::person:alice       → plugin namespace
 ///   user::vacation AND user::family             → boolean AND
@@ -211,6 +221,19 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
         ));
     }
 
+    // Filename substring: name:fuji matches `mount_fuji.jpeg`. Checked before
+    // the bare-tag fallthrough, so it shadows any tag literally spelled
+    // `name:something` — which stays reachable through the namespace form,
+    // `user::name:something`. Same for `desc:`.
+    if let Some(needle) = token.strip_prefix("name:") {
+        return Ok((text_term(TextField::Filename, needle)?, rest));
+    }
+
+    // Description substring: desc:sunset
+    if let Some(needle) = token.strip_prefix("desc:") {
+        return Ok((text_term(TextField::Description, needle)?, rest));
+    }
+
     // Geo presence: has:geo, missing:geo
     if token == "has:geo" {
         return Ok((FilterExpr::HasGeo { present: true }, rest));
@@ -252,14 +275,62 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
         return Ok((FilterExpr::HasNamespace { namespace }, rest));
     }
 
-    // Bare tag: search all namespaces
-    Ok((
-        FilterExpr::Tag {
+    // Bare word: the tag it names in any namespace, or a substring of the
+    // filename, or a substring of the description.
+    Ok((bare_word(token), rest))
+}
+
+/// Expand a bare word into `tag OR filename OR description`.
+///
+/// The tag half stays an **exact** match while the other two are substrings.
+/// That asymmetry is deliberate: a tag is a token from a controlled vocabulary
+/// that autocomplete completes for you, so substring-matching it would make
+/// `cat` match `cathedral` and there would be no way to ask for just `cat`. A
+/// filename and a description are prose nobody types in full.
+///
+/// Case is folded on the text halves only, and only over ASCII — see
+/// [`text_term`] for why the two sides have to agree on that.
+fn bare_word(token: &str) -> FilterExpr {
+    let needle = token.to_ascii_lowercase();
+    FilterExpr::Or {
+        left: Box::new(FilterExpr::Tag {
             namespace: TagNamespace::Any,
-            value: token.clone(),
-        },
-        rest,
-    ))
+            value: token.to_string(),
+        }),
+        right: Box::new(FilterExpr::Or {
+            left: Box::new(FilterExpr::Text {
+                field: TextField::Filename,
+                value: needle.clone(),
+            }),
+            right: Box::new(FilterExpr::Text {
+                field: TextField::Description,
+                value: needle,
+            }),
+        }),
+    }
+}
+
+/// Build an explicit `name:`/`desc:` term, folding the needle's case once here
+/// instead of once per row in SQL.
+///
+/// **ASCII** folding specifically, because the other side of the comparison is
+/// SQLite's `lower()`, which folds ASCII and nothing else. Folding the needle
+/// more thoroughly than the column would turn an exact match into a miss:
+/// `FÜJI` would become `füji` while `FÜJI.jpg` stayed `fÜji.jpg`, so typing a
+/// filename exactly as it is spelled would find nothing.
+///
+/// An empty needle is an error rather than a match-everything: `instr(x, '')`
+/// finds the empty string at position 1, so `name:` on its own would compile to
+/// a term that matches every file that has a name — a filter written to narrow,
+/// silently widening. That is the bug `color:red` had for a year.
+fn text_term(field: TextField, needle: &str) -> Result<FilterExpr, ParseError> {
+    if needle.is_empty() {
+        return Err(ParseError::EmptyText(field.column().to_string()));
+    }
+    Ok(FilterExpr::Text {
+        field,
+        value: needle.to_ascii_lowercase(),
+    })
 }
 
 fn parse_geo_bbox<'a>(bbox_str: &str, rest: &'a [String]) -> ParseResult<'a> {
@@ -462,16 +533,101 @@ fn parse_namespace(s: &str) -> TagNamespace {
 mod tests {
     use super::*;
 
+    /// Assert `expr` is a bare word's expansion — `tag OR filename OR
+    /// description`, all three carrying `word` — and hand back the namespace
+    /// the tag half searched.
+    ///
+    /// The tests below are about *tokenizing* (colons, parentheses, `=`), so
+    /// they assert through this rather than restating the three-node shape each
+    /// time.
+    fn bare_word_parts(expr: &FilterExpr, word: &str) -> TagNamespace {
+        let FilterExpr::Or { left, right } = expr else {
+            panic!("Expected a bare-word expansion, got {:?}", expr)
+        };
+        let FilterExpr::Tag { namespace, value } = &**left else {
+            panic!("Expected the tag term on the left, got {:?}", left)
+        };
+        assert_eq!(value, word, "tag half matches the word as typed");
+        let FilterExpr::Or { left: name, right: desc } = &**right else {
+            panic!("Expected the two text terms on the right, got {:?}", right)
+        };
+        let needle = word.to_ascii_lowercase();
+        assert!(
+            matches!(&**name, FilterExpr::Text { field: TextField::Filename, value } if *value == needle),
+            "expected a lowercased filename term, got {:?}",
+            name
+        );
+        assert!(
+            matches!(&**desc, FilterExpr::Text { field: TextField::Description, value } if *value == needle),
+            "expected a lowercased description term, got {:?}",
+            desc
+        );
+        namespace.clone()
+    }
+
     #[test]
     fn test_simple_tag() {
         let expr = parse_filter("vacation").unwrap();
-        match expr {
-            FilterExpr::Tag { namespace, value } => {
-                assert_eq!(namespace, TagNamespace::Any);
-                assert_eq!(value, "vacation");
-            }
-            _ => panic!("Expected Tag"),
-        }
+        assert_eq!(bare_word_parts(&expr, "vacation"), TagNamespace::Any);
+    }
+
+    /// A bare word searches the filename too, so `fuji` finds `mount_fuji.jpeg`
+    /// with no tag involved. Case is folded on the way into the text terms
+    /// while the tag half keeps the spelling it was given — tag matching is
+    /// exact, and `Japan` is not `japan`.
+    #[test]
+    fn test_bare_word_searches_text_case_folded() {
+        let expr = parse_filter("Fuji").unwrap();
+        assert_eq!(bare_word_parts(&expr, "Fuji"), TagNamespace::Any);
+    }
+
+    #[test]
+    fn test_explicit_name_term() {
+        let expr = parse_filter("name:FUJI").unwrap();
+        assert!(matches!(
+            expr,
+            FilterExpr::Text { field: TextField::Filename, ref value } if value == "fuji"
+        ));
+    }
+
+    #[test]
+    fn test_explicit_desc_term() {
+        let expr = parse_filter("desc:Sunset").unwrap();
+        assert!(matches!(
+            expr,
+            FilterExpr::Text { field: TextField::Description, ref value } if value == "sunset"
+        ));
+    }
+
+    /// The needle is folded exactly as far as SQLite folds the column, and no
+    /// further: ASCII only. Folding the `Ü` here would make a filename typed
+    /// exactly as it is spelled stop matching.
+    #[test]
+    fn test_needle_folds_ascii_only() {
+        let expr = parse_filter("name:FÜJI").unwrap();
+        assert!(matches!(
+            expr,
+            FilterExpr::Text { field: TextField::Filename, ref value } if value == "fÜji"
+        ));
+    }
+
+    /// `name:` with nothing after it is rejected rather than matching every
+    /// file — see [`text_term`].
+    #[test]
+    fn test_empty_text_term_is_rejected() {
+        assert!(matches!(parse_filter("name:"), Err(ParseError::EmptyText(_))));
+        assert!(matches!(parse_filter("desc:"), Err(ParseError::EmptyText(_))));
+    }
+
+    /// The explicit terms compose like any other, and negate correctly.
+    #[test]
+    fn test_text_terms_compose() {
+        let expr = parse_filter("name:fuji AND NOT desc:winter").unwrap();
+        let FilterExpr::And { left, right } = expr else {
+            panic!("Expected And")
+        };
+        assert!(matches!(*left, FilterExpr::Text { field: TextField::Filename, .. }));
+        assert!(matches!(*right, FilterExpr::Not { .. }));
     }
 
     #[test]
@@ -548,13 +704,7 @@ mod tests {
     fn test_bare_tag_cross_namespace() {
         // A word that is NOT a namespace name should still search all namespaces
         let expr = parse_filter("example").unwrap();
-        match expr {
-            FilterExpr::Tag { namespace, value } => {
-                assert_eq!(namespace, TagNamespace::Any);
-                assert_eq!(value, "example");
-            }
-            _ => panic!("Expected Tag, got {:?}", expr),
-        }
+        assert_eq!(bare_word_parts(&expr, "example"), TagNamespace::Any);
     }
 
     #[test]
@@ -570,14 +720,8 @@ mod tests {
         let expr = parse_filter("rating:general").unwrap();
         // Without a namespace (no ::), this should be parsed contextually.
         // "rating:general" doesn't start with "rating>=" etc., so it falls through
-        // to bare tag matching.
-        match expr {
-            FilterExpr::Tag { namespace, value } => {
-                assert_eq!(namespace, TagNamespace::Any);
-                assert_eq!(value, "rating:general");
-            }
-            _ => panic!("Expected bare Tag, got {:?}", expr),
-        }
+        // to bare word matching.
+        assert_eq!(bare_word_parts(&expr, "rating:general"), TagNamespace::Any);
     }
 
     #[test]
@@ -598,13 +742,10 @@ mod tests {
         // Danbooru-style tags like "hatsune_miku_(vocaloid)" should not be
         // split by the tokenizer.
         let expr = parse_filter("hatsune_miku_(vocaloid)").unwrap();
-        match expr {
-            FilterExpr::Tag { namespace, value } => {
-                assert_eq!(namespace, TagNamespace::Any);
-                assert_eq!(value, "hatsune_miku_(vocaloid)");
-            }
-            _ => panic!("Expected Tag, got {:?}", expr),
-        }
+        assert_eq!(
+            bare_word_parts(&expr, "hatsune_miku_(vocaloid)"),
+            TagNamespace::Any
+        );
     }
 
     #[test]
@@ -746,15 +887,9 @@ mod tests {
 
     #[test]
     fn test_non_date_equals_falls_through_to_tag() {
-        // A bare token with "=" that isn't a date field stays a tag.
+        // A bare token with "=" that isn't a date field stays a bare word.
         let expr = parse_filter("foo=bar").unwrap();
-        match expr {
-            FilterExpr::Tag { namespace, value } => {
-                assert_eq!(namespace, TagNamespace::Any);
-                assert_eq!(value, "foo=bar");
-            }
-            _ => panic!("Expected Tag, got {:?}", expr),
-        }
+        assert_eq!(bare_word_parts(&expr, "foo=bar"), TagNamespace::Any);
     }
 
     #[test]

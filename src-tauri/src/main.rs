@@ -320,6 +320,7 @@ fn main() {
             commands::tags::set_rating,
             commands::tags::set_color_label,
             commands::tags::set_color_label_batch,
+            commands::tags::set_description,
             commands::tags::set_notes,
             commands::tags::add_user_tag_batch,
             commands::tags::remove_user_tag_batch,

@@ -136,6 +136,7 @@ pub struct MergeCandidate {
     pub rating: Option<u8>,
     pub color_label: Option<String>,
     pub notes: Option<String>,
+    pub description: Option<String>,
     pub companion_location: Option<MergeGps>,
     /// GPS read from embedded EXIF (read-only context; can be promoted into the
     /// keeper's companion location).
@@ -178,6 +179,7 @@ fn read_merge_candidate(path: &str) -> MergeCandidate {
         rating: core.as_ref().and_then(|m| m.rating),
         color_label: core.as_ref().and_then(|m| m.color_label.clone()),
         notes: core.as_ref().and_then(|m| m.notes.clone()),
+        description: core.as_ref().and_then(|m| m.description.clone()),
         companion_location: core.as_ref().and_then(|m| m.location).map(Into::into),
         exif_location: exif::extract_location(p).map(Into::into),
     }
@@ -210,6 +212,7 @@ pub struct MergePlan {
     pub rating: Option<u8>,
     pub color_label: Option<String>,
     pub notes: Option<String>,
+    pub description: Option<String>,
     pub location: Option<MergeGps>,
     /// Epoch seconds to stamp on the keeper file, when the user chose a
     /// different copy's timestamp.
@@ -219,9 +222,10 @@ pub struct MergePlan {
 /// Merge selected metadata from a duplicate group into the keeper, then trash
 /// the discarded copies.
 ///
-/// User tags, rating, color label, notes, and location are taken verbatim from
-/// the resolved plan. Auto and plugin tags are unioned from every copy (keeper
-/// included) since they carry no conflict — more provenance is strictly better.
+/// User tags, rating, color label, notes, description, and location are taken
+/// verbatim from the resolved plan. Auto and plugin tags are unioned from every
+/// copy (keeper included) since they carry no conflict — more provenance is
+/// strictly better.
 /// Union the auto and plugin tags across every copy. These carry no conflict —
 /// more provenance is strictly better — so they are always merged wholesale.
 fn union_auto_plugin_tags(
@@ -269,6 +273,7 @@ fn write_merged_companion(
     let rating = plan.rating;
     let color_label = plan.color_label.clone();
     let notes = plan.notes.clone();
+    let description = plan.description.clone();
     let location: Option<Location> = plan.location.map(Into::into);
 
     modify_companion(&plan.keeper, |c| {
@@ -285,6 +290,7 @@ fn write_merged_companion(
         };
         core.color_label = color_label.clone();
         core.notes = notes.clone();
+        core.description = description.clone();
         core.location = location;
     })
 }
@@ -317,6 +323,7 @@ pub async fn merge_duplicates_impl(
             // Same reason as the rating: the merge wrote the companion, and the
             // filter reads the column.
             let _ = db.update_color_label(&plan.keeper, plan.color_label.as_deref());
+            let _ = db.update_description(&plan.keeper, plan.description.as_deref());
             if let Ok(counts) = db.query_all_tag_counts() {
                 state.autocomplete.refresh(counts).await;
             }
@@ -391,9 +398,11 @@ mod tests {
             let core = c.meta.core.get_or_insert_with(CoreMeta::default);
             core.rating = Some(5);
             core.notes = Some("from dup".into());
+            core.description = Some("A cat on a beach.".into());
         });
 
-        // Resolve: keep 5-star rating and dup's notes; union of user tags.
+        // Resolve: keep 5-star rating, dup's notes and description; union of
+        // user tags.
         let plan = MergePlan {
             keeper: keeper.clone(),
             discard: vec![other.clone()],
@@ -401,6 +410,7 @@ mod tests {
             rating: Some(5),
             color_label: None,
             notes: Some("from dup".into()),
+            description: Some("A cat on a beach.".into()),
             location: None,
             set_mtime: None,
         };
@@ -415,5 +425,6 @@ mod tests {
         let core = merged.meta.core.unwrap();
         assert_eq!(core.rating, Some(5));
         assert_eq!(core.notes.as_deref(), Some("from dup"));
+        assert_eq!(core.description.as_deref(), Some("A cat on a beach."));
     }
 }

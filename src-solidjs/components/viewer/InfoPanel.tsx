@@ -5,6 +5,7 @@ import {
   addUserTag,
   removeUserTag,
   getAllThumbnailTiers,
+  setDescription as saveDescription,
 } from "../../lib/ipc";
 import { rateItem } from "../../stores/galleryStore";
 import type { ThumbnailTierInfo } from "../../lib/ipc";
@@ -53,6 +54,10 @@ export function InfoPanel(props: {
   onTagFilter?: (namespace: string, tag: string) => void;
 }) {
   const [meta, setMeta] = createSignal<MetaInfo | null>(null);
+  const [description, setDescription] = createSignal("");
+  // What the last successful write left on disk, so a commit that changes
+  // nothing costs no round-trip.
+  let savedDescription = "";
   const [tags, setTags] = createSignal<{ namespace: string; tag: string }[]>([]);
   const [newTag, setNewTag] = createSignal("");
   const [rating, setRating] = createSignal(0);
@@ -72,6 +77,24 @@ export function InfoPanel(props: {
     });
   };
 
+  // Persist the description if it differs from what is on disk.
+  //
+  // Takes the path explicitly because the two callers that matter are *not*
+  // the blur handler: navigating to the next image leaves the textarea mounted
+  // and focused (so no blur fires), and closing the viewer removes it (which
+  // also fires no blur). Both commit against the path being left, not the one
+  // arriving.
+  const commitDescription = async (path: string) => {
+    const next = description().trim();
+    if (!path || next === savedDescription) return;
+    try {
+      await saveDescription(path, next || null);
+      savedDescription = next;
+    } catch (err) {
+      console.error("Failed to set description:", err);
+    }
+  };
+
   const loadTags = async (path: string) => {
     try {
       const result = await getTags(path);
@@ -82,9 +105,12 @@ export function InfoPanel(props: {
   createEffect(
     on(
       () => props.path,
-      async (path) => {
+      async (path, prevPath) => {
+        if (prevPath) await commitDescription(prevPath);
         if (!path) return;
         setMeta(null);
+        setDescription("");
+        savedDescription = "";
         setTags([]);
         setRating(0);
         setLastRated(null);
@@ -100,6 +126,8 @@ export function InfoPanel(props: {
               height: result.height,
               duration_seconds: result.duration_seconds,
             });
+            setDescription(result.description ?? "");
+            savedDescription = result.description ?? "";
             setRating(result.rating ?? 0);
             setLastRated(result.last_rated);
           }
@@ -176,6 +204,12 @@ export function InfoPanel(props: {
   };
   window.addEventListener("lightview:rating-changed", onRatingChanged);
   onCleanup(() => window.removeEventListener("lightview:rating-changed", onRatingChanged));
+
+  // Closing the viewer removes the textarea without blurring it, so an
+  // in-progress description would be lost without this.
+  onCleanup(() => {
+    void commitDescription(props.path);
+  });
 
   let tagInputRef: HTMLInputElement | undefined;
   const onFocusTagInput = () => {
@@ -270,6 +304,21 @@ export function InfoPanel(props: {
                 <div class="text-neutral-500 mt-0.5">{formatDate(meta()!.date_taken!)}</div>
               </Show>
             </Show>
+          </div>
+
+          {/* Description — prose about what the file shows. Searchable with
+              `desc:` or a bare word, and never suggested as a tag; notes stay
+              a separate, private field. Saved on blur. */}
+          <div class="border-t border-neutral-800 pt-3 mt-3">
+            <div class="text-neutral-500 font-medium mb-1.5">Description</div>
+            <textarea
+              class="w-full bg-neutral-800/50 rounded px-2 py-1.5 text-neutral-300 placeholder-neutral-600 resize-y min-h-14 focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              rows="3"
+              placeholder="Describe this image…"
+              value={description()}
+              onInput={(e) => setDescription(e.currentTarget.value)}
+              onBlur={() => void commitDescription(props.path)}
+            />
           </div>
 
           {/* Thumbnails */}

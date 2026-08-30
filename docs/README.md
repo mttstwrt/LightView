@@ -72,6 +72,7 @@ answer to "why not the obvious thing?" is longer than a sentence.
 - [0013 — The host samples video frames; plugins only ever see stills](decisions/0013-the-host-samples-video-frames.md)
 - [0014 — Ship `lightview-worker` with the release](decisions/0014-ship-the-worker-with-the-release.md)
 - [0015 — Plugin UI is a fixed set of host-drawn shapes, not a declared layout](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
+- [0016 — Filenames and descriptions are indexed columns, searched by substring](decisions/0016-filenames-and-descriptions-are-indexed-columns.md)
 
 ## Open work
 

@@ -39,7 +39,10 @@ A query is a boolean expression over terms. `AND`, `OR`, `NOT`, and parentheses
 work as expected; a bare word with no operator searches every namespace.
 
 ```
-vacation                                    any namespace contains this tag
+vacation                                    a tag in any namespace — or the
+                                            filename, or the description
+name:fuji                                   filename only
+desc:volcano                                description only
 user::vacation                              a specific namespace
 plugin.face-recognition::person:alice       a plugin namespace
 Japan  Kyoto  United_States                 place names, from geocoded GPS
@@ -55,6 +58,42 @@ date>=2024-01-01  date=2024  added<=2024-06 dates: taken / added / viewed
 width>=1920  height<=1080                   pixel dimensions
 size>=10mb  size<=500kb                     file size (b/kb/mb/gb)
 ```
+
+## What a bare word searches
+
+A bare word matches three things: the tag, the filename, and the description.
+`fuji` finds `mount_fuji.jpeg` whether or not anyone tagged it, and finds a
+photo whose description mentions the volcano. The parser expands the word into
+`tag OR name OR desc` itself, so the tree the evaluator walks says exactly what
+it matches — and `NOT fuji` gets De Morgan from the existing `Not` arm instead
+of being a second place to get it right.
+
+The three terms do not match the same way, and the asymmetry is deliberate:
+**the tag is exact, the filename and description are substrings.** A tag is a
+token from a controlled vocabulary that autocomplete completes for you, so
+substring-matching it would make `cat` match `cathedral` with no way left to ask
+for just `cat`. A filename and a description are prose nobody types in full.
+Case is folded on the two text terms and not on the tag — `Japan` is still not
+`japan`, which is what autocomplete is for. The folding is **ASCII-only on both
+sides**, deliberately: the column goes through SQLite's `lower()`, which folds
+nothing else, so folding the needle more thoroughly in Rust would turn an exact
+match into a miss — `FÜJI` would become `füji` while `FÜJI.jpg` stayed
+`fÜji.jpg`, and typing a filename exactly as spelled would find nothing.
+
+`name:` and `desc:` narrow to one of the two text fields. They are checked
+before the bare-word fallthrough, so they shadow any tag literally spelled
+`name:something` — which stays reachable through the namespace form,
+`user::name:something`, the same escape hatch that keeps `rating:general` a tag.
+Neither accepts an empty needle: `instr(x, '')` finds the empty string at
+position 1, so `name:` alone would compile to a term matching every file that
+has a name, which is a filter written to narrow that silently widens.
+
+The filename is the basename, not the path. Matching the whole path would fold
+the gallery root into every row — a library living in `~/Photos-fuji` would
+answer `fuji` with all of it — so `media_meta.filename` holds the basename with
+its extension, populated by the same scan that discovers the file. Folder names
+are therefore not searchable; if they should be, the term to add is `path:` over
+the *gallery-relative* path, which has the same property the basename does.
 
 Two parsing details are worth knowing because they look like bugs otherwise.
 First, a colon is part of a tag value, not a separator: `rating:general` is the
@@ -112,6 +151,24 @@ it is the record of intent rather than the query surface.
 `color:none` is the absence of a label rather than a label spelled "none" — it
 compiles to `IS NULL` and binds no parameter. "Which of these have I not triaged
 yet?" is the question a colour workflow actually asks.
+
+The text terms are the same story twice over. `description` is a mirror of
+`meta.core.description` written by every path that sets it, for the same reason
+`color_label` is one. `filename` duplicates a substring of the primary key,
+which looks redundant until you try to extract a basename in SQL — there is no
+portable way, and the `rtrim`/`replace` trick mishandles Windows separators, so
+the column is filled by the directory scan that already holds the name. Neither
+column is indexed: an unanchored `%needle%` cannot use a B-tree, so an index
+would cost writes to be ignored. They are scan columns, and a bare word is
+consequently one pass over `media_meta` where it used to be an index seek —
+tens of milliseconds on a large gallery, paid when the user presses Enter rather
+than per keystroke. If that ever becomes the bottleneck, the answer is an FTS5
+trigram index, not a B-tree.
+
+Both terms compile with an `IS NOT NULL` guard, and that guard is load-bearing.
+`instr(lower(NULL), 'x')` is NULL, `false OR NULL` is NULL, and `NOT NULL` is
+NULL — which SQLite does not select. Without the guard, `NOT fuji` would throw
+away every file that has no description at all.
 
 `apply_filter` returns bare paths and takes no `DISTINCT`: `media_meta.path` is
 the primary key and tag terms are correlated `EXISTS` subqueries rather than
@@ -173,6 +230,11 @@ The backend one was deleted rather than kept as a second answer to the same
 question.
 
 ## Autocomplete
+
+Descriptions and filenames are absent from all of this, by construction rather
+than by a filter: the vocabulary is built from `tag_counts`, and neither of them
+is a tag. A description is a paragraph, so tokenising it into the tag vocabulary
+would put every word in the gallery into the suggestion list.
 
 `AutocompleteEngine` holds every unique tag in memory — about 300 KB at 5,000
 tags, so there is no cache-eviction story to tell. It is refreshed from

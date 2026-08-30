@@ -51,6 +51,10 @@ pub struct MediaMeta {
     pub last_rated: Option<i64>,
     pub gps_lat: Option<f64>,
     pub gps_lon: Option<f64>,
+    /// The companion's description, as mirrored into the index. Rides along
+    /// here rather than in its own command because the info panel asks for this
+    /// row the moment it opens — a separate round-trip would buy nothing.
+    pub description: Option<String>,
 }
 
 
@@ -693,7 +697,7 @@ pub async fn get_media_meta_impl(
     let mut stmt = db
         .conn()
         .prepare_cached(
-            "SELECT path, media_type, file_size, date_taken, width, height, duration, rating, last_rated, gps_lat, gps_lon FROM media_meta WHERE path = ?1",
+            "SELECT path, media_type, file_size, date_taken, width, height, duration, rating, last_rated, gps_lat, gps_lon, description FROM media_meta WHERE path = ?1",
         )
         .map_err(|e| e.to_string())?;
 
@@ -712,6 +716,7 @@ pub async fn get_media_meta_impl(
             last_rated: row.get(8).map_err(|e| e.to_string())?,
             gps_lat: row.get(9).map_err(|e| e.to_string())?,
             gps_lon: row.get(10).map_err(|e| e.to_string())?,
+            description: row.get(11).map_err(|e| e.to_string())?,
         })),
         None => Ok(None),
     }

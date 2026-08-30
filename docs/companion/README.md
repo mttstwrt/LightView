@@ -66,16 +66,31 @@ one — and doing so kept the wire format unchanged. Note the asymmetry with `me
 duplicated here, while the *name* exists nowhere else and so is written to disk.
 
 `meta.core` holds the fields the app itself owns: `rating`, `date_rated`,
-`color_label`, `notes`, `media` (dimensions, duration, codec), and `location`
-(decimal degrees, WGS-84, optional altitude in metres).
+`color_label`, `notes`, `description`, `media` (dimensions, duration, codec),
+and `location` (decimal degrees, WGS-84, optional altitude in metres).
 
-Two of those — `rating` and `color_label` — are also **mirrored into
-`media_meta`** columns, because filtering and sorting run in SQLite and never
-open a sidecar. The companion stays the source of truth: the mirror is written
-by every path that sets the field, and rebuilt from the companion by the
-indexing pass at gallery open, so deleting the cache loses nothing. Adding a
-third filterable `meta.core` field means adding a column and a mirror in the
-same places — see [`query/`](../query/README.md).
+`notes` and `description` are both free text and are deliberately *not* one
+field. Notes are the owner's private remarks about a file; a description says
+what the file shows, is searchable by `desc:` and by any bare filter word, and
+is the field a generator is expected to write. Keeping them apart is what makes
+"describe everything that has no description" a safe thing to offer — it cannot
+overwrite anything a person wrote for themselves. A description is prose, so it
+never becomes tags: the autocomplete vocabulary is built from `tag_counts`, and
+a description reaches no part of it.
+
+Three of these — `rating`, `color_label`, and `description` — are also
+**mirrored into `media_meta`** columns, because filtering and sorting run in
+SQLite and never open a sidecar. The companion stays the source of truth: the
+mirror is written by every path that sets the field, and rebuilt from the
+companion by the indexing pass at gallery open, so deleting the cache loses
+nothing. Adding a fourth filterable `meta.core` field means adding a column and
+a mirror in the same places — see [`query/`](../query/README.md).
+
+Adding `description` needed no schema-version bump, and that is the general
+rule: an `Option` field that older builds simply do not write is additive in
+both directions — they ignore the key, this one reads it as absent. A bump is
+for renaming or retyping a field, where an old reader would misread what it
+finds.
 
 ## Where the file lives
 

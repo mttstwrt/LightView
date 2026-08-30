@@ -346,6 +346,22 @@ async fn dispatch(app: &AppState, command: &str, args: Value) -> Result<Value, D
             ok(tags::set_color_label_batch_impl(app, a.paths, a.label).await)
         }
 
+        // Description is the same tier again: one field in a companion the
+        // client can already read. It is on the allowlist where `set_notes` is
+        // not, because a description is written *for* an audience — the phone
+        // in the room is a likelier place to type one than the desktop app, and
+        // a generator that writes them reaches the host by this route too.
+        // `null` (or blank) clears it.
+        "set_description" => {
+            #[derive(Deserialize)]
+            struct A {
+                path: String,
+                description: Option<String>,
+            }
+            let a: A = parse(args)?;
+            ok(tags::set_description_impl(app, a.path, a.description).await)
+        }
+
         // --- Gallery-wide tag management -----------------------------------
         // Still the metadata-write tier — these only rewrite the `user` tag
         // list inside companion sidecars, exactly like add/remove_user_tag —

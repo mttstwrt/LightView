@@ -36,6 +36,9 @@ export interface CoreMeta {
   rating?: number;
   color_label?: string;
   notes?: string;
+  /** Prose describing what the media shows — human- or machine-written.
+   *  Searched by `desc:` and by bare filter words; never suggested as a tag. */
+  description?: string;
   media?: MediaInfo;
 }
 
@@ -69,7 +72,8 @@ export type FilterExpr =
   | { type: "rating"; op: "gte" | "lte" | "eq"; value: number }
   | { type: "media_type"; value: MediaType }
   | { type: "has_namespace"; namespace: TagNamespace }
-  | { type: "color_label"; value: string };
+  | { type: "color_label"; value: string }
+  | { type: "text"; field: "filename" | "description"; value: string };
 
 export type TagNamespace = "user" | "auto" | `plugin.${string}` | "any";
 

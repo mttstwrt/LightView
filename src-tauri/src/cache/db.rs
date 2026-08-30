@@ -364,6 +364,30 @@ const MIGRATIONS: &[Migration] = &[
                 WHERE color_label IS NOT NULL;
         ",
     },
+    // The two free-text columns the filter language searches by substring:
+    // `filename` is the media file's basename, `description` is mirrored out of
+    // the companion's `meta.core.description`. Both exist for the same reason
+    // `color_label` does — filtering compiles to SQL over `media_meta` and never
+    // opens a sidecar.
+    //
+    // Neither is indexed, deliberately: an unanchored `%needle%` match cannot
+    // use a B-tree, so an index here would cost writes and disk to be ignored by
+    // every query. They are scan columns. If a large gallery ever makes that
+    // scan felt, the answer is an FTS5 trigram index, not a B-tree.
+    //
+    // `filename` duplicates a substring of `path` on purpose. Matching against
+    // the whole path would fold the gallery root into every row, so a library
+    // living in `~/Photos-fuji` would return every file for `fuji`. It is
+    // backfilled by `populate_media_meta` on the next open rather than here,
+    // because SQLite has no portable basename (the `rtrim`/`replace` trick
+    // mishandles Windows separators) and that walk already holds the name.
+    Migration {
+        version: 18,
+        sql: "
+            ALTER TABLE media_meta ADD COLUMN filename TEXT;
+            ALTER TABLE media_meta ADD COLUMN description TEXT;
+        ",
+    },
 ];
 
 /// Read the current schema version from `gallery_meta`.

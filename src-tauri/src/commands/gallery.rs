@@ -61,10 +61,25 @@ fn populate_media_meta(
             .unwrap_or_default()
             .as_secs() as i64;
 
+        // Upsert rather than INSERT OR IGNORE, but only over `filename`, and
+        // only when it is missing. Every other column here is either set once at
+        // discovery (date_added) or owned by a later pass (dimensions, rating),
+        // so re-stamping them on each open would throw that work away.
+        //
+        // The conflict branch exists purely to backfill rows that predate the
+        // column: the v18 migration adds it empty, because SQLite has no
+        // portable basename to compute one with (the `rtrim`/`replace` trick
+        // mishandles Windows separators) and this walk already holds the name.
+        // The `IS NULL` guard is what keeps that a one-time cost instead of a
+        // row-per-file write on every open — a path's basename cannot change
+        // without the path itself changing, and a gallery move rebases paths
+        // while keeping every basename intact.
         let mut stmt = tx
             .prepare_cached(
-                "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, width, height, duration, date_added)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)",
+                "INSERT INTO media_meta (path, date_taken, file_size, media_type, width, height, duration, date_added, filename)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET filename = excluded.filename
+                     WHERE media_meta.filename IS NULL",
             )
             .map_err(|e| e.to_string())?;
 
@@ -83,6 +98,7 @@ fn populate_media_meta(
                 entry.size as i64,
                 media_type,
                 now,
+                entry.name,
             ])
             .map_err(|e| e.to_string())?;
         }
@@ -392,7 +408,7 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
             }
         };
         let mut rating_stmt = match tx.prepare_cached(
-            "UPDATE media_meta SET rating = ?2, last_rated = ?3, color_label = ?4 WHERE path = ?1",
+            "UPDATE media_meta SET rating = ?2, last_rated = ?3, color_label = ?4, description = ?5 WHERE path = ?1",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -451,11 +467,13 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
                         let _ =
                             ins_stmt.execute(rusqlite::params![media_path_str, namespace, tag]);
                     }
-                    // Mirror the companion's rating and colour label into
-                    // media_meta. The row is keyed by absolute path, so after a
-                    // gallery move/copy it starts NULL even though the companion
-                    // holds both — and neither is filterable or sortable until
-                    // it is a column here.
+                    // Mirror the companion's rating, colour label, and
+                    // description into media_meta. The row is keyed by absolute
+                    // path, so after a gallery move/copy they start NULL even
+                    // though the companion holds them — and none of them is
+                    // filterable or sortable until it is a column here. This is
+                    // also the path that picks up a companion edited by hand,
+                    // or by another LightView over a shared drive.
                     let core = companion.meta.core.as_ref();
                     let rating = core.and_then(|c| c.rating);
                     let last_rated = core
@@ -468,11 +486,19 @@ fn index_companions(db: &CacheDb, gallery_path: &str) {
                         .and_then(|c| c.color_label.as_deref())
                         .map(|l| l.trim().to_lowercase())
                         .filter(|l| !l.is_empty());
+                    // Kept in the case it was written in — the query folds
+                    // both sides — but blank collapses to NULL, so "has a
+                    // description" stays a question the column can answer.
+                    let description = core
+                        .and_then(|c| c.description.as_deref())
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty());
                     let _ = rating_stmt.execute(rusqlite::params![
                         media_path_str,
                         rating,
                         last_rated,
-                        color_label
+                        color_label,
+                        description
                     ]);
                     let _ = state_stmt.execute(rusqlite::params![media_path_str, companion_mtime]);
                     indexed += 1;
@@ -658,9 +684,13 @@ pub fn insert_media_meta_row(conn: &rusqlite::Connection, path_str: &str) -> boo
         }
         Err(_) => return false,
     };
+    // `filename` is set here rather than left to the next `populate_media_meta`:
+    // a file dropped into a watched gallery is expected to answer to `name:` in
+    // the same session it appeared.
+    let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or(path_str);
     conn.execute(
-        "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, date_added) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![path_str, mtime, size, media_type, now],
+        "INSERT OR IGNORE INTO media_meta (path, date_taken, file_size, media_type, date_added, filename) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![path_str, mtime, size, media_type, now, filename],
     )
     .is_ok()
 }

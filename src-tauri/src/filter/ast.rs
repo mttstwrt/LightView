@@ -81,6 +81,42 @@ pub enum FilterExpr {
         op: CompareOp,
         value: i64,
     },
+    /// Case-insensitive **substring** match against a free-text `media_meta`
+    /// column — the filename or the description.
+    ///
+    /// Substring, where a [`FilterExpr::Tag`] is exact: a tag is a token drawn
+    /// from a controlled vocabulary that autocomplete can complete, while a
+    /// filename and a description are prose nobody types in full.
+    ///
+    /// `value` arrives **ASCII-lowercased** — folded once at parse time rather
+    /// than once per row, and folded exactly as far as SQLite's `lower()` folds
+    /// the column, since a needle folded more thoroughly than its haystack
+    /// stops matching text typed exactly as it is spelled.
+    Text {
+        field: TextField,
+        value: String,
+    },
+}
+
+/// Which free-text column a [`FilterExpr::Text`] searches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextField {
+    /// The media file's basename, including extension (`media_meta.filename`).
+    Filename,
+    /// The companion's `meta.core.description`, mirrored into
+    /// `media_meta.description`.
+    Description,
+}
+
+impl TextField {
+    /// The `media_meta` column this field maps to.
+    pub fn column(&self) -> &'static str {
+        match self {
+            TextField::Filename => "filename",
+            TextField::Description => "description",
+        }
+    }
 }
 
 /// Which numeric column a [`FilterExpr::Numeric`] targets.

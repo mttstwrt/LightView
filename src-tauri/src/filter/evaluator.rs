@@ -156,6 +156,30 @@ pub fn to_sql(expr: &FilterExpr, params: &mut Vec<String>) -> String {
             format!("({})", clauses.join(" AND "))
         }
 
+        FilterExpr::Text { field, value } => {
+            // Column name comes from a fixed enum, not user input — safe to
+            // interpolate. The needle is a parameter, and arrives lowercased.
+            //
+            // `instr` rather than `LIKE '%' || ? || '%'`: the needle is whatever
+            // the user typed, and `%` and `_` are wildcards inside `LIKE`, so
+            // that form would need escaping to mean what it says. `instr` has no
+            // metacharacters.
+            //
+            // The `IS NOT NULL` guard is load-bearing, not defensive padding.
+            // `instr(lower(NULL), 'x')` is NULL, `false OR NULL` is NULL, and
+            // `NOT NULL` is NULL — so without it, every file lacking a
+            // description would silently drop out of `NOT fuji`, which expands
+            // to a negated disjunction containing this term.
+            let col = field.column();
+            params.push(value.clone());
+            format!(
+                "(m.{} IS NOT NULL AND instr(lower(m.{}), ?{}) > 0)",
+                col,
+                col,
+                params.len()
+            )
+        }
+
         FilterExpr::Numeric { field, op, value } => {
             // Column name comes from a fixed enum, not user input — safe to
             // interpolate. The bound is a parameter. width/height are nullable,
@@ -227,6 +251,111 @@ mod tests {
         let sql = to_sql(&expr, &mut params);
         assert_eq!(sql, "(m.color_label IS NULL AND m.rating >= ?1)");
         assert_eq!(params, vec!["4".to_string()]);
+    }
+
+    /// A bare word compiles to the tag lookup it always did, plus a substring
+    /// match on the filename and the description — which is what makes
+    /// `mount_fuji.jpeg` answer to `fuji` with no tag on it.
+    #[test]
+    fn test_to_sql_bare_word_searches_tags_filename_and_description() {
+        let expr = parse_filter("Fuji").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert_eq!(
+            sql,
+            "(EXISTS (SELECT 1 FROM tag_index ti WHERE ti.path = m.path AND ti.tag = ?1) OR              ((m.filename IS NOT NULL AND instr(lower(m.filename), ?2) > 0) OR              (m.description IS NOT NULL AND instr(lower(m.description), ?3) > 0)))"
+        );
+        // The tag keeps the spelling it was given (tag matching is exact); the
+        // text needles are folded once, here, rather than per row.
+        assert_eq!(
+            params,
+            vec!["Fuji".to_string(), "fuji".to_string(), "fuji".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_to_sql_explicit_text_terms() {
+        let expr = parse_filter("name:fuji").unwrap();
+        let mut params = Vec::new();
+        assert_eq!(
+            to_sql(&expr, &mut params),
+            "(m.filename IS NOT NULL AND instr(lower(m.filename), ?1) > 0)"
+        );
+        assert_eq!(params, vec!["fuji".to_string()]);
+
+        let expr = parse_filter("desc:sunset").unwrap();
+        let mut params = Vec::new();
+        assert_eq!(
+            to_sql(&expr, &mut params),
+            "(m.description IS NOT NULL AND instr(lower(m.description), ?1) > 0)"
+        );
+        assert_eq!(params, vec!["sunset".to_string()]);
+    }
+
+    /// The `IS NOT NULL` guard is what keeps a negated bare word from throwing
+    /// away every file that has no description. Without it the term is NULL,
+    /// the disjunction is NULL, and `NOT NULL` is NULL — which SQLite does not
+    /// select. Assert it is present on both text terms under a `NOT`.
+    #[test]
+    fn test_to_sql_negated_bare_word_guards_null() {
+        let expr = parse_filter("NOT fuji").unwrap();
+        let mut params = Vec::new();
+        let sql = to_sql(&expr, &mut params);
+        assert!(sql.starts_with("NOT ("));
+        assert_eq!(sql.matches("IS NOT NULL AND instr").count(), 2);
+    }
+
+    /// The compiled SQL, run against a real database rather than asserted as a
+    /// string: the v18 columns exist, `instr(lower(…))` folds case, and — the
+    /// one that would be silent — a negated bare word still returns the files
+    /// that have no description at all.
+    #[test]
+    fn text_terms_run_against_the_real_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::cache::db::CacheDb::open(tmp.path()).unwrap();
+        for (path, filename, description) in [
+            ("/g/mount_fuji.jpeg", "mount_fuji.jpeg", None),
+            ("/g/IMG_2001.jpg", "IMG_2001.jpg", Some("A volcano at dawn.")),
+            ("/g/cat.png", "cat.png", None),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO media_meta (path, file_size, media_type, filename, description)
+                     VALUES (?1, 0, 'image', ?2, ?3)",
+                    rusqlite::params![path, filename, description],
+                )
+                .unwrap();
+        }
+
+        let matching = |query: &str| -> Vec<String> {
+            let expr = parse_filter(query).unwrap();
+            let mut params = Vec::new();
+            let where_clause = to_sql(&expr, &mut params);
+            let sql = format!(
+                "SELECT m.path FROM media_meta m WHERE {} ORDER BY m.path",
+                where_clause
+            );
+            let refs: Vec<&dyn rusqlite::types::ToSql> = params
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let mut stmt = db.conn().prepare(&sql).unwrap();
+            let rows = stmt
+                .query_map(refs.as_slice(), |r| r.get::<_, String>(0))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // No tag anywhere in this database: these all match on text alone.
+        assert_eq!(matching("FUJI"), vec!["/g/mount_fuji.jpeg"]);
+        assert_eq!(matching("volcano"), vec!["/g/IMG_2001.jpg"]);
+        assert_eq!(matching("desc:VOLCANO"), vec!["/g/IMG_2001.jpg"]);
+        assert_eq!(matching("name:img"), vec!["/g/IMG_2001.jpg"]);
+        // Both files without a description survive the negation.
+        assert_eq!(
+            matching("NOT volcano"),
+            vec!["/g/cat.png", "/g/mount_fuji.jpeg"]
+        );
     }
 
     #[test]

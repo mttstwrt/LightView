@@ -147,8 +147,6 @@ impl CacheDb {
         Ok(result)
     }
 
-    /// Update only the rating for a file in the cache.
-    /// Also sets `last_rated` to the current timestamp.
     /// Mirror a companion's colour label into the index.
     ///
     /// Unlike [`Self::update_rating`] there is no companion timestamp to carry
@@ -164,6 +162,29 @@ impl CacheDb {
         Ok(())
     }
 
+    /// Mirror a companion's description into the index.
+    ///
+    /// Stored with the case it was written in — unlike the colour label, which
+    /// is a value from a small closed set and is folded on the way in. A
+    /// description is prose the user should get back verbatim; the match folds
+    /// instead, `lower()` on this column against a needle the parser already
+    /// folded. Blank is stored as NULL so "has a description" stays a question
+    /// the column can answer.
+    pub fn update_description(
+        &self,
+        path: &str,
+        description: Option<&str>,
+    ) -> Result<(), CacheError> {
+        let normalized = description.map(str::trim).filter(|d| !d.is_empty());
+        self.conn().execute(
+            "UPDATE media_meta SET description = ?1 WHERE path = ?2",
+            rusqlite::params![normalized, path],
+        )?;
+        Ok(())
+    }
+
+    /// Update only the rating for a file in the cache. Also sets `last_rated`
+    /// to the current timestamp.
     pub fn update_rating(&self, path: &str, rating: Option<u8>) -> Result<(), CacheError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -173,40 +194,6 @@ impl CacheDb {
         self.conn().execute(
             "UPDATE media_meta SET rating = ?1, last_rated = ?2 WHERE path = ?3",
             rusqlite::params![rating, now, path],
-        )?;
-        Ok(())
-    }
-
-    /// Insert or update media metadata for a file.
-    /// Preserves `date_added` on update; sets it to now on first insert.
-    pub fn upsert_media_meta(
-        &self,
-        path: &str,
-        date_taken: Option<i64>,
-        file_size: i64,
-        media_type: &str,
-        width: Option<u32>,
-        height: Option<u32>,
-        duration: Option<f64>,
-        rating: Option<u8>,
-    ) -> Result<(), CacheError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        self.conn().execute(
-            "INSERT INTO media_meta (path, date_taken, file_size, media_type, width, height, duration, rating, date_added)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(path) DO UPDATE SET
-               date_taken = excluded.date_taken,
-               file_size = excluded.file_size,
-               media_type = excluded.media_type,
-               width = excluded.width,
-               height = excluded.height,
-               duration = excluded.duration,
-               rating = excluded.rating",
-            rusqlite::params![path, date_taken, file_size, media_type, width, height, duration, rating, now],
         )?;
         Ok(())
     }

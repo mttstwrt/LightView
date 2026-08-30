@@ -162,6 +162,21 @@ pub struct CoreMeta {
     pub date_rated: Option<String>,
     pub color_label: Option<String>,
     pub notes: Option<String>,
+    /// A prose description of what the media shows — written by a person, or
+    /// generated for them. Mirrored into `media_meta.description` so `desc:`
+    /// and bare words can search it.
+    ///
+    /// Separate from `notes` on purpose, and not a merge of the two: notes are
+    /// the owner's private remarks about a file, and a generator that is free
+    /// to overwrite a description must not be free to overwrite those. The
+    /// distinction is what makes "regenerate every description" a safe thing to
+    /// offer.
+    ///
+    /// Descriptions never become tags. They are prose, so tokenising them into
+    /// the tag vocabulary would flood autocomplete with every word in the
+    /// gallery; keeping them in a column instead means the autocomplete engine
+    /// cannot suggest from them by construction rather than by a filter.
+    pub description: Option<String>,
     pub media: Option<MediaInfo>,
     pub location: Option<Location>,
 }
@@ -214,6 +229,37 @@ mod tests {
         assert_eq!(parsed.file, "test.jpg");
         assert_eq!(parsed.media_type, MediaType::Image);
         assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// A companion written before `description` existed still parses — the
+    /// field is `Option`, which serde fills with `None` when the key is absent.
+    /// That is what makes adding it additive rather than a schema-version bump.
+    #[test]
+    fn test_description_is_optional_and_round_trips() {
+        let without = r#"{
+            "schema_version": 1,
+            "file": "test.jpg",
+            "file_hash": "",
+            "media_type": "image",
+            "created": "2024-01-01T00:00:00Z",
+            "modified": "2024-01-01T00:00:00Z",
+            "tags": { "user": [], "auto": [], "plugins": {} },
+            "meta": { "core": { "rating": 4 }, "plugins": {} }
+        }"#;
+        let parsed: CompanionFile = serde_json::from_str(without).unwrap();
+        assert_eq!(parsed.meta.core.as_ref().unwrap().description, None);
+
+        let mut companion = CompanionFile::new("test.jpg", MediaType::Image);
+        companion.meta.core = Some(CoreMeta {
+            description: Some("A snow-capped volcano at dawn.".to_string()),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&companion).unwrap();
+        let back: CompanionFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.meta.core.unwrap().description.as_deref(),
+            Some("A snow-capped volcano at dawn.")
+        );
     }
 
     #[test]

@@ -613,6 +613,48 @@ pub async fn set_color_label_batch(
     set_color_label_batch_impl(&state, paths, label).await
 }
 
+/// Set the description for a media file. `None` (or blank) clears it.
+///
+/// Writes the companion first — it is the record of intent — then mirrors the
+/// text into `media_meta.description`, exactly as [`set_color_label_batch_impl`]
+/// does. Without the mirror, `desc:sunset` could not see the description the
+/// user just typed: the filter compiles to SQL over `media_meta` and never
+/// opens a sidecar.
+///
+/// One path, not a batch: the two writers are the info panel and the merge
+/// dialog, both of which describe one file. Setting the *same* prose on a
+/// selection is not a thing anyone has asked for, and a generator writes
+/// different text per file, so it would not use such a command either.
+pub async fn set_description_impl(
+    state: &AppState,
+    path: String,
+    description: Option<String>,
+) -> Result<(), String> {
+    // Blank is an absent description, not an empty one: a cleared textarea and
+    // a never-filled one are the same state to every reader.
+    let description = description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    modify_companion(&path, |c| {
+        let core = c.meta.core.get_or_insert_with(CoreMeta::default);
+        core.description = description.clone();
+    })?;
+    let db = state.cache_db.lock().await;
+    if let Some(db) = db.as_ref() {
+        let _ = db.update_description(&path, description.as_deref());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_description(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    description: Option<String>,
+) -> Result<(), String> {
+    set_description_impl(&state, path, description).await
+}
+
 /// Set notes for a media file.
 #[tauri::command]
 pub async fn set_notes(

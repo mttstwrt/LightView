@@ -354,7 +354,10 @@ The filter bar accepts a small query language (`filter/ast` → `parser` → `ev
 Examples:
 
 ```
-vacation                               # match the term in any namespace
+vacation                               # a tag in any namespace, or the
+                                       # filename, or the description
+name:fuji                              # filename only (substring)
+desc:volcano                           # description only (substring)
 user::vacation                         # only user tags
 plugin.wd-tagger::1girl                # a specific plugin namespace
 user::vacation AND user::family        # boolean AND

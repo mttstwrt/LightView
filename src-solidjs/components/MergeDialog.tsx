@@ -46,7 +46,7 @@ function formatGps(g: MergeGps): string {
 /**
  * Merge dialog: pick a keeper file, resolve per-field conflicts, then fold the
  * selected data into the keeper and trash the rest. Tags union by default;
- * scalar fields (rating/color/notes/location/mtime) are pick-one.
+ * scalar fields (rating/color/notes/description/location/mtime) are pick-one.
  */
 export function MergeDialog(props: {
   paths: string[];
@@ -65,6 +65,7 @@ export function MergeDialog(props: {
   const [rating, setRating] = createSignal<number | null>(null);
   const [colorLabel, setColorLabel] = createSignal<string | null>(null);
   const [notes, setNotes] = createSignal<string | null>(null);
+  const [description, setDescription] = createSignal<string | null>(null);
   const [location, setLocation] = createSignal<MergeGps | null>(null);
   const [mtime, setMtime] = createSignal<number | null>(null);
 
@@ -112,6 +113,7 @@ export function MergeDialog(props: {
     setRating(firstNonNull((c) => c.rating));
     setColorLabel(firstNonNull((c) => c.color_label));
     setNotes(firstNonNull((c) => c.notes));
+    setDescription(firstNonNull((c) => c.description));
     setLocation(firstNonNull((c) => c.companion_location ?? c.exif_location));
     // Default mtime: the earliest across copies (usually the original).
     const times = cands.map((c) => c.mtime).filter((t): t is number => t != null);
@@ -159,6 +161,7 @@ export function MergeDialog(props: {
       rating: rating(),
       color_label: colorLabel(),
       notes: notes(),
+      description: description(),
       location: location(),
       set_mtime: setMt,
     };
@@ -338,6 +341,38 @@ export function MergeDialog(props: {
                         classList={{
                           "bg-teal-700/40 text-teal-200": notes() === v,
                           "bg-neutral-800 text-neutral-400 hover:bg-neutral-700": notes() !== v,
+                        }}
+                      >
+                        {v}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </FieldRow>
+            </Show>
+
+            {/* Description */}
+            <Show when={candidates().some((c) => c.description != null && c.description !== "")}>
+              <FieldRow label="Description" hint="pick one">
+                <div class="flex flex-col gap-1.5 w-full">
+                  <button
+                    onClick={() => setDescription(null)}
+                    class="px-2 py-1 text-[11px] rounded cursor-pointer transition-colors text-left"
+                    classList={{
+                      "bg-teal-700/40 text-teal-200": description() == null,
+                      "bg-neutral-800 text-neutral-400 hover:bg-neutral-700": description() != null,
+                    }}
+                  >
+                    None
+                  </button>
+                  <For each={uniqueValues(candidates().map((c) => c.description))}>
+                    {(v) => (
+                      <button
+                        onClick={() => setDescription(v)}
+                        class="px-2 py-1 text-[11px] rounded cursor-pointer transition-colors text-left whitespace-pre-wrap"
+                        classList={{
+                          "bg-teal-700/40 text-teal-200": description() === v,
+                          "bg-neutral-800 text-neutral-400 hover:bg-neutral-700": description() !== v,
                         }}
                       >
                         {v}
