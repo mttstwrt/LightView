@@ -491,7 +491,7 @@ is against.
 | 17 | …colour labels are settable, filterable, invisible in the justified grid, and unsortable |
 | 18 | …`rating:x` is a tag and `rating>=x` is a comparison; `::` is a namespace and `:` is not |
 | 19 | …`reindex_gallery` does not regenerate thumbnails |
-| 20 | …the tier route coalesces and the `?fit=` route does not |
+| 20 | …the tier route coalesces and the `?fit=` route does not — removed rather than fixed, by dropping the grid's use of `?fit=` (change 8) |
 | 21 | …`auth_layer` takes the writer lock in front of the read-only pool that exists to avoid it |
 | 22 | …the service worker serves the cached shell only when genuinely offline, unless `?lv_offline=1` |
 | 23 | …two persisted client caches have a 30-day ceiling, and the boot snapshot is never a source of truth |
@@ -705,6 +705,14 @@ obscured. `<gallery>/.lightview/sets.json`, written with the same atomic
 write-and-rename as companions, indexed into the derived cache for query speed
 the same way companions already feed `tag_index`.
 
+**Members are ordered, and that is free.** A member list is a list; keeping its
+order costs nothing and buys the case a burst and a face cluster do not have —
+a comic strip, a scanned zine, a photo essay: works that exist as several images
+in a fixed sequence. Nothing else in LightView can express "these are pages 1
+through 12". Ordering the member list means the grid can present a set as its
+first page, the viewer can walk it in order, and none of that needs a second
+concept.
+
 Two things fall out of it for free:
 
 - **A filter term**, and it needs no new syntax: `set:alice` names one,
@@ -716,6 +724,15 @@ Two things fall out of it for free:
 
 Removes ledger item 4, and the duplicates panel becomes "resolve these candidate
 sets" rather than a separate screen with its own vocabulary.
+
+**No migration code.** Existing `not_duplicates` rows are not translated into
+sets. The tier collapse in Change 2 changes what perceptual hashes are computed
+from, so a translation would have to reason about which old verdicts still
+describe pairs the new hash groups together — a body of logic that runs once and
+is then dead weight forever. Re-answering a handful of duplicate prompts is
+cheaper than owning that code. The same principle applies to the companion
+location in Change 8 and to galleries whose cache predates Change 3: read what
+is there, write the new shape, and let the old one age out.
 
 **One scaling note, not a recommendation:** detection is all-pairs Hamming,
 quadratic in hashed files. At ten thousand images that is fifty million
@@ -785,23 +802,148 @@ Small, but each is an existing feature that lies:
   no label.
 - **Rename the binary** — `productName: "Gallery"` versus a `.desktop` file that
   execs `lightview` (E3).
-- **A coalescer on `?fit=`** (B1), which every remote tagging job now goes
-  through.
 - **`reindex_gallery` regenerates thumbnails** (B2).
 
-Removes ledger items 16, 17, 19, 20, 29, 30.
+B1 — the missing coalescer on `?fit=` — is deliberately not on this list. See
+"the served-original path" in Change 8: dropping the grid's use of that route
+removes the need for the coalescer rather than fixing it.
+
+Removes ledger items 16, 17, 19, 29, 30.
+
+## Change 8 — Dead weight, and what falls out of the changes above
+
+A second pass over the tree, looking specifically for code that is already
+unreachable or about to become so. Most of this is not a decision — it is
+bookkeeping that changes 1 and 2 create and someone has to actually do.
+
+### Already dead, regardless of anything else
+
+**The `/thumbhash` route and the `lightview://thumbhash/` protocol arm serve
+nobody.** The ThumbHash blob is inlined into the sorted-items payload — that is
+the entire reason `get_sorted_items` carries a `LEFT JOIN thumbnails` — and the
+frontend decodes it client-side in `lib/thumbhashPlaceholder.ts`. Nothing in
+`lib/ipc.ts` builds a thumbhash URL; there is no `thumbhashUrl` to build one
+with. The service worker even has a cache branch for `/thumbhash/*`, matching
+requests that are never made. Delete the route, the protocol arm,
+`AppState::thumbhash_png_cache`, `ThumbhashOutcome`, and the service-worker
+branch.
+
+**`storage.companion_location` is a setting that does nothing.** It has a radio
+control in `SettingsMenu`, a field in `AppSettings`, a `CompanionLocation` type
+in `lib/types.ts`, and a line in the persisted `settings.toml`. Every write path
+in the Rust tree reaches disk through `modify_companion` → `write_companion` →
+`write_companion_at(…, CompanionLocation::default())`. The parameterized forms
+exist and are never passed anything but the default, so **changing the setting
+moves no file.** Delete the setting and the control; keep the read fallback,
+which costs nothing and means a gallery holding `Alongside` sidecars from an
+older build keeps resolving them with no migration pass — the same reasoning as
+the dedup verdicts.
+
+**`tags.auto` is a namespace nothing writes.** It is defined in the companion
+schema, unioned by the duplicate merge, and parseable as `auto::` in the filter
+— but no command sets it. Plugins write `tags.plugins.<name>`; the user writes
+`tags.user`. It is a third of the tag model carrying nothing. Worth confirming
+against a real gallery before deleting the read path, since a companion written
+by an older build could still hold entries; deleting the *namespace* from the
+filter and the merge is safe either way.
+
+### Falls out of Change 2, for free
+
+**The GPU pipeline becomes unreachable.** `state.gpu_pipeline` has exactly one
+call site, in `generate_thumbnails_batch_impl`. That is reachable only from
+`get_thumbnails_batch`, which is a Tauri command **absent from the remote
+allowlist**, whose only caller in the frontend is `GalleryGrid.tsx`. Delete the
+square grid and the whole chain is dead code: `pipeline/gpu_pipeline.rs` (450
+lines), the `wgpu` and `pollster` dependencies, the `gpu` cargo feature, and the
+GPU probe in `hardware/`.
+
+That is a stronger argument than the one worth making on its own terms — there
+is no measurement anywhere in this repository showing the GPU path beats
+`fast_image_resize`'s SIMD path, and it accelerates one of four generation
+entry points rather than the serve path, the tier warm, or the idle worker. But
+the reachability argument needs no measurement at all.
+
+**Four generation entry points become two.** `get_thumbnails_batch` and
+`precache_thumbnails` are called only from `GalleryGrid` and from one
+maintenance button in `SettingsMenu`; `JustifiedGrid` uses
+`ensure_tier_thumbnails` exclusively. With one grid and one tier family, what is
+left is `ensure_tier_thumbnails` (batch warm) and `generate_and_store_tier`
+(the serve path's miss), and the maintenance button calls the former.
+
+**Most of `hardware/` stops earning its keep.** `storage_type`, `filesystem` and
+`supports_reflink` are probed at startup, logged once, and displayed in the
+debug panel Change 6 deletes. They drive no decision anywhere. `cpu_cores` sizes
+the thumbnail pool and `total_ram_mb` feeds the memory-pressure signal; the GPU
+probe goes with the pipeline above. What remains is two numbers, which is a
+function rather than a subsystem.
+
+### Falls out of Change 1, for free
+
+**The GIF atlas exists solely to work around a WebKitGTK bug**, and both module
+doc comments say so: WebKitGTK 2.52 animates `<img>` GIFs several times too fast
+and leaks a decoded copy of every frame on each loop. The workaround is a
+backend-rendered PNG sprite sheet played on a canvas — `gif_serve.rs` (187),
+`cache/gif_atlas.rs` (103), `GifCanvas.tsx` (171), a cache table, an HTTP route,
+a tier parameter, and a display setting. Every other browser plays a GIF from an
+`<img>` correctly. Change 1 removes the engine; this goes with it.
+
+Worth stating the risk plainly, because it is the one item here that is not pure
+subtraction: the atlas also happens to give bounded, explicitly-closed memory per
+animated file, which an `<img>` does not. If animated GIFs turn out to be a
+memory problem on a phone, the answer is the same one Change 6 leaves open for
+thumbnails — `createImageBitmap` and an explicit `close()` — and not a
+resurrected sprite-sheet pipeline.
+
+**`RenderConfig` stops existing.** `GDK_BACKEND`, `WEBKIT_DISABLE_DMABUF_RENDERER`
+and the GPU-acceleration override are process-level settings that describe
+WebKitGTK, stored in their own file in the data directory because they cannot
+take effect after GTK init. That is one of the four configuration homes Change 3
+counts, and it empties itself.
+
+### Two that are decisions, not consequences
+
+**Drop the served-original path in the justified grid.** At mid and high zoom a
+native-format still can bypass the tiers entirely for a backend resize of the
+original, `GET /media?fit=<px>`. The frontend documentation calls it "the one
+thing that is genuinely different", and it carries its own machinery: a 256px
+quantization bucket to keep the URL cache-stable, an explicit rule that such
+cells are never warmed ahead of the viewport, and a missing coalescer (B1).
+
+The reason it is never warmed is the reason to drop it: each one is a full
+source decode inside the request, measured in seconds, landing on the same
+bounded pool as the visible cells — so a look-ahead cannot win the race. `jh` at
+2560px is cached, warmed, and bounded. Give up a little sharpness at maximum
+zoom and the grid has exactly one way to get pixels.
+
+B1 then evaporates rather than being fixed. The only remaining `?fit=` caller is
+the plugin download path, where each file is requested once per job, so there
+are no concurrent requests for the same key to coalesce.
+
+**Cut the display knobs.** `AppSettings.display` carries fifteen, six of them
+about autoplay alone — `video_hover_preview`, `video_autoplay_loop`,
+`gif_autoplay_grid`, `video_autoplay_grid`, `video_autoplay_max_seconds`,
+`video_autoplay_viewer` — plus `scroll_blur`, `start_at_bottom`,
+`justified_high_detail`, `mobile_filter_sheet`, and `map_dark_mode`, which dies
+with the map. `performance.thumbnail_threads` duplicates a value `hardware/`
+already detects better.
+
+This is the repository's own first principle applied to itself: *do not add
+configuration options that were not asked for; every knob is a permanent
+maintenance surface and a combinatorial test case.* Two settings — "animate in
+the grid" and "autoplay in the viewer" — cover what the six do, and the detected
+thread count should simply win.
 
 ## What this adds up to
 
 | | Now | After | Removed |
 |---|---|---|---|
-| Rust | 26,900 | ~20,000 | Tauri host, geo commands, `views.rs`, 4 tier tables, settings commands, one executor |
-| TypeScript | 19,800 | ~13,500 | square grid, map, view switcher, diagnostics, dual-runtime branching, most of settings |
+| Rust | 26,900 | ~18,500 | Tauri host, GPU pipeline, GIF atlas, geo commands, `views.rs`, 4 tier tables, settings commands, one executor |
+| TypeScript | 19,800 | ~13,000 | square grid, map, view switcher, `GifCanvas`, diagnostics, dual-runtime branching, most of settings |
 | Binaries | 3 | 2 | `lightview` and `lightview-headless` become one |
 | Views | 5 declared / 3 built | 1 | |
 | Thumbnail tiers | 7 in 2 families | 3 in 1 | |
 | Command surfaces | 80 + 48, implicitly related | 1 table, 2 trust levels | |
-| Config homes | 4 | 2 (gallery file, server file) | |
+| Config homes | 4 | 2 (gallery file, server file) | `RenderConfig` empties itself with WebKitGTK |
 | Ledger entries | ~35 | ~15 | |
 
 The fifteen that survive are the ones that are *inherent* rather than
@@ -828,6 +970,13 @@ never happens.
 6. **Sets** (Change 4).
 7. **Plugins** (Change 5), then the remaining frontend and honesty items
    (Changes 6 and 7).
+
+Change 8 is not a step. Most of it is bookkeeping that steps 2 and 4 create —
+delete the square grid and the GPU pipeline is unreachable; drop WebKitGTK and
+the GIF atlas has no reason to exist — so it is done as part of those steps
+rather than after them. The three items that are dead today (the `/thumbhash`
+route, the `companion_location` setting, the `auto` namespace) can go at any
+point, including first.
 
 ## Where this proposal is weakest
 
