@@ -75,6 +75,11 @@ answer to "why not the obvious thing?" is longer than a sentence.
 
 ## Open work
 
+[`refactor.md`](refactor.md) is a standing proposal rather than a description:
+a complete inventory of the system as it is, and the argument for a
+substantially smaller one. Nothing in it has been built, and it is the only page
+here that describes a system that does not exist.
+
 [`todo.md`](todo.md) is the running list of known gaps — things that are
 understood but not done. It is deliberately short; anything with enough shape
 to be designed belongs in a subsystem page instead. Items are grouped by the
