@@ -588,6 +588,17 @@ command registry, the `*_impl` wrapper convention, `initMediaServer`, every
 `isTauri()` branch, `safeListen`, the dual-default `capabilitiesStore`, the
 Tauri-events-vs-SSE duality, and the `@tauri-apps/*` dependencies.
 
+**The grid's scroll tuning is deliberately left alone.** `frontend/README.md`
+says outright that WebKitGTK's main-thread image decode is the premise behind
+the decode gate, the staged tier upgrade and most `isTauri()` branches, and that
+no harness here can measure that platform. Dropping the engine therefore removes
+the *justification* for machinery that has never been measured — but the
+scroller works, it is the part a user feels most directly, and a re-measurement
+pass would be speculative work on a component that is not currently a problem.
+Decided: ship the move, and revisit only if scrolling is worse afterwards. The
+`isTauri()` branches themselves still go, since there is no Tauri to branch on;
+what stays is the tuning they were guarding.
+
 ## Change 2 — One view, three tiers
 
 Delete `GalleryGrid` (1025), `MapView` (273), `ViewSwitcher` (113),
@@ -620,6 +631,75 @@ and the dHash downsamples to 9×8 regardless.
 
 `prewarm_tiers` collapses to "warm `j`". Removes ledger items 5, 8, and the
 enablement half of 12.
+
+### One pipeline, and what that actually means
+
+The tier collapse is worth more than four fewer tables, and the reason is not
+visible from the tier list. There are two *generator families* in
+`pipeline/thumbnailer.rs` today, and they are not symmetric:
+
+- The **square** family is four parallel implementations. `generate_for_path`
+  dispatches to `generate_image_thumbnail` — itself a three-way split into
+  `generate_jpeg_thumbnail`, `generate_heic_thumbnail` and
+  `generate_generic_thumbnail` — or to `generate_video_thumbnail`. Each does its
+  own decode, crop, resize and encode.
+- The **fit** family is one function. `generate_for_path_fit` calls
+  `decode_image`, which pushes the source-type dispatch *below* the pipeline, and
+  everything after that — `fit_dims`, `resize_rgba`, encode — is single-copy.
+  `fit_rgba` is its tail, factored out for callers that already hold pixels.
+
+So deleting the square tiers deletes **four parallel implementations of the same
+operation**, and what is left is:
+
+```
+decode_image(path, edge)  →  fit_dims + resize_rgba  →  encode WebP
+  dispatch on format           one implementation        one encoder
+```
+
+**The `?fit=` route was never a second pipeline.** Change 8 below treats it as
+one and is wrong to: `http_server/routes.rs`, `plugin/input.rs` and both tier
+paths in `commands/media.rs` all call `generate_for_path_fit` already, at
+`ThumbFormat::Webp`, differing only in the edge they ask for and whether the
+result is stored. The right move is therefore not to drop the route but to put
+the cache-and-coalesce wrapper around the one function, so **a tier is just a
+cached edge** and the route inherits coalescing rather than needing a second one.
+B1 is then solved by construction instead of dropped.
+
+**One encoder, and B5 stops existing.** All three surviving tiers and the
+`?fit=` route are WebP today. With no square family there is no JPEG output, so
+`rgba_to_rgb`, `encode_rgb_to_jpeg` and `encode_rgba_to_jpeg` go — and B5, which
+is that two of four `(format, source layout)` combinations convert a whole
+buffer before resizing rather than after, has no combinations left to be
+inconsistent about. A todo removed by deletion rather than by measurement.
+
+**The derivation helpers go.** `store_derived_extras`, `derive_standard_extras`,
+`derive_micro_from_standard` and `derive_micro_for_cached` all exist to keep
+Micro and ThumbHash in step with Standard, under a transaction invariant that
+"a Standard row implies a ThumbHash blob and a Micro row". With Micro gone and
+the ThumbHash computed during `j` generation, that is a side output of one
+function rather than four helpers and an invariant to uphold.
+
+**What stays branched, and why none of it is a second failure mode.** Four
+decoders inside `decode_image` — JPEG with scale-on-decode, HEIC via `libheif`,
+video via `ffmpeg`, everything else via the `image` crate. Different container
+formats genuinely need different decoders; this is dispatch that converges on
+RGBA immediately, not duplication. `fit_rgba` is the shared tail for the one
+caller holding its own pixels — a video frame at a chosen timestamp, which no
+path-based entry can express. The HEIC transcode cache is an optimization in
+front of one decoder, worth keeping at ~500 ms a decode, and it is a cache
+rather than a path.
+
+**The invariant to state once and defend:** every cached thumbnail is
+`generate_for_path_fit(path, edge)` at one of three edges. Anything that makes
+that untrue — a tier derived from a larger tier instead of decoded, a second
+encoder, a GPU fast path — is a new failure mode and has to be argued for rather
+than slipped in as an optimization.
+
+The obvious candidate is worth refusing in advance: deriving `jm` from a cached
+`jh`. The Micro-from-Standard fast path it would imitate was worth its branch
+because it saved a 16× decode on the rung the grid hammers hardest. `jm` from
+`jh` saves 4×, on a tier that is LRU-bounded and rarely cold, in exchange for a
+second way for a thumbnail to be wrong. Decode from source, always.
 
 ## Change 3 — Split storage by lifetime, not by format
 
@@ -903,24 +983,25 @@ counts, and it empties itself.
 ### Two that are decisions, not consequences
 
 **Drop the served-original path in the justified grid.** At mid and high zoom a
-native-format still can bypass the tiers entirely for a backend resize of the
+native-format still can bypass the tier *cache* for a backend resize of the
 original, `GET /media?fit=<px>`. The frontend documentation calls it "the one
 thing that is genuinely different", and it carries its own machinery: a 256px
-quantization bucket to keep the URL cache-stable, an explicit rule that such
-cells are never warmed ahead of the viewport, and a missing coalescer (B1).
+quantization bucket to keep the URL cache-stable, and an explicit rule that such
+cells are never warmed ahead of the viewport.
 
 The reason it is never warmed is the reason to drop it: each one is a full
 source decode inside the request, measured in seconds, landing on the same
 bounded pool as the visible cells — so a look-ahead cannot win the race. `jh` at
 2560px is cached, warmed, and bounded. Give up a little sharpness at maximum
-zoom and the grid has exactly one way to get pixels.
+zoom and the grid has one way to get pixels rather than two.
 
-B1 then shrinks to the point of not being worth writing. The only remaining
-`?fit=` caller is the plugin download path, which requests each file once per
-job — so the concurrent-same-key case needs two workers running different
-plugins over the same gallery at the same time. That is a real configuration,
-just a rare one, and one redundant decode when it happens is cheaper than a
-second coalescer to maintain.
+Note what this is *not*, since an earlier draft of this section had it wrong:
+`?fit=` is not a second pipeline. It calls the same `generate_for_path_fit` the
+tiers do (see "One pipeline" under Change 2), so what is being dropped is a
+second *caching policy* in the grid, not a second implementation. The route
+itself stays, for the plugin download path, and gains coalescing by going
+through the same wrapper the tiers use — which is why B1 is not on Change 7's
+list.
 
 **Cut the display knobs.** `AppSettings.display` carries fifteen, six of them
 about autoplay alone — `video_hover_preview`, `video_autoplay_loop`,
