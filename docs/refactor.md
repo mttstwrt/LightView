@@ -491,7 +491,7 @@ is against.
 | 17 | …colour labels are settable, filterable, invisible in the justified grid, and unsortable |
 | 18 | …`rating:x` is a tag and `rating>=x` is a comparison; `::` is a namespace and `:` is not |
 | 19 | …`reindex_gallery` does not regenerate thumbnails |
-| 20 | …the tier route coalesces and the `?fit=` route does not — removed rather than fixed, by dropping the grid's use of `?fit=` (change 8) |
+| 20 | …the tier route coalesces and the `?fit=` route does not — removed rather than fixed, by dropping the grid's use of `?fit=` (change 9) |
 | 21 | …`auth_layer` takes the writer lock in front of the read-only pool that exists to avoid it |
 | 22 | …the service worker serves the cached shell only when genuinely offline, unless `?lv_offline=1` |
 | 23 | …two persisted client caches have a 30-day ceiling, and the boot snapshot is never a source of truth |
@@ -656,7 +656,7 @@ decode_image(path, edge)  →  fit_dims + resize_rgba  →  encode WebP
   dispatch on format           one implementation        one encoder
 ```
 
-**The `?fit=` route was never a second pipeline.** Change 8 below treats it as
+**The `?fit=` route was never a second pipeline.** Change 9 below treats it as
 one and is wrong to: `http_server/routes.rs`, `plugin/input.rs` and both tier
 paths in `commands/media.rs` all call `generate_for_path_fit` already, at
 `ThumbFormat::Webp`, differing only in the edge they ask for and whether the
@@ -811,7 +811,7 @@ from, so a translation would have to reason about which old verdicts still
 describe pairs the new hash groups together — a body of logic that runs once and
 is then dead weight forever. Re-answering a handful of duplicate prompts is
 cheaper than owning that code. The same principle applies to the companion
-location in Change 8 and to galleries whose cache predates Change 3: read what
+location in Change 9 and to galleries whose cache predates Change 3: read what
 is there, write the new shape, and let the old one age out.
 
 **One scaling note, not a recommendation:** detection is all-pairs Hamming,
@@ -827,8 +827,9 @@ contained and wants a measurement first.
 reason for a local run to bypass the queue. Every plugin run goes through the
 job queue: one code path, one progress display, one cancel. `cancel_plugin_batch`,
 the Tauri plugin toast, and the duplicate progress store all go. The remote
-worker stays as the second executor, unchanged — it earns its complexity, and
-the file-window machinery is measured and correct.
+executor stays as the second one — its file-window machinery is measured and
+correct — but Change 8 folds it into the same binary and, with it, into the same
+job loop, so "three executors become one" is literal rather than approximate.
 
 **Delete the stubs.** `ExecutionConfig::Wasm`, advisory `capabilities`, and
 `ui.context_menu_items` promise things that do not exist. A stub that errors is
@@ -844,6 +845,33 @@ the name becomes an ordinary `tags.user` entry on every member. What
 `findings-and-ui.md` deferred as "genuinely new state — a `plugin_groups` table,
 a merge and rename surface, and an answer to what happens when a re-run reshapes
 a cluster" is machinery Change 4 has to build anyway.
+
+**Plugin input is quantized up to a cached tier edge.** A plugin declares the
+longest edge it wants; the host serves the smallest tier that is at least that
+big — up to 512 gets `j`, up to 1280 gets `jm`, up to 2560 gets `jh`, and
+anything larger decodes from source. Round **up**, never down: a model handed a
+smaller image than it trained on has lost information it cannot recover, while
+one handed a larger image downsizes internally, which is what it does with any
+input anyway. The bundled taggers declare 1024 and so get `jm`; a 448-pixel
+model gets `j`.
+
+The payoff is the whole reason to do it. Today every tagging job pays one full
+source decode per image, on both the local and the remote path — that is what
+`input.max_edge` bought, and it only avoided decoding a 60-megapixel original at
+full size rather than avoiding the decode. Quantized to tier edges, **a job over
+a warmed gallery does no decoding at all**: the idle worker has already produced
+`j`, and `jm` and `jh` are one request each through the cached, coalesced tier
+route. On the N100 that this feature exists for, that is the difference between
+a job that costs hours of host CPU and one that costs none.
+
+It also collapses a route. The plugin host stops asking for `/media?fit=<edge>`
+and starts asking for `/thumb/<tier>/<path>` — the same URL a browser asks for,
+through the same cache and the same coalescer. `?fit=` survives only for edges
+above the top tier, which no plugin has asked for.
+
+Videos are the exception, and an irreducible one: a frame at a chosen timestamp
+is not a tier and never will be, so `?frame=i&frames=n` still decodes. Clips are
+a small fraction of a library and sample five frames each.
 
 **Defer findings.** The `choice`/`confirm`/`label` shapes, `pending::`, and the
 two extra tables are a good design for a plugin that does not exist yet. `sets`
@@ -885,12 +913,84 @@ Small, but each is an existing feature that lies:
 - **`reindex_gallery` regenerates thumbnails** (B2).
 
 B1 — the missing coalescer on `?fit=` — is deliberately not on this list. See
-"the served-original path" in Change 8: dropping the grid's use of that route
+"the served-original path" in Change 9: dropping the grid's use of that route
 removes the need for the coalescer rather than fixing it.
 
 Removes ledger items 16, 17, 19, 29, 30.
 
-## Change 8 — Dead weight, and what falls out of the changes above
+## Change 8 — One binary, three roles
+
+`lightview-worker` exists for one reason: the server is an N100 that cannot run
+ML models, so a desktop with a GPU runs them against the server's gallery. That
+requirement is real. A second binary is not the only way to meet it.
+
+**The rule, stated once:** an instance offers whatever plugins are installed on
+it to whatever gallery it is attached to — its own, or a remote one. Three modes
+fall out, and any machine can be any combination:
+
+| Invocation | Role |
+|---|---|
+| `lightview <dir>` | serve `<dir>` on loopback and open a browser at it |
+| `lightview --serve <dir>` | serve `<dir>` on `0.0.0.0` with TLS and pairing |
+| `lightview --remote <url>` | attach to a remote instance and offer this machine's plugins to it |
+
+The third is today's `lightview-worker run`, and the pairing it needs is the
+*same* device pairing a browser needs: the worker already redeems a PIN at
+`/pair/redeem` and stores the resulting cookie. Under the two trust levels from
+Change 1 a plugin host is an ordinary `Device` — it writes tags and claims jobs,
+and it cannot touch the filesystem. No new trust level, no new enrollment flow.
+
+**`--remote` must not open a browser**, and this is worth stating because the
+natural reading of "launch the app as a client" is that it should. Attaching a
+GPU machine to a NAS is a long-running background job — a systemd unit on a
+headless desktop, grinding for hours. Coupling it to a foreground process with a
+browser window would take that away for nothing, because the viewer role needs
+no binary at all: browsing a remote gallery is a browser pointed at its URL, and
+the server already serves the SPA. Keep the mode single-purpose.
+
+### What is actually deleted, and what only moves
+
+The honest accounting, because the headline number and the line count disagree.
+
+**Deleted.** `bin/lightview-worker/main.rs` (539) — its subcommands become modes
+on the one binary, and `install` / `plugins` are already thin wrappers over the
+`plugin::install` code the desktop commands share. `bin/lightview-worker/config.rs`
+(65) — `worker.toml` folds into the single server config file Change 3
+introduces. The `worker` cargo feature and its `required-features` bin
+declaration. The separate release artifact, and with it the premise of
+[decision 0014](decisions/0014-ship-the-worker-with-the-release.md): "ship the
+worker with the release" exists because a separately-built worker can be months
+stale against its server, and one binary cannot be stale against itself.
+
+**Moved, not deleted.** `http.rs` (424) and `job.rs` (650) are the claim loop,
+the bounded download window, `PartTracker` and the staleness rules. That is the
+actual work and it relocates into the crate rather than evaporating — but it
+lands next to `tagging/local.rs` (380), and the two are already most of the way
+to being one thing: both drive `plan_parts`, `InputPolicy`, `PartTracker` and
+`MergedItem` from `plugin::input`, and differ only in **how bytes are obtained**
+(an HTTP fetch versus a local read) and **where tags go** (`apply_plugin_tags`
+over HTTP versus `apply_plugin_tags_impl` directly). One job loop parameterized
+on a byte source and a result sink replaces both, which is the same shape
+`plugin::input` already uses for preparing input.
+
+So roughly 2,050 lines of executor code become roughly 1,000, and three binaries
+become one. The line saving is modest; the concept saving is the point.
+
+**The cost, stated plainly.** `reqwest` becomes an unconditional dependency
+rather than a feature-gated one, so every build carries an HTTP client it may
+not use. Against a binary that already links `axum`, `rustls` and `hyper`, the
+marginal cost is small — but it is a real cost and it is the price of the
+feature going away.
+
+**One thing gets slightly worse, and it is worth naming.** `PluginInfo.api_version`
+and the reported worker binary version exist to answer "what is that machine
+actually running?", which is how a rebuilt worker next to a year-old plugin copy
+survived as a configuration. One binary removes half that question — there is no
+separate worker version to skew — but a **stale plugin install** is still
+possible on any machine, so the `api_version` in the announce keeps earning its
+place. Keep it; drop only the binary-version field.
+
+## Change 9 — Dead weight, and what falls out of the changes above
 
 A second pass over the tree, looking specifically for code that is already
 unreachable or about to become so. Most of this is not a decision — it is
@@ -1023,7 +1123,7 @@ thread count should simply win.
 |---|---|---|---|
 | Rust | 26,900 | ~18,500 | Tauri host, GPU pipeline, GIF atlas, geo commands, `views.rs`, 4 tier tables, settings commands, one executor |
 | TypeScript | 19,800 | ~13,000 | square grid, map, view switcher, `GifCanvas`, diagnostics, dual-runtime branching, most of settings |
-| Binaries | 3 | 2 | `lightview` and `lightview-headless` become one |
+| Binaries | 3 | **1** | `lightview` + `lightview-headless` merge; the worker becomes `--remote` |
 | Views | 5 declared / 3 built | 1 | |
 | Thumbnail tiers | 7 in 2 families | 3 in 1 | |
 | Command surfaces | 80 + 48, implicitly related | 1 table, 2 trust levels | |
@@ -1052,10 +1152,12 @@ never happens.
 5. **Split storage** (Change 3). Deletes `rebase_root`, E2, and the settings
    sprawl.
 6. **Sets** (Change 4).
-7. **Plugins** (Change 5), then the remaining frontend and honesty items
-   (Changes 6 and 7).
+7. **Plugins** (Change 5) and **the binary merge** (Change 8) together — the
+   second folds the worker's job loop into the first's single executor, and
+   splitting them would mean writing that loop twice.
+8. The remaining frontend and honesty items (Changes 6 and 7).
 
-Change 8 is not a step. Most of it is bookkeeping that steps 2 and 4 create —
+Change 9 is not a step. Most of it is bookkeeping that steps 2 and 4 create —
 delete the square grid and the GPU pipeline is unreachable; drop WebKitGTK and
 the GIF atlas has no reason to exist — so it is done as part of those steps
 rather than after them. The three items that are dead today (the `/thumbhash`
