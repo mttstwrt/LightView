@@ -915,9 +915,12 @@ bounded pool as the visible cells — so a look-ahead cannot win the race. `jh` 
 2560px is cached, warmed, and bounded. Give up a little sharpness at maximum
 zoom and the grid has exactly one way to get pixels.
 
-B1 then evaporates rather than being fixed. The only remaining `?fit=` caller is
-the plugin download path, where each file is requested once per job, so there
-are no concurrent requests for the same key to coalesce.
+B1 then shrinks to the point of not being worth writing. The only remaining
+`?fit=` caller is the plugin download path, which requests each file once per
+job — so the concurrent-same-key case needs two workers running different
+plugins over the same gallery at the same time. That is a real configuration,
+just a rare one, and one redundant decode when it happens is cheaper than a
+second coalescer to maintain.
 
 **Cut the display knobs.** `AppSettings.display` carries fifteen, six of them
 about autoplay alone — `video_hover_preview`, `video_autoplay_loop`,
