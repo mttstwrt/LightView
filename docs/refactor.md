@@ -543,19 +543,45 @@ filesystem access by design, so a served directory chooser replaces it in about
 was already a second path to code the HTTP route shares.
 
 **Trust becomes a property of the bind, not of the build.** One command table,
-each entry carrying the minimum trust it requires:
+each entry carrying the minimum trust it requires — and there are two levels,
+not three:
 
 | Level | Reachable from | Covers |
 |---|---|---|
-| `Public` | anyone | `/healthz`, `/cert`, `/pair/redeem`, `/auth/*` |
 | `Device` | any paired client | browse, metadata writes, trash, upload, enqueue tagging |
-| `Owner` | loopback bind only | filesystem copy/move/clipboard/open-with, gallery open, plugin install |
+| `Owner` | loopback bind only | copy, move, clipboard, open-with, gallery open, plugin install |
+
+The bootstrap routes — `/healthz`, `/cert`, `/pair/redeem`, `/auth/*` — are
+unauthenticated by necessity, since there would otherwise be no way past the auth
+layer the first time. That is a route group, not a trust level: no *command* is
+ever reachable unauthenticated, so giving it a name in the same table would
+imply a third tier of command that does not exist.
 
 That table *is* the answer to "local mode has filesystem controls, serve mode has
 only move to trash." It is one list you can read top to bottom, rather than 80
 commands in one place, 48 in another, and the difference held in your head. The
 rule that keeps it honest is a single one: **`Owner` is granted by a loopback
 bind and by nothing else — there is no flag that widens it.**
+
+**Local mode is selection-scoped, and that keeps path confinement universal.**
+`Owner` covers the operations that already exist — copy, move, clipboard,
+open-with, applied to a selection — and not filesystem navigation. The
+distinction matters more than it sounds: `path_in_gallery` stays on **every**
+route with no exception, because every path a command *reads* is still a
+gallery member. What `Owner` widens is the *destination* of a copy or move,
+which was never confined and never can be. Sources confined always, destinations
+confined never, and one trust level deciding who may name a destination at all.
+
+A file-manager-shaped local mode would have broken that. It would need paths
+outside the root to be readable, which means `path_in_gallery` gains a bypass —
+and a bypass on the one check standing between the server and the host
+filesystem is the last place to want a conditional. Ruling it out is what lets
+the confinement rule stay a rule.
+
+One consequence for the folder picker: the only two places that name a directory
+are opening a gallery and choosing a copy/move destination. Both are "pick a
+directory", both are `Owner`, so they are one served component rather than the
+two the native dialog was doing.
 
 Removes ledger items 1, 2, 3, 9, 10, 13. Deletes `main.rs` (429), the Tauri
 command registry, the `*_impl` wrapper convention, `initMediaServer`, every
@@ -655,16 +681,23 @@ quadratic in a group, invisible in the UI, keyed on absolute paths, and cannot
 express "these three belong together."
 
 Replace `not_duplicates` with one positive concept. A **set** is a small durable
-record — an id, a kind, a name, and a member list keyed by gallery-relative path
-plus the companion's existing `file_hash` so a rename is recoverable:
+record: an id, a name, an optional `source` naming whatever proposed it, and a
+member list keyed by gallery-relative path plus the companion's existing
+`file_hash` so a rename is recoverable.
 
-| Kind | Means | Produced by |
-|---|---|---|
-| `variants` | the same picture, differently encoded | the duplicate finder, confirmed |
-| `related` | belong together and are **not** duplicates | the user, from a rejected candidate group |
-| `cluster` | a plugin grouped these | a plugin, named by the user |
+**There is only one kind of set**, and the first draft of this proposal was wrong
+to give it three (`variants`, `related`, `cluster`). Check what each would
+actually have done. A confirmed *variants* group does not persist — the merge
+trashes the extras, so one file survives and there is no set left to store; an
+unconfirmed one is a candidate, recomputed from perceptual hashes on demand
+exactly as it is today. That leaves "these belong together and are not duplicates
+of each other," which is the same record whether a person made it from a rejected
+candidate group, a plugin proposed it, or a burst was grouped by time. The
+difference between a burst and a face cluster is the **name**, plus who proposed
+it — which is a field, not a type. One kind, no enum, no arm per kind anywhere
+downstream.
 
-A pair inside a `related` set is never offered as a duplicate again — which is
+A pair co-occurring in any set is never offered as a duplicate again — which is
 exactly what `not_duplicates` does, at one record per *set* rather than per
 *pair*, with a name, in a file you can read. It is not in the companions, so
 nothing clutters per-image metadata; it is not buried in SQLite, so nothing is
@@ -674,7 +707,9 @@ the same way companions already feed `tag_index`.
 
 Two things fall out of it for free:
 
-- **A filter term.** `set:burst-2024-04-02`, `in::related`, `in::any`.
+- **A filter term**, and it needs no new syntax: `set:alice` names one,
+  `has::set` matches any — the same two shapes the language already has for
+  tags.
 - **Stacking.** A set is a collapsible unit in the grid — the burst of forty
   frames renders as one cell you can expand. That is the feature the concept was
   worth building for anyway.
@@ -765,7 +800,7 @@ Removes ledger items 16, 17, 19, 20, 29, 30.
 | Binaries | 3 | 2 | `lightview` and `lightview-headless` become one |
 | Views | 5 declared / 3 built | 1 | |
 | Thumbnail tiers | 7 in 2 families | 3 in 1 | |
-| Command surfaces | 80 + 48, implicitly related | 1 table, 3 trust levels | |
+| Command surfaces | 80 + 48, implicitly related | 1 table, 2 trust levels | |
 | Config homes | 4 | 2 (gallery file, server file) | |
 | Ledger entries | ~35 | ~15 | |
 
