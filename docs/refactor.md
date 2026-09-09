@@ -707,17 +707,22 @@ This is the answer to "process a folder of two hundred images and never open it
 again, or be the stable place for thousands." Today one SQLite file holds both,
 inside the user's photo folder, and nothing ever cleans it up.
 
-**Durable, portable, small → `<gallery>/.lightview/`**
+**Durable → the photos and their companion files. Nothing else.**
 
-- companion sidecars, unchanged
-- `gallery.json` — a generated gallery **id**, the companion location, the
-  default filter, trash retention
-- `sets.json` — see Change 4
-- `trash/`, unchanged
+That is the whole rule, and it is stronger than the first draft of this section,
+which also wanted a `gallery.json` and a `sets.json`. Neither survives contact
+with the rule: sets become tags in the companions (Change 4), and everything
+`gallery.json` was going to hold is either a deleted setting (companion
+location), server configuration (below), or cache-keying detail that should not
+be user data at all. `trash/` stays under `.lightview/` because a trashed file
+*is* a photo and its companion.
 
-Kilobytes to low megabytes. Safe to copy, sync, or read with `grep`.
+So a gallery on disk is: the media, the sidecars, and a trash folder. Delete
+everything else and re-open it, and you are back — slower, having re-thumbnailed,
+but with nothing lost. That is the property, and it is worth more than any
+individual thing that could have been stored alongside.
 
-**Derived, disposable, machine-local → `<data_dir>/galleries/<gallery-id>/cache.db`**
+**Derived, disposable, machine-local → `<data_dir>/galleries/<hash-of-root>/cache.db`**
 
 Everything regenerable: `media_meta`, `tag_index`, `tag_counts`, `index_state`,
 `gif_atlas`, the three thumbnail tables, `phash`. Three consequences, all of
@@ -731,13 +736,50 @@ them things currently missing:
    to the transient-versus-durable question, and it is not expressible today
    because the caches are scattered across the filesystem.
 3. **Paths become gallery-relative**, because the root is no longer implied by
-   the file's location. `rebase_root`, `infer_old_root`, and structural
-   observation F1 are deleted outright — and because the cache is keyed by the
-   *id* stored in `.lightview/gallery.json`, moving the folder keeps the cache
-   anyway. Strictly better than both of today's behaviours.
+   the file's location. `rebase_root`, `infer_old_root` and structural
+   observation F1 are deleted outright.
 
 A read-only gallery also improves: derived data goes to the local data dir, and
 only the durable half degrades, rather than nothing working at all.
+
+**Where the rule costs something, stated so it is a choice.** Keying the cache
+by a hash of the canonical root means **moving a gallery re-thumbnails it**.
+Today `rebase_root` preserves the cache across a move, and an id in a
+`.lightview/gallery.json` would too, for about two lines. It is not in the design
+because an id is not something the user needs — it exists only to save the
+machine work — and the rule earns its power by having no exceptions. If moving
+large galleries turns out to be a real habit rather than a rare event, adding
+that file later is a small, additive change; building it now on the guess is
+what the rule is against.
+
+### No migration code
+
+The database is now *purely* derived, and that unlocks the thing a versioned
+schema was protecting: **delete it and rebuild instead of migrating it.**
+
+`cache.db` gets a single format integer. If it does not match the build's,
+`fs::remove_file` and re-index. That deletes the seventeen-entry `MIGRATIONS`
+list, `run_migrations`, the `const fn` deriving `SCHEMA_VERSION` from it, the
+"strictly increasing versions" and "idempotent re-run" tests that guard it, the
+warning about a database stamped ahead of this build, and
+[decision 0003](decisions/0003-derive-schema-version-from-migrations.md) along
+with the failure it records. Every future schema change becomes a bump of one
+integer and no thought at all about what an older database looks like.
+
+This is only safe *because* of the split above. A file holding device pairings,
+dedup verdicts and per-gallery settings cannot be deleted on a version mismatch;
+a file holding only thumbnails and indexes can. The two changes are one change.
+
+**The companion file keeps its version, and this is the exception that proves
+the rule.** A sidecar is a wire format other LightView installations read and
+write; it holds intent that exists nowhere else, and deleting a user's tags
+because a number did not match is not a trade anyone would take. `schema_version`
+stays stamped on write and checked on read, and `migration::migrate` stays the
+one function a version 2 would change. It is currently the identity function and
+about twenty lines — cheap insurance on the only data that matters.
+
+The cost of all this is re-thumbnailing on a format bump, which is exactly the
+cost the derived cache exists to be able to pay.
 
 **Server configuration → a TOML file in the data dir**, read at startup and on
 change: bind address, port, TLS SANs, password hash and inactivity window,
@@ -752,67 +794,84 @@ deployment configures itself by editing a file, which is what a headless
 deployment expects. Pairing stays a command (`lightview pair` prints a PIN)
 because minting a code is an action, not a setting.
 
-Removes ledger items 12, 13, 27, 31, and most of 14.
+Removes ledger items 12, 13, 27, 31, and most of 14 — and turns 31 from "removed"
+into *true*: `cache.db` becomes a cache you can genuinely delete.
 
-## Change 4 — Sets replace pairwise non-duplicates
+## Change 4 — A set is a tag
 
 The complaint is exact: pairwise negative facts are the wrong shape. They are
 quadratic in a group, invisible in the UI, keyed on absolute paths, and cannot
 express "these three belong together."
 
-Replace `not_duplicates` with one positive concept. A **set** is a small durable
-record: an id, a name, an optional `source` naming whatever proposed it, and a
-member list keyed by gallery-relative path plus the companion's existing
-`file_hash` so a rename is recoverable.
+An earlier draft answered that with a new durable record in a new file,
+`sets.json`. The rule in Change 3 — *the photos and their companions are the
+only durable data* — rules that out, and forcing the answer through the rule
+produces a much smaller one. **Set membership is a tag.** A `set` namespace
+alongside `user` and `plugin.<name>`, one tag per member:
 
-**There is only one kind of set**, and the first draft of this proposal was wrong
-to give it three (`variants`, `related`, `cluster`). Check what each would
-actually have done. A confirmed *variants* group does not persist — the merge
-trashes the extras, so one file survives and there is no set left to store; an
-unconfirmed one is a candidate, recomputed from perceptual hashes on demand
-exactly as it is today. That leaves "these belong together and are not duplicates
-of each other," which is the same record whether a person made it from a rejected
-candidate group, a plugin proposed it, or a burst was grouped by time. The
-difference between a burst and a face cluster is the **name**, plus who proposed
-it — which is a field, not a type. One kind, no enum, no arm per kind anywhere
-downstream.
+```
+set::vacation-burst-3      a burst that is not forty duplicates
+set::kellys-comic          a work that exists as several images
+set::alice                 a face cluster, once a person has named it
+```
 
-A pair co-occurring in any set is never offered as a duplicate again — which is
-exactly what `not_duplicates` does, at one record per *set* rather than per
-*pair*, with a name, in a file you can read. It is not in the companions, so
-nothing clutters per-image metadata; it is not buried in SQLite, so nothing is
-obscured. `<gallery>/.lightview/sets.json`, written with the same atomic
-write-and-rename as companions, indexed into the derived cache for query speed
-the same way companions already feed `tag_index`.
+That is the entire data model. No new file, no new table, no new wire format, no
+new filter syntax — `set::kellys-comic` and `has::set` are the two shapes the
+language already has for every other tag. The tag index, `tag_counts`,
+autocomplete, grouping and the `/api/invoke` tag-write commands all apply
+unchanged, and the whole thing is reconstructable from companions because it *is*
+companion content.
 
-**Members are ordered, and that is free.** A member list is a list; keeping its
-order costs nothing and buys the case a burst and a face cluster do not have —
-a comic strip, a scanned zine, a photo essay: works that exist as several images
-in a fixed sequence. Nothing else in LightView can express "these are pages 1
-through 12". Ordering the member list means the grid can present a set as its
-first page, the viewer can walk it in order, and none of that needs a second
-concept.
+**"Not a duplicate" stops being stored at all.** It becomes a derived fact: two
+files that share any `set::` tag are never offered as a duplicate pair. One
+`EXISTS` clause in the duplicate finder replaces the `not_duplicates` table, its
+`path_a < path_b` canonicalization, and its standing exception from
+`path_keyed_tables()` — the table is not relocated, it is *deleted*, and ledger
+item 4 goes with it. Forty burst frames cost forty tag rows instead of 780
+pairwise ones, and the user sees a name rather than a list of negations.
 
-Two things fall out of it for free:
+**Order comes from the gallery's own sort.** A comic strip's pages are
+`page01.jpg`, `page02.jpg`; the sort that already orders the grid orders the set.
+Storing an explicit ordinal per member would mean a second thing to keep in step
+with the filename, for a case the filename already answers. If a set genuinely
+needs an order its filenames do not carry, that is the moment to add an ordinal —
+not before.
 
-- **A filter term**, and it needs no new syntax: `set:alice` names one,
-  `has::set` matches any — the same two shapes the language already has for
-  tags.
+**One kind, and no `source` field.** An earlier draft had three kinds
+(`variants`, `related`, `cluster`) and then two fields; both were wrong for the
+same reason. A confirmed *variants* group does not persist — the merge trashes
+the extras, so one file survives and there is no set left. An unconfirmed one is
+a *candidate*, recomputed from perceptual hashes on demand exactly as today. What
+remains is one relation: these belong together. Whether a person, a plugin, or a
+timestamp heuristic proposed it changes nothing about what is stored, and a
+plugin that wants its proposal attributed already has `meta.plugins[<name>]`.
+
+Two things fall out for free:
+
+- **Filtering and grouping**, with no new code: `set::kellys-comic` narrows,
+  `has::set` finds everything grouped, and `compute_groups` can already group by
+  a tag.
 - **Stacking.** A set is a collapsible unit in the grid — the burst of forty
   frames renders as one cell you can expand. That is the feature the concept was
-  worth building for anyway.
+  worth building for anyway, and it needs the set to be queryable, which it now
+  is by construction.
 
-Removes ledger item 4, and the duplicates panel becomes "resolve these candidate
-sets" rather than a separate screen with its own vocabulary.
+The duplicates panel becomes "these look alike; are they the same file, or a
+set?" — merge, or name a set — rather than a screen with its own vocabulary.
 
-**No migration code.** Existing `not_duplicates` rows are not translated into
-sets. The tier collapse in Change 2 changes what perceptual hashes are computed
-from, so a translation would have to reason about which old verdicts still
-describe pairs the new hash groups together — a body of logic that runs once and
-is then dead weight forever. Re-answering a handful of duplicate prompts is
-cheaper than owning that code. The same principle applies to the companion
-location in Change 9 and to galleries whose cache predates Change 3: read what
-is there, write the new shape, and let the old one age out.
+**No migration code**, here or anywhere. Existing `not_duplicates` rows are not
+translated. The tier collapse in Change 2 changes what perceptual hashes are
+computed from, so a translation would have to reason about which old verdicts
+still describe pairs the new hash groups together — logic that runs once and is
+then dead weight forever. Re-marking a handful of duplicates is cheaper than
+owning that code, and the same reasoning is what deletes the schema migrations
+in Change 3.
+
+Note the one thing this gives up against the `sets.json` design: a set cannot
+name a file that has no companion. In practice every file LightView knows about
+acquires one the moment anything is said about it, and being in a set is saying
+something about it — so the companion is created, exactly as adding a tag
+already does.
 
 **One scaling note, not a recommendation:** detection is all-pairs Hamming,
 quadratic in hashed files. At ten thousand images that is fifty million
@@ -837,14 +896,22 @@ worse than an honest absence. `api_version` keeps only version 1 — a version 0
 plugin is refused everywhere rather than refused in one place and allowed in
 another.
 
-**Add exactly one output kind: `sets`.** This is the answer to "something more
-complex like facial clustering." A face cluster *is* a set — the same record,
-the same file, the same UI, the same naming interaction as a confirmed duplicate
-group. The plugin emits proposed groupings; the user confirms and names them;
-the name becomes an ordinary `tags.user` entry on every member. What
-`findings-and-ui.md` deferred as "genuinely new state — a `plugin_groups` table,
-a merge and rename surface, and an answer to what happens when a re-run reshapes
-a cluster" is machinery Change 4 has to build anyway.
+**Add exactly one output kind: `groups`.** This is the answer to "something more
+complex like facial clustering." A plugin emits proposed groupings of paths; the
+user confirms and names one; naming it writes `set::alice` on every member. That
+is the whole feature, and after Change 4 it needs **no new storage at all** —
+the confirmation is a batch tag write, which `add_user_tag_batch` already is.
+
+What `findings-and-ui.md` deferred as "genuinely new state — a `plugin_groups`
+table, a merge and rename surface, and an answer to what happens when a re-run
+reshapes a cluster the user already named" mostly dissolves. Merging two clusters
+is renaming a tag; splitting one is retagging a selection; a re-run that reshapes
+a cluster cannot disturb the confirmed name, because that name lives in
+`tags.user`-class storage and the plugin's own bucket is what gets replaced. The
+one genuinely new piece is where an *unconfirmed* proposal lives while it waits
+for an answer, and that is scaffolding in the derived cache — regenerable by
+re-running the plugin, which is exactly the `not_duplicates` precedent applied
+to something that deserves it.
 
 **Plugin input is quantized up to a cached tier edge.** A plugin declares the
 longest edge it wants; the host serves the smallest tier that is at least that
@@ -889,7 +956,10 @@ Removes ledger items 9, 10, 11.
 - Delete the diagnostics subsystem — `DebugOverlay`, `Sparkline`, `DevtoolsApp`,
   `perfMonitor`, `metricRows`, `devtools.html`, `get_perf_snapshot` (~1,000
   lines across both sides). Removing the second HTML entry also removes the
-  chunk-naming confusion that has its own documented section.
+  chunk-naming confusion that has its own documented section. Checked: the
+  overlay was largely non-functional already, so this is a deletion rather than
+  a trade — the headless Playwright harness is the measurement surface, and it
+  is the more trustworthy one.
 - `SettingsMenu` 1333 → roughly 300: Display, Thumbnails, Default Filter.
 - Merge `pluginStore`, `taggingStore` and `thumbnailProgressStore` into one
   activity store, now that there is one execution path.
@@ -939,6 +1009,15 @@ The third is today's `lightview-worker run`, and the pairing it needs is the
 `/pair/redeem` and stores the resulting cookie. Under the two trust levels from
 Change 1 a plugin host is an ordinary `Device` — it writes tags and claims jobs,
 and it cannot touch the filesystem. No new trust level, no new enrollment flow.
+
+**One instance per role.** A machine that both serves its own gallery and hosts
+plugins for a remote one runs two processes, each with its own config, and that
+is the constraint rather than a limitation to work around. The alternative — one
+process holding a list of attachments — means a config file with a repeated
+section, a lifecycle where one attachment failing must not take down the server,
+and a log where two unrelated jobs interleave. Two processes get all of that from
+the operating system for free. It also keeps `--remote` and `--serve` mutually
+exclusive, which is one fewer combination to reason about.
 
 **`--remote` must not open a browser**, and this is worth stating because the
 natural reading of "launch the app as a client" is that it should. Attaching a
@@ -1128,7 +1207,7 @@ thread count should simply win.
 | Thumbnail tiers | 7 in 2 families | 3 in 1 | |
 | Command surfaces | 80 + 48, implicitly related | 1 table, 2 trust levels | |
 | Config homes | 4 | 2 (gallery file, server file) | `RenderConfig` empties itself with WebKitGTK |
-| Ledger entries | ~35 | ~15 | |
+| Ledger entries | ~35 | ~13 | items 4 and 31 now removed outright rather than mitigated |
 
 The fifteen that survive are the ones that are *inherent* rather than
 accumulated: speculation shares one bounded pool; grid cells must be keyed by
@@ -1164,28 +1243,62 @@ rather than after them. The three items that are dead today (the `/thumbhash`
 route, the `companion_location` setting, the `auto` namespace) can go at any
 point, including first.
 
-## Where this proposal is weakest
+## Where this proposal was weakest, and what is left
 
-Stated so it can be argued with rather than discovered later.
+The first draft listed four. Three are now closed, and saying so plainly matters
+more than preserving a balanced-looking list of caveats.
 
-- **Change 1 gives up a native window.** A browser tab is a browser tab: no
-  window chrome you control, no native menu, and an `--app`-mode launch that
-  behaves differently per browser. If "feels like a desktop app" matters more
-  than the code it costs, the honest alternative is a minimal native shell
-  (`tao` + `wry`, or Iced hosting a webview) that loads the same loopback URL —
-  which keeps one frontend and re-adds only a window. That is the compromise
-  worth considering; Iced *replacing* the frontend is not.
-- **Change 3 changes where a user's data lives.** Galleries that already carry a
-  populated `cache.db` need a one-time migration, and someone who has been
-  copying a folder between machines expecting the thumbnails to travel will
-  notice. The gallery-id key makes moves work; copies to a second machine will
-  re-thumbnail.
-- **Change 4 replaces a working feature.** `not_duplicates` is small, correct,
-  and tested. Sets are strictly more capable but are new code in the place a
-  user's judgement is stored, and getting them wrong loses decisions that cannot
-  be recomputed.
-- **Deleting the diagnostics overlay removes the only in-app measurement
-  surface.** Several decisions in this codebase rest on numbers that overlay
-  helped produce. If it goes, the replacement is the headless Playwright harness,
-  which is already the more trustworthy of the two — but it is not the same
-  thing as watching a live counter while scrolling.
+**Giving up a native window is not a loss.** The concern was that a browser tab
+has no window chrome, no native menu, and an `--app`-mode launch that differs per
+browser. Weighed against the thing it was being traded for, that was the wrong
+frame: the native window was *measurably slower than a browser on the same
+machine*. WebKitGTK is not a cost being paid for polish; it is a cost being paid
+for nothing. Change 1 stops being a trade and becomes a straight improvement, and
+the `tao`/`wry` shell floated as a compromise is not needed.
+
+**Where user data lives is settled, and the rule got stricter.** The worry was
+that moving the cache would strand galleries and surprise anyone copying a folder
+between machines. The answer is not a better migration — it is that **the photos
+and their companion files are the only durable data**, full stop. Everything else
+is regenerable by definition, so there is nothing to strand. That rule then went
+further than the concern did: it deleted `sets.json` and `gallery.json` from the
+design, and it is what makes deleting the migration machinery safe. The residual
+cost is named in Change 3 — moving a gallery re-thumbnails it — and it is a
+deliberate choice rather than an oversight.
+
+**Deleting the diagnostics overlay costs nothing.** The stated risk was losing
+the only in-app measurement surface, since several decisions in this codebase
+rest on numbers it helped produce. Checked: it was largely non-functional
+already. That turns a trade-off into a straight deletion, and the headless
+Playwright harness — the more trustworthy of the two — is what remains.
+
+**What is actually left.** One item, and it is smaller than it was.
+
+Sets replace a working feature. `not_duplicates` is small, correct and tested,
+and its replacement is new code in the place a user's judgement is stored. Making
+a set a *tag* rather than a new record shrinks the exposure considerably — the
+storage, indexing, querying and write paths are all machinery that already exists
+and is already exercised — but the finder's "never offer a pair that shares a
+set" clause is new, and if it is wrong the symptom is a duplicate prompt you
+already answered coming back. That is annoying rather than destructive, and
+re-marking is the accepted price throughout this document; it is worth a test
+that outlives the change.
+
+## Decisions taken during review
+
+Recorded here because they are the answers that shaped the sections above, and a
+reader who disagrees should know they were decided rather than assumed.
+
+- **Local mode is selection-scoped**, not filesystem navigation — which is what
+  keeps `path_in_gallery` universal (Change 1).
+- **The grid's scroll tuning is not re-measured** after WebKitGTK leaves. Ship
+  the move; revisit only if scrolling regresses (Change 1).
+- **Plugin input rounds up to a cached tier edge**, so a warmed gallery tags
+  without decoding (Change 5).
+- **One instance per role.** A machine serving its own gallery and hosting
+  plugins for another runs two processes (Change 8).
+- **No migration code anywhere**, for the cache schema or for dedup verdicts.
+  The companion file keeps its version, because it is the only thing that cannot
+  be regenerated (Changes 3 and 4).
+- **Re-marking duplicates and re-thumbnailing are accepted costs**, repeatedly
+  and deliberately, in exchange for code that does not carry its own history.
