@@ -1273,32 +1273,116 @@ certificate behind NAT needs its SANs named; an offline-capable web client has
 caches that can lie. Those are properties of the problem. The other twenty are
 properties of the history.
 
-## Sequence
+## How this gets built
 
-Each step leaves a working tree, and each is worth doing even if the next one
-never happens.
+**This is a rebuild, not a refactor**, and the decision is worth stating first
+because it changes what every section above means in practice.
 
-1. **Change 7's formatting commit**, while nothing is in flight — it blocks
-   clean diffs on everything else.
-2. **Delete the map** (part of Change 2). Smallest, self-contained, immediate.
-3. **Collapse to one grid and three tiers** (rest of Change 2). Touches the
-   schema; do it before the storage move so there is less to move.
-4. **Drop Tauri** (Change 1). The largest conceptual win, and the prerequisite
-   for the single executor.
-5. **Split storage** (Change 3). Deletes `rebase_root`, E2, and the settings
-   sprawl.
-6. **Sets** (Change 4).
-7. **Plugins** (Change 5) and **the binary merge** (Change 8) together — the
-   second folds the worker's job loop into the first's single executor, and
-   splitting them would mean writing that loop twice.
-8. The remaining frontend and honesty items (Changes 6 and 7).
+The nine changes rewrite roughly 60% of the tree. At that ratio "incremental"
+stops buying what it usually buys: each step would have to negotiate with the
+shape it is replacing — keeping the `*_impl` split alive through the tier
+collapse, threading seven tiers through a storage move that only wants three,
+carrying `AppState`'s twenty-five fields through a change that dissolves half of
+them. Every constraint that would justify paying that cost has been removed:
+there is one user, no continuity requirement, and no need for intermediate
+commits to be runnable.
 
-Change 9 is not a step. Most of it is bookkeeping that steps 2 and 4 create —
-delete the square grid and the GPU pipeline is unreachable; drop WebKitGTK and
-the GIF atlas has no reason to exist — so it is done as part of those steps
-rather than after them. The three items that are dead today (the `/thumbhash`
-route, the `companion_location` setting, the `auto` namespace) can go at any
-point, including first.
+Same repository, one branch, the old tree deleted in the same commit that adds
+the new one. Git carries the history, which is all "record keeping" needed.
+
+### There is no data migration, and probably no script either
+
+The durable format does not change. A companion file written by the current
+build is readable by the new one: the schema is the same, `set::` is a namespace
+old files simply have none of, and `auto` is a namespace nothing ever wrote.
+Everything else on disk is derived and gets rebuilt on first open.
+
+So the old binary keeps working on the old deployment for as long as the rebuild
+takes. There is no cutover, no downtime, and no window where a gallery is
+unreadable — the two builds read the same photos and the same sidecars. The only
+thing deliberately abandoned is the `not_duplicates` table, which was already
+decided.
+
+### What ports, and what is written fresh
+
+The existing architecture already draws the line, and it draws it in the right
+place. Seven modules — `filter/`, `sort/`, `autocomplete/`, `geocode/`,
+`companion/`, `provider/`, `util/` — total 3,594 lines and contain **zero**
+references to `AppState`. They are ordinary libraries taking a connection or a
+struct, and none of the nine changes touches their subject matter.
+
+| Ported near-verbatim | Why |
+|---|---|
+| `filter/`, `sort/`, `autocomplete/`, `companion/`, `geocode/` (~3,400) | correct, decoupled, and unaffected by every change here |
+| `plugin/input.rs`, `runner.rs`, `manifest.rs`, `install.rs` (~1,900) | `PartTracker` and the staleness rules are a year-old silent bug already found; do not re-find it |
+| `pipeline/video.rs`, `exif.rs`, `heic_cache.rs`, `decode_image`, `fit_dims` (~1,200) | ffmpeg rotation handling and HEIC decode are knowledge, not code |
+| `thumb_serve::get_or_generate`'s coalescer | the enrol-before-recheck ordering is subtle and was arrived at by failure |
+| The justified grid, the viewer, and the fourteen `lib/` primitives (~6,000 TS) | measured, tuned, and untestable by `tsc` — the riskiest thing to retype |
+
+| Written fresh | Why |
+|---|---|
+| `cache/` | three tables, no migrations, relative paths, a new location |
+| `commands/` + `http_server/` → one dispatch | the `*_impl` split exists only to keep two adapters in step |
+| `AppState` | half its fields are Tauri, GPU, or dual-transport artifacts |
+| `tagging/` + the worker | one job loop over two byte sources |
+| The CLI | three modes replacing three binaries |
+
+The pattern is not a coincidence: **the layer that ports is exactly the layer
+that already knew nothing about its callers.** A rebuild is cheap here because
+the architecture was right about where to put its seams, even where it was wrong
+about what sat on top of them.
+
+### The honest risk
+
+A rebuild has no natural stopping point. Incremental work is bounded by each
+step; a rewrite can drift into re-litigating decisions that were already settled
+correctly — the justified grid's zoom hysteresis, the tier budget's warm
+seeding, the scrub gate. The mitigation is the port table above: **anything in
+the left column is copied, not reconsidered.** Reopening one of those needs a
+reason written down, not a feeling that it could be nicer.
+
+The second risk is that "rebuild" becomes licence to add. Every change in this
+document subtracts. The finished tree should be smaller than 34,000 lines, and
+if it is not, something was added that nobody asked for.
+
+### Order of construction
+
+Not a shipping sequence — nothing ships until it all does — but a dependency
+order:
+
+1. **The pure modules**, moved across unchanged. They compile against nothing.
+2. **`cache/`**, since everything above it needs its shape: three tables,
+   relative paths, a format integer instead of a migration list.
+3. **The pipeline**, ported around the one `generate_for_path_fit` path.
+4. **The server and its one command table**, with trust derived from the bind.
+5. **The frontend**, ported: justified grid, viewer, primitives, minus the square
+   grid, the map, the diagnostics, and the dual-runtime branches.
+6. **Plugins and tagging**, one job loop, then `--remote`.
+7. **The docs**, rewritten against what exists.
+
+## The decision records go
+
+`decisions/` is being deleted rather than extended, and the reasoning belongs
+here because it is the same reasoning as everything else in this document.
+
+The format has a failure mode it cannot avoid: append-only means monotonic
+growth, and "a reversal is a new file that supersedes the old" means the truth
+about any one topic is spread across however many files happen to touch it, in
+an order the reader has to reconstruct. Fifteen files today, eleven more implied
+by this refactor, and the answer to "why is the cache where it is?" would live in
+two of them. That is baggage in exactly the sense the rest of this document is
+against.
+
+What the records hold that is worth keeping is the *why* — and the right home
+for that is the subsystem page describing the thing, as prose, next to what it
+explains. "This was tried and rejected because X" reads better beside the code
+it constrains than in a numbered annex, and it stops the reader having to know
+that an annex exists. Git holds the rest; a decision's history is its commit.
+
+So: fold the surviving reasoning into the subsystem pages, delete the directory
+and the convention, and drop the "add a decision file" clause from the
+engineering principles. The eleven records this refactor would otherwise have
+demanded are never written, which is a saving on top of the fifteen deleted.
 
 ## Where this proposal was weakest, and what is left
 
@@ -1346,27 +1430,18 @@ that outlives the change.
 Three pieces of work that no individual change owns, and that are therefore the
 ones most likely to be skipped.
 
-### The decision records
+### The decision records — deleted, not rewritten
 
-`decisions/` is append-only by its own rule: a reversed decision gets a **new**
-file with a superseding link, never an edit. Six of the fifteen are reversed
-here — [0001](decisions/0001-one-cache-per-gallery.md) (the cache moves out of
-the gallery), [0002](decisions/0002-two-families-of-thumbnail-tiers.md) (one
-family, three tiers), [0003](decisions/0003-derive-schema-version-from-migrations.md)
-(no migrations at all), [0005](decisions/0005-remote-invoke-is-an-allowlist.md)
-(one command table with trust levels),
-[0008](decisions/0008-no-view-module-api.md) (one view, so enablement has
-nothing to enable), and [0014](decisions/0014-ship-the-worker-with-the-release.md)
-(no worker binary to ship).
+The first version of this section counted eleven decision files the refactor
+would owe: six superseding the ones it reverses (0001, 0002, 0003, 0005, 0008,
+0014) and five for choices made here. That debt is cancelled by deleting the
+convention instead — see [The decision records go](#the-decision-records-go).
+The reasoning worth keeping moves into the subsystem pages; git holds the rest.
 
-Five more choices in this document have real alternatives and so want records of
-their own: browser-only as the single runtime, a set being a tag, deleting the
-cache rather than migrating it, one binary with three roles, and the trash
-layout. That is about eleven files, plus a rewrite of most subsystem READMEs.
-
-Skipping it re-creates precisely the condition this refactor exists to fix —
-documentation that confidently describes a system that no longer exists — and it
-would do so in the one place a reader trusts most.
+What survives as real work is the subsystem READMEs themselves, which describe a
+system that will no longer exist. That is not optional and not deferrable:
+documentation confidently describing the wrong system is the condition this
+refactor is against, in the place a reader trusts most.
 
 ### `todo.md` nearly empties, and that is the scorecard
 
@@ -1430,5 +1505,10 @@ reader who disagrees should know they were decided rather than assumed.
 - **No migration code anywhere**, for the cache schema or for dedup verdicts.
   The companion file keeps its version, because it is the only thing that cannot
   be regenerated (Changes 3 and 4).
+- **This is a rebuild in the same repository**, landing as one branch rather
+  than nine shippable steps, with a port table deciding what is copied and what
+  is written fresh.
+- **`decisions/` is deleted**, convention and all; the reasoning folds into the
+  subsystem pages.
 - **Re-marking duplicates and re-thumbnailing are accepted costs**, repeatedly
   and deliberately, in exchange for code that does not carry its own history.
