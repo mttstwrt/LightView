@@ -75,6 +75,12 @@ answer to "why not the obvious thing?" is longer than a sentence.
 
 ## Open work
 
+[`_planning/rebuild/design.md`](_planning/rebuild/design.md) is the approved-pending
+plan for the rebuild: a single self-sufficient document covering requirements,
+target architecture, what is ported versus written fresh, the order of
+construction, and the decisions already settled. It is what an implementer
+reads.
+
 [`refactor.md`](refactor.md) is a standing proposal rather than a description:
 a complete inventory of the system as it is, and the argument for a
 substantially smaller one. Nothing in it has been built, and it is the only page

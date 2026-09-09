@@ -33,7 +33,16 @@ Tailwind v4 · Vite 5.
 
 Driving the whole stack without a display — headless server, `curl` against every route, real SPA in headless Chromium — is [`docs/build-and-verify.md`](docs/build-and-verify.md). It is the only way to exercise the grid, which `tsc` cannot cover.
 
-**A rebuild is planned.** [`docs/refactor.md`](docs/refactor.md) is a complete inventory of the system as it stands and the argument for a substantially smaller one: one runtime, one view, three thumbnail tiers, one binary, and no migration code. Read it before designing anything large — several subsystems described in `docs/` are slated to be replaced rather than extended.
+**A rebuild is planned, and the plan is written.**
+[`docs/_planning/rebuild/design.md`](docs/_planning/rebuild/design.md) is the
+single, self-sufficient plan — requirements, target architecture, the port
+table, construction order, and every decision already taken. It is written to be
+executed with no other context. Read it before designing anything large; most
+subsystems described elsewhere in `docs/` are slated to be replaced rather than
+extended.
+[`docs/refactor.md`](docs/refactor.md) is the argument behind it and the
+inventory of the system being replaced — useful background, not required to
+execute.
 
 ## Core Architecture
 - **Boundary:** Frontend calls Rust via `src-solidjs/lib/ipc.ts` (canonical IPC).
