@@ -212,6 +212,9 @@ lightview pair               mint a one-time pairing PIN for this machine, and e
 lightview remote-pair --server <url> --pin <n> [--name X] [--trust-new]
                              redeem a PIN against a remote server and store the
                              credential this machine will use for --remote
+lightview password           set or clear the gallery password, reading it from
+                             stdin — never from argv, where it lands in shell
+                             history and `ps`
 lightview cache              show the derived-cache directory and its size
 lightview cache --prune      evict least-recently-opened galleries to the budget
 ```
@@ -346,12 +349,30 @@ only the durable half degrades rather than nothing working.
 
 `server.toml` in the data dir, read at startup and on change: bind address,
 port, TLS SANs, password hash, inactivity window, upload enable and scheme,
-remote-delete flag, trash retention, cache budget. Not commands. A headless
+trash retention, cache budget.
+
+**There is no remote-delete flag.** Today one exists and gates the whole trash
+group plus merge; requirement 2 makes move-to-trash something a remote client
+*gets*, not something it might get, so a flag could only narrow `Device` into a
+third trust state — an *except* that is not on section 2's list. Two consequences
+worth naming rather than discovering: **`purge_trash` and `merge_duplicates`
+become unreachable remotely**, where today they are reachable with the flag on,
+and a gallery can no longer be served with deletion turned off. Not commands. A headless
 deployment configures itself by editing a file, which is what a headless
 deployment expects.
 
 Pairing stays a command (`lightview pair` prints a PIN) because minting a code
-is an action, not a setting.
+is an action, not a setting. **So does the password**, for a sharper reason: the
+stored value is an argon2id PHC string, and "configuration is a file" cannot mean
+asking a person to hand-compute a hash. `lightview password` reads the passphrase
+from stdin, hashes it, and writes the field; `lightview password --clear`
+removes it. The hash format is argon2id with the crate's default parameters,
+unchanged from today.
+
+**The password gates the `--serve` bind only.** A loopback session is already
+authenticated by the launch token, and someone with local shell access has the
+photos regardless. This is also a contract change worth naming: the password
+moves from per-gallery to per-machine along with the pairings.
 
 Display preferences stay per-client: `.lightview/settings.toml` for a local
 gallery, browser local storage for a remote one. A phone and a desktop looking
@@ -407,9 +428,15 @@ original path. There is no metadata file.
 
 - **Purge** is `read_dir`, parse the numeric name, compare against the retention
   window, `remove_dir_all`. No file reads.
-- **Restore** moves back to `<root>/<relative path>`, refusing if something
-  already occupies it, `create_dir_all` for a vanished parent, then prunes empty
-  directories back up to the timestamp directory.
+- **Restore** moves the media back to `<root>/<relative path>`, refusing if
+  something already occupies it, `create_dir_all` for a vanished parent, then
+  prunes empty directories back up to the timestamp directory. **The companion
+  goes to the current write location** — `.lightview/companions/<relative
+  path>.lightview.json` — not alongside the media where the trash entry keeps
+  it. A naive path-mirroring restore drops it beside the photo, where the read
+  fallback in section 3.7 still finds it, so it *appears* to work and the next
+  metadata write forks a second sidecar. The trash round-trip test must assert
+  the companion's destination, not just the media's.
 - **One delete is one directory**, which makes undoing an operation a natural
   unit.
 - The companion sits alongside the media inside the trash, uniformly, whichever
@@ -481,10 +508,9 @@ holds a read-only connection, and are drained **immediately before** an eviction
 pass; reversing that order evicts what the user is looking at. Both write paths
 enforce the budget, not just the batch one.
 
-**Idle backfill** warms `j` when no SSE subscriber is connected and no
-user-driven thumbnail request landed in 60 s, newest-first (the order the
-default date-descending sort presents), re-checking both signals between work
-units. It also computes perceptual hashes.
+**Idle backfill** warms `j` when no user-driven thumbnail request has landed in
+60 s, newest-first (the order the default date-descending sort presents),
+re-checking between work units. It also computes perceptual hashes.
 
 **Video**, carried over intact because it is knowledge rather than code:
 `ffmpeg` does the downscale in its filter graph at exact pixel dimensions, so a
@@ -502,9 +528,9 @@ desktop user was a separate kind of client detected by a thumbnail-activity
 timestamp. After this rebuild **the local user is an SSE subscriber**, so that
 counter is true whenever anyone has the gallery open in a browser and the
 backfill would never run at all — taking perceptual hashing, and therefore
-duplicate detection, with it. Use the activity timestamp alone: idle means no
-user-driven thumbnail request in the last 60 s, re-checked between work units.
-The subscriber count no longer means anything and must not be consulted.
+duplicate detection, with it. **The activity timestamp is the only signal.** The
+subscriber count no longer means anything and must not be consulted; the
+sentence above is the authoritative statement of `is_idle`.
 
 **Placeholders must not write source dimensions.** A `0×0` write both fills the
 `width IS NULL` gap that guards the column and hands the grid a degenerate
@@ -529,10 +555,19 @@ only the latter ships a build where HEIC thumbnails work and the viewer is blank
 — a failure that survives to production because the grid looks correct.
 
 **`?fit=<edge>`** returns an aspect-preserving WebP resize of a still, through
-the same `generate_for_path_fit` the tiers use and the same coalescer. It does
-not apply to video or GIF; those fall back to the whole file. It exists for
-plugin input above the top tier and for nothing else, now that the grid uses
-tiers only.
+the same `generate_for_path_fit` the tiers use and the same coalescer. It applies
+to `jpg`/`jpeg`/`png`/`webp` only; GIF and video fall back to the whole file. It
+exists for plugin input above the top tier and for nothing else, now that the
+grid uses tiers only.
+
+**`?frame=<i>&frames=<n>`** extracts one evenly-spaced still from a clip and
+returns it as WebP, honouring `?fit=` as the frame's edge. **This is a fourth
+required behaviour, not an optional one** — it is the entire reason a `--remote`
+plugin host needs no `ffmpeg` and does not pull whole videos across the LAN, and
+section 3.10 promises that every executor prepares input identically. Omit it and
+`--remote` silently cannot tag video, which is the failure this rebuild inherits
+a fix for. Step 7's acceptance requires a clip in the test gallery for exactly
+this reason.
 
 **Paths on the wire are gallery-relative**, matching the database. Two
 exceptions, both `Owner`: a copy or move *destination* is absolute by necessity,
@@ -621,6 +656,16 @@ is versioned and replaced wholesale on a re-run, which is right for geocoded
 place names and exactly wrong for a set: a set is user-owned and must survive
 re-tagging.
 
+**Unknown keys are preserved on write, not dropped.** `#[serde(default)]` makes
+an old sidecar *parse*; it does not stop the next write from erasing what the
+struct no longer models. Removing the `auto` field means the first rating change
+or plugin run silently deletes a user's `auto` tags from the one file that
+cannot be regenerated. So `TagCollection` and `MetaCollection` each carry a
+`#[serde(flatten)] extra: Map<String, Value>` and round-trip it untouched. The
+decision in section 4 — that `auto` tags are dropped — is a decision about the
+*index*, and this is what keeps it from quietly becoming a decision about the
+*file*.
+
 **Every field of the tag and meta structs takes `#[serde(default)]`.** None of
 them has it today. That attribute — not the schema version — is what makes an
 old sidecar without `set`, and a new one without `auto`, parse rather than fail.
@@ -687,6 +732,19 @@ set::vacation-burst-3      a burst that is not forty duplicates
 set::kellys-comic          a work that exists as several images
 set::alice                 a face cluster, once a person has named it
 ```
+
+**The tag-write commands take a namespace parameter.** Every one of them is
+user-hardcoded today — add, remove, the batch forms, rename, merge, delete, list
+— so "the tag-write commands apply unchanged" was wrong. Each gains a
+`namespace` argument accepting `user` or `set` and nothing else; a plugin
+namespace is never writable this way, since a plugin bucket is replaced
+wholesale by its own run. One parameter on an existing family, rather than a
+parallel family, because the operations are identical and only the destination
+differs.
+
+That gives sets their whole surface for free: create is a batch add over a
+selection, rename is `rename`, merge two clusters is `merge`, delete is
+`delete`, and the tag manager lists both namespaces instead of one.
 
 That is the entire data model. No new file, no new table, no new wire format, no
 new filter syntax. The tag index, `tag_counts`, autocomplete, grouping and the
@@ -909,22 +967,37 @@ needs its own credential, stored at `<data_dir>/remote.toml`, mode 0600:
 
 `lightview remote-pair --server <url> --pin <n>` redeems the PIN, captures and
 prints the certificate fingerprint for confirmation, and writes the file.
-Certificate rotation — which happens when the LAN IP changes — must produce a
-clear error naming `--trust-new` rather than a TLS failure, and `--trust-new`
-re-pins while keeping the cookie. **Never disable verification as a workaround;
-the pin is the whole authentication story on that leg.**
+**`--pin` is required only on a first pairing.** `remote-pair --server <url>
+--trust-new` re-pins the certificate against an existing `remote.toml` and keeps
+the cookie, which is the whole point of a re-pin: no new device row, no new
+secret, nothing for a human to redeem.
+
+Certificate rotation must produce an error naming `--trust-new` rather than a
+bare TLS failure. **Never disable verification as a workaround; the pin is the
+whole authentication story on that leg.**
+
+**A DHCP lease change is the sharp edge here.** The certificate regenerates when
+the LAN IP changes, which breaks every attached `--remote` instance until someone
+runs `--trust-new` — on the deployment the mode exists for, a headless systemd
+unit. Two mitigations, both cheap and neither novel: give the server a static
+address or a reserved lease, and name every address the clients dial in
+`--tls-san` so a change does not re-mint. Say this in the deployment docs rather
+than letting each user discover it once.
 
 **Auth is on the hot path.** It runs on every thumbnail request, so it must not
 take the writer lock and must not write unconditionally. Read through the
 read-only pool; rate-limit any `last_seen` touch.
 
-**Change notification.** The fs-watcher publishes batches to a broadcast channel
-relayed as SSE on `/api/events`. Late subscribers see only changes from
-subscription onward — a reconnecting phone should re-fetch state, not replay
-history. Tagging events ride a **separate** broadcast merged into the same
-stream, because the fs channel's subscriber count doubles as the "is anyone
-watching?" signal for the idle worker and tagging traffic must not make the
-server think a user is present.
+**Change notification.** The fs-watcher and the tagging queue publish to **one**
+broadcast channel, relayed as SSE on `/api/events` with a typed event kind per
+message. Late subscribers see only events from subscription onward — a
+reconnecting phone should re-fetch state, not replay history.
+
+They are two channels today for one reason: the fs channel's subscriber count
+doubled as the "is anyone watching?" signal for the idle worker, and tagging
+traffic must not make the server think a user is present. Section 3.5 abolishes
+that signal, so the reason is gone and the second channel with it. One channel,
+one stream, one concept fewer.
 
 **Uploads** are the one write channel from a device. Once a file lands, the
 ordinary fs-watcher ingests it — uploads have no separate indexing path.
@@ -954,6 +1027,27 @@ it is not to be reconsidered: `JustifiedGrid`, `MediaViewer`, `VideoPlayer`,
 `urlVersions`, `pathIndex`, `thumbQueue`, `fetchLoop`, `cellSources`,
 `loadedUrls`, `scrollHost`, `bootSnapshot`, `viewerCache`, `thumbhashPlaceholder`.
 
+**Three components in the keep list need real work, and calling them
+"near-verbatim" was wrong.**
+
+- **`DuplicatesPanel`** calls `markNotDuplicates`, which no longer exists. Its
+  replacement gesture is *name a set*: a text field with autocomplete over
+  existing `set::` tags, writing a batch add across the group. The rest of the
+  panel — detection, grouping, thresholds, the merge entry point — is unchanged.
+- **`AutoTagPanel`** gains the **group-confirmation UI, which requirement 7 asks
+  for and no earlier draft designed.** One block per proposed group: a row of
+  member thumbnails at the `j` tier, a name field with the same autocomplete,
+  **Confirm** (a batch add of `set::<name>` over the members) and **Dismiss**
+  (drop it from the in-memory proposal set). No new panel and no review queue —
+  the filter bar plus the grid is how you look at a set afterwards.
+- **`TrashPanel`** renders an entry id that today is `<epoch_ms>_<seq>` and is
+  validated as digits and underscores. Section 3.4's layout makes one timestamp
+  directory hold many files, so **an entry id is now `<epoch_ms>/<relative
+  path>`** — it contains slashes and takes the per-segment encoding rule from
+  section 3.5b. `list_trash` returns `{id, original_path, file_name, deleted_at,
+  size}` as before, with `deleted_at` parsed from the leading segment and
+  `original_path` being everything after it.
+
 **`lib/ipc.ts` is written fresh, not ported.** Every one of its ~84 call
 wrappers targets a command name and argument shape that section 3.2 replaces.
 The *components* calling it port near-verbatim; the module underneath them does
@@ -982,6 +1076,12 @@ process that may have no display.
 (1,333 lines → roughly 300: Display, Thumbnails, Default Filter). Merge
 `pluginStore`, `taggingStore` and `thumbnailProgressStore` into one activity
 store.
+
+**`App.tsx` is rewritten, not ported.** It has no entry in either list because it
+is neither: it hosts every panel and imports both `@tauri-apps/api/window` and
+the dialog plugin. The panel wiring, the scroll host, the keyboard handling and
+the scrollbar indicator builders port; the window controls and the dialog calls
+go.
 
 **The rest of `lib/`, decided rather than left out.** Ported: `mediaExts`,
 `mediaPlayback`, `openAtBottom`, `clientPrefs`, `swControl` (the recovery-page
@@ -1086,7 +1186,7 @@ nicer.
 | `pipeline/video.rs` | 810 | ffmpeg rotation, exact-dimension downscale, timeouts, ISO 6709 |
 | `pipeline/{exif,heic_cache}.rs` | 273 | EXIF extraction; a 12-entry transcode LRU keyed on (path, mtime) |
 | `pipeline/thumbnailer.rs` — `decode_image`, `fit_dims`, `generate_for_path_fit`, `fit_rgba`, `resize_rgba`, `compute_thumbhash`, WebP encode | ~600 of 1,149 | the one render path |
-| `thumb_serve::get_or_generate` coalescer | ~120 | enrol-before-recheck ordering, three-attempt bound |
+| `thumb_serve::get_or_generate` **and `cache/coalescer.rs`** | ~200 | enrol-before-recheck ordering, three-attempt bound — and the mechanism that matters more: **the generator slot is an RAII guard.** A dropped request future, which the grid's virtual scrolling causes constantly, must release the slot. The previous explicit-release design leaked the key and presented as "the server stops responding until restart". `cache/` is otherwise written fresh; this file is the exception. |
 | `cache/duplicates.rs` dHash | 319 | the hash and the Hamming comparison |
 | Frontend: `JustifiedGrid`, `MediaViewer`, `ThumbnailCell`, `ScrollBar`, `ContextMenu`, all `lib/` primitives | ~6,000 | measured, tuned, and untestable by `tsc` |
 
@@ -1153,7 +1253,7 @@ with what each step must produce.
 | 1 | **Pure modules** | `filter/`, `sort/`, `autocomplete/`, `geocode/`, `companion/`, `util/`, `provider/`, `file_clipboard/` moved across; `auto` removed and `set` added in `TagNamespace` **and its TypeScript mirror**, `#[serde(default)]` on the companion structs, quoted strings in the tokenizer | the ported tests pass **after their `auto::` cases are rewritten to `set::`** — the enum is serialized both directions, so this is a wire change, not only a parser change — plus new tests for quoting, `set::`, and an old sidecar parsing without `set` |
 | 2 | **`cache/`** | three tables, relative paths, `format_version`, the path-keyed sweep and its test | a fresh open indexes a gallery; a version bump deletes and rebuilds |
 | 3 | **Pipeline** | one render path, three tiers, the coalescer, the byte budget, the idle worker | tier bytes appear for a test gallery at all three edges |
-| 4 | **Server + command table** | routes, the two trust levels, path confinement, TLS, pairing, SSE, upload | `curl` exercises every route; an unauthenticated call is 401; an `Owner` command on a non-loopback bind is 403 |
+| 4 | **Server + command table** | routes, the two trust levels, path confinement, TLS, pairing, the launch-token session, SSE, upload | `curl` exercises every route; an unauthenticated call is 401; an `Owner` command on a non-loopback bind is 403; **and on a loopback bind, redeeming a launch token and then calling the directory-listing endpoint succeeds** |
 | 5 | **CLI** | the three modes | `lightview <dir>` opens a browser; `--serve` binds and pairs |
 | 6 | **Frontend** | the ported SPA against the new API | the grid fills in headless Chromium |
 | 7 | **Plugins + tagging** | one job loop; `remote.toml` (server url, cookie, `cert_sha256` TOFU pin, instance id and name, poll interval) and the `remote-pair` verb that writes it; then `--remote` | the example tagger completes a job locally, and a second process attached with `--remote` completes one against a self-signed server without disabling verification |
@@ -1181,6 +1281,15 @@ browser is the *only* runtime.
 - trash: round-trip a nested path, refuse a restore onto an occupied
   destination, purge by age from the directory name alone
 - the tier budget: hysteresis at 1.25×, warm seeding, drain-before-evict
+
+**Both binds must be exercised, and the loopback one is the least-reviewed
+surface in this document.** Section 6's browser recipe pairs a device and drives
+`--serve`, which is `Device` throughout — so on its own it verifies that `Owner`
+is *refused* and never that it works. Add a loopback pass: start `lightview
+<dir>` with the browser launch suppressed, read the token from stdout, redeem it,
+and call a directory listing, a copy into a temp destination, and `purge_trash`.
+Without it the launch-token flow, the picker endpoint and the whole `Owner` half
+of the trust table ship unverified.
 
 **End-to-end, no display required.** Build the SPA (`npm run build` — `dist/`
 is embedded at compile time, so the Rust build fails without it), start the
@@ -1234,7 +1343,16 @@ one only with a written reason.
 | **The bundled taggers declare 512, not 1024** | every tagging job generates `jm` per image on the server |
 | **Group proposals are in-memory, not a table** | a path-keyed table introduced five steps after the sweep list is defined |
 | **The directory picker is an `Owner` listing endpoint**, not `rfd` | a new GTK/portal dependency on a possibly-headless process |
+| **`auto` tags in old sidecars are dropped from the index, and preserved in the file** by a flattened extras map | the next write erases durable data the struct no longer models |
 | **`auto` tags in old sidecars are dropped, not folded into `user::`** | machine output silently promoted to user intent |
+| **A loopback client holds a process-lifetime session, not a device row**; token redeemed at `/auth/launch`, 60 s, single use | ambient authority on `127.0.0.1`, or a pairing flow where none is wanted |
+| **`Origin` on loopback, `Sec-Fetch-Site: same-origin` on `--serve`** | a `0.0.0.0` bind has no fixed origin to name, which is why CORS is `Any` today |
+| **Under `--serve`, nothing is `Owner`**; the host is administered by CLI and `server.toml` | a web UI that can move files on the server |
+| **One process per gallery**, enforced by an advisory lock on the cache directory | two writers on one `cache.db` behind an in-process mutex |
+| **The password is a CLI verb reading stdin**, argon2id, `--serve` only | hand-editing a hash into TOML |
+| **Tag-write commands take a `namespace` of `user` or `set`** | a parallel command family for an identical operation |
+| **One broadcast channel, not two** | a second channel whose only justification was the abolished subscriber-count signal |
+| **The cache budget is enforced only by `lightview cache --prune`**; the LRU key is the cache file's mtime | a gallery discovering its thumbnails were evicted as it opens |
 
 ---
 
