@@ -44,8 +44,15 @@ What the rebuilt system must do. Everything else in this document serves these.
    processed once and never reopened, and a stable library of many thousands.
 6. **Duplicate detection with durable "these are not duplicates"** that is
    visible, nameable, and not per-pair clutter.
-7. **Plugin execution** for auto-tagging, including grouping outputs a person
-   confirms and names (face clustering, bursts, multi-image works).
+7. **Plugin execution** for auto-tagging: a plugin runs over a gallery, locally
+   or on a paired machine, and writes tags back.
+
+   **Grouping outputs a person confirms and names — face clustering and the
+   like — is deliberately *not* in this rebuild.** Its durable half is: naming a
+   group writes `set::<name>` on every member, which section 3.9 delivers in
+   full and which is reachable today from a selection. What is deferred is the
+   channel by which a *plugin* proposes a grouping. See "Grouping is deferred"
+   in section 3.10 for why, and for what it costs to add later.
 
 ### Non-functional
 
@@ -108,7 +115,7 @@ Five contracts change. Two are durable and need care; three are local.
 | `.lightview/trash/` layout | the user's own filesystem | **Replaced.** `<epoch_ms>/<gallery-relative path>` instead of `<epoch_ms>_<seq>/` + `meta.json` | Low — old entries are not read; purge them before switching or leave them inert |
 | `cache.db` | nothing but this process | **Replaced**, moved out of the gallery, and deletable on a version mismatch | None — fully derived |
 | `/api/invoke` + routes | the SPA, and a `--remote` instance | **Replaced** by one command table with trust levels | None — both sides ship together |
-| Plugin NDJSON protocol | plugins on disk | `api_version: 1` only; input quantized to tier edges; new `groups` result kind | Medium — bundled plugins are rewritten in the same change |
+| Plugin NDJSON protocol | plugins on disk | `api_version: 1` only; input quantized to tier edges. **No new result kinds.** | Low — bundled plugins are rewritten in the same change, and the shape is unchanged |
 
 **The companion file is the only thing here that cannot be regenerated.** Treat
 any change to it as the largest commitment in the plan.
@@ -124,10 +131,8 @@ The plan is overwhelmingly subtractive. What it *adds*:
   them.
 - **One CLI mode** (`--remote`) — but it deletes a binary, a cargo feature, a
   config file, and a release artifact.
-- **One `groups` plugin result kind** — needing no new storage, because a
-  confirmed group is a batch tag write.
-
-Nothing else is added. Every other change removes.
+Nothing else is added. Every other change removes. An earlier draft also added
+a `groups` plugin result kind; it is deferred, for the reasons in section 3.10.
 
 **Cases still needing the word *except*** after this plan, all of them
 properties of the problem rather than the history:
@@ -843,38 +848,72 @@ the decode silently.
 promise things that do not exist. A stub that errors is worse than an honest
 absence.
 
-**The wire shape of `groups`**, since `tag` was the only shape the first draft
-gave. A plugin may emit it alongside `tags` in an ordinary result line, or as a
-standalone line at end of stream when the grouping is only knowable across the
-whole job:
+**Grouping is deferred, and the result kind is deleted rather than stubbed.**
 
-```json
-{"groups": [
-  {"id": "face:7", "label": "unnamed cluster 7",
-   "paths": ["2026/january/a.jpg", "2026/january/b.jpg"]}
-]}
-```
+An earlier draft added a `groups` result kind — a plugin proposes groupings, the
+user names one, the name becomes `set::<name>` on every member — and claimed it
+needed "no new storage at all". That claim does not survive the motivating case.
+Wiring a face-clustering plugin to a confirmation screen needs four things this
+plan does not have:
 
-`id` is the plugin's own stable key so a re-run can be matched against a name the
-user already gave. `label` is a suggestion the user may overwrite. Paths are
-gallery-relative.
+1. **A way to get proposals off a remote host.** Tags travel back through
+   `apply_plugin_tags`; groups have no equivalent command. Under `--remote` the
+   model runs on a desktop and the panel is served by the NAS, so proposals are
+   produced in the wrong process with nothing to carry them.
+2. **A terminal-line contract.** `PluginResult.path` is required, so a
+   standalone `{"groups": …}` line does not deserialize. Worse, the download
+   window releases a permit only when a result matches a request — a plugin that
+   withholds output until it has seen every face **deadlocks past 64 images**,
+   which is precisely the failure this codebase shipped for a year. A clustering
+   plugin must emit a per-image acknowledgement to keep permits recycling and
+   then a terminal line, and that is a contract, not an implementation detail.
+3. **Durable proposals.** "Losing them on restart costs one re-run" is true of a
+   tagger and false of clustering, where a re-run is hours of GPU across the
+   library. They need a `plugin_groups` table in the derived cache, path-keyed,
+   in the sweep list.
+4. **Regions, and a channel home.** `{id, label, paths}` points at whole photos,
+   so a group shot with five people lands in five clusters with nothing
+   distinguishing which face is which — the feature does not work for the case
+   it exists for. And cluster ids are not stable across runs, so without a
+   channel carrying already-confirmed names back to the plugin, a second pass
+   re-proposes everyone.
 
-**Unconfirmed proposals live in memory, in the job/activity state — not in a
-table.** They are regenerable by re-running the plugin, they are meaningless
-after the job that produced them, and a table would have to join the path-keyed
-sweep list defined five steps earlier. Losing them on restart costs one re-run.
+**Why deferring is cheap.** Each of those is additive against decisions this plan
+already makes: a command is one row in the command table; a table is one line in
+`path_keyed_tables()`, covered automatically by its test, behind a
+`format_version` bump that deletes and rebuilds for free; `path` becoming
+`Option` plus a `groups` field is backwards compatible and gated by
+`api_version: 2`, which exists for exactly this; `region` and `known` are
+additive JSON with `serde(default)`.
 
-**One new result kind: `groups`.** A plugin emits proposed groupings of paths;
-the user confirms and names one; naming it writes `set::<name>` on every member.
-**No new storage** — the confirmation is a batch tag write. Merging two clusters
-is renaming a tag; splitting one is retagging a selection; a re-run cannot
-disturb the confirmed name, because the plugin's own bucket is what gets
-replaced. Unconfirmed proposals live in the derived cache as scaffolding,
-regenerable by re-running the plugin.
+**The one decision that had to be made early is made:** a confirmed group name is
+a `set::` tag in the companion (section 3.9). That is the load-bearing choice, it
+is independent of how a grouping gets proposed, and sets need nothing from the
+clustering case — naming, many members, and one photo in several sets all work
+identically for a burst. Regions are proposal-time scaffolding, discarded on
+confirmation; if face boxes are ever wanted durably, `meta.plugins["face"]`
+already exists to hold them.
 
-**Findings are deferred.** The `choice`/`confirm`/`label` shapes, a `pending::`
-filter term and two extra tables are a good design for a plugin that does not
-exist yet. `groups` covers both motivating cases that do.
+**Deleted, not stubbed.** A result kind a plugin can emit into with nothing
+receiving it reports success and does nothing — the shape of the video-tagging
+bug this rebuild inherits a fix for, and the reason this plan deletes the `Wasm`
+variant rather than leaving it erroring. The same rule applies to an addition of
+mine.
+
+**And principle 2 says so directly:** *no abstraction, interface, or plugin point
+for a single implementation.* A `groups` protocol with no plugin is a plugin
+point with **zero**. Designing it now also means designing it with nothing to
+test against, which is how a shape turns out wrong the first time a real
+clustering plugin meets it.
+
+Build it when a plugin exists that needs it. Grouping by selection — what a
+burst or a comic actually needs — works from day one through the tag commands in
+section 3.9.
+
+**Findings are deferred for the same reason**, and more comfortably: the
+`choice`/`confirm`/`label` shapes, a `pending::` filter term and two extra tables
+are an elaborate design for plugins that do not exist. Nothing here forecloses
+them.
 
 **One executor, one queue.** Every plugin run goes through the job queue,
 including a local one: one code path, one progress display, one cancel. The
@@ -1034,12 +1073,10 @@ it is not to be reconsidered: `JustifiedGrid`, `MediaViewer`, `VideoPlayer`,
   replacement gesture is *name a set*: a text field with autocomplete over
   existing `set::` tags, writing a batch add across the group. The rest of the
   panel — detection, grouping, thresholds, the merge entry point — is unchanged.
-- **`AutoTagPanel`** gains the **group-confirmation UI, which requirement 7 asks
-  for and no earlier draft designed.** One block per proposed group: a row of
-  member thumbnails at the `j` tier, a name field with the same autocomplete,
-  **Confirm** (a batch add of `set::<name>` over the members) and **Dismiss**
-  (drop it from the in-memory proposal set). No new panel and no review queue —
-  the filter bar plus the grid is how you look at a set afterwards.
+- **`AutoTagPanel`** loses its desktop/web branch (one runtime now) and keeps
+  the worker roster, the per-plugin run entries and the job list. It gains
+  nothing: plugin-proposed grouping is deferred, so there is no proposal section
+  to render.
 - **`TrashPanel`** renders an entry id that today is `<epoch_ms>_<seq>` and is
   validated as digits and underscores. Section 3.4's layout makes one timestamp
   directory hold many files, so **an entry id is now `<epoch_ms>/<relative
@@ -1256,7 +1293,7 @@ with what each step must produce.
 | 4 | **Server + command table** | routes, the two trust levels, path confinement, TLS, pairing, the launch-token session, SSE, upload | `curl` exercises every route; an unauthenticated call is 401; an `Owner` command on a non-loopback bind is 403; **and on a loopback bind, redeeming a launch token and then calling the directory-listing endpoint succeeds** |
 | 5 | **CLI** | the three modes | `lightview <dir>` opens a browser; `--serve` binds and pairs |
 | 6 | **Frontend** | the ported SPA against the new API | the grid fills in headless Chromium |
-| 7 | **Plugins + tagging** | one job loop; `remote.toml` (server url, cookie, `cert_sha256` TOFU pin, instance id and name, poll interval) and the `remote-pair` verb that writes it; then `--remote` | the example tagger completes a job locally, and a second process attached with `--remote` completes one against a self-signed server without disabling verification |
+| 7 | **Plugins + tagging** | one job loop; `remote.toml` (server url, cookie, `cert_sha256` TOFU pin, instance id and name, poll interval) and the `remote-pair` verb that writes it; then `--remote` | the example tagger completes a job locally, and a second process attached with `--remote` completes one against a self-signed server without disabling verification — **with a clip in the test gallery**, so `?frame=` is exercised and a video's companion gains a merged tag entry rather than being silently skipped |
 | 8 | **Docs** | `docs/` rewritten; `_planning/rebuild/` and `refactor.md` deleted | every page describes what exists |
 
 ---
@@ -1341,7 +1378,7 @@ one only with a written reason.
 | **`tags.set` is a sibling of `tags.user`**, with `#[serde(default)]` on every field | old sidecars fail to parse, or sets get erased by plugin re-runs |
 | **`purge_trash` and `merge_duplicates` are `Owner`; `restore_trash` is `Device`** | remote clients get permanent deletion, which requirement 2 forbids |
 | **The bundled taggers declare 512, not 1024** | every tagging job generates `jm` per image on the server |
-| **Group proposals are in-memory, not a table** | a path-keyed table introduced five steps after the sweep list is defined |
+| **Plugin-proposed grouping is deferred and its result kind deleted, not stubbed** | a protocol a plugin can emit into with nothing receiving it — the video-tagging failure shape, and a plugin point with zero implementations |
 | **The directory picker is an `Owner` listing endpoint**, not `rfd` | a new GTK/portal dependency on a possibly-headless process |
 | **`auto` tags in old sidecars are dropped from the index, and preserved in the file** by a flattened extras map | the next write erases durable data the struct no longer models |
 | **`auto` tags in old sidecars are dropped, not folded into `user::`** | machine output silently promoted to user intent |
@@ -1363,8 +1400,12 @@ Named so their absence reads as a decision rather than an oversight.
 - **The map view, the infinite canvas, the virtual folder view.** The first is
   deleted; the other two were designed and unbuilt, and are incompatible with
   having one view. They leave the roadmap.
-- **Plugin findings** (`choice`/`confirm`/`label`, `pending::`). Deferred; the
-  `groups` kind covers the cases that exist.
+- **Plugin-proposed grouping** (a `groups` result kind, face clustering). See
+  section 3.10 — deferred until a plugin exists that would use it, and deleted
+  rather than left as a stub. Naming a group *from a selection* ships, because
+  that is just a batch tag write.
+- **Plugin findings** (`choice`/`confirm`/`label`, `pending::`). Deferred; no
+  plugin needs them.
 - **A decode-worker pool / canvas cells.** Would give up the browser's own image
   cache (measured: returning to visited positions costs +2 MB rather than
   +55 MB) in exchange for explicit `ImageBitmap.close()`. Two rationales on two
