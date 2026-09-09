@@ -1,5 +1,18 @@
 # AGENTS.md
 
+The single guidance file for this repository. `CLAUDE.md` is a symlink to it —
+there is no second copy to drift.
+
+LightView is a local media gallery: it opens a folder of images and videos,
+indexes it into SQLite, generates thumbnails at several resolutions, and
+presents a browsable grid plus a full-resolution viewer. The same application
+serves that gallery to phones and laptops on the LAN. Rust backend, SolidJS
+frontend in a webview, three binaries out of one crate.
+
+**Stack:** Rust 2024 · Tauri 2 · rusqlite (bundled SQLite) · rayon · tokio ·
+wgpu · image · fast_image_resize · libheif-rs — and TypeScript · SolidJS ·
+Tailwind v4 · Vite 5.
+
 ## Development Commands
 - **Full App (Dev):** `cargo tauri dev`
 - **Frontend Dev:** `npm run dev`
@@ -18,6 +31,10 @@
 ## Deeper Reference
 [`docs/`](docs/README.md) — subsystem maps and cross-module invariants. Start at [`docs/architecture.md`](docs/architecture.md); each subsystem README states the invariants its callers must uphold, so read the one covering whatever you are about to change.
 
+Driving the whole stack without a display — headless server, `curl` against every route, real SPA in headless Chromium — is [`docs/build-and-verify.md`](docs/build-and-verify.md). It is the only way to exercise the grid, which `tsc` cannot cover.
+
+**A rebuild is planned.** [`docs/refactor.md`](docs/refactor.md) is a complete inventory of the system as it stands and the argument for a substantially smaller one: one runtime, one view, three thumbnail tiers, one binary, and no migration code. Read it before designing anything large — several subsystems described in `docs/` are slated to be replaced rather than extended.
+
 ## Core Architecture
 - **Boundary:** Frontend calls Rust via `src-solidjs/lib/ipc.ts` (canonical IPC).
 - **Protocol:** Media/thumbnails are served via `lightview://` (custom URI protocol).
@@ -33,41 +50,70 @@
 
 These are ordered. When they conflict, the earlier one wins.
 
-### 1. Plan before you build
+### 1. Work out the architecture before you write code
 
-Thinking is cheap in a plan and expensive once it's code — catch a wrong
-assumption or a bad approach before anything is written, not after.
+Thinking is cheap in a plan and expensive once it's code. The point of planning
+is not the document — it's forcing the structural questions to be answered while
+they are still free to answer differently. Most bad code in a codebase is not
+badly written; it is correctly written in the wrong place, against the wrong
+contract, or adding a concept that did not need to exist.
 
-**No code changes without a written, approved plan.** No size exception —
-depth scales with the change instead: a typo fix might be one sentence, a new
+**No code changes without a written, approved plan.** No size exception — depth
+scales with the change instead: a one-line fix might be one sentence, a new
 subsystem a paragraph per section. A short plan is the rule working, not a
 workaround.
 
-**Record the plan** in chat if nothing about the change would trigger the
-update rules in principle 5 (no new or changed subsystem, interface, or data
-flow). Otherwise record it as `docs/_planning/<slug>/requirements.md` and
-`design.md` (layout in principle 5). Either way, answer in writing before
-presenting for approval:
+Answer these in writing, in this order, before presenting anything for approval.
+The first three are the architectural ones and are the reason this principle is
+first:
 
-- **Approach** — what you're going to do.
-- **Alternatives** — what else could work, and why each one lost.
-- **Impact** — what this touches, what could break, what depends on it.
-- **Assumptions** — what you're taking on faith, and what happens if it's wrong.
+- **Placement** — where does this sit, and which way do the dependencies point?
+  Name the module. Domain modules must not learn about their callers; if the
+  change makes a lower layer aware of a higher one, that is the finding, and the
+  plan is wrong before it starts.
+- **Contract** — what interface, wire format, schema, or invariant changes, and
+  who is on the other side of it? Name both sides. A format other installations
+  read, or state a user cannot regenerate, is a much larger commitment than a
+  cache and should be argued for as one.
+- **Cost in concepts** — what does this add that a reader will have to hold in
+  their head? A code path, a table, a config knob, a second way to do something
+  that already has one. Count it honestly, and check the opposite direction
+  first: **could the requirement be met by deleting something instead?** If a
+  change adds a case that has to be explained with the word *except*, say so in
+  the plan; every such case is permanent until someone removes it.
+- **Alternatives** — what else could work, and why each one lost. "It was the
+  first thing I thought of" is not a reason.
+- **Assumptions** — what you are taking on faith, and what happens if it is
+  wrong. Anything unmeasured belongs here, named as unmeasured.
+
+Two checks worth running against your own plan, because both failures are
+common and quiet. **The second-implementation test:** if the plan introduces an
+abstraction, an interface, or a plugin point, name the second real consumer. If
+there isn't one, write the concrete thing (principle 2). **The seam test:** if
+the change is hard to place, that is usually the architecture telling you the
+seam is in the wrong spot — say so rather than working around it.
+
+**Record the plan** in chat if nothing about the change would trigger the update
+rules in principle 5 (no new or changed subsystem, interface, or data flow).
+Otherwise record it as `docs/_planning/<slug>/requirements.md` and `design.md`
+(layout in principle 5).
 
 **Review it — independently when you can.** A subagent or fresh session scoped
-to just the plan catches what self-review won't; use one if available.
-Otherwise review it yourself, adversarially. Fix what you find.
+to just the plan catches what self-review won't; use one if available. Otherwise
+review it yourself, adversarially: argue the plan is wrong and see what survives.
+Fix what you find.
 
-**Get explicit approval** before creating `tasks.md` or touching code. Revise
-and re-present on feedback — silence isn't approval.
+**Get explicit approval** before creating `tasks.md` or touching code. Revise and
+re-present on feedback — silence isn't approval.
 
 **Disclose every departure** from the approved plan when you report progress.
-Stop and get approval if a departure leaves any of the four questions above
-without a confident answer.
+Stop and get approval if a departure leaves any of the five questions above
+without a confident answer — especially Placement or Contract, since those are
+the ones that are expensive to undo once code exists.
 
-**On completion**, fold what's durable into the permanent docs (principle 5)
-and delete `docs/_planning/<slug>/`, if one exists. Git history is the record
-of what was tried.
+**On completion**, fold what's durable into the permanent docs (principle 5) and
+delete `docs/_planning/<slug>/`, if one exists. Git history is the record of what
+was tried.
 
 ### 2. Simplest thing that works
 

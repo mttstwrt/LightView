@@ -1391,13 +1391,23 @@ out of the docs layout, the "Decisions." paragraph is replaced by *reasoning
 lives beside what it constrains*, and the update rule now says to record a choice
 in the subsystem page it affects.
 
-`AGENTS.md` turned out never to have carried the rule. The two guidance files
-have drifted — `AGENTS.md` has five principles including "plan before you build"
-and a `docs/_planning/<slug>/` convention that `CLAUDE.md` does not mention;
-`CLAUDE.md` had four and the decision log. Two documents telling an agent
-different things about the same repository is the same category of problem as
-everything else here, and reconciling them into one belongs in the rebuild's
-documentation pass.
+`AGENTS.md` turned out never to have carried the rule, and the two guidance
+files had drifted badly — different principle counts, different numbering (so
+each file's internal "principle N" cross-references pointed at the other's wrong
+rule), a `docs/_planning/` convention in one and a decision log in the other.
+
+**Resolved rather than deferred**, since a rebuild guided by two contradictory
+documents is worse than one guided by either. `AGENTS.md` is now the single file
+and `CLAUDE.md` is a symlink to it, so there is no second copy that *can* drift.
+Principle 1 was rewritten from "plan before you build" to **work out the
+architecture before you write code**: the plan's first three questions are now
+placement (which module, and which way the dependencies point), contract (what
+format or invariant changes, and who is on the other side), and cost in concepts
+— which asks explicitly whether deleting something would meet the requirement
+instead, and requires any new case needing the word *except* to be named in the
+plan. Two self-checks came with it: name the second consumer before writing an
+abstraction, and treat "this change is hard to place" as the architecture
+reporting a bad seam rather than as an obstacle to route around.
 
 ## Where this proposal was weakest, and what is left
 
