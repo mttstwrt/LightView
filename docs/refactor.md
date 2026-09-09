@@ -715,7 +715,8 @@ with the rule: sets become tags in the companions (Change 4), and everything
 `gallery.json` was going to hold is either a deleted setting (companion
 location), server configuration (below), or cache-keying detail that should not
 be user data at all. `trash/` stays under `.lightview/` because a trashed file
-*is* a photo and its companion.
+*is* a photo and its companion — see below for why it needs no metadata file
+either.
 
 So a gallery on disk is: the media, the sidecars, and a trash folder. Delete
 everything else and re-open it, and you are back — slower, having re-thumbnailed,
@@ -751,6 +752,62 @@ machine work — and the rule earns its power by having no exceptions. If moving
 large galleries turns out to be a real habit rather than a rare event, adding
 that file later is a small, additive change; building it now on the guess is
 what the rule is against.
+
+### Trash needs no exemption
+
+`meta.json` looked like the one thing in a gallery that is neither a photo nor a
+companion: restore has to know where a file came from. Mirroring the
+gallery-relative path *inside* the trash removes it — a file at
+`2026/january/photo.jpeg` is trashed to `trash/…/2026/january/photo.jpeg`, and
+the path is the provenance.
+
+Two things stop a bare mirror from working, and one segment fixes both:
+
+**Deletion time has nowhere to live.** Purge needs `deleted_at`. The file's
+mtime cannot carry it — a rename preserves mtime, and preserving it is the
+point: the duplicate merge deliberately stamps a keeper's mtime, and restoring a
+file with a rewritten one would be silent data loss. `ctime` is neither portable
+nor exposed reliably.
+
+**Relative paths are not unique over time.** Trash `2026/january/photo.jpeg`,
+restore it, edit it, trash it again, and the second copy overwrites the first.
+Today's `<epoch_ms>_<seq>` directory guarantees uniqueness; a bare mirror gives
+that up.
+
+So: **`trash/<epoch_ms>/<gallery-relative path>`.** The timestamp segment is the
+deletion time and the uniqueness key; everything after it is the original path.
+
+That does better than merely replacing `meta.json`:
+
+- **Purge gets cheaper, not just simpler.** `purge_entries` currently reads a
+  `meta.json` per entry to learn `deleted_at`. With the timestamp in the
+  directory name it is one `read_dir`, a numeric parse, a compare, and
+  `remove_dir_all` — no file reads at all. `list_trash` loses the same per-entry
+  read.
+- **One delete is one directory**, so "undo that delete" becomes a natural unit.
+  Restoring a whole operation is restoring a directory, where today the caller
+  has to remember which entry ids belonged together.
+- **It is browsable.** `ls .lightview/trash/` shows what was deleted and when,
+  with no application involved — the same property the companion files have, for
+  the same reason.
+- **The two companion slots go.** An entry currently carries both
+  `companion.lightview_folder.json` and `companion.alongside.json` because it
+  cannot know which location the original used. Inside a mirrored trash the
+  companion sits alongside the media uniformly, and restore writes it to the one
+  current write location. `COMPANION_ENTRIES` and its loop disappear.
+
+What carries over untouched: refusing a restore when something already occupies
+the destination, `create_dir_all` for a parent directory that no longer exists,
+and `.lightview` already being skipped by the media scan, the companion indexer
+and the fs-watcher.
+
+Two costs, both small and worth naming. Restoring leaves empty directories
+behind (`trash/<ts>/2026/january/`), so restore prunes upward to the timestamp
+directory — a few lines. And the prefix adds roughly thirty-five characters to
+every path, which matters only in a gallery already close to the system limit.
+
+**The rule therefore holds with no amendment:** everything durable in a gallery
+is a photo, a companion, or a path.
 
 ### No migration code
 
