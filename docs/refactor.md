@@ -1275,8 +1275,9 @@ properties of the history.
 
 ## How this gets built
 
-**This is a rebuild, not a refactor**, and the decision is worth stating first
-because it changes what every section above means in practice.
+**This is a rebuild, not a refactor**, in **this repository**, and the decision is
+worth stating first because it changes what every section above means in
+practice.
 
 The nine changes rewrite roughly 60% of the tree. At that ratio "incremental"
 stops buying what it usually buys: each step would have to negotiate with the
@@ -1383,6 +1384,20 @@ So: fold the surviving reasoning into the subsystem pages, delete the directory
 and the convention, and drop the "add a decision file" clause from the
 engineering principles. The eleven records this refactor would otherwise have
 demanded are never written, which is a saving on top of the fifteen deleted.
+
+**Done in `CLAUDE.md` ahead of the rebuild**, since the rule was live and would
+otherwise have applied to the rebuild's own commits: the `decisions/` entry is
+out of the docs layout, the "Decisions." paragraph is replaced by *reasoning
+lives beside what it constrains*, and the update rule now says to record a choice
+in the subsystem page it affects.
+
+`AGENTS.md` turned out never to have carried the rule. The two guidance files
+have drifted — `AGENTS.md` has five principles including "plan before you build"
+and a `docs/_planning/<slug>/` convention that `CLAUDE.md` does not mention;
+`CLAUDE.md` had four and the decision log. Two documents telling an agent
+different things about the same repository is the same category of problem as
+everything else here, and reconciling them into one belongs in the rebuild's
+documentation pass.
 
 ## Where this proposal was weakest, and what is left
 
@@ -1509,6 +1524,8 @@ reader who disagrees should know they were decided rather than assumed.
   than nine shippable steps, with a port table deciding what is copied and what
   is written fresh.
 - **`decisions/` is deleted**, convention and all; the reasoning folds into the
-  subsystem pages.
+  subsystem pages. The rule is already out of `CLAUDE.md`.
+- **A dark period is accepted.** The backend is not built against the existing
+  SPA as a compatibility target; the first working thing is the whole system.
 - **Re-marking duplicates and re-thumbnailing are accepted costs**, repeatedly
   and deliberately, in exchange for code that does not carry its own history.

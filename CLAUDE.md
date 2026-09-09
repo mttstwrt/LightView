@@ -355,8 +355,6 @@ It is part of every change, not a follow-up.
 docs/
   README.md              entry point; map of the docs with links to each subsystem
   architecture.md        component map, data flow, dependency direction
-  decisions/
-    0001-<slug>.md       one decision per file, numbered, append-only
   <subsystem>/
     README.md            subsystem overview
     <topic>.md           only when a topic outgrows the README
@@ -377,16 +375,20 @@ relying on directory nesting to imply them.
 and to the subsystems it names. `architecture.md` and each subsystem README are hubs;
 no page should be reachable only by browsing the filesystem.
 
-**Decisions.** When a choice has alternatives worth recording, add
-`docs/decisions/NNNN-<slug>.md` with: context, options considered, the choice, and
-the consequences. Decision files are never edited after the fact. If a decision is
-reversed, write a new one and add a superseding link to the old.
+**Reasoning lives beside what it constrains.** When a choice had alternatives worth
+recording, write them into the subsystem page that describes the thing — "this was
+tried and rejected because X" belongs next to the code it explains, where a reader
+finds it without knowing to look. There is no separate decision log: a numbered,
+append-only annex grows forever, and the answer to one question ends up spread
+across however many files happen to touch it. Git holds the history; a decision's
+record is its commit.
 
 **Update rules.** In the same change, whenever you:
 - add, remove, rename, or move a subsystem — update `architecture.md` and fix links
 - change a data flow, interface contract, or file/wire format — update the affected
   subsystem READMEs on both sides of the boundary
-- make a decision with real alternatives — add a decision file
+- make a decision with real alternatives — record it in the subsystem page it
+  affects, alongside what it constrains
 - write code that contradicts something the docs currently state — fix the docs
 
 Prose over bullet fragments. Do not paste code that will drift; link to it and explain
