@@ -1341,6 +1341,79 @@ already answered coming back. That is annoying rather than destructive, and
 re-marking is the accepted price throughout this document; it is worth a test
 that outlives the change.
 
+## What the refactor leaves behind
+
+Three pieces of work that no individual change owns, and that are therefore the
+ones most likely to be skipped.
+
+### The decision records
+
+`decisions/` is append-only by its own rule: a reversed decision gets a **new**
+file with a superseding link, never an edit. Six of the fifteen are reversed
+here — [0001](decisions/0001-one-cache-per-gallery.md) (the cache moves out of
+the gallery), [0002](decisions/0002-two-families-of-thumbnail-tiers.md) (one
+family, three tiers), [0003](decisions/0003-derive-schema-version-from-migrations.md)
+(no migrations at all), [0005](decisions/0005-remote-invoke-is-an-allowlist.md)
+(one command table with trust levels),
+[0008](decisions/0008-no-view-module-api.md) (one view, so enablement has
+nothing to enable), and [0014](decisions/0014-ship-the-worker-with-the-release.md)
+(no worker binary to ship).
+
+Five more choices in this document have real alternatives and so want records of
+their own: browser-only as the single runtime, a set being a tag, deleting the
+cache rather than migrating it, one binary with three roles, and the trash
+layout. That is about eleven files, plus a rewrite of most subsystem READMEs.
+
+Skipping it re-creates precisely the condition this refactor exists to fix —
+documentation that confidently describes a system that no longer exists — and it
+would do so in the one place a reader trusts most.
+
+### `todo.md` nearly empties, and that is the scorecard
+
+Of the twenty open items, roughly seventeen close as a side effect rather than
+by being worked:
+
+| Closed by | Items |
+|---|---|
+| Change 2 and the pipeline collapse | B1, B3, B5 |
+| Change 3 | E2, F1 |
+| Change 5 | A4's deferred half, and A7's group case |
+| Change 7 | B2, C1, C4, E1, E3 |
+| Change 8 | A3 |
+| Change 9 | D2 |
+
+**Two are cancelled rather than closed, and that should be explicit.** C2 (the
+infinite scrolling canvas) and C3 (the virtual folder view) are designed,
+unbuilt, and incompatible with one view. They leave the roadmap; the design notes
+stay in the decision history as things considered and dropped.
+
+**Three survive untouched**, and it is worth knowing which: **A6** (move the ML
+taggers to their own repository — named in Change 5, still a real task), **A8**
+(a tagging job rebuilds the whole `tag_counts` table every 32 files, which no
+change here addresses and which still wants a measurement on a large library),
+and **B4** (`auth_layer` takes the writer lock in front of the read-only pool,
+which also still wants a number before code).
+
+### The tests sit opposite the risk
+
+189 Rust unit tests, no frontend harness. The changes with the least coverage are
+the ones where being wrong is least recoverable, and two deserve naming.
+
+`remove_media_rows_clears_every_path_keyed_table` (`cache/db.rs`) guards the
+invariant that every path-keyed table is swept together — the failure it prevents
+is a multi-megabyte blob keyed to a path that can never be reached again. Four of
+those tables are being deleted. That test must be **updated**, not removed with
+them.
+
+The duplicate finder's new "never offer a pair that shares a `set::` tag" clause
+is the one piece of genuinely new logic sitting where a user's judgement is
+stored. It is cheap to test and expensive to get wrong quietly, so it should have
+a test that outlives the change.
+
+The grid remains untestable by `tsc` and covered only by driving the real SPA
+against the headless server. That does not change here, and after Change 1 it is
+the *only* runtime, so the harness is worth more than it was.
+
 ## Decisions taken during review
 
 Recorded here because they are the answers that shaped the sections above, and a
