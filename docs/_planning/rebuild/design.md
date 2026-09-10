@@ -39,12 +39,15 @@ What the rebuilt system must do. Everything else in this document serves these.
    beyond that**, and no way to enable it.
 3. **`lightview --remote <url>`** — attach this machine's plugins to a remote
    instance and run its tagging jobs. Replaces the `lightview-worker` binary.
-4. **One grid view: justified.** Aspect-preserving rows. No square grid, no map.
-5. **Storage that suits both usage patterns** — a folder of two hundred images
+4. **Installable as an ordinary system package**, invoked as `lightview` from
+   anywhere on `PATH`. A requirement rather than a nicety, and incompatible with
+   how the current build resolves its state directory — see section 3.3.
+5. **One grid view: justified.** Aspect-preserving rows. No square grid, no map.
+6. **Storage that suits both usage patterns** — a folder of two hundred images
    processed once and never reopened, and a stable library of many thousands.
-6. **Duplicate detection with durable "these are not duplicates"** that is
+7. **Duplicate detection with durable "these are not duplicates"** that is
    visible, nameable, and not per-pair clutter.
-7. **Plugin execution** for auto-tagging: a plugin runs over a gallery, locally
+8. **Plugin execution** for auto-tagging: a plugin runs over a gallery, locally
    or on a paired machine, and writes tags back.
 
    **Grouping outputs a person confirms and names — face clustering and the
@@ -56,14 +59,14 @@ What the rebuilt system must do. Everything else in this document serves these.
 
 ### Non-functional
 
-8. **Fewer concepts.** The measure is how many times the word *except* is needed
+9. **Fewer concepts.** The measure is how many times the word *except* is needed
    to describe the system truthfully. The system being replaced needs it about
    thirty-five times; the target is about thirteen, and the survivors must be
    properties of the problem rather than of the history.
-9. **Smaller.** ~26,900 lines of Rust and ~19,800 of TypeScript become roughly
+10. **Smaller.** ~26,900 lines of Rust and ~19,800 of TypeScript become roughly
    18,500 and 13,000. **If the finished tree is not smaller, something was added
    that nobody asked for.**
-10. **The photos and their companion files are the only durable data.**
+11. **The photos and their companion files are the only durable data.**
     Everything else must be reconstructable from them.
 
 ### Explicit non-requirements
@@ -162,17 +165,17 @@ properties of the problem rather than the history:
     regression for a NAS mount browsed locally as well as served.
 
 Anything beyond this list that a plan step introduces is a regression against
-requirement 8 and needs to be argued for explicitly.
+requirement 9 and needs to be argued for explicitly.
 
 ### Alternatives
 
 | Considered | Why it lost |
 |---|---|
-| **Iced** for the desktop UI | `--serve` needs a web client regardless, so this means maintaining two complete UIs forever — the opposite of requirement 8 |
+| **Iced** for the desktop UI | `--serve` needs a web client regardless, so this means maintaining two complete UIs forever — the opposite of requirement 9 |
 | **`tao`/`wry` shell** around the loopback URL | Keeps one frontend and re-adds a native window; still available later if a browser tab proves unacceptable, but the window is not currently wanted |
 | **Incremental refactor**, nine shippable steps | At ~60% rewrite each step negotiates with the shape it replaces; requirement for runnable intermediates was explicitly waived |
 | **New repository** with a salvage list | Loses history for no benefit; the same result is achievable on a branch |
-| **`sets.json`** as a durable set store | Violates requirement 10 — a set is expressible as tags in files that already exist |
+| **`sets.json`** as a durable set store | Violates requirement 11 — a set is expressible as tags in files that already exist |
 | **Keeping `not_duplicates`** and adding sets alongside | Two answers to one question; the pairwise table is what the complaint was about |
 | **Migrating the cache schema** | The database is fully derived, so deleting and rebuilding is strictly simpler and the migration code would be permanent |
 | **Compatibility shim** so the old SPA drives the new backend | Doubles the API surface for the duration; the dark period was accepted instead |
@@ -224,9 +227,9 @@ lightview cache              show the derived-cache directory and its size
 lightview cache --prune      evict least-recently-opened galleries to the budget
 ```
 
-**`pair` takes no gallery argument.** Pairings live in the data dir and are a
-property of this machine serving (section 3.3), so there is nothing per-gallery
-to name. The consequence, stated because it is a real widening: a phone paired
+**`pair` takes no gallery argument.** Pairings live in the state directory and
+are a property of the account serving (section 3.3), so there is nothing
+per-gallery to name. The consequence, stated because it is a real widening: a phone paired
 to this machine is paired to every gallery this machine serves, now or later.
 That is consistent with all paired devices being equally trusted, and it is the
 cost of removing the per-gallery cookie-name mint.
@@ -242,6 +245,33 @@ plugins for a remote one runs two processes, each with its own config.
 holding a list of attachments — means a repeated config section, a lifecycle
 where one failing attachment must not take down the server, and interleaved
 logs. Two processes get all of that from the operating system.
+
+### 3.1b Packaging
+
+The binary is `lightview`, from Cargo's package name — the `productName:
+"Gallery"` mismatch that makes today's `.desktop` file point at a binary the
+build does not produce is a Tauri bundling artifact and dies with Tauri.
+
+**A package is one executable and three small files.** The SPA is embedded at
+compile time, so there is nothing to install alongside it:
+
+| Installed | Purpose |
+|---|---|
+| `/usr/bin/lightview` | the binary |
+| `lightview.desktop` | `MimeType=inode/directory` and `Exec=lightview %f`, so a file manager offers "Open with LightView" on a folder, plus a `Desktop Action` for a folder's background |
+| an icon | for the above |
+| systemd **user** units (optional) | `lightview-serve@.service` and `lightview-remote@.service`, for the two long-running modes |
+
+**Runtime dependencies:** `ffmpeg` and `ffprobe` for video thumbnails and frame
+extraction — without them clips fall back to a placeholder rather than failing —
+and `xdg-utils` for the browser launch in local mode. `libheif` is linked, not
+shelled out to, so it is a build dependency and a shared-library dependency
+rather than a runtime binary.
+
+**Nothing is installed into a shared writable location.** All state is per-user
+under XDG (section 3.3), so the package installs read-only files and creates no
+directories at install time. That is what makes it an ordinary package rather
+than one with a post-install script.
 
 ### 3.2 Trust is a property of the bind
 
@@ -307,25 +337,55 @@ setting. The default filter is user intent and lives here.
 Kilobytes to low megabytes. Safe to copy, sync, or read with `grep`. Delete
 everything else and reopen, and nothing is lost but time.
 
-**The data dir holds two different things, and conflating them is dangerous.**
+**Machine-local state follows the XDG base directories**, and the split that
+requirement 4 forces is the same one safety already forced:
 
 ```
-<data_dir>/
-  galleries/<sha256-of-canonical-root>/cache.db   DERIVED — disposable, budgeted
-  ─────────────────────────────────────────────
-  tls/                                            NOT derived: private key
-  server.toml                                     NOT derived: password hash, SANs
-  devices.db                                      NOT derived: every pairing
-  remote.toml                                     NOT derived: --remote credential
-  install_id                                      NOT derived: cookie-name suffix
-  plugins/<name>/                                 NOT derived: installed plugin code
+$XDG_CACHE_HOME/lightview/        (~/.cache/lightview)
+  galleries/<sha256-of-canonical-root>/cache.db    DERIVED — disposable, budgeted
+
+$XDG_DATA_HOME/lightview/         (~/.local/share/lightview)
+  tls/                            private key and certificate
+  devices.db                      every pairing
+  install_id                      cookie-name suffix
+  plugins/<name>/                 installed plugin code
+
+$XDG_CONFIG_HOME/lightview/       (~/.config/lightview)
+  server.toml                     serve configuration
+  remote.toml                     --remote credential, mode 0600
 ```
 
-**The budget and `lightview cache --prune` apply to `galleries/` only.** Nothing
-else under the data dir is regenerable: losing `devices.db` re-pairs every phone
-by hand, and losing `tls/` re-prompts every browser. The first draft filed all of
-it under one "derived, disposable" heading, which is how a future maintainer
-clearing a cache un-pairs the household.
+**The current build cannot be packaged**, and this is why the plan says so
+explicitly rather than inheriting the mechanism. `util::paths::data_dir()`
+resolves to `<exe_dir>/data/`, documented as deliberate — *"so a portable
+install carries its plugins, TLS material, and recent-gallery list with it."*
+Install that binary to `/usr/bin/lightview` and its state directory becomes
+`/usr/bin/data/`: root-owned, unwritable, broken on first run.
+
+**Three directories where the first draft had one, and that is fewer things to
+explain, not more.** Each is a standard location with an established meaning, so
+"which of these can I safely delete?" is answered by the path rather than by a
+paragraph. A user emptying `~/.cache`, or systemd-tmpfiles sweeping it, becomes
+safe *by construction* — which is exactly the property the earlier one-directory
+version needed a warning to achieve.
+
+`--data-dir <path>` overrides all three with `<path>/{cache,data,config}`, for
+containers and for tests. The Docker image sets it, or sets the `XDG_*`
+variables; either way one line in the compose file replaces the volume mount the
+exe-relative layout needed.
+
+**Portable install is given up**, and it was a real capability deliberately
+built: a copied directory carried its own plugins and certificates. It is
+directly incompatible with requirement 4, and neither deployment this system
+has — a container and a desktop — is a USB stick.
+
+**Pairings are therefore per *user account*, not per machine.** Two users on one
+host serving galleries hold separate device lists, which is right. In a
+container it is moot: one account runs everything, so `lightview pair` and
+`lightview --serve` share a state directory by construction.
+
+**The budget and `lightview cache --prune` apply to the cache directory only** —
+which under XDG is now enforced by the path rather than by this sentence.
 
 Consequences, all of them currently missing:
 
@@ -344,7 +404,7 @@ lives inside the gallery, so a NAS mount is thumbnailed once and read by
 everything; after this it is thumbnailed per machine that opens it locally. The
 serve-plus-browse flow is unaffected, since a browser holds no cache of its own. An id file in `.lightview/` would avoid that for two lines,
 and is deliberately not in the design — an id is not something the user needs,
-and requirement 10 earns its power by having no exceptions. Add it later if
+and requirement 11 earns its power by having no exceptions. Add it later if
 moving large galleries turns out to be a habit.
 
 **A read-only gallery improves:** derived data goes to the local data dir, so
@@ -352,7 +412,7 @@ only the durable half degrades rather than nothing working.
 
 #### Configuration is a file; commands are actions
 
-`server.toml` in the data dir, read at startup and on change: bind address,
+`server.toml` in the config directory, read at startup and on change: bind address,
 port, TLS SANs, password hash, inactivity window, upload enable and scheme,
 trash retention, cache budget.
 
@@ -950,7 +1010,8 @@ claim, enqueue, status **and heartbeat** — the heartbeat is the only traffic a
 wedged job produces.
 
 **The server never receives or executes code.** A job carries a plugin *name*;
-an instance only runs manifests installed under its own `data_dir()/plugins`.
+an instance only runs manifests installed under its own state directory's
+`plugins/`.
 
 **Move the ML taggers out of this repository.** Keep `plugins/example-auto-tagger`
 — dependency-free `python3`, and what the verification recipe drives. The three
@@ -988,12 +1049,13 @@ by hand or a 32-byte hex token in a QR code — the PIN is safe because of the
 10-minute TTL and single-use redemption, not because six digits are hard to
 guess.
 
-Pairings live in the **data dir**, not the gallery, because they are a property
-of this machine serving. That removes the per-gallery cookie-name mint that
+Pairings live in the **state directory**, not the gallery, because they are a
+property of this account serving. That removes the per-gallery cookie-name mint that
 existed because cookies are scoped by host and not by port.
 
 **A `--remote` instance has no browser, so none of the above reaches it.** It
-needs its own credential, stored at `<data_dir>/remote.toml`, mode 0600:
+needs its own credential, stored at `$XDG_CONFIG_HOME/lightview/remote.toml`,
+mode 0600:
 
 | Field | Purpose |
 |---|---|
@@ -1337,7 +1399,7 @@ unauthenticated call is 401. Then drive the real SPA in headless Chromium at
 fills. This is the only way to exercise tier selection, eviction and decode
 timing.
 
-**The acceptance test for the whole change** is requirement 9: the finished tree
+**The acceptance test for the whole change** is requirement 10: the finished tree
 must be smaller. The baseline is 26,939 lines of Rust and 19,760 of TypeScript,
 counted as: every `.rs` file under `src-tauri/src/` including inline
 `#[cfg(test)]` modules and excluding `benches/`; every `.ts` and `.tsx` under
@@ -1382,6 +1444,8 @@ one only with a written reason.
 | **The directory picker is an `Owner` listing endpoint**, not `rfd` | a new GTK/portal dependency on a possibly-headless process |
 | **`auto` tags in old sidecars are dropped from the index, and preserved in the file** by a flattened extras map | the next write erases durable data the struct no longer models |
 | **`auto` tags in old sidecars are dropped, not folded into `user::`** | machine output silently promoted to user intent |
+| **Machine-local state follows XDG**, with a `--data-dir` override | the exe-relative state directory, which makes `/usr/bin` installation impossible |
+| **Portable install is given up** | a capability deliberately built, incompatible with being packaged |
 | **A loopback client holds a process-lifetime session, not a device row**; token redeemed at `/auth/launch`, 60 s, single use | ambient authority on `127.0.0.1`, or a pairing flow where none is wanted |
 | **`Origin` on loopback, `Sec-Fetch-Site: same-origin` on `--serve`** | a `0.0.0.0` bind has no fixed origin to name, which is why CORS is `Any` today |
 | **Under `--serve`, nothing is `Owner`**; the host is administered by CLI and `server.toml` | a web UI that can move files on the server |
@@ -1413,6 +1477,7 @@ Named so their absence reads as a decision rather than an oversight.
 - **A BK-tree for duplicate detection.** All-pairs is fine at this scale.
 - **Per-device scopes.** All paired devices are equally trusted.
 - **EXIF writing.** No path exists and acquiring one means rewriting image bytes.
+- **A portable install.** Requirement 4 replaces it; see section 3.3.
 
 **Open items carried forward** — real, and none of them blocking:
 
