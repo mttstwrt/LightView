@@ -14,11 +14,23 @@ describes. Requirements are section 1 below. The split exists to keep a plan
 reviewable; for a change this size the two halves reference each other on nearly
 every line, and separating them would mean reading both to understand either.
 
-**Reviewed.** An independent cold read (principle 1) plus an adversarial
-self-review produced twenty-eight findings, all folded into the text below
-rather than appended — including one **false claim** the first draft made about
-the existing code, corrected in section 4. Where a finding forced a decision
-that had not been made, the decision is stated inline and repeated in section 7.
+**Reviewed, three rounds.** Two independent cold reads and an adversarial
+self-review, then a **five-angle cold review** — performance, security,
+simplicity, factual accuracy against the codebase, and failure modes — each
+carried out with no memory of the conversation that produced this plan. Findings
+are folded into the text rather than appended, so the reasoning sits where the
+decision is. Six that reverse a settled decision or turn on a fact about the
+deployment are in **section 9** instead, undecided and marked as such.
+
+Two classes of finding recur and are worth naming, because they are what a fourth
+review should hunt for. **False claims about the existing code**: the first draft
+asserted that nothing writes the `auto` namespace and that the `hardware/` probes
+drive nothing; both are false, and both sat in the port table, which tells an
+implementer not to reconsider its contents. **Sentences that over-describe a
+ported check**: the draft said uploads "confirm the *resolved* destination", and
+the code says in its own doc comment that it is lexical. That class is the most
+expensive error this document can contain, because it reads as "already
+handled".
 
 **On completion:** fold what is durable into `docs/`, delete
 `docs/_planning/rebuild/`, and delete `docs/refactor.md` — its inventory
@@ -170,9 +182,11 @@ property of the problem.** A ledger that quietly accumulates history-shaped
 entries measures nothing:
 
 - **`dist/` must exist before any `cargo` command** is a property of choosing
-  `rust-embed` with a required folder. `.gitignore` excludes `dist/`; add
-  `!dist/.gitkeep`, commit the file, and `cargo check` works on a fresh clone
-  forever. A build without `npm run build` then serves a 404 at `/` — a loud
+  `rust-embed` with a required folder. `.gitignore:8` excludes `dist/`, and git
+  **cannot re-include a file whose parent directory is excluded** — so the
+  negation alone does not work. The line becomes `dist/*` followed by
+  `!dist/.gitkeep`, and that file is committed. Then `cargo check` works on a
+  fresh clone forever. A build without `npm run build` then serves a 404 at `/` — a loud
   runtime failure instead of a confusing build failure. Two lines for one
   permanent exception. Step 0 had already found the trick and used it only as
   scaffolding.
@@ -180,6 +194,26 @@ entries measures nothing:
   build in this repository's history ever wrote an alongside sidecar, so the
   fallback is defensive code for a condition this application cannot produce.
   Section 3.7 states what deleting it costs.
+
+**Four the plan introduces and an earlier draft did not ledger.** They are
+listed rather than argued away, because an unlisted exception is an undisclosed
+cost:
+
+15. `cache/` is written fresh *except* `coalescer.rs`, which is ported — the port
+    table says so itself.
+16. Plugin input is a cached tier *except* video frames, which are a timestamp
+    rather than an edge.
+17. The geocoder is not a plugin *except* that it writes into
+    `tags.plugins["location"]`, because the bucket's replace-wholesale lifetime is
+    the one it wants.
+18. Confinement is universal *except* that it is lexical for requests answered
+    from the database and canonicalizing for requests that open a file — section
+    3.2 explains why, and the cost of collapsing them is a `realpath` walk per
+    grid cell.
+
+Two an earlier draft would have added were removed instead by design changes
+above: `tag_counts` sitting outside the path-keyed sweep, and display preferences
+being per-client *except* locally (sections 9.2 and 9.4).
 
 Anything beyond this list that a plan step introduces is a regression against
 requirement 9 and needs to be argued for explicitly.
@@ -223,6 +257,25 @@ consequence is stated.
    Quadratic; fifty million comparisons at ten thousand images. It will not hold
    at a hundred thousand. Leave it until it hurts.
 
+**Five more the plan was relying on without naming**, surfaced by cold review.
+Each is now addressed in the section given, but they are listed here because an
+unnamed assumption is itself the defect:
+
+7. That the duplicate hasher can decode whatever codec the `j` tier stores. It
+   cannot — section 3.9.
+8. That the ThumbHash can be read out of a row containing a 30 KB blob without
+   paying for the blob. It cannot — section 3.3.
+9. That `cache.db`'s mtime tracks "opened". Under WAL it tracks "checkpointed" —
+   section 3.3.
+10. That the panels addressing *arbitrary* files (tag manager, duplicates, merge)
+    are served by a backfill ordered **newest-first**. They are not — section 9.
+11. That `devices.db` gets a read pool. Section 3.11 requires auth to read
+    "through the read-only pool", but section 3.3 defines a pool only for
+    `cache.db`'s thumbnail path. If `devices.db` is one connection behind a
+    mutex, the serialization auth is supposed to avoid is moved rather than
+    removed. **Decided: `devices.db` gets its own small read-only pool**, since
+    auth runs on every thumbnail request.
+
 ---
 
 ## 3. Target architecture
@@ -233,7 +286,9 @@ consequence is stated.
 lightview <dir>              serve <dir> on 127.0.0.1:<ephemeral>, open a browser at it
 lightview --serve <dir>      serve <dir> on 0.0.0.0:<port> over TLS, with pairing
 lightview --remote <url>     attach to a remote instance, offer this machine's plugins
-lightview pair               mint a one-time pairing PIN for this machine, and exit
+lightview pair               mint a one-time pairing code for this machine, and exit
+lightview devices            list paired devices (id, name, last seen)
+lightview devices revoke <id>   revoke one pairing
 lightview remote-pair --server <url> --pin <n> [--name X] [--trust-new]
                              redeem a PIN against a remote server and store the
                              credential this machine will use for --remote
@@ -243,6 +298,16 @@ lightview password           set or clear the gallery password, reading it from
 lightview cache              show the derived-cache directory and its size
 lightview cache --prune      evict least-recently-opened galleries to the budget
 ```
+
+**`devices` exists because nothing else could.** An earlier draft stored every
+pairing in `devices.db` and specified enrollment in detail, with no way to see or
+undo one: the device-management UI lives in the part of `SettingsMenu` section
+3.12 cuts, and section 7 settles that **nothing is `Owner` under `--serve`**, so a
+web UI could not be the answer even if it survived. A lost phone would stay paired
+forever — and since pairing is now per account rather than per gallery, to every
+gallery the machine will ever serve. Administering the host from a shell is
+already the plan's answer for the password and for `server.toml`; this joins that
+list rather than reopening the trust model.
 
 **`pair` takes no gallery argument.** Pairings live in the state directory and
 are a property of the account serving (section 3.3), so there is nothing
@@ -349,6 +414,17 @@ One command table. Each entry carries the minimum trust it requires.
 | `Device` | any paired client | browse · sorted items · filter · autocomplete · media and thumbnail routes · tags, ratings, colour labels, notes, sets · `record_view` · `get_media_meta` · `regenerate_thumbnail` · **trash: move-to-trash, list, restore** · upload · duplicate detection and `get_merge_candidates` · enqueue/cancel a tagging job · `apply_plugin_tags` and the worker claim/update/complete/fail set |
 | `Owner` | **a loopback bind only** | copy · move · clipboard · open-with · open a gallery · list a directory (the picker) · install a plugin · **`purge_trash`** · **`merge_duplicates`** · write `.lightview/settings.toml` |
 
+**The client is told its own trust level, because otherwise it cannot obey the
+next sentence.** Section 3.12 keeps components that offer copy, move, clipboard
+and open-with, and this section says the frontend hides what the client cannot
+do — but the store that answered that question is deleted with the desktop/web
+split, and no replacement was named. Ported panels would offer `Owner` actions to
+a phone and collect 403s. One `Device`-level command, `get_capabilities`,
+returning `{ trust: "device" | "owner", upload: bool, clipboard: bool }` — the
+clipboard entry because section 3.12 makes its availability a runtime question
+rather than a compile-time one. The server enforces regardless; this exists only
+so the UI does not lie.
+
 Three of those placements were unstated in the first draft and are decisions,
 not omissions. **`restore_trash` is `Device`** — it writes a file back to a path
 the user already chose, which is the inverse of a delete the same client was
@@ -358,6 +434,17 @@ allowed to make. **`purge_trash` is `Owner`**, because permanent deletion is not
 keeper's mtime on disk, and trashes the others; a remote client may *find*
 duplicates and see the candidates, and may not resolve them. The frontend hides
 what the client cannot do, and the server enforces it regardless.
+
+**`open_with` names an index, not a program.** Today the command takes a
+`command: String` and a `Vec<String>` of arguments straight off the wire and
+spawns them (`commands/settings.rs:900-915`) — which is why every other finding
+in this section escalates from "file access" to "code execution", and why the
+loopback session exists at all. The user already configures `external_apps` as
+`{label, command, args}`; make the command `open_with(app_index, path)` so the
+server looks the entry up in its own configuration and substitutes a confined
+path into the configured placeholder. The wire then carries an integer and a
+gallery-relative path, and **no request can name a program**. This removes a
+parameter rather than adding a check.
 
 **`Owner` is granted by a loopback bind and by nothing else. There is no flag
 that widens it.** This is the single security rule of the system and it must
@@ -373,24 +460,202 @@ other listener yields `Device` regardless of who dialled in. Stated here because
 prose about "a loopback bind" reads ambiguously, and the ambiguous reading is
 the exploitable one.
 
-The bootstrap routes — `/healthz`, `/cert`, `/pair/redeem`, `/auth/password`,
-`/auth/status` — are unauthenticated by necessity, since there would otherwise
-be no way past the auth layer the first time. They are a route group, **not** a
-trust level: no *command* is ever reachable unauthenticated, and naming them in
-the table would imply a third tier of command that does not exist.
+The bootstrap routes — `/healthz`, `/cert`, `/pair/redeem`, `/auth/launch`,
+`/auth/password`, `/auth/status` — are unauthenticated by necessity, since there
+would otherwise be no way past the auth layer the first time. They are a route
+group, **not** a trust level: no *command* is ever reachable unauthenticated, and
+naming them in the table would imply a third tier of command that does not exist.
+(`/auth/launch` was missing from an earlier draft's list, which would have put
+the token-redemption route behind the auth layer it exists to get you through.)
 
-**Path confinement is universal, with no exception.** Every route that resolves
-a filesystem path canonicalizes it and compares against the gallery root
-canonicalized once at open, returning **404, not 403** — a 403 confirms the
-existence of files the caller has no business knowing about. What `Owner`
-widens is the *destination* of a copy or move, which was never confined and
-never can be. Sources confined always; destinations confined never; one trust
-level deciding who may name a destination.
+#### The loopback session
 
-Uploads enforce confinement three times over, because the filename comes from
-an untrusted device: reduce to basename with traversal rejected, require the
-extension to resolve to a known media type, and confirm the resolved
-destination is inside the root before writing a byte.
+**This subsection is here because an earlier draft settled the design in section
+7's decision table and never specified it anywhere else.** A one-line row is a
+decision; section 3 is where an implementer reads *how*, and the security core of
+the system was missing from it.
+
+**The bind.** `lightview <dir>` binds a **random address in `127.0.0.0/8`** —
+`127.<r>.<r>.<r>` on an ephemeral port — not `127.0.0.1`. The reason is specific
+and it is the one thing here that cannot be fixed later:
+
+> **Cookies are not port-scoped, and `SameSite` is site-scoped.** A cookie set by
+> `127.0.0.1:54321` is a host-only cookie for `127.0.0.1` and is sent to **every
+> other port on that host**. Any local service the user opens — a dev server, a
+> notebook, a downloaded repository's `npm run dev` — receives the LightView
+> session cookie in its request headers, and can replay it from a non-browser
+> client where no `Origin` is expected. `HttpOnly` does not help; the *server*
+> reads it. And `SameSite=Strict` blocks cross-*site* requests, but
+> `127.0.0.1:3000` and `127.0.0.1:54321` are the **same site**, so a page served
+> by any other local port can already issue credentialed POSTs.
+
+The whole `/8` routes to `lo` on Linux and the entire range is a
+"potentially trustworthy origin", so the secure context the async Clipboard API
+needs is preserved. Binding a random address in it makes the session cookie's
+host belong to **this process alone**: no other local service can receive it, and
+no page on another local port is same-site with it. One line at bind, one line in
+the launch URL.
+
+**The token.** 32 random bytes generated at startup, held in memory, never
+written to disk. It is delivered in the launch URL — `http://127.<r>.<r>.<r>:<port>/?t=<token>`
+— and **the URL is also printed to stdout, unconditionally**. Printing is not a
+debugging affordance: on a headless host (an SSH session, a container) `xdg-open`
+fails and the URL would otherwise be unknowable. It also means no
+`--no-browser` flag is needed — the process always prints, always attempts the
+launch, and reports if the launch failed. One fewer knob (principle 2), and
+section 6's verification recipe stops depending on a flag that was never defined.
+The cost, named rather than discovered: under a systemd user unit the URL lands
+in the journal. A 60-second single-use token on a process-private loopback
+address is an acceptable thing to have in a log; a password would not be, which
+is why section 3.3 reads that from stdin instead.
+
+**Redemption.** `POST /auth/launch` with the token exchanges it for the session
+cookie. Single use, 60-second TTL. The frontend calls
+`history.replaceState` immediately so `?t=` does not persist in the address bar,
+session restore, or history.
+
+**The session cookie** is `HttpOnly`, `SameSite=Strict`, `Path=/`, and lives for
+the process. It cannot carry `Secure` — loopback is plaintext — which is exactly
+why the random-address bind above is doing the isolation work that `Secure` would
+otherwise do.
+
+**The `Origin` rule, stated precisely enough to implement.** On every
+state-changing request: **reject when `Origin` is present and is not byte-equal
+to this server's scheme + host + port. Allow `Origin` absent.** Two traps, both
+of which the loose wording would have walked into — a *site*-level comparison, or
+accepting `Sec-Fetch-Site: same-site`, both pass an attacker on another local
+port; and *requiring* the header breaks `--remote` and the `curl` recipe, because
+non-browser clients do not send it. Browsers always send `Origin` on a
+cross-origin POST, so absence is safe. `Sec-Fetch-Site` is a useful second signal
+and never a requirement.
+
+Under `--serve` the same check uses `Sec-Fetch-Site: same-origin` instead, because
+a `0.0.0.0` bind has no single origin to name — which is why CORS is `Any` today.
+
+**Behaviour at the edges, decided rather than left to the implementer:**
+
+| Case | Behaviour |
+|---|---|
+| Token never redeemed, or redeemed after 60 s | The bind stays up and unauthenticated callers get 401. Recovery is `lightview cache`-style: the running process prints a fresh URL on request. **Never a loopback fallback** — see the rule below |
+| Token redeemed twice | The second attempt is 401. Single-use means single-use |
+| A second browser tab | Shares the cookie; no second token needed |
+| Process restart | New token, new session, new address. A stale tab gets 401 |
+| A 401 without `WWW-Authenticate` on loopback | **Not** the not-paired path. Section 3.12's `ipc.ts` contract redirects to pairing on that signal, and there is no pairing flow on a loopback bind — a stale tab would be sent to a page that cannot exist. Show "this session ended; restart LightView" |
+
+**The hard rule, restated to cover the place it would actually be broken:** no
+flag widens `Owner`, **and no failure path widens it either.** Every one of the
+rows above is a case where the tempting shortcut is "just trust loopback this
+once", and that shortcut is the whole vulnerability.
+
+#### Path confinement is a type, not a call
+
+**This is the most important correction in the plan, and it comes from a cold
+review that took the previous wording at face value and then read the code it
+described.** The earlier draft said "path confinement is universal, with no
+exception. Every **route** that resolves a filesystem path canonicalizes it."
+Both halves were wrong in a way that matters: the dangerous paths in this system
+arrive as **command arguments**, not as route captures — and the ported command
+layer's checks are lexical or absent.
+
+Three confirmed instances, all reachable at `Device` trust:
+
+- **`trash_files` uses `strip_prefix`, which preserves `..`.**
+  `commands/trash.rs:120-127`. `Path::new("/g/photos/../../etc/passwd")
+  .strip_prefix("/g/photos")` returns `Ok("../../etc/passwd")` — a check that
+  passes. `move_file` (`trash.rs:85-89`, a rename with a copy-and-delete
+  fallback) then deposits the host file **inside** `.lightview/trash/`, which is
+  inside the gallery root and therefore served by the media route. That is
+  arbitrary host-file exfiltration to a phone, plus destruction of anything
+  writable. Today it sits behind the `remote.allow_delete` flag
+  (`http_server/api.rs:575-581`); **this plan deletes that flag**, so it would
+  ship promoted from opt-in to always-on.
+- **Tag writes check nothing at all.** `commands/tags.rs:169-190` reaches
+  `modify_companion` (`tags.rs:24-49`), which does `Path::new(path)` and never
+  compares against the root. A device can create a companion JSON anywhere on
+  the host with attacker-chosen contents, and the distinct error strings make it
+  a filesystem-existence oracle. Section 3.9 rewrites exactly these functions,
+  which is what makes this the moment to fix it rather than a separate task.
+- **`enqueue_job` joins a device-supplied plugin name onto the plugin
+  directory.** `plugin/runner.rs:68-71`. `Path::join` with an **absolute**
+  argument discards the base entirely, and `..` traverses. The `manifest.name ==
+  name` check afterwards is not a guard, because whoever writes the manifest
+  writes its name. This breaks section 3.10's stated invariant that an instance
+  only runs manifests installed under its own `plugins/`.
+
+**So confinement is a newtype.** `GalleryPath` has exactly one constructor: it
+takes a wire path, rejects any component that is not `Component::Normal`, joins
+it to the gallery root captured at open, canonicalizes, and compares. Every
+command argument and route capture that names a media file **is** a
+`GalleryPath`, so a handler cannot forget the check — there is no unchecked
+`String` for it to forget it on. Returning **404, not 403**, because a 403
+confirms the existence of files the caller has no business knowing about.
+
+This is fewer concepts, not more: the scattered `path_in_gallery` calls collapse
+into the extractor, and "sources confined always" becomes a property the
+compiler enforces instead of a sentence in a doc comment. `path_in_gallery`
+itself (`http_server/routes.rs:632-642`) is **correct today** — it canonicalizes
+per request and uses `Path::starts_with`, which is component-wise, so
+`/g/photos-secret` does not match `/g/photos`. It is the model for the
+constructor, not a thing to replace.
+
+**Destinations are the deliberate exception, and the only one.** A copy or move
+*destination* was never confined and never can be — that is the entire content
+of the `Owner` level. Sources confined always; destinations confined never; one
+trust level deciding who may name a destination.
+
+**But canonicalizing is not free, and it must not sit on the thumbnail hot
+path.** `tokio::fs::canonicalize` is a blocking-pool hop plus a `realpath` walk —
+one `lstat` per component, which on a NAS mount is round trips rather than
+syscalls — and the current thumb route pays it before the cache lookup, on every
+cell of every scroll (`routes.rs:473` → `:640`). The existing comment
+(`routes.rs:472`) states the actual requirement precisely: the check exists for
+the **generate-on-miss** branch, which decodes an arbitrary file. So
+`GalleryPath` has two constructors after all, and the split is principled:
+**lexical** (reject non-`Normal` components, join, no syscall) for a request
+answered from the database, and **canonicalizing** in the branch that is about
+to open a real file — generate-on-miss, the media route, `?fit=`, `?frame=`,
+and every filesystem command. Nothing reaches the filesystem without a
+canonicalized check; nothing pays for one to read a cached blob.
+
+#### Uploads
+
+**The earlier draft said uploads "confirm the *resolved* destination is inside
+the root before writing a byte". The code it was describing is lexical and says
+so in its own doc comment** (`http_server/uploads.rs:217-238`: *"Not symlink-safe
+on its own"*), and it checks only the **directory**, before `create_dir_all`
+(`routes.rs:939`, `:948`) — the final destination is never checked at all. Point
+`Uploads/` at a bigger disk with a symlink, which is an ordinary thing to do, and
+every upload lands outside the root while the check returns true. Nothing outside
+the root is indexed or served, so it fails **silently**.
+
+A plan sentence that over-describes a ported check is the most expensive kind of
+error in this document, because section 4 tells the implementer not to reconsider
+ported code. It reads as "already handled".
+
+What uploads actually enforce, in order:
+
+1. Reduce the filename to a basename, rejecting traversal. Verified sound:
+   `sanitize_component` (`uploads.rs:135-154`) fails closed on every divergence a
+   reviewer could construct between the extension read from the raw name and the
+   sanitized one.
+2. Require the extension to resolve to a known media type. Verified sound: the
+   allowlist (`companion/schema.rs:102-112`) admits no `.json`, `.svg` or
+   `.html`, so a device cannot land a companion file, anything inside
+   `.lightview/`, or a script-bearing type served from the gallery's own origin.
+3. **Canonicalize the destination directory after `create_dir_all` and compare** —
+   the `GalleryPath` constructor above, not a second mechanism.
+4. **Create the final file with `RENAME_NOREPLACE`.** The dedupe loop checks
+   `!candidate.exists()` and then renames unconditionally
+   (`uploads.rs:189-211`, `routes.rs:1009`); between those two steps, two phones
+   uploading `IMG_0001.jpg` do clobber each other, which is the exact thing the
+   loop's comment claims it prevents.
+
+**And uploads need bounds, which they have never had.** `field.bytes()`
+(`routes.rs:905`) holds each part in RAM in full, under a 512 MiB per-request cap
+(`server.rs:132`), with unbounded parts per request and unbounded concurrent
+requests — a paired phone can OOM the NAS with a handful of parallel POSTs.
+Stream each part to the temp file instead, cap the part count, and refuse when
+free space is below a margin.
 
 ### 3.3 Storage
 
@@ -424,7 +689,8 @@ $XDG_CACHE_HOME/lightview/        (~/.cache/lightview)
 $XDG_DATA_HOME/lightview/         (~/.local/share/lightview)
   tls/                            private key and certificate
   devices.db                      every pairing
-  install_id                      cookie-name suffix
+  install_id                      cookie-name suffix (`--serve` only; see section 3.2)
+  recent.json                     recently opened galleries, for the opener
   plugins/<name>/                 installed plugin code
 
 $XDG_CONFIG_HOME/lightview/       (~/.config/lightview)
@@ -470,11 +736,47 @@ them as though it were the only one:
 | **tier budget** | `jm` and `jh` rows inside one gallery's `cache.db` | automatically, on both write paths (section 3.5) |
 | **cache-directory ceiling** | total bytes under `galleries/`, across galleries | only by `lightview cache --prune`, LRU on the cache file's mtime |
 
-The ceiling and `lightview cache --prune` apply to the cache directory only —
-which under XDG is now enforced by the path rather than by this sentence. The
-tier budget is derived from free disk and overridden by
-`LIGHTVIEW_TIER_BUDGET_MB`, never by configuration; `server.toml`'s key is the
-ceiling.
+The ceiling applies to the cache directory only — which under XDG is now
+enforced by the path rather than by this sentence. The tier budget is derived
+from free disk and overridden by `LIGHTVIEW_TIER_BUDGET_MB`, never by
+configuration; `server.toml`'s key is the ceiling.
+
+**Three corrections an earlier draft needed here, each of which was a real
+failure rather than a wording problem:**
+
+- **The ceiling is enforced at gallery open, not only by a command.** "Enforced
+  only by `lightview cache --prune`" means requirement 6's first case — two
+  hundred images processed once and never reopened — leaves a permanent cache
+  that nothing reclaims, in a directory this plan advertises as safe *because* it
+  is budgeted. A hundred such folders is a hundred orphan caches. Open is the
+  right moment: it is one `read_dir` and a sort, and it is exactly when a stale
+  cache is provably unused. `--prune` stays as the manual override.
+- **The LRU key is an explicit `<gallery dir>/last_opened` file, not `cache.db`'s
+  mtime.** Under `journal_mode=WAL` writes land in `cache.db-wal` and the main
+  file's mtime moves only on checkpoint — so an mtime key measures *least recently
+  written*, and a fully-warmed gallery you open daily and never write to looks
+  colder than the throwaway folder you touched once. It would evict exactly the
+  wrong thing.
+- **`--prune` takes each gallery's `flock` non-blocking and skips what it cannot
+  get.** Unlinking a `cache.db` that a running process holds open is completely
+  silent on Linux: that process keeps writing to the unlinked inode and the work
+  is discarded at exit. Pruning to reclaim space would throw away the thumbnails
+  a running `--serve` generated all afternoon.
+
+**And the tier budget's floor must respect free disk.** The current computation
+is `share.clamp(floor, ceiling)` (`commands/media.rs:1049-1067`), which *raises* a
+near-zero share up to the 512 MiB floor; with the 1.25× hysteresis
+(`cache/thumbnails.rs:355`) each bounded tier can reach 640 MiB before the first
+eviction. That is a guaranteed ~1.25 GiB of bounded tiers plus an unbounded `j`,
+per gallery — and this plan **moves** that from the gallery's own filesystem, a
+NAS with terabytes, to `~/.cache` on the OS disk. Use `min(floor, free / 4)` so a
+nearly-full disk is not handed 512 MiB per tier by definition.
+
+Naming what a full disk looks like, because it is loud in the log and invisible
+in the UI: the tier write fails, `get_or_generate` logs a warning and returns a
+miss (`thumb_serve.rs:136-139`), the route answers 404 (`routes.rs:497`), the
+service worker caches nothing because the response is not `ok`, and the grid
+re-requests and re-decodes the same file on every scroll pass forever.
 
 Consequences, all of them currently missing:
 
@@ -511,12 +813,23 @@ tolerates any number of readers; `cache.db` is the thing that does not. Keying
 the lock the same way the cache is keyed also means the two can never disagree
 about what "the same gallery" is.
 
-**`flock` specifically, because it has no stale state to recover.** The kernel
-releases it when the file descriptor closes — on exit, on `SIGKILL`, on a
-container being torn down. A pidfile would need liveness checks, a staleness
-window and a way to break the lock, all of which are ways to get it wrong. A
-second process **exits immediately** with a message naming the gallery, rather
-than blocking on a lock a long-running server never releases.
+**`flock(LOCK_EX | LOCK_NB)` specifically, because it has no stale state to
+recover.** The kernel releases it when the file descriptor closes — on exit, on
+`SIGKILL`, on a container being torn down. A pidfile, or a lock-by-file-existence,
+would survive a crash and brick the gallery until someone deleted a file they
+have never heard of. Say `flock` in the plan rather than "an advisory lock",
+because the difference *is* the answer to "what happens after a crash", and note
+that a leftover lock **file** is not a leftover lock.
+
+**A second launch opens the first one's window rather than refusing.** The
+package ships a `.desktop` file with `Exec=lightview %f` (section 3.1b), so
+double-clicking a folder twice is an ordinary user action, and "refused: already
+running" is a bad answer to it — especially since the port is ephemeral, so the
+second process cannot even tell the user where the first one is. The lock holder
+writes `<cache dir>/instance.json` — pid and launch URL — while holding the lock;
+a second `lightview <dir>` reads it, opens a browser there, and exits 0. That
+requires the first process to be able to mint a fresh launch token on request,
+which section 3.2's expired-token recovery needs anyway.
 
 Two consequences, both stated because they are real limits rather than bugs:
 
@@ -525,18 +838,41 @@ Two consequences, both stated because they are real limits rather than bugs:
   time means pointing a browser at the served URL, which needs no second
   process. This is a narrowing against today, where the failure is silent
   instead.
-- **The lock is per machine, so it does not coordinate two machines mounting the
-  same NAS share.** It does not need to: after section 3.3 each machine has its
-  own derived cache, which is exception 14 on section 2's ledger. What the two
-  still share is the companion files, and a concurrent metadata write from two
-  machines resolves last-writer-wins through the atomic rename in section 3.7 —
-  no corruption, no merge.
+- **The lock is per machine and per account, so it does not coordinate two
+  machines mounting the same NAS share** — nor `--serve` on the NAS plus a local
+  `lightview <dir>` on a desktop over the mount, which is the two-role deployment
+  section 3.1 contemplates. Each machine has its own derived cache (exception 14
+  on section 2's ledger) and therefore its own private lock, so both processes are
+  equally certain they are the only writer. What they share is `.lightview/` —
+  the companions and the trash — and concurrent metadata writes resolve
+  last-writer-wins through the atomic rename in section 3.7: no corruption, no
+  merge, and **no visibility**. Worth stating plainly because it is a regression
+  in *detectability*: today the shared in-gallery `cache.db` at least made the
+  collision loud. Accepted, because the alternative is a lock file inside
+  `.lightview/`, which puts machine coordination into the durable tree that
+  requirement 11 says holds photos and intent only.
+- **One `server.toml` holds one port**, so two concurrent `--serve` processes on
+  one account cannot both start — which contradicts section 3.1's "every gallery
+  this machine serves, now or later" unless `--port` overrides the file. It does.
 
 #### Configuration is a file; commands are actions
 
-`server.toml` in the config directory, read at startup and on change: bind address,
-port, TLS SANs, password hash, inactivity window, upload enable and scheme,
-trash retention, the cache-directory ceiling.
+`server.toml` in the config directory, read at startup and on change: bind
+address, port, TLS SANs, password hash, inactivity window, upload enable and
+scheme, the cache-directory ceiling.
+
+**Trash retention is deliberately not in that list, and putting it there would
+delete files.** It lives today in `gallery_meta` *inside the gallery*
+(`commands/trash.rs:36`), so it travels with the folder, and `auto_purge`
+`remove_dir_all`s everything past the window on **every gallery open**
+(`gallery.rs:1021`). Move it to a per-machine config file and the NAS gallery
+served by the container at, say, 365 days is opened once on the desktop — whose
+`server.toml` does not exist, so it uses the 30-day default — and eleven months
+of the *shared* `.lightview/trash/` is permanently deleted, with no warning. It
+therefore goes in **`.lightview/settings.toml`**, next to the default filter.
+Section 3.3 already makes the argument for that file — the default filter is user
+intent and must survive a format bump — and it applies with more force to the one
+setting in the system that destroys data.
 
 **There is no remote-delete flag.** Today one exists and gates the whole trash
 group plus merge; requirement 2 makes move-to-trash something a remote client
@@ -567,21 +903,72 @@ at the same gallery must not fight over thumbnail size.
 
 #### The database
 
-Three thumbnail tables plus the index. **No migration list, no
+Three thumbnail tables plus the index — and **no `tag_counts`**; section 9.1 says
+why it goes and what replaces it. **No migration list, no
 `SCHEMA_VERSION` derivation, no idempotency tests.** One `format_version`
 integer in `gallery_meta`; if it does not match the build's, delete the file and
 re-index.
 
 | Table | Holds |
 |---|---|
-| `media_meta` | relative path (PK), media type, size, mtime, `date_taken`, `date_added`, `last_viewed`, `last_rated`, rating, width, height, duration, `gps_lat`, `gps_lon`, `color_label` |
+| `media_meta` | relative path (PK), media type, size, mtime, `date_taken`, `date_added`, `last_viewed`, `last_rated`, rating, width, height, duration, `gps_lat`, `gps_lon`, `color_label`, **`thumbhash`** |
 | `tag_index` | `(path, namespace, tag)` — rebuilt from companions |
-| `tag_counts` | `(namespace, tag) → count` — rebuilt from `tag_index`; feeds autocomplete |
 | `index_state` | companion mtime per path, so re-indexing skips unchanged files |
-| `thumbs_j` | 512px fit — also carries the ThumbHash blob and the `phash` column |
+| `thumbs_j` | 512px fit — also carries the `phash` column |
 | `thumbs_jm` | 1280px fit — LRU byte-budgeted |
 | `thumbs_jh` | 2560px fit — LRU byte-budgeted |
 | `gallery_meta` | key/value: `format_version`, location tagger version |
+
+**The ThumbHash lives on `media_meta`, not on the tier — and that placement is
+the difference between a gallery that opens instantly and one that does not.**
+An earlier draft put it on `thumbs_j` and had section 3.6 reach it with a
+`LEFT JOIN`, "purely to inline the ~25-byte ThumbHash". In the current schema
+`thumbhash` was added by a later `ALTER TABLE` (`cache/db.rs:156`), so it sits
+*after* the 20–40 KB thumbnail blob in record order. SQLite spills a blob that
+size to overflow pages, and reaching a column past it walks that row's overflow
+chain — so the join touches essentially every byte of the thumbnail table to
+produce 25 bytes per row. `get_sorted_items` is the most frequent expensive query
+in the system: gallery open, every sort change, every filter apply, every
+filesystem change. On a 20k library `thumbs_j` is several hundred megabytes
+against a 256 MB `mmap_size`.
+
+It is path-keyed, it is already swept with the media row, and moving it deletes
+the join, the alias-qualification trap section 3.6 has to warn about, and one
+line of `path_keyed_tables()` reasoning. **`phash` stays on `thumbs_j`**: it is
+read once per duplicate scan rather than per gallery open, so the cost argument
+does not apply to it.
+
+Migrations are forbidden after this ships, so a schema mistake here is not a
+patch later — it is a `format_version` bump that re-thumbnails every library.
+
+**`date_added` and `last_viewed` are mirrored into `meta.core`, or requirement 11
+is false.** Both are sort fields (`sort/sorter.rs:26-27`); neither exists in the
+companion (`companion/schema.rs:159-167`); `record_view` writes only the database
+(`sorter.rs:215-225`) and `date_added` is set to *now* at insert
+(`gallery.rs:60`). So "delete everything else and reopen, and nothing is lost but
+time" is **not true today** — three operations this plan blesses destroy them
+permanently and silently: a `format_version` bump, `lightview cache --prune`, and
+the scan-prune below. After any of them, "Date added" collapses to a single
+instant for the whole library and "Last viewed" is empty. Mirror both into
+`meta.core` exactly as `rating` and `color_label` already are, and rebuild them
+at index time. Two fields on a struct that is already gaining `#[serde(default)]`
+throughout.
+
+**A scan that errored is not a prune authority.** `populate_media_meta` deletes
+every path-keyed row for any path missing from the scan result
+(`gallery.rs:88-116`), and `list_dir_recursive` swallows walkdir errors and
+returns `Ok` regardless (`provider/local.rs:46-49`). Two ordinary events
+therefore wipe the cache: **a NAS not yet mounted at boot** — the mountpoint
+exists and is empty, so the scan returns zero entries and everything is pruned,
+including the two unrecoverable columns above — and any transient `EIO`
+mid-walk, which prunes partially with no log line. `provider/local.rs` sits in
+the "ported near-verbatim, not to be reconsidered" table, so this ships unless
+the plan says otherwise. Two guards: **propagate walkdir errors** instead of
+`continue`, and **refuse the prune when a previously-populated gallery scans to
+zero**, loudly. (One item to check rather than assume: the walk's
+`filter_entry(|e| !e.file_name().starts_with('.'))` is evaluated on the root
+too, so a gallery at `~/.photos` may scan to zero for a third reason. Worth a
+five-line test.)
 
 **Indexes are part of the schema, not an optimization to add afterwards.**
 Section 3.6's rule — a field is filterable only if it is indexed — makes them
@@ -593,12 +980,22 @@ can compare (`date_taken`, `date_added`, `last_viewed`, `rating`, `color_label`,
 `media_type`, `width`, `height`, `size`); `thumbs_jm` and `thumbs_jh` on
 `accessed_at`, which the eviction window function orders by.
 
-The location tagger version stays here despite being a stamp rather than a
-cache, and the coupling must be stated: **deleting the derived cache causes one
-re-geocode pass, which rewrites every geotagged sidecar.** That is a derived
-wipe triggering durable writes. It is idempotent and costs one pass, so it is
-accepted rather than designed around — but "delete everything else and reopen,
-and nothing is lost but time" means *time*, including sidecar mtimes moving.
+**Deleting the derived cache causes one re-geocode pass, which rewrites every
+geotagged sidecar** — a derived wipe triggering durable writes. An earlier draft
+blamed the location-tagger version stamp in `gallery_meta` and left it at that.
+**That is the wrong cause, and it matters because the obvious remedy — move the
+stamp somewhere durable — fixes nothing.** The actual "already geocoded?" test is
+a `NOT EXISTS` over `tag_index` (`gallery.rs:240-246`), and `tag_index` is
+derived; section 3.8 requires the geocode pass to run *before* the companion
+index pass, so on any fresh or wiped cache the table is empty and every geotagged
+file is re-tagged whatever the stamp says.
+
+**Gate the skip on the durable side**: read the candidate's
+`tags.plugins["location"].version` from the companion on a cold cache. The
+alternative — run geocode *after* the index pass and re-index only the paths it
+wrote — also works and is a larger reordering. Either way the pass becomes a
+no-op on a rebuilt cache, which is what makes "nothing is lost but time" true
+rather than "nothing is lost but time, and every sidecar's mtime".
 
 **Every path-keyed table is swept together.** Keep a single
 `path_keyed_tables()` source of truth and a test asserting that removing a
@@ -607,15 +1004,46 @@ multi-megabyte blob keyed to a path nothing can reach again. There is no
 `not_duplicates`, so there is no table sitting outside that sweep.
 
 PRAGMAs, carried over because they were measured: `journal_mode=WAL`,
-`temp_store=MEMORY`, `mmap_size=268435456` (per connection), `cache_size` 64 MB
-on the writer and 8 MB per read-only pool connection.
+**`synchronous=NORMAL`**, `temp_store=MEMORY`, `mmap_size=268435456` (per
+connection), `cache_size` 64 MB on the writer and 8 MB per read-only pool
+connection. `synchronous=NORMAL` (`cache/db.rs:499`) was missing from an earlier
+draft's list; without it the writer inherits SQLite's default `FULL` and fsyncs
+the WAL on every commit, which on a batched index pass over a large library is a
+large startup regression that nobody would trace back to an omission from a list
+marked authoritative.
 
 Connection strategy, carried over: one writer behind a `tokio::Mutex` (because
 `rusqlite::Connection` is `Send` but not `Sync`), and a read-only pool of 2–6
-connections from `available_parallelism` for the thumbnail serve path. **Never
-hold the writer across a decode, an encode, or a subprocess.** More than one
-statement means a transaction — SQLite autocommits per statement, so a
+connections from `available_parallelism` for the thumbnail serve path. More than
+one statement means a transaction — SQLite autocommits per statement, so a
 variable-length write loop pays a WAL commit each time.
+
+**The writer is held for statements only — never across filesystem I/O, an image
+decode or encode, a subprocess, or a loop whose length scales with the library.**
+An earlier draft said "never across a decode, an encode, or a subprocess", which
+is narrower than the violations being ported and would have let every one of them
+through:
+
+| Site | Held across | Caught by the old wording? |
+|---|---|---|
+| `pipeline/idle.rs:196-200` → `duplicates.rs:110-146` | **64 image decodes** per acquisition | yes — and it is ported anyway, as "the idle backfill also computes perceptual hashes" |
+| `commands/gallery.rs:977-1010` | the GPS backfill, the location backfill (a rayon sidecar read-modify-**write** over every geotagged file, `:271-284`), `index_companions` reading every companion off disk (`:446`), and a checkpoint | **no** |
+| `commands/duplicates.rs:63-65` | the entire all-pairs Hamming loop, on an async worker with no `spawn_blocking` | **no** |
+| `commands/plugins.rs:514-521` | `rebuild_tag_counts` + `query_all_tag_counts` + `autocomplete.refresh()`, **per apply batch of 32** | **no** |
+
+Every one of these blocks `generate_and_store_tier`, which needs the writer to
+store (`commands/media.rs:1246`) — so the grid cannot warm a single thumbnail
+while any of them runs. Opening a 20k gallery holds the writer through the whole
+index pass; a tagging job over it does a full `tag_index` aggregate plus an
+autocomplete rebuild roughly 625 times under the lock, which is what section 8
+lists as wanting "a measurement on a large library". The arithmetic does not need
+a measurement.
+
+Three consequences follow and are part of the design, not tuning: the open-time
+index pass reads companions and writes sidecars **outside** the lock and takes it
+only to commit batched statements; `find_duplicates` loads `(path, phash)` under
+the lock, releases it, and runs the loop on `spawn_blocking`; and the tagging job
+maintains counts incrementally, rebuilding once at job completion.
 
 ### 3.4 Trash
 
@@ -635,9 +1063,55 @@ original path. There is no metadata file.
   metadata write forks a second sidecar. The trash round-trip test must assert
   the companion's destination, not just the media's.
 - **One delete is one directory**, which makes undoing an operation a natural
-  unit.
+  unit. **Keep the `_<seq>` uniqueness suffix** on the timestamp segment
+  (`<epoch_ms>_<seq>/`, `commands/trash.rs:99-115`): an earlier draft dropped it,
+  and two deletes landing in the same millisecond would then merge into one
+  directory, silently breaking the invariant this bullet states.
 - The companion sits alongside the media inside the trash, uniformly, whichever
-  location it came from.
+  location it came from. **Media first, companion second** (`trash.rs:133-142`).
+  Reversed, a crash between the two moves leaves the photo in the gallery with
+  its ratings and tags in the trash — state the order, because either order looks
+  arbitrary until you name the failure.
+
+#### The entry id is not a path, and that is a security requirement
+
+**An earlier draft made the client-visible entry id `<epoch_ms>/<relative path>`
+— a string containing slashes — and a cold review found that this creates an
+arbitrary-file-move primitive at `Device` trust.** The reasoning is worth keeping
+in full, because the deleted check is the thing that would have stopped it and
+the plan is what deletes it.
+
+`valid_entry_id` (`trash.rs:70-75`) accepts digits and underscores only, and its
+comment names this exact attack: *"Anything else (separators, `..`) is rejected
+so a remote client can't escape the trash dir."* A slash-bearing id cannot pass
+it, so the new layout **forces its removal**. The code it guards normalizes
+nothing: `trash.rs:262` is `root.join(id)`, and `Path::join` with an absolute
+argument discards the base entirely; `resolve_original` (`trash.rs:93-99`) pushes
+`..` components verbatim. `restore_trash` is `Device`. The chain:
+
+1. Upload `x.jpg` whose bytes are a plugin manifest — it passes the extension
+   allowlist, which checks the name, not the content.
+2. Move it to trash.
+3. `restore_trash` with `<ts>/../../../../tmp/evil/manifest.json` — the file is
+   renamed there.
+4. `enqueue_job(plugin_name = "/tmp/evil")` — see section 3.10 — and the server
+   executes the manifest's command.
+
+Even without step 4 it is arbitrary write-anywhere as the server user:
+`~/.config/autostart/`, `~/.bashrc`, a systemd user unit.
+
+**So the id stays opaque and the destination is rebuilt from validated parts.**
+`list_trash` returns `{id, relative_path, file_name, deleted_at, size}` where
+**`id` is the directory name only** (`<epoch_ms>_<seq>`, digits and underscores,
+validated as today) and `relative_path` is a separate field. `restore_trash`
+takes both, and **every component of `relative_path` must be
+`Component::Normal`** before any join — the `GalleryPath` constructor from
+section 3.2, not a second mechanism. Confine against the **trash root**, not the
+gallery root: `.lightview/trash/` is *inside* the gallery, so a gallery-root
+check passes a path that has escaped the trash.
+
+This also deletes work: section 3.12's per-segment percent-encoding rule for
+trash ids goes away, because an id with no slashes needs no encoding.
 
 Two things a bare path mirror could not do, and why the timestamp segment
 exists: mtime cannot carry the deletion time (a rename preserves it, and
@@ -766,6 +1240,44 @@ section 3.10 promises that every executor prepares input identically. Omit it an
 a fix for. Step 7's acceptance requires a clip in the test gallery for exactly
 this reason.
 
+#### The routes, named
+
+Only the thumbnail route was named in an earlier draft, while behaviours were
+being specified as query parameters on "the media route" and step 4's acceptance
+called an endpoint that had no path, arguments or response shape. The whole
+surface is small enough to write down:
+
+| Route | Trust | Notes |
+|---|---|---|
+| `POST /api/invoke` | per command | the one command table |
+| `GET /api/events` | `Device` | SSE, one channel, typed events |
+| `GET /thumb/{tier}/{*rel}` | `Device` | `j` · `jm` · `jh` |
+| `GET /media/{*rel}` | `Device` | Range/206, HEIC transcode, `?fit=`, `?frame=` |
+| `POST /api/upload` | `Device` | section 3.5c |
+| `GET /api/dirs?path=` | **`Owner`** | the directory picker: returns `{name, path}` for subdirectories only, never media, never file contents |
+| `GET /healthz` · `GET /cert` | bootstrap | unauthenticated |
+| `POST /pair/redeem` · `POST /auth/launch` · `POST /auth/password` · `GET /auth/status` | bootstrap | unauthenticated |
+
+**The command table is a deliverable of step 4, not prose here** — but its shape
+is fixed: `(name, argument struct, minimum trust)`, one row per command, and the
+trust level is a field rather than a lookup in a second list. That is the whole
+replacement for today's 78-command registration plus a 46-arm allowlist kept in
+step by hand.
+
+Enumerating today's frontend calls turned up commands that section 3.2's
+categories do not account for, and each needs a decision rather than a discovery
+during step 6: `get_recent_galleries` / `remove_recent_gallery` (`Owner`; the
+store is named in section 3.3), `generate_pairing_code` and `revoke_remote_device`
+/ `delete_remote_device` (**not commands at all** — they become the
+`lightview devices` verbs, since nothing is `Owner` under `--serve`),
+`get_server_capabilities` (replaced by `get_capabilities`, section 3.2),
+`rebuild_thumbnails` and `precache_thumbnails` (`Device`; the Thumbnails pane
+section 3.12 keeps calls both, and "rebuild" now means three tiers rather than
+seven), `get_all_thumbnail_tiers` (`Device`; `InfoPanel` is in the ported list and
+calls it), and `list_plugins` (`Device`; both `AutoTagPanel` and `ContextMenu`
+call it). `close_gallery` and `reindex_gallery` have no live caller and are
+dropped — stated so their absence is a decision.
+
 **Paths on the wire are gallery-relative**, matching the database. Two
 exceptions, both `Owner`: a copy or move *destination* is absolute by necessity,
 and a plugin's temp file path is absolute by protocol. Carry the encoding rule
@@ -773,6 +1285,120 @@ with it — **percent-encode each path segment independently and leave `/`
 literal**, because axum's router decodes captures but rejects paths containing
 raw encoded slashes. A single `encodeURIComponent` over the whole path 404s every
 file in a subdirectory.
+
+### 3.5c Ingest — how a new file becomes a grid cell
+
+**This section exists because nobody had traced it.** A cold review followed one
+photo from a phone's upload to a cell in another client's grid and found that the
+middle of the path — the part between "the file lands" and "the client is told" —
+was described in the plan by a single sentence: *"once a file lands, the ordinary
+fs-watcher ingests it."* The watcher is named three times in this document and
+never specified, and the code it refers to splits in a way that guarantees the
+policy is lost: `util/fs_watch.rs` is **ported**, and it is a 60-line transport
+whose own doc comment says *"deliberately only a transport… the caller decides
+what a burst of events means"*. The 190 lines that decide are in
+`commands/gallery.rs:674-862`, and `commands/` is in the written-fresh column. So
+all of it would be re-derived from nothing.
+
+Section 3.5b takes a page to say the media route is written fresh and these
+behaviours must be carried deliberately. The watcher deserves the same page.
+
+**The watcher's policy, carried deliberately:**
+
+- **A quiet-period debounce, not a throttle.** `POLL_MS` 300, `DEBOUNCE_MS` 500,
+  and the timer is **reset by every event** (`gallery.rs:714-715`, `:802`). A
+  phone uploading two hundred photos back to back produces no database rows and
+  no SSE until 500 ms after the last one lands. That is correct and deliberate,
+  and it is invisible unless written down.
+- **Three skip filters, in this order**: the `settings.toml` hot-reload branch
+  must run **before** the `.lightview` skip (`:751-784`), or changing a display
+  preference stops reaching the running process; then `.lightview` itself; then
+  the media-extension filter (`:787-793`), which is the only reason the upload's
+  own `.lv-upload-*.tmp` file is invisible to the watcher.
+- **Only `Create` and `Modify(Name(To))` count as additions.** `Modify(Data)` is
+  ignored entirely (`:795-813`).
+- **The insert is `INSERT OR IGNORE` of five columns** (`:661-665`).
+- **Armed on the canonical root.** Today the database and the watcher both use
+  the user-supplied path (`provider/local.rs:38`, `gallery.rs:1055`), so they
+  agree by accident. Section 3.3 makes database paths relative to the
+  **canonical** root (`gallery.rs:953-961`); leave the watcher on the
+  user-supplied one and every event fails `strip_prefix`, which looks exactly
+  like "not in this gallery". Concretely: `lightview --serve ~/photos` where
+  `~/photos` is a symlink to `/mnt/nas/photos` uploads fine, thumbnails fine, and
+  **the grid never learns the file exists** until a restart. A strip failure is a
+  `log::warn`, never a silent `continue`.
+- **`notify`'s own errors are surfaced.** `fs_watch.rs:53-57` is `if let Ok(event)`,
+  which drops them on the floor — and inotify watch-limit exhaustion and queue
+  overflow arrive exactly there. On a large gallery against a default
+  `fs.inotify.max_user_watches` the watcher goes **partially deaf with no log
+  line**: some subtrees stop ingesting and nothing says so. The same channel
+  carries the unmount signal, so a NAS dropping out mid-run is equally silent and
+  the watcher is never re-armed.
+- **Armed before the readiness gate opens.** `gallery_gate` 503s every route
+  until the gallery is set (`http_server/middleware.rs:84-98`), which happens
+  inside `open_gallery_impl` — *before* the caller starts the watcher
+  (`bin/lightview-headless.rs:156`). A file arriving in that window is in neither
+  the completed scan nor the watcher. The window is milliseconds today, but the
+  gate appears nowhere in this plan, and a fresh implementation without one turns
+  the window into the entire initial scan.
+
+**The upload writer, carried deliberately.** Section 3.2 covers confinement;
+these four are the rest of it, and every one is load-bearing:
+
+- **Temp file in the destination directory, then rename** (`routes.rs:988-1020`).
+  Without it the watcher fires `Create` on an empty file and the `INSERT OR
+  IGNORE` records `file_size = 0` and `date_taken = <upload time>` — and because
+  it is `INSERT OR IGNORE`, **nothing ever corrects them**. The thumbnail
+  self-heals, because it is generated on demand later; the metadata does not. Size
+  sort, `size>=10mb` and date sort are permanently wrong for that file.
+- **Stamp the mtime on the temp file *before* the rename** (`:983-1011`), or the
+  indexer records the upload time as the capture time and every uploaded photo
+  sorts as "today" forever.
+- **Collision dedupe**, and **`RENAME_NOREPLACE`** so it cannot lose its race
+  (section 3.2).
+- **Remove the temp file on *every* error path.** Today `?` propagates out of the
+  write (`routes.rs:995`) and only a failed *rename* triggers cleanup (`:1016`),
+  so an `ENOSPC` or a dropped connection leaves `.lv-upload-<nanos>-<rand>.tmp`
+  behind permanently. It has no media extension, so neither the scan nor the
+  watcher will ever see it: invisible litter accumulating in the one tree this
+  plan tells the user is safe to `grep`, `rsync` and back up.
+
+**A path is immutable within a gallery session.** This is the cheap resolution to
+a three-layer staleness problem: nothing updates a row whose file was replaced
+(`INSERT OR IGNORE`, and `Modify(Data)` is not watched), the tier lookup is keyed
+on path with no mtime predicate (`cache/thumbnails.rs:198-211`,
+`thumb_serve.rs:65-96`), and the ETag is a hash of the *cached thumbnail bytes*
+(`routes.rs:204`), which have not changed — so a phone revalidates, gets a 304,
+and re-stamps its freshness window for up to thirty days. Section 3.5's sentence
+about ETag revalidation refreshing a phone's grid is true for a **new** file and
+false for a **changed** one, and it is stated as though it were general. Dedupe
+guarantees a new upload is a new path; replacing a file in place on the host is
+outside what this design supports, and saying so is cheaper than putting `mtime`
+in every tier lookup.
+
+**A newly ingested file gets its companion indexed in the same breath.**
+`insert_media_meta_row` writes five columns and never touches `tag_index`; the
+watcher `continue`s on companion files (`:781-784`); `index_companions` runs only
+in the post-open background task. So a batch of photos arriving *with* their
+sidecars over `rsync` or Samba — the NAS case, which is this plan's headline
+deployment — appears in the grid with no tags, no rating and no colour label
+until the process restarts, and any edit made in that state overwrites a
+companion the index never read. One line in the add branch fixes it:
+`read_companion` + `reindex_tags_for_file` + `set_index_state`, exactly as
+`restore_trash_impl` already does (`commands/trash.rs:319-325`).
+
+**The client half.** The SSE event racing the thumbnail is benign — the event
+carries paths, the client refetches, and the thumbnail generates on demand; the
+new cell paints from nothing and reflows when the image loads. The **reconnect**
+is not benign. Section 3.11 says a reconnecting phone should re-fetch state
+rather than replay history, which is a requirement with no owner:
+`App.tsx:496-502` registers three listeners and no `onopen`, and `EventSource`
+reconnects silently, so every event during the gap is gone. On a phone that
+happens constantly — screen lock, Wi-Fi to LTE, backgrounding — and with the item
+list persisted in IndexedDB the client can sit on a confidently wrong grid
+indefinitely. `App.tsx` is in the rewritten column, so the omission carries
+forward by default unless it is assigned here: **`onopen` re-fetches boot state**,
+named alongside the two `ipc.ts` behaviours section 3.12 already pins down.
 
 ### 3.6 Query — filter, sort, group, autocomplete
 
@@ -794,7 +1420,16 @@ width>=1920  size>=10mb     pixel dimensions, file size (b/kb/mb/gb)
 ```
 
 Removed: the `GeoBbox` term (its only caller was the map view) and the `auto`
-namespace (nothing ever wrote it). Added: `set`.
+namespace. Added: `set`.
+
+**On `auto`: an earlier draft said here that nothing ever wrote it. That is
+false**, and section 4 corrects it — the duplicate merge unions `tags.auto`
+across every copy onto the survivor and writes it back
+(`commands/duplicates.rs:238,276`), with a test asserting exactly that
+(`:384,390,414`). The conclusion survives because it propagates rather than
+originates — no command *creates* an auto tag — but the sentence stating it did
+not, and it is repeated here because leaving the corrected claim in one section
+and the false one in another is how a reader gets the uncorrected version.
 
 **Add quoted strings to the tokenizer.** Today a tag containing a space cannot
 be named by any query — it fails outright, and autocomplete offers such tags, so
@@ -812,13 +1447,38 @@ comparison. **A field is filterable only if it is indexed** — that is the
 constraint the language is shaped by, and the reason `rating` and `color_label`
 are mirrored from the companion into columns.
 
-**Sorting** selects from `media_meta` with a `LEFT JOIN` on the `j` tier, purely
-to inline the ~25-byte ThumbHash into the payload so the grid paints every cell
-blurry before any thumbnail request goes out. **Qualify every column with the
-table alias** — the joined table has its own `path` and `media_type`, and a bare
-column name makes SQLite reject the statement as ambiguous. A filtered path list
-binds as one JSON parameter expanded with `json_each`, so one prepared statement
-serves every filter size.
+**Sorting** is a single-table select from `media_meta`, which now carries the
+ThumbHash (section 3.3) so the grid paints every cell blurry before any thumbnail
+request goes out. There is no join. An earlier draft kept the ThumbHash on the
+tier table and reached it with a `LEFT JOIN`, which is what created the
+alias-qualification hazard the port table cites as a reason to keep `sort/`
+(*"the joined table has its own `path` and `media_type`, and a bare column name
+makes SQLite reject the statement as ambiguous"*). Moving one column deletes the
+join, the hazard and the warning together. The ported code already qualifies
+every column (`sort/sorter.rs:68-72`), so keeping that habit costs nothing and
+survives if a join ever returns.
+
+**The filter compiles into the sort statement.** One command,
+`get_items { sort, order, sub_sort, filter, group_by }`, and the `WHERE` fragment
+goes straight into it. An earlier draft kept the current two-step shape, in which
+`apply_filter` returns a `Vec<String>` of paths that the *client* hands straight
+back to `get_sorted_items` to be re-expanded with `json_each`
+(`commands/filter.rs:45`, `stores/filterStore.ts:58-59`, `sorter.rs:121`) — the
+filter result crosses the network twice, and `filteredPaths` has no other
+consumer anywhere in the frontend. At 20k matches that is roughly a megabyte of
+path strings up and a multi-megabyte item payload down, per debounced keystroke,
+to a phone. Compiling it in deletes `apply_filter`, the path list, the JSON
+parameter and the `json_each` expansion. The current split exists so that
+"changing the sort does not re-run the filter" (`commands/filter.rs:5-6`) — it
+buys one indexed SQL scan at the price of two network transfers of the whole
+result set.
+
+**Filesystem changes send what changed, not everything.** `App.tsx:466-472`
+re-fetches the entire sorted list on any `fs-changed` event carrying an addition
+— and passes `undefined` for the filter, silently dropping the active filter as
+it goes. One phone upload costs every connected client a full-library payload.
+Send the added and removed paths and splice client-side; refetch only when the
+client cannot place an insertion.
 
 **Grouping** is a separate in-memory pass over the already-sorted list, emitting
 `{label, start_index, count}` where the group key changes. Compare a
@@ -874,10 +1534,23 @@ its own key, so a re-run replaces that plugin's output and touches nothing else.
 `rating` and `color_label` are mirrored into `media_meta` columns by every path
 that sets them, and rebuilt from the companion at index time.
 
-**Writes are atomic**: serialize to a uniquely-named temp file **in the target
-directory** (same filesystem, therefore an atomic rename) and rename into place.
-A reader sees the old file or the new one, never a truncated one. The writer
-stamps `modified`, not the caller.
+**Writes are atomic *and durable*, which are two different claims and the code
+today makes only the first.** Serialize to a uniquely-named temp file **in the
+target directory** (same filesystem, therefore an atomic rename), then
+`write_all` → **`sync_all` on the file** → rename → **`sync_all` on the parent
+directory**. A reader sees the old file or the new one, never a truncated one —
+that part `companion/writer.rs:59-62` already gets right. What it does not do is
+fsync anything, so on ext4 the rename can be durable while the data is not, and
+the NAS leg is weaker still. This document calls the companion *"the only thing
+here that cannot be regenerated"* and *"the largest commitment in the plan"*, and
+then rested it on a durability guarantee the code does not provide.
+
+**Remove the temp file on every error path.** Today it is removed only when the
+*rename* fails (`writer.rs:62-66`), so an `ENOSPC` inside the write leaks
+`.lightview-tmp-<uuid>.json` into the durable tree — the same shape as the upload
+temp leak in section 3.5c, in a different directory.
+
+The writer stamps `modified`, not the caller.
 
 **One companion location, read and write** — `.lightview/companions/`. The
 `companion_location` setting is deleted; it had a UI control and never reached a
@@ -959,8 +1632,8 @@ selection, rename is `rename`, merge two clusters is `merge`, delete is
 `delete`, and the tag manager lists both namespaces instead of one.
 
 That is the entire data model. No new file, no new table, no new wire format, no
-new filter syntax. The tag index, `tag_counts`, autocomplete, grouping and the
-tag-write commands all apply unchanged, and it is reconstructable from
+new filter syntax. The tag index, autocomplete, grouping and the tag-write
+commands all apply unchanged, and it is reconstructable from
 companions because it *is* companion content.
 
 **"Not a duplicate" is not stored.** It is derived: two files sharing any
@@ -973,10 +1646,23 @@ the user sees a name rather than a list of negations.
 into memory, runs all-pairs Hamming in Rust, and today loads the whole
 `not_duplicates` table separately to suppress pairs by hash lookup
 (`duplicates.rs:181`). The replacement keeps that shape rather than inventing a
-SQL one: a single `SELECT path, tag FROM tag_index WHERE namespace = 'set'` into
-a `HashMap<path, SmallSet<tag>>`, then a set-intersection test per candidate
-pair. Most files carry no set tag, so the common case is an absent-key early-out
-and the cost is a rounding error against the Hamming loop itself.
+SQL one: a single `SELECT path, tag FROM tag_index WHERE namespace = 'set'`
+loaded once before the loop.
+
+**Index-based, not path-keyed**, and the code being replaced says why
+(`duplicates.rs:143-152`): probing a set keyed by paths *"meant building an owned
+`(String, String)` for every near-match just to ask whether it had been
+dismissed — two allocations and a string comparison per candidate… Indices make
+it two integers and no allocation."* So: interned set ids in a
+`Vec<SmallVec<[u32; 2]>>` indexed by the same position map the loop already
+builds (`duplicates.rs:174-179`), and suppression is an intersection of two tiny
+sorted lists.
+
+That comment matters more here than it did for `not_duplicates`, because of a
+reversal worth stating: dismissed pairs were rare, so the old check almost never
+fired. Set co-membership is the **common** case — a forty-frame burst is 780
+near-matches, every one of them suppressed. A check that used to be cold is now
+the inner loop of the one quadratic algorithm in the tree.
 
 **Order comes from the gallery's own sort.** A comic strip's pages are
 `page01.jpg`, `page02.jpg`. Storing an ordinal per member would be a second
@@ -998,11 +1684,33 @@ one through it.
 sidecar; trashing a member shrinks it silently. That is accepted — a set is not
 a durable object with an identity, it is a name several files agree on.
 
-**Duplicate detection**, otherwise unchanged: a 64-bit dHash computed from the
-cached `j` thumbnail (already decoded, already in the database, so hashing a
-gallery costs no source decodes), stored in a `phash` column so it dies with the
-thumbnail it describes. All-pairs Hamming comparison; threshold is a parameter
-for precision, not for cost.
+**Duplicate detection**: a 64-bit dHash computed from the cached `j` thumbnail
+(already decoded, already in the database, so hashing a gallery costs no source
+decodes), stored in a `phash` column on `thumbs_j`. All-pairs Hamming comparison;
+threshold is a parameter for precision, not for cost.
+
+> **The ported hasher is codec-specific, and `j` is WebP. Ported unchanged, this
+> destroys the library.** `cache/duplicates.rs:136-141` matches `"rgba"` and
+> `"jpeg"` and falls through to `_ => None`, then stores `hash.unwrap_or(0)`.
+> Today it reads the *Standard* tier, which is JPEG — only the fit tiers are WebP
+> (`cache/thumbnails.rs:146-151`). Point it at `thumbs_j` and **every row stores
+> the sentinel `0`**. `find_duplicates` selects `WHERE phash IS NOT NULL`
+> (`duplicates.rs:155`), so every row qualifies; `hamming(0, 0)` is `0`, which is
+> under any threshold; the all-pairs loop (`:214-222`) unions **the entire
+> library into one duplicate group**. There is no error, no log line, and no
+> failing test — `find_duplicates` returns `Ok`. `DuplicatesPanel` renders it and
+> `merge_duplicates` trashes the non-keepers.
+>
+> Assumption 4 in section 2 discussed only the *geometry* change (square crop to
+> aspect-preserving) and never noticed the codec change riding along with it.
+>
+> **Two fixes, both required.** Decode with `thumbnailer::decode_thumb_bytes_to_rgba`
+> (`pipeline/thumbnailer.rs:472`, whose own doc comment says the `image` crate
+> sniffs the codec so JPEG and WebP both work) and feed `dhash_rgba`. And **stop
+> conflating "could not hash" with "hashed to zero"** — a genuinely flat image
+> legitimately hashes to 0 — so store `NULL` on failure and keep the
+> `IS NOT NULL` filter meaningful. Section 6 carries the test this needs: a
+> `j`-tier row yields a non-sentinel hash, and two unrelated photos do not group.
 
 **Merge**, unchanged: fold several copies' metadata onto one survivor and trash
 the rest. User tags union (editable), plugin tags union (automatic), rating /
@@ -1152,11 +1860,31 @@ directly). Both already share `plan_parts`, `InputPolicy`, `PartTracker` and
 | worker TTL / announce | 45 s / 15 s | registry liveness |
 | job stall / no-progress | 90 s / 30 min | a stalled *claim* is requeued; a job that stops **progressing** is failed. The prose below is authoritative — an earlier draft's "requeue vs. fail" in this cell read as though progress loss could requeue, which is the wedge-forever case |
 | finished jobs retained | 50 | |
+| terminal-call retry | backoff to ~5 min | `complete`/`fail` is **retried until acknowledged**, see below |
 
 **Requests are keyed on the temp file *name*, not the full path.** A plugin that
 canonicalizes its input under a symlinked `TMPDIR` echoes back a different
 string for the same file; keying on the name makes directory-level rewriting
 harmless. Log an unmatched result rather than dropping it silently.
+
+**The terminal call is retried, and the queue is volatile — say both.** Today
+`complete_tagging_job` is fire-and-forget (`let _ = client.invoke(…)`,
+`bin/lightview-worker/job.rs:484`), so one lost packet at the finish line leaves
+the job `Running` and ninety seconds later it is requeued: **hours of GPU
+re-spent because a single call dropped.** Retry the terminal `complete`/`fail`
+with backoff until it is acknowledged or the job is provably gone. And the whole
+registry is in memory (`tagging/mod.rs:1-20`), so a `--serve` restart drops every
+queued job with no record — that is acceptable (one re-enqueue) but it must be
+written down rather than discovered.
+
+Worth recording as sound, since it is the part most likely to be "improved":
+duplication under a network partition is bounded and self-healing. The worker
+keeps computing while the server requeues, so both run the same paths — but
+`apply_plugin_tags` is per-file and idempotent (`commands/plugins.rs:490-559`) and
+not gated on the job claim, so a partially applied batch of 32 is simply sixteen
+companions written and sixteen not, and the re-run finishes them. `Filter` targets
+re-resolve at claim time and skip what is already tagged. Wasted GPU, no data
+loss.
 
 **Liveness and progress are separate clocks.** A heartbeat proves the process is
 alive, not that the job is moving — a tagger's first run legitimately produces
@@ -1169,6 +1897,23 @@ wedged job produces.
 **The server never receives or executes code.** A job carries a plugin *name*;
 an instance only runs manifests installed under its own state directory's
 `plugins/`.
+
+**That invariant is broken today by one line, and `enqueue_job` is `Device`.**
+`find_plugin` does `plugin_dir.join(name)` (`plugin/runner.rs:68-71`) — and
+`Path::join` with an **absolute** argument discards the base entirely, while `..`
+traverses out of it. The `manifest.name == name` check afterwards is not a guard,
+because whoever writes the manifest writes its name field. Combined with the
+trash-restore primitive section 3.4 closes, this was a full path from a paired
+phone to code execution on the server. **Reject any `name` that is not a single
+`Component::Normal` before the join** — or better, delete the join fast path
+entirely, since the fallback branch (`runner.rs:76-85`) already finds a plugin by
+scanning installed manifests. Deleting it makes the invariant structural: only an
+actual child of the install root can ever be selected.
+
+Worth carrying forward as sound, so it is not "fixed" away: job *targets* are
+already confined. `tagging/mod.rs:650-673` intersects device-supplied paths with
+rows that exist in `media_meta`, so `enqueue_job` cannot point a plugin at an
+arbitrary host file. Keep the intersection.
 
 **Move the ML taggers out of this repository.** Keep `plugins/example-auto-tagger`
 — dependency-free `python3`, and what the verification recipe drives. The three
@@ -1187,7 +1932,19 @@ regenerated when the LAN IP changes or expiry nears. The certificate carries
 `basicConstraints CA:TRUE` and `keyCertSign` alongside its serverAuth EKU — not
 because it signs anything, but because iOS and macOS only offer the full-trust
 toggle for CA certificates, and a click-through exception is per-origin and
-short-lived. `GET /cert` serves the PEM unauthenticated; it leaks nothing, since
+short-lived.
+
+**It must also carry X.509 `nameConstraints`, and today it does not**
+(`http_server/tls.rs:194-200` sets `is_ca` and `keyCertSign` with SANs only). The
+consequence of the trade this plan is deliberately making has never been written
+down: once that certificate is enabled under iOS *Certificate Trust Settings*,
+the phone trusts **any** server certificate that key signs — for a bank as
+readily as for the gallery — and the key is a file on a home NAS that any backup,
+snapshot or `rsync` of the data directory carries off. Permitted subtrees =
+exactly the SANs the certificate already names; excluded = everything else. Two
+lines next to `is_ca`, `rcgen` supports it directly, Apple and Chromium both
+enforce it, and the iOS install flow is unchanged. The trade stays; its blast
+radius stops being "the internet". `GET /cert` serves the PEM unauthenticated; it leaks nothing, since
 every handshake hands out the same certificate, and it must be reachable
 *before* the browser trusts the connection enough to pair.
 
@@ -1202,9 +1959,29 @@ stores a **SHA-256** hash of the secret — deliberately not argon2: the secret 
 32 random bytes, so a slow hash buys nothing against that search space, and
 verification runs on *every thumbnail request*. Comparison is length-checked and
 constant-time. Enrollment is a short-lived, single-use row: a 6-digit PIN typed
-by hand or a 32-byte hex token in a QR code — the PIN is safe because of the
-10-minute TTL and single-use redemption, not because six digits are hard to
-guess.
+by hand or a 32-byte hex token in a QR code.
+
+**An earlier draft said the PIN is safe "because of the 10-minute TTL and
+single-use redemption, not because six digits are hard to guess". Single use
+bounds a successful guess, not the number of attempts,** and there is no rate
+limit, attempt counter or lockout anywhere in the redemption path
+(`http_server/auth_routes.rs:43-88` → `devices.rs:222-241`, a bare
+`SELECT … WHERE code = ?1`). A million codes over a 600-second window is about
+1,700 guesses a second to exhaust, trivially parallel on a LAN, against a server
+whose ordinary job is hundreds of thumbnail requests per scroll — and the
+distinct 404/409/410 responses confirm progress. Two things make the prize
+larger than one gallery: pairings are now per **account**, so a guessed PIN is a
+permanent credential for every gallery this machine serves; and the argon2id
+password never fires, because a freshly redeemed device gets `last_auth_at = now`
+(`devices.rs:250-258`) and the challenge only triggers past the inactivity window
+(`middleware.rs:190-196`, six hours by default).
+
+**Fail closed on the pairing row, not per IP:** an `attempts` column, incremented
+on every failed redemption while a code is outstanding, and **every outstanding
+pairing row is deleted at ten failures**. The human runs `lightview pair` again.
+One column and one `UPDATE`; no configuration, no timing state, no per-client
+bookkeeping — and it makes the sentence above true. `POST /auth/password`
+(`auth_routes.rs:99-131`) gets the same treatment.
 
 Pairings live in the **state directory**, not the gallery, because they are a
 property of this account serving. That removes the per-gallery cookie-name mint that
@@ -1218,29 +1995,58 @@ mode 0600:
 |---|---|
 | `server_url` | where to attach |
 | `cookie` | `<name>=<id>.<secret>`, obtained by redeeming a PIN |
-| `cert_sha256` | **trust-on-first-use pin of the server's end-entity certificate** — the server is self-signed, so this, not a CA, is what authenticates it |
+| `spki_sha256` | **pin of the server's public key (SPKI), not of the certificate** — the server is self-signed, so this, not a CA, is what authenticates it |
 | `instance_id` | stable uuid minted at pair time; identifies this host in the worker registry |
 | `instance_name` | what the web UI shows |
 | `poll_secs` | claim interval, default 3 |
 
-`lightview remote-pair --server <url> --pin <n>` redeems the PIN, captures and
-prints the certificate fingerprint for confirmation, and writes the file.
-**`--pin` is required only on a first pairing.** `remote-pair --server <url>
---trust-new` re-pins the certificate against an existing `remote.toml` and keeps
-the cookie, which is the whole point of a re-pin: no new device row, no new
-secret, nothing for a human to redeem.
+**How the pin is implemented matters as much as that it exists.** The current
+verifier is the right shape and must be copied, not re-derived: it compares an
+exact SHA-256 digest of the presented leaf while keeping signature verification
+on (`bin/lightview-worker/http.rs:55-70`). The tempting rustls shortcut — insert
+the certificate into a `RootCertStore`, which looks natural precisely *because*
+the certificate is `CA:TRUE` — silently stops being a pin, since anything that
+key signs would then validate. **State it as: an exact digest of the presented
+key, never a trust anchor.**
+
+**Pin the SPKI, and persist the key.** An earlier draft pinned the certificate
+DER, and `generate()` mints a fresh key pair on every regeneration
+(`http_server/tls.rs:203`). Between them, a DHCP lease change breaks every
+attached `--remote` instance — a headless systemd unit, on the deployment this
+mode exists for — and the documented remedy is `--trust-new`, which re-pins
+whatever answers with no PIN and no verification, then sends it the existing
+device cookie. That is a design that **trains the operator to bypass the pin on a
+routine event**, which is worth more to an attacker than the pin is worth to us.
+Persisting the key and pinning the SPKI means a SAN change re-mints only the
+certificate: every existing pin keeps working, and `--trust-new` goes back to
+being the rare deliberate act it should be.
+
+**First use must be verifiable, and today it is not.** The worker prints the
+fingerprint and asks the operator to *"compare with the fingerprint shown on the
+host"* (`bin/lightview-worker/main.rs:155-157`) — and **no host command prints
+one** (`lightview pair` prints the PIN and nothing else). So the operator has
+nothing to compare against and answers yes, which means an active LAN attacker at
+pairing time presents his own certificate, receives the PIN, redeems it upstream,
+hands back a cookie, and holds both a valid `Device` credential and a permanent
+MITM position. The fix costs one string and no new argument: **fold a fingerprint
+prefix into the pairing code the human already carries.** `lightview pair` prints
+`042917.a3f19c8e4b21`; `remote-pair` aborts unless the observed SPKI hash starts
+with those twelve hex digits. Same ergonomics, and trust-on-first-use becomes
+authenticated-first-use.
+
+**The PIN is read from stdin, not argv** — section 3.1 rejects argv for the
+password because it lands in shell history and `ps`, and the same is true of a
+PIN for its ten-minute life. Passing the combined code above on stdin satisfies
+both.
 
 Certificate rotation must produce an error naming `--trust-new` rather than a
-bare TLS failure. **Never disable verification as a workaround; the pin is the
-whole authentication story on that leg.**
-
-**A DHCP lease change is the sharp edge here.** The certificate regenerates when
-the LAN IP changes, which breaks every attached `--remote` instance until someone
-runs `--trust-new` — on the deployment the mode exists for, a headless systemd
-unit. Two mitigations, both cheap and neither novel: give the server a static
-address or a reserved lease, and name every address the clients dial in
-`--tls-san` so a change does not re-mint. Say this in the deployment docs rather
-than letting each user discover it once.
+bare TLS failure, and **a pin mismatch is fatal, not a retry loop** — otherwise
+systemd restarts the unit into the same wall forever while the server requeues
+and discards its in-flight work. **Never disable verification as a workaround;
+the pin is the whole authentication story on that leg.** Give the server a static
+address or a reserved lease and name every address clients dial in `--tls-san`
+anyway; with the key persisted this is now an ergonomics note rather than a
+sharp edge.
 
 **Auth is on the hot path.** It runs on every thumbnail request, so it must not
 take the writer lock and must not write unconditionally. Read through the
@@ -1256,6 +2062,23 @@ doubled as the "is anyone watching?" signal for the idle worker, and tagging
 traffic must not make the server think a user is present. Section 3.5 abolishes
 that signal, so the reason is gone and the second channel with it. One channel,
 one stream, one concept fewer.
+
+**But the two channels also carry different lag contracts, and merging them
+naively collapses both into the expensive one.** On `RecvError::Lagged` the fs
+relay emits an empty payload that the client reads as "refetch everything"
+(`routes.rs:761-765`), while the tagging relay simply `continue`s, safe because
+every tagging event is a full snapshot the client re-syncs anyway (`:793-795`).
+With one channel the receiver cannot tell which domain it missed, so the safe
+answer is the fs answer — and tagging is by far the heavier producer, broadcasting
+a snapshot per apply batch plus reaps and heartbeats. Lag would become common
+exactly where it was rare, and each occurrence would cost every connected client a
+full-library payload.
+
+So: **one channel, typed lag recovery.** On `Lagged`, emit a single `resync` event
+naming the domains that may have been missed, and the client re-fetches only
+those. And **throttle job-progress broadcasts to at most one per second** — a
+progress bar does not need 32-file granularity, and it is the only high-rate
+producer on the shared channel.
 
 **Uploads** are the one write channel from a device. Once a file lands, the
 ordinary fs-watcher ingests it — uploads have no separate indexing path.
@@ -1296,13 +2119,13 @@ it is not to be reconsidered: `JustifiedGrid`, `MediaViewer`, `VideoPlayer`,
   the worker roster, the per-plugin run entries and the job list. It gains
   nothing: plugin-proposed grouping is deferred, so there is no proposal section
   to render.
-- **`TrashPanel`** renders an entry id that today is `<epoch_ms>_<seq>` and is
-  validated as digits and underscores. Section 3.4's layout makes one timestamp
-  directory hold many files, so **an entry id is now `<epoch_ms>/<relative
-  path>`** — it contains slashes and takes the per-segment encoding rule from
-  section 3.5b. `list_trash` returns `{id, original_path, file_name, deleted_at,
-  size}` as before, with `deleted_at` parsed from the leading segment and
-  `original_path` being everything after it.
+- **`TrashPanel`** keeps rendering an opaque entry id. Section 3.4 explains at
+  length why the id must **not** become a path: `list_trash` returns
+  `{id, relative_path, file_name, deleted_at, size}` where `id` is still
+  `<epoch_ms>_<seq>` (digits and underscores, validated as today) and the
+  original location travels in its own field. The panel change is therefore
+  smaller than an earlier draft claimed — it reads `relative_path` where it read
+  `original_path`, and passes both fields back to `restore_trash`.
 
 **`lib/ipc.ts` is written fresh, not ported.** Every one of its ~84 call
 wrappers targets a command name and argument shape that section 3.2 replaces.
@@ -1372,10 +2195,15 @@ browser at a narrow width takes the mobile path — and the mobile default sizes
 cells for two columns. Redefine it deliberately: viewport width plus `hasTouch()`,
 which is a capability rather than a guess.
 
-`memoryPressure` polled a backend command that was never in the allowlist, so on
-the web it 403'd into an empty catch and the viewer cache's pressure eviction
-simply did not exist. One runtime now, so read one signal:
-`navigator.deviceMemory`, sampled once, because it is a static device class.
+`memoryPressure` **is already most of the way there and must not be rewritten
+from scratch.** An earlier draft described a defect that has since been fixed in
+the tree: `lib/memoryPressure.ts:62-66` already branches to a single
+`navigator.deviceMemory` read on the web, the empty catch is gone in favour of a
+log-once flag (`:53-57`, `:84-91`), and the module comment states the old bug in
+the past tense (`:17-22`). The backend command genuinely is absent from the
+allowlist, so that half was right — but the prescribed remedy is already written.
+The remaining work is deleting the desktop poll branch, not re-deriving 111 lines
+of working, commented code.
 
 **Grid invariants that must survive the port**, each of which fails silently:
 
@@ -1515,8 +2343,19 @@ is `GalleryGrid`. `gif_serve.rs` (187), `cache/gif_atlas.rs` (103) and
 with the engine. `views.rs` (164) and the enabled-views setting. `commands/geo.rs`
 (268). The `/thumbhash` route, protocol arm and PNG cache — the blob is inlined
 into the items payload and decoded client-side; nothing ever fetched the route.
-`RenderConfig`. The `hardware/` probes for storage type, filesystem and reflink,
-which are logged and displayed and drive nothing; keep core count and RAM.
+`RenderConfig`. The `hardware/` probes for **filesystem and reflink**, which are
+logged and displayed and drive nothing (there is no reflink copy path); keep core
+count and RAM.
+
+**Not `storage_type` — an earlier draft listed it here and that was false.** It
+is the *sole* input to `thumbnail_threads()` (`hardware/mod.rs:72-80`: NVMe →
+`cores.min(12)`, SSD → `(cores/2).clamp(2,8)`, HDD → 2, Network →
+`(cores/4).clamp(1,4)`), which `lib.rs:350` consumes to build the rayon
+`thumb_pool` every thumbnail in the system runs on (`lib.rs:378-382`). Deleting
+it silently replaces an I/O-class-aware 2–12 threads with whatever the
+implementer invents — on the N100 server that section 3.5's idle backfill exists
+for, and on the NAS mount where "Network → 4" is the whole point. Keep the probe,
+or replace the policy deliberately and say so; do not delete it as dead weight.
 `decisions/` and the whole convention. Most of `docs/refactor.md`'s subject
 matter.
 
@@ -1529,12 +2368,16 @@ with what each step must produce.
 
 | # | Step | Produces | Done when |
 |---|---|---|---|
-| 0 | **Branch and clear** | the old tree deleted in the same commit that adds the first new file, **plus `!dist/.gitkeep` in `.gitignore` and that file committed** — permanently, not as scaffolding: it is what deletes the "`dist/` must exist before any `cargo` command" exception (section 2) | `cargo check` on an empty skeleton, from a clone that has never run `npm` |
-| 1 | **Pure modules** | `filter/`, `sort/`, `autocomplete/`, `geocode/`, `companion/`, `util/`, `provider/`, `file_clipboard/` moved across; `auto` removed and `set` added in `TagNamespace` **and its TypeScript mirror**, `#[serde(default)]` on the companion structs, quoted strings in the tokenizer | the ported tests pass **after their `auto::` cases are rewritten to `set::`** — the enum is serialized both directions, so this is a wire change, not only a parser change — plus new tests for quoting, `set::`, and an old sidecar parsing without `set` |
+| 0 | **Branch and clear** | the old tree deleted in the same commit that adds the first new file, **plus `dist/*` + `!dist/.gitkeep` in `.gitignore` and that file committed** (the
+bare `dist/` exclusion cannot be negated) — permanently, not as scaffolding: it is what deletes the "`dist/` must exist before any `cargo` command" exception (section 2) | `cargo check` on an empty skeleton, from a clone that has never run `npm` |
+| 1 | **Pure modules** | `filter/`, `sort/`, `autocomplete/`, `geocode/`, `companion/`, `util/`, `provider/`, `file_clipboard/` moved across; `auto` removed and `set` added in `TagNamespace` **and its TypeScript mirror**, `#[serde(default)]` on the companion structs, quoted strings in the tokenizer | the ported tests pass **after their `auto::` cases are rewritten to `set::` and
+their `GeoBbox` cases are deleted** — the term has live code and tests
+(`filter/ast.rs:60`, `evaluator.rs:110`, `parser.rs:224,265,298`, and tests at
+`parser.rs:761,775,782,787,808`) that will not compile once it goes — the enum is serialized both directions, so this is a wire change, not only a parser change — plus new tests for quoting, `set::`, and an old sidecar parsing without `set` |
 | 2 | **`cache/`** | three tables, relative paths, `format_version`, the named indexes, the `flock` on the cache directory, the path-keyed sweep and its test | a fresh open indexes a gallery; a version bump deletes and rebuilds |
 | 3 | **Pipeline** | one render path, three tiers, the coalescer, the byte budget, the idle worker | tier bytes appear for a test gallery at all three edges |
 | 4 | **Server + command table** | routes, the two trust levels, path confinement, TLS, pairing, the launch-token session, SSE, upload | `curl` exercises every route; an unauthenticated call is 401; an `Owner` command on a non-loopback bind is 403; **and on a loopback bind, redeeming a launch token and then calling the directory-listing endpoint succeeds** |
-| 5 | **CLI** | the three modes | `lightview <dir>` opens a browser; `--serve` binds and pairs |
+| 5 | **CLI** | `<dir>` and `--serve` (`--remote` lands in step 7, which builds what it attaches to) | `lightview <dir>` opens a browser; `--serve` binds and pairs |
 | 6 | **Frontend** | the ported SPA against the new API | the grid fills in headless Chromium |
 | 7 | **Plugins + tagging** | one job loop; `remote.toml` (server url, cookie, `cert_sha256` TOFU pin, instance id and name, poll interval) and the `remote-pair` verb that writes it; then `--remote` | the example tagger completes a job locally, and a second process attached with `--remote` completes one against a self-signed server without disabling verification — **with a clip in the test gallery**, so `?frame=` is exercised and a video's companion gains a merged tag entry rather than being silently skipped |
 | 8 | **Docs** | `docs/` rewritten; `_planning/rebuild/`, `refactor.md` and `todo.md` deleted; `.claude/skills/verify/SKILL.md` rewritten against the new CLI | every page describes what exists, and the verify recipe runs |
@@ -1549,8 +2392,14 @@ browser is the *only* runtime.
 
 **Rust tests to carry or write:**
 
-- the path-keyed sweep test — **update it, do not delete it** with the four tier
-  tables it currently covers
+- the path-keyed sweep test — **update it, do not delete it**. It currently
+  covers **eleven** tables, not four: `path_keyed_tables()` chains four non-tier
+  tables with `ThumbTier::ALL`, which is seven (`cache/db.rs:23-27`,
+  `cache/thumbnails.rs:111-119`). It also asserts `not_duplicates` behaviour
+  (`db.rs:843,873-880`), which goes with the table
+- **the duplicate hasher decodes what the `j` tier actually stores** — a `j` row
+  yields a non-sentinel hash, and two unrelated photos do not group. Section 3.9
+  explains why this is the cheapest test in the list to be missing
 - filter parse/compile round-trips, including quoted strings and `set::`
 - the sort alias qualification (a bare column name must not compile)
 - companion round-trip, atomic write, and the read fallback
@@ -1641,7 +2490,21 @@ one only with a written reason.
 | **The password is a CLI verb reading stdin**, argon2id, `--serve` only | hand-editing a hash into TOML |
 | **Tag-write commands take a `namespace` of `user` or `set`** | a parallel command family for an identical operation |
 | **One broadcast channel, not two** | a second channel whose only justification was the abolished subscriber-count signal |
-| **The cache-directory *ceiling* is enforced only by `lightview cache --prune`** — a different mechanism from the per-tier budget, which is automatic (section 3.3 names both); the ceiling's LRU key is the cache file's mtime | a gallery discovering its thumbnails were evicted as it opens |
+| **Path confinement is a `GalleryPath` newtype**, lexical for DB-answered requests and canonicalizing before any file is opened | the ported command layer's checks, which are lexical (`trash_files`) or absent (tag writes) |
+| **The trash entry id stays opaque**; the original location travels in its own field | `restore_trash` at `Device` becomes an arbitrary-file-move primitive |
+| **The loopback bind is a random `127.x.x.x`**, not `127.0.0.1` | the session cookie reaches every other local port, where `SameSite` is same-site and does not help |
+| **`open_with` takes an index into configured apps**, never a program name | `Owner` means arbitrary code execution, which is what makes every other finding an RCE |
+| **Pin the SPKI and persist the TLS key**; the pairing code carries a fingerprint prefix | `--trust-new` on every DHCP lease change trains the operator to re-pin whatever answers |
+| **The PIN fails closed after ten attempts** | a million-code space with no rate limit, for a credential that is now per account |
+| **The launch URL is always printed to stdout**; no `--no-browser` flag | a headless local mode with no way to learn its own URL, and a verification recipe depending on an undefined flag |
+| **The ThumbHash moves to `media_meta`** | the items query walks the thumbnail table's overflow pages to extract 25 bytes a row |
+| **The filter compiles into the sort statement** | the filter result crosses the network twice, with the client as courier |
+| **The duplicate hasher decodes RGBA, and failure stores `NULL`** | every row hashes to the sentinel `0` and the whole library becomes one duplicate group |
+| **`date_added` and `last_viewed` are mirrored into `meta.core`** | requirement 11 is false, and three blessed operations destroy them silently |
+| **A scan that errored is not a prune authority** | an unmounted NAS at boot wipes every path-keyed row |
+| **Trash retention lives in `.lightview/settings.toml`**, not `server.toml` | a desktop's default retention deletes a served gallery's trash |
+| **`tag_counts` is deleted**; autocomplete aggregates at refresh | a table outside the sweep the plan says has no exceptions |
+| **The cache-directory *ceiling* is enforced at gallery open and by `lightview cache --prune`** — a different mechanism from the per-tier budget; the LRU key is an explicit `last_opened` file, never `cache.db`'s mtime | unbounded growth in `~/.cache`, and an LRU that evicts the warmest gallery |
 
 ---
 
@@ -1670,9 +2533,148 @@ Named so their absence reads as a decision rather than an oversight.
 **Open items carried forward** — real, and none of them blocking:
 
 - Move the ML taggers to their own repository (section 3.10).
-- A tagging job rebuilds the whole `tag_counts` table every 32 files. Cost scales
-  with the *library*, not the batch, under the single writer. Wants a
-  measurement on a large library before anything is built.
 - Authentication reads under the writer lock in front of a read-only pool. Four
   cheap `SELECT`s, so whether the serialization is measurable depends on queue
-  depth on a real phone. Get the number first.
+  depth on a real phone. Get the number first. (Section 2's assumption 11 settles
+  where those reads go; this is about whether it mattered.)
+
+---
+
+## 9. Raised by the five-angle review, and not yet settled
+
+Five independent cold reviews — performance, security, simplicity, factual
+accuracy, and failure modes — produced findings that are folded into sections 1
+through 8 above. Six were **not** folded in, because each reverses a decision
+already taken or turns on a fact about the deployment that this document cannot
+supply. They are recorded here rather than decided quietly.
+
+### 9.1 `tag_counts` is deleted — settled
+
+Not an open question, recorded here because it removes something section 3.3
+previously listed. `tag_counts` is keyed `(namespace, tag)`, so it is **not**
+path-keyed and sits outside the sweep that section 3.3 claims has no exceptions;
+it needs its own two maintenance paths (`cache/counts.rs:1-9`), and rebuilding it
+per apply batch is section 8's open item. Autocomplete already holds every tag in
+memory with counts. Populate that from one
+`SELECT namespace, tag, COUNT(*) FROM tag_index GROUP BY 1, 2` at refresh — one
+aggregate over an indexed table, at the moments the engine already refreshes.
+A table, two maintenance paths, an index, a sweep exception and an open item, all
+deleted, and section 3.3's sentence becomes true.
+
+### 9.2 Does the desktop mount the NAS gallery?
+
+**This is the one question whose answer could delete the most code**, and only
+you can answer it. If the Arch desktop can mount the gallery the server serves,
+then `--remote` — the worker registry, claim/announce/heartbeat, `remote.toml`,
+`remote-pair`, the SPKI pin, `--trust-new`, `?frame=`, eight of the ten rows in
+section 3.10's constants table, and the `AutoTagPanel` worker roster — can be
+replaced by one verb on the strong machine:
+
+```
+lightview tag <dir> --plugin <name> [--filter <expr>]
+```
+
+Companions are files; the server's watcher ingests them (section 3.5c). That is
+roughly 3,700 Rust and 600 TypeScript lines, and it is the difference between
+requirement 10 being comfortable and being a stretch (9.6).
+
+What it costs: you could no longer start a tagging run **from the phone UI** —
+tagging would join the password, pairing and `server.toml` as things administered
+from a shell. Given section 7 already settles that the host is administered by
+CLI, that is consistent rather than a new exception.
+
+If the mount does not exist, `--remote` stays as designed — but the **worker
+registry** should still go, because with one attachable host there is nothing to
+schedule between, nothing to pin to, and nothing to requeue to.
+
+### 9.3 Tag-panel thumbnails are 34× larger than the panel shows
+
+Section 3.5 assigns "tag-panel thumbs" to `j` (512px) in a table cell, and nobody
+checked the number. `TagManagerPanel` renders up to 120 thumbnails
+(`TagManagerPanel.tsx:54`) in an 88px grid (`:432`), sourced today from the 128px
+square tier (`:438`). Decoded, that is ~7.9 MB becoming **~84 MB** — and
+`lib/runtime.ts:80-90` documents that this is precisely the axis iOS kills tabs
+on. `DuplicatesPanel` and `MergeDialog` do the same thing.
+
+Worse, these three panels address *arbitrary* files — typically old ones — while
+the idle backfill warms `j` **newest-first**, so each panel open can fire up to
+120 simultaneous generate-on-miss requests at the part of the library the
+backfill reaches last.
+
+Two resolutions, and the plan should not ship with neither:
+
+- **A fourth cached tier at 128px**, unbounded like `j` because the rows are ~4 KB.
+  It has three real consumers, so it passes the second-implementation test — but
+  it reverses section 7's "three tiers, one family", which is why it is here and
+  not folded in.
+- **Route panel thumbnails through `?fit=128`**, accepting an uncached resize per
+  panel open. Cheaper in concepts, more expensive per open.
+
+I lean to the fourth tier: the ladder becomes 128/512/1280/2560, which is still
+one family and one render path, and "three tiers" was never the requirement —
+"one pipeline" was.
+
+### 9.4 Removing served-original grid cells deletes measured tuning
+
+Section 3.12 removes it in one bullet. It takes with it `ORIGINAL_SRC_TOLERANCE`,
+`FIT_BUCKET`, the resolution gate and the never-warm rule
+(`JustifiedGrid.tsx:135-150,271-276,396-402`) — the last of which carries a
+recorded measurement saying that warming those cells *made things worse*. Two
+consequences nobody priced: a cell at mid detail decodes ~1750px instead of
+~768px (the same file records "four times the memory per cell" for one rung), and
+six rows of speculative precache now **generate and store** `jh` for cells that
+previously produced nothing at all.
+
+Either keep `?fit=` as a grid source with its gates intact — it costs no new
+machinery, since the route and coalescer survive for 9.3 — or remove it and
+record the memory number in section 7 as a decision. Section 7 currently says
+scroll tuning is "not re-measured", which is a different claim from "measured
+tuning is deleted".
+
+### 9.5 Where do display preferences and the default filter live?
+
+Section 3.3 says display preferences are per-client, and puts `settings.toml`
+inside the gallery — where it is per-*gallery*, so two desktops mounting one NAS
+share it, which is the exact fight that paragraph exists to prevent.
+
+Display preferences should go to `clientPrefs` for **every** client, local
+included; that much is clear and removes a local-versus-remote branch the rest of
+the plan works to abolish. What is not clear is the rest of the file, and it
+interacts with section 3.2's trust model:
+
+- **Trash retention** must travel with the gallery (section 3.3) and must not be
+  settable by a phone — it deletes files.
+- **The default filter** is user intent and should survive a format bump, but
+  under `--serve` nothing is `Owner`, so as written *nobody can set it from the
+  only UI that deployment has*.
+
+My recommendation: the default filter becomes a `Device` command writing
+`.lightview/settings.toml`, and trash retention is set only by a CLI verb on the
+host. That is two trust levels on one file, which is an exception — the
+alternative is two files, which is a concept. I would take the exception, but it
+is your call.
+
+### 9.6 Requirement 10's line-count target is probably not reachable as accounted
+
+Two reviewers arrived here independently. Ported Rust is 7,861 lines by this
+document's own figures; the 18,500 target leaves 10,639 for `cache/`, `server/`,
+`AppState`, `tagging/`, `cli`, trash, TLS, pairing, uploads and middleware, whose
+current equivalents total ~16,891 — a 37% cut, of which only ~2,600 lines can be
+accounted for concretely. TypeScript is the same shape: the explicit deletions
+sum to ~3,653 lines, plus perhaps 600 from stripping the `isTauri` branches and
+~570 from a leaner `ipc.ts`, reaching ~14,900 rather than 13,000, with the
+~6,588-line keep list declared off-limits.
+
+There is also a **placement** gap underneath it, which is principle 1's first
+question: the port table maps `commands/` (6,557) and `http_server/` (3,800) onto
+`server/`, the *adapter* — but `media.rs`, `gallery.rs`, `tags.rs`, `plugins.rs`,
+`files.rs` and `duplicates.rs` are domain logic, and only ~940 lines of the
+10,357 are genuinely dual-adapter overhead. Either ~4,500 lines land in the
+adapter, which is the failure section 2 says the plan must not commit, or there
+is a `services/` layer the Placement diagram does not name.
+
+Both need settling before step 4, and they settle together: name `services/` in
+the diagram and give it a budget, then restate requirement 10 as a number that
+can be defended. If 9.2 deletes `--remote`, the target is comfortable; if not,
+~21,000 / 15,000 is the honest figure and should be written as such rather than
+missed.
