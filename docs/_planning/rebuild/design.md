@@ -49,8 +49,11 @@ What the rebuilt system must do. Everything else in this document serves these.
 2. **`lightview --serve <dir>`** — serve a gallery over the LAN. Remote clients
    get metadata writes, upload, and move-to-trash. **No filesystem access
    beyond that**, and no way to enable it.
-3. **`lightview --remote <url>`** — attach this machine's plugins to a remote
-   instance and run its tagging jobs. Replaces the `lightview-worker` binary.
+3. **`lightview tag <dir> --plugin <name>`** — run a plugin over a gallery from
+   the machine that can afford to, writing tags back. Replaces both the
+   `lightview-worker` binary and the `--remote` mode an earlier draft designed to
+   replace it. **This is confirmed to work because the desktop can mount the
+   gallery the server serves** — see section 9.2 for what that fact deletes.
 4. **Installable as an ordinary system package**, invoked as `lightview` from
    anywhere on `PATH`. A requirement rather than a nicety, and incompatible with
    how the current build resolves its state directory — see section 3.3.
@@ -74,7 +77,7 @@ What the rebuilt system must do. Everything else in this document serves these.
 9. **Fewer concepts.** The measure is how many times the word *except* is needed
    to describe the system truthfully. The system being replaced needs it about
    thirty-five times. **Section 2's ledger is the target, and it lists
-   fourteen** — that list is the definition, not an estimate standing beside it.
+   thirteen** — that list is the definition, not an estimate standing beside it.
    An earlier draft named a number here and then listed a different number
    there, which is how a falsifiable target quietly stops being falsifiable.
    Every survivor must be a property of the problem rather than of the history.
@@ -132,7 +135,7 @@ Five contracts change. Two are durable and need care; three are local.
 | Companion file `<media>.lightview.json` | other LightView installs, `grep`, the user | **`tags.set: []` added as a sibling of `tags.user`; `tags.auto` removed.** Every field of the tag and meta structs gains `#[serde(default)]`, which is what makes an old sidecar parse. Schema version and `migrate()` hook stay. | Low, *given the serde attributes* — without them an old file fails to parse |
 | `.lightview/trash/` layout | the user's own filesystem | **Replaced.** `<epoch_ms>/<gallery-relative path>` instead of `<epoch_ms>_<seq>/` + `meta.json` | Low — old entries are not read; purge them before switching or leave them inert |
 | `cache.db` | nothing but this process | **Replaced**, moved out of the gallery, and deletable on a version mismatch | None — fully derived |
-| `/api/invoke` + routes | the SPA, and a `--remote` instance | **Replaced** by one command table with trust levels | None — both sides ship together |
+| `/api/invoke` + routes | the SPA | **Replaced** by one command table with trust levels | None — both sides ship together |
 | Plugin NDJSON protocol | plugins on disk | `api_version: 1` only; input quantized to tier edges. **No new result kinds.** | Low — bundled plugins are rewritten in the same change, and the shape is unchanged |
 
 **The companion file is the only thing here that cannot be regenerated.** Treat
@@ -147,12 +150,13 @@ The plan is overwhelmingly subtractive. What it *adds*:
 - **One trust level distinction** (`Device` / `Owner`) — but it replaces an
   80-command list, a 48-arm allowlist, and the implicit relationship between
   them.
-- **One CLI mode** (`--remote`) — but it deletes a binary, a cargo feature, a
-  config file, and a release artifact.
+- **One CLI verb** (`lightview tag`) — but it deletes a binary, a cargo feature,
+  a config file, a release artifact, a job broker, a credential store and a
+  certificate-pinning protocol.
 Nothing else is added. Every other change removes. An earlier draft also added
 a `groups` plugin result kind; it is deferred, for the reasons in section 3.10.
 
-**Cases still needing the word *except*** after this plan — fourteen, each a
+**Cases still needing the word *except*** after this plan — thirteen, each a
 property of the problem rather than of the history:
 
 1. Four decoders inside one decode function (formats genuinely differ)
@@ -165,13 +169,12 @@ property of the problem rather than of the history:
 8. `warping` must not be cleared by `markSettled()`
 9. Speculation shares the one bounded pool, so it is gated on "nothing outstanding"
 10. Self-signed TLS behind NAT needs its SANs named by hand
-11. An offline-capable web client has caches that can lie
-12. `.safe-panel` sets all four paddings and overrides `p-*`
-13. Two files sharing a `set::` tag are never offered as a duplicate pair —
+11. `.safe-panel` sets all four paddings and overrides `p-*`
+12. Two files sharing a `set::` tag are never offered as a duplicate pair —
     **including when they genuinely are duplicates.** Two identical scans inside
     a 200-page comic will not be found. Accepted: the alternative is storing
     pairwise verdicts again.
-14. A gallery mounted at different paths on two machines gets two derived
+13. A gallery mounted at different paths on two machines gets two derived
     caches. Today the cache lives *inside* the gallery and is shared by every
     machine that mounts it; keying by hash-of-canonical-root gives that up. It
     is the price of getting the blob out of the photo folder, and it is a real
@@ -194,19 +197,24 @@ entries measures nothing:
   build in this repository's history ever wrote an alongside sidecar, so the
   fallback is defensive code for a condition this application cannot produce.
   Section 3.7 states what deleting it costs.
+- **An offline-capable web client has caches that can lie.** Nothing in section 1
+  asks for offline operation, and a phone that cannot reach the server cannot
+  display a photo anyway. Section 3.12 deletes the service worker; the browser's
+  own HTTP cache, with the `ETag` revalidation section 3.5 already specifies,
+  does the thumbnail caching correctly and with no code.
 
 **Four the plan introduces and an earlier draft did not ledger.** They are
 listed rather than argued away, because an unlisted exception is an undisclosed
 cost:
 
-15. `cache/` is written fresh *except* `coalescer.rs`, which is ported — the port
+14. `cache/` is written fresh *except* `coalescer.rs`, which is ported — the port
     table says so itself.
-16. Plugin input is a cached tier *except* video frames, which are a timestamp
+15. Plugin input is a cached tier *except* video frames, which are a timestamp
     rather than an edge.
-17. The geocoder is not a plugin *except* that it writes into
+16. The geocoder is not a plugin *except* that it writes into
     `tags.plugins["location"]`, because the bucket's replace-wholesale lifetime is
     the one it wants.
-18. Confinement is universal *except* that it is lexical for requests answered
+17. Confinement is universal *except* that it is lexical for requests answered
     from the database and canonicalizing for requests that open a file — section
     3.2 explains why, and the cost of collapsing them is a `realpath` walk per
     grid cell.
@@ -285,13 +293,11 @@ unnamed assumption is itself the defect:
 ```
 lightview <dir>              serve <dir> on 127.0.0.1:<ephemeral>, open a browser at it
 lightview --serve <dir>      serve <dir> on 0.0.0.0:<port> over TLS, with pairing
-lightview --remote <url>     attach to a remote instance, offer this machine's plugins
+lightview tag <dir> --plugin <name> [--filter <expr>]
+                             run a plugin over a gallery and write tags back
 lightview pair               mint a one-time pairing code for this machine, and exit
 lightview devices            list paired devices (id, name, last seen)
 lightview devices revoke <id>   revoke one pairing
-lightview remote-pair --server <url> --pin <n> [--name X] [--trust-new]
-                             redeem a PIN against a remote server and store the
-                             credential this machine will use for --remote
 lightview password           set or clear the gallery password, reading it from
                              stdin — never from argv, where it lands in shell
                              history and `ps`
@@ -316,17 +322,49 @@ to this machine is paired to every gallery this machine serves, now or later.
 That is consistent with all paired devices being equally trusted, and it is the
 cost of removing the per-gallery cookie-name mint.
 
-**`--remote` must not open a browser.** Attaching a GPU machine to a NAS is a
-long-running background job — a systemd unit on a headless desktop. Coupling it
-to a foreground process buys nothing, because browsing a remote gallery is a
-browser pointed at its URL and needs no binary at all.
+**`lightview tag` is why there is no `--remote` mode, and no worker binary.**
 
-**One instance per role.** A machine that both serves its own gallery and hosts
-plugins for a remote one runs two processes, each with its own config.
-`--serve` and `--remote` are mutually exclusive. The alternative — one process
-holding a list of attachments — means a repeated config section, a lifecycle
-where one failing attachment must not take down the server, and interleaved
-logs. Two processes get all of that from the operating system.
+The problem it solves is real and unchanged: the server is an N100 that cannot
+run the models, and the desktop has the GPU. An earlier draft solved it by
+building a distributed job broker — a worker registry with TTL and liveness,
+announce/claim/update/complete/fail, job pinning, two staleness clocks, a
+`remote.toml` credential, a `remote-pair` verb, a trust-on-first-use certificate
+pin, `--trust-new`, and a `?frame=` route on the media server whose *only*
+justification was feeding that worker. All of it exists to move bytes and results
+between two machines over HTTP.
+
+**The desktop can mount the gallery.** So it doesn't need a protocol; it needs a
+path. `lightview tag /mnt/nas/photos --plugin wd-tagger` opens the gallery the
+way any other mode does, runs the plugin locally, and writes companions. The
+server picks them up (see below). Nothing is claimed, nothing is heartbeated,
+nothing is pinned, and nothing needs a credential — the filesystem already
+answered the authentication question.
+
+Two consequences worth stating rather than discovering:
+
+- **Tagging is started from a shell, not from the phone.** That is consistent
+  with the password, pairing and `server.toml` already being administered that
+  way (section 7), and it is the price of the deletion.
+- **The bytes move, not the decodes.** The old worker fetched a small `?fit=`
+  image over HTTP, so the N100 paid the decode. `lightview tag` reads full files
+  over the mount and decodes on the desktop, which is more network and much less
+  server CPU — the right trade when the server is the bottleneck. The desktop
+  builds its own derived cache for that gallery on the first run, so subsequent
+  runs read cached tiers locally; the cache-directory ceiling (section 3.3) is
+  what stops that growing without bound.
+
+**The server must notice companions written from another machine, and `inotify`
+will not tell it.** Remote writes over NFS or SMB do not generate local
+filesystem events — this is a property of the protocols, not a bug to work
+around. The fix needs no route, no credential and no new code: `index_companions`
+is already idempotent and gated on companion mtime via `index_state`, so **run it
+periodically from the idle worker**, not only at gallery open. That one change
+also covers `rsync` drops, Samba writes, and a second machine browsing the same
+share — every case where a sidecar appears without a local event.
+
+**One instance per role, still.** A machine that serves its own gallery and also
+tags a remote one runs `--serve` and `lightview tag` as separate processes, which
+is what the operating system is for.
 
 ### 3.1b Packaging
 
@@ -339,7 +377,7 @@ build does not produce is a Tauri bundling artifact and dies with Tauri.
 | Target | Carries | Why |
 |---|---|---|
 | **Container image** (Arch base) | `--serve` on the Ubuntu server | The host distro is irrelevant, which is the point: the image carries current `libheif` and `ffmpeg`, sidestepping the Ubuntu 24.04 libheif-1.17 problem that forces a source build on a Debian-family *host*. |
-| **Arch package** (PKGBUILD) | the local viewer **and** the `--remote` plugin host, on one desktop | Idiomatic on Arch, current libheif and ffmpeg for free, CUDA and the plugin's own Python venv untouched, `lightview` on `PATH`, and the `.desktop` file works. |
+| **Arch package** (PKGBUILD) | the local viewer **and** `lightview tag`, on one desktop | Idiomatic on Arch, current libheif and ffmpeg for free, CUDA and the plugin's own Python venv untouched, `lightview` on `PATH`, and the `.desktop` file works. |
 
 **A package is one executable and three small files.** The SPA is embedded at
 compile time, so there is nothing to install alongside it:
@@ -368,8 +406,8 @@ The XDG move above makes a Flatpak build *possible* — the sandbox's private ho
 at `~/.var/app/<app-id>/` is exactly the layout, where the exe-relative one would
 have failed against a read-only `/app`. It is still the wrong choice here:
 
-- **One desktop runs two roles.** The local viewer and the `--remote` plugin
-  host are both on the Arch machine. The plugin host spawns a Python subprocess
+- **One desktop runs two roles.** The local viewer and `lightview tag` are both
+  on the Arch machine. Tagging spawns a Python subprocess
   with its own venv and a CUDA stack, which is genuinely painful to sandbox — so
   a Flatpak viewer means a Flatpak *and* a native install of the same binary, on
   two update paths. That is precisely what deleting `lightview-worker` was for.
@@ -524,8 +562,8 @@ state-changing request: **reject when `Origin` is present and is not byte-equal
 to this server's scheme + host + port. Allow `Origin` absent.** Two traps, both
 of which the loose wording would have walked into — a *site*-level comparison, or
 accepting `Sec-Fetch-Site: same-site`, both pass an attacker on another local
-port; and *requiring* the header breaks `--remote` and the `curl` recipe, because
-non-browser clients do not send it. Browsers always send `Origin` on a
+port; and *requiring* the header breaks the `curl` recipe, because non-browser
+clients do not send it. Browsers always send `Origin` on a
 cross-origin POST, so absence is safe. `Sec-Fetch-Site` is a useful second signal
 and never a requirement.
 
@@ -613,8 +651,8 @@ the **generate-on-miss** branch, which decodes an arbitrary file. So
 `GalleryPath` has two constructors after all, and the split is principled:
 **lexical** (reject non-`Normal` components, join, no syscall) for a request
 answered from the database, and **canonicalizing** in the branch that is about
-to open a real file — generate-on-miss, the media route, `?fit=`, `?frame=`,
-and every filesystem command. Nothing reaches the filesystem without a
+to open a real file — generate-on-miss, the media route, `?fit=`, and every
+filesystem command. Nothing reaches the filesystem without a
 canonicalized check; nothing pays for one to read a cached blob.
 
 #### Uploads
@@ -695,7 +733,6 @@ $XDG_DATA_HOME/lightview/         (~/.local/share/lightview)
 
 $XDG_CONFIG_HOME/lightview/       (~/.config/lightview)
   server.toml                     serve configuration
-  remote.toml                     --remote credential, mode 0600
 ```
 
 **The current build cannot be packaged**, and this is why the plan says so
@@ -775,7 +812,7 @@ nearly-full disk is not handed 512 MiB per tier by definition.
 Naming what a full disk looks like, because it is loud in the log and invisible
 in the UI: the tier write fails, `get_or_generate` logs a warning and returns a
 miss (`thumb_serve.rs:136-139`), the route answers 404 (`routes.rs:497`), the
-service worker caches nothing because the response is not `ok`, and the grid
+the browser caches nothing because the response is not `ok`, and the grid
 re-requests and re-decodes the same file on every scroll pass forever.
 
 Consequences, all of them currently missing:
@@ -914,6 +951,7 @@ re-index.
 | `media_meta` | relative path (PK), media type, size, mtime, `date_taken`, `date_added`, `last_viewed`, `last_rated`, rating, width, height, duration, `gps_lat`, `gps_lon`, `color_label`, **`thumbhash`** |
 | `tag_index` | `(path, namespace, tag)` — rebuilt from companions |
 | `index_state` | companion mtime per path, so re-indexing skips unchanged files |
+| `thumbs_js` | 128px fit — panel thumbnails; unbounded, rows ~4 KB |
 | `thumbs_j` | 512px fit — also carries the `phash` column |
 | `thumbs_jm` | 1280px fit — LRU byte-budgeted |
 | `thumbs_jh` | 2560px fit — LRU byte-budgeted |
@@ -1124,13 +1162,36 @@ fs-watcher. Keep all three.
 
 ### 3.5 Thumbnails — one pipeline
 
-Three tiers, one family, all aspect-preserving, all WebP.
+**Four tiers, one family**, all aspect-preserving, all WebP.
 
 | Tier | Segment | Longest edge | Bounded | Also carries |
 |---|---|---|---|---|
-| `j` | `j` | 512 | no | ThumbHash blob, `phash`, GIF handling, tag-panel thumbs |
+| `js` | `js` | 128 | no | panel thumbnails |
+| `j` | `j` | 512 | no | `phash`, GIF handling, the grid's base rung |
 | `jm` | `jm` | 1280 | **LRU** | the viewer's progressive underlay |
 | `jh` | `jh` | 2560 | **LRU** | high zoom |
+
+**`js` exists because an earlier draft assigned panel thumbnails to `j` and
+nobody did the arithmetic.** `TagManagerPanel` renders up to 120 thumbnails
+(`TagManagerPanel.tsx:54`) in an 88px grid (`:432`), today from a 128px tier
+(`:438`). At 512px that is ~7.9 MB of decoded bitmaps becoming **~84 MB** —
+roughly 34× the pixels the screen can show, on the exact axis `lib/runtime.ts:80-90`
+documents as the one iOS kills tabs on. `DuplicatesPanel` and `MergeDialog` do
+the same thing, so there are three real consumers and the second-implementation
+test is satisfied rather than argued around.
+
+It also fixes a scheduling mismatch: those three panels address *arbitrary*,
+typically old files, while the idle backfill warms newest-first — so each panel
+open could fire up to 120 simultaneous generate-on-miss requests at precisely the
+part of the library the backfill reaches last. `js` rows are ~4 KB, so the tier
+is unbounded and the backfill warms it alongside `j` for a few megabytes per
+gallery.
+
+**This reverses "three tiers, one family" from section 7, deliberately.** Three
+was never the requirement — *one pipeline* was, and four edges through one
+`generate_for_path_fit` is still one pipeline, one family, one encoder. A tier is
+a cached edge; the ladder having four rungs costs a table and a row in
+`path_keyed_tables()`, not a concept.
 
 **One render path, and this is the invariant that keeps it one:**
 
@@ -1143,7 +1204,7 @@ decode_image(path, edge)  →  fit_dims + resize_rgba  →  encode WebP
 `libheif`, video via `ffmpeg`, everything else via the `image` crate — and
 converges on RGBA immediately. That is dispatch, not duplication.
 
-**Every cached thumbnail is `generate_for_path_fit(path, edge)` at one of three
+**Every cached thumbnail is `generate_for_path_fit(path, edge)` at one of four
 edges.** Anything that makes this untrue — a tier derived from a larger tier
 instead of decoded, a second encoder, a GPU fast path — is a new failure mode
 and must be argued for, not slipped in as an optimization.
@@ -1227,18 +1288,27 @@ only the latter ships a build where HEIC thumbnails work and the viewer is blank
 
 **`?fit=<edge>`** returns an aspect-preserving WebP resize of a still, through
 the same `generate_for_path_fit` the tiers use and the same coalescer. It applies
-to `jpg`/`jpeg`/`png`/`webp` only; GIF and video fall back to the whole file. It
-exists for plugin input above the top tier and for nothing else, now that the
-grid uses tiers only.
+to `jpg`/`jpeg`/`png`/`webp` only; GIF and video fall back to the whole file.
 
-**`?frame=<i>&frames=<n>`** extracts one evenly-spaced still from a clip and
-returns it as WebP, honouring `?fit=` as the frame's edge. **This is a fourth
-required behaviour, not an optional one** — it is the entire reason a `--remote`
-plugin host needs no `ffmpeg` and does not pull whole videos across the LAN, and
-section 3.10 promises that every executor prepares input identically. Omit it and
-`--remote` silently cannot tag video, which is the failure this rebuild inherits
-a fix for. Step 7's acceptance requires a clip in the test gallery for exactly
-this reason.
+**It stays as a grid source at mid and high detail, with its eligibility gates
+intact.** An earlier draft removed served-original cells in a single bullet —
+"the grid uses tiers only" — which would also have deleted
+`ORIGINAL_SRC_TOLERANCE`, the 256px quantization bucket, the resolution gate and
+the never-warm rule (`JustifiedGrid.tsx:135-150,271-276,396-402`), the last of
+which carries a recorded measurement saying that warming those cells *made things
+worse*. Two costs nobody had priced: a cell at mid detail would decode ~1750px
+instead of ~768px against a file that records "four times the memory per cell"
+for one rung, and six rows of speculative precache would begin **generating and
+storing** `jh` for cells that previously produced nothing at all. Keeping the
+route costs no new machinery — it and the coalescer exist anyway.
+
+**`?frame=` is deleted along with `--remote`.** It existed for exactly one
+consumer — a remote plugin host that had no `ffmpeg` and could not pull whole
+videos across the LAN — and `lightview tag` runs beside the files with `ffmpeg`
+already listed as a runtime dependency (section 3.1b). Video frame extraction
+happens in `plugin/input.rs`, locally, as it always did for a local run. Step 7's
+acceptance still requires a clip in the test gallery: the failure being guarded
+against was never the route, it was video being silently skipped.
 
 #### The routes, named
 
@@ -1252,7 +1322,7 @@ surface is small enough to write down:
 | `POST /api/invoke` | per command | the one command table |
 | `GET /api/events` | `Device` | SSE, one channel, typed events |
 | `GET /thumb/{tier}/{*rel}` | `Device` | `j` · `jm` · `jh` |
-| `GET /media/{*rel}` | `Device` | Range/206, HEIC transcode, `?fit=`, `?frame=` |
+| `GET /media/{*rel}` | `Device` | Range/206, HEIC transcode, `?fit=` |
 | `POST /api/upload` | `Device` | section 3.5c |
 | `GET /api/dirs?path=` | **`Owner`** | the directory picker: returns `{name, path}` for subdirectories only, never media, never file contents |
 | `GET /healthz` · `GET /cert` | bootstrap | unauthenticated |
@@ -1748,8 +1818,8 @@ passes through untouched. All executors share this machinery, so a plugin cannot
 behave differently depending on where it ran.
 
 **Input is quantized up to a cached tier edge.** A plugin declares the longest
-edge it wants; the host serves the smallest tier at least that big — ≤512 → `j`,
-≤1280 → `jm`, ≤2560 → `jh`, above that decode from source. **Round up, never
+edge it wants; the host serves the smallest tier at least that big — ≤128 → `js`,
+≤512 → `j`, ≤1280 → `jm`, ≤2560 → `jh`, above that decode from source. **Round up, never
 down**: a model handed a smaller image than it trained on has lost information it
 cannot recover. The plugin host reads the same `/thumb/<tier>/<path>` URLs a
 browser does. Video frames are the irreducible exception — a frame at a timestamp
@@ -1782,9 +1852,10 @@ Wiring a face-clustering plugin to a confirmation screen needs four things this
 plan does not have:
 
 1. **A way to get proposals off a remote host.** Tags travel back through
-   `apply_plugin_tags`; groups have no equivalent command. Under `--remote` the
-   model runs on a desktop and the panel is served by the NAS, so proposals are
-   produced in the wrong process with nothing to carry them.
+   `apply_plugin_tags`; groups have no equivalent command. With `lightview tag`
+   the model runs on the desktop and the panel is served by the NAS, so proposals
+   are produced in the wrong process with nothing to carry them — the collapse in
+   section 3.1 makes this *more* true, not less.
 2. **A terminal-line contract.** `PluginResult.path` is required, so a
    standalone `{"groups": …}` line does not deserialize. Worse, the download
    window releases a permit only when a result matches a request — a plugin that
@@ -1840,12 +1911,25 @@ section 3.9.
 are an elaborate design for plugins that do not exist. Nothing here forecloses
 them.
 
-**One executor, one queue.** Every plugin run goes through the job queue,
-including a local one: one code path, one progress display, one cancel. The
-`--remote` executor is the same job loop parameterized on a byte source (HTTP
-fetch vs local read) and a result sink (`apply_plugin_tags` over HTTP vs
-directly). Both already share `plan_parts`, `InputPolicy`, `PartTracker` and
-`MergedItem`.
+**One executor, in process, and no queue between machines.** A plugin run is a
+local operation: read bytes, feed the subprocess, write companions, report
+progress. It is driven from the UI on a loopback bind and from `lightview tag`
+on the command line, and those are the same code path with a different progress
+sink.
+
+An earlier draft made every run go through a job *queue* so that a local run and
+a remote one shared a code path — an executor "parameterized on a byte source
+(HTTP fetch vs local read) and a result sink". With `--remote` gone there is one
+byte source and one sink, so the parameterization has one implementation and
+principle 2 says to write the concrete thing. What goes with it: the worker
+registry, announce/claim/update/complete/fail, job pinning, the requeue-versus-
+fail distinction between two staleness clocks, and the fire-and-forget terminal
+call whose loss would re-run an entire job.
+
+What stays is everything about running *one* plugin well, because that was never
+the distributed part: `plan_parts`, `InputPolicy`, `PartTracker`, `MergedItem`,
+and the staleness rules below — a wedged subprocess is still a wedged subprocess
+whether or not a second machine is involved.
 
 **Constants, carried over because they were arrived at by failure:**
 
@@ -1857,36 +1941,21 @@ directly). Both already share `plan_parts`, `InputPolicy`, `PartTracker` and
 | `NO_RESULT_STALL` | 20 min | outer backstop; refreshed **only by results that matched** |
 | apply batch | 32 | results per `apply_plugin_tags` |
 | `MAX_LOCAL_PENDING` | 32 | in-process executor's pending window, with the compile-time invariant `MAX_VIDEO_FRAMES * 2 <= MAX_LOCAL_PENDING` — a clip must never fill the window by itself |
-| worker TTL / announce | 45 s / 15 s | registry liveness |
-| job stall / no-progress | 90 s / 30 min | a stalled *claim* is requeued; a job that stops **progressing** is failed. The prose below is authoritative — an earlier draft's "requeue vs. fail" in this cell read as though progress loss could requeue, which is the wedge-forever case |
-| finished jobs retained | 50 | |
-| terminal-call retry | backoff to ~5 min | `complete`/`fail` is **retried until acknowledged**, see below |
+| no-progress | 30 min | a run that stops **progressing** is failed and reported. Never retried: retrying hands the same wedge to the same plugin |
 
 **Requests are keyed on the temp file *name*, not the full path.** A plugin that
 canonicalizes its input under a symlinked `TMPDIR` echoes back a different
 string for the same file; keying on the name makes directory-level rewriting
 harmless. Log an unmatched result rather than dropping it silently.
 
-**The terminal call is retried, and the queue is volatile — say both.** Today
-`complete_tagging_job` is fire-and-forget (`let _ = client.invoke(…)`,
-`bin/lightview-worker/job.rs:484`), so one lost packet at the finish line leaves
-the job `Running` and ninety seconds later it is requeued: **hours of GPU
-re-spent because a single call dropped.** Retry the terminal `complete`/`fail`
-with backoff until it is acknowledged or the job is provably gone. And the whole
-registry is in memory (`tagging/mod.rs:1-20`), so a `--serve` restart drops every
-queued job with no record — that is acceptable (one re-enqueue) but it must be
-written down rather than discovered.
+**A run is resumable because writes are per-file and idempotent.** Companions are
+written as results arrive (`commands/plugins.rs:490-559`), so an interrupted run —
+`Ctrl-C`, a crash, a closed laptop — leaves the files it finished finished. Re-run
+it with the same `--filter` and the already-tagged files are skipped. That is the
+whole recovery story now, and it replaces a page about requeueing, claim
+expiry and partially applied batches.
 
-Worth recording as sound, since it is the part most likely to be "improved":
-duplication under a network partition is bounded and self-healing. The worker
-keeps computing while the server requeues, so both run the same paths — but
-`apply_plugin_tags` is per-file and idempotent (`commands/plugins.rs:490-559`) and
-not gated on the job claim, so a partially applied batch of 32 is simply sixteen
-companions written and sixteen not, and the re-run finishes them. `Filter` targets
-re-resolve at claim time and skip what is already tagged. Wasted GPU, no data
-loss.
-
-**Liveness and progress are separate clocks.** A heartbeat proves the process is
+**Liveness and progress are still separate clocks.** A heartbeat proves the process is
 alive, not that the job is moving — a tagger's first run legitimately produces
 nothing for minutes while it loads a model. Track `progressed_at` separately and
 **fail** (not requeue) a job that stops progressing; requeueing hands the same
@@ -1987,66 +2056,17 @@ Pairings live in the **state directory**, not the gallery, because they are a
 property of this account serving. That removes the per-gallery cookie-name mint that
 existed because cookies are scoped by host and not by port.
 
-**A `--remote` instance has no browser, so none of the above reaches it.** It
-needs its own credential, stored at `$XDG_CONFIG_HOME/lightview/remote.toml`,
-mode 0600:
-
-| Field | Purpose |
-|---|---|
-| `server_url` | where to attach |
-| `cookie` | `<name>=<id>.<secret>`, obtained by redeeming a PIN |
-| `spki_sha256` | **pin of the server's public key (SPKI), not of the certificate** — the server is self-signed, so this, not a CA, is what authenticates it |
-| `instance_id` | stable uuid minted at pair time; identifies this host in the worker registry |
-| `instance_name` | what the web UI shows |
-| `poll_secs` | claim interval, default 3 |
-
-**How the pin is implemented matters as much as that it exists.** The current
-verifier is the right shape and must be copied, not re-derived: it compares an
-exact SHA-256 digest of the presented leaf while keeping signature verification
-on (`bin/lightview-worker/http.rs:55-70`). The tempting rustls shortcut — insert
-the certificate into a `RootCertStore`, which looks natural precisely *because*
-the certificate is `CA:TRUE` — silently stops being a pin, since anything that
-key signs would then validate. **State it as: an exact digest of the presented
-key, never a trust anchor.**
-
-**Pin the SPKI, and persist the key.** An earlier draft pinned the certificate
-DER, and `generate()` mints a fresh key pair on every regeneration
-(`http_server/tls.rs:203`). Between them, a DHCP lease change breaks every
-attached `--remote` instance — a headless systemd unit, on the deployment this
-mode exists for — and the documented remedy is `--trust-new`, which re-pins
-whatever answers with no PIN and no verification, then sends it the existing
-device cookie. That is a design that **trains the operator to bypass the pin on a
-routine event**, which is worth more to an attacker than the pin is worth to us.
-Persisting the key and pinning the SPKI means a SAN change re-mints only the
-certificate: every existing pin keeps working, and `--trust-new` goes back to
-being the rare deliberate act it should be.
-
-**First use must be verifiable, and today it is not.** The worker prints the
-fingerprint and asks the operator to *"compare with the fingerprint shown on the
-host"* (`bin/lightview-worker/main.rs:155-157`) — and **no host command prints
-one** (`lightview pair` prints the PIN and nothing else). So the operator has
-nothing to compare against and answers yes, which means an active LAN attacker at
-pairing time presents his own certificate, receives the PIN, redeems it upstream,
-hands back a cookie, and holds both a valid `Device` credential and a permanent
-MITM position. The fix costs one string and no new argument: **fold a fingerprint
-prefix into the pairing code the human already carries.** `lightview pair` prints
-`042917.a3f19c8e4b21`; `remote-pair` aborts unless the observed SPKI hash starts
-with those twelve hex digits. Same ergonomics, and trust-on-first-use becomes
-authenticated-first-use.
-
-**The PIN is read from stdin, not argv** — section 3.1 rejects argv for the
-password because it lands in shell history and `ps`, and the same is true of a
-PIN for its ten-minute life. Passing the combined code above on stdin satisfies
-both.
-
-Certificate rotation must produce an error naming `--trust-new` rather than a
-bare TLS failure, and **a pin mismatch is fatal, not a retry loop** — otherwise
-systemd restarts the unit into the same wall forever while the server requeues
-and discards its in-flight work. **Never disable verification as a workaround;
-the pin is the whole authentication story on that leg.** Give the server a static
-address or a reserved lease and name every address clients dial in `--tls-san`
-anyway; with the key persisted this is now an ergonomics note rather than a
-sharp edge.
+**Nothing else attaches over the network.** An earlier draft gave `--remote` its
+own credential file, a trust-on-first-use certificate pin, a `remote-pair` verb
+and a `--trust-new` escape hatch — roughly a page of security design whose whole
+job was authenticating one machine to another. Section 3.1 deletes the mode, so
+all of it goes with it, and the TLS story shrinks to what browsers need. Two
+findings from the security review are worth keeping as *warnings against
+rebuilding it*, should a future change bring a machine-to-machine leg back: pin
+the public key rather than the certificate and persist the key, or a DHCP lease
+change trains the operator to re-pin whatever answers; and make first use
+verifiable, because trust-on-first-use with nothing to compare against is just
+trust.
 
 **Auth is on the hot path.** It runs on every thumbnail request, so it must not
 take the writer lock and must not write unconditionally. Read through the
@@ -2106,7 +2126,7 @@ it is not to be reconsidered: `JustifiedGrid`, `MediaViewer`, `VideoPlayer`,
 `scrollDynamics`, `loadPriority`, `thumbSwap`, `thumbProgress`,
 `galleryControls`, `wheelScroll`, `thumbRegeneration`, `justifiedLayout`,
 `urlVersions`, `pathIndex`, `thumbQueue`, `fetchLoop`, `cellSources`,
-`loadedUrls`, `scrollHost`, `bootSnapshot`, `viewerCache`, `thumbhashPlaceholder`.
+`loadedUrls`, `scrollHost`, `viewerCache`, `thumbhashPlaceholder`.
 
 **Three components in the keep list need real work, and calling them
 "near-verbatim" was wrong.**
@@ -2115,10 +2135,13 @@ it is not to be reconsidered: `JustifiedGrid`, `MediaViewer`, `VideoPlayer`,
   replacement gesture is *name a set*: a text field with autocomplete over
   existing `set::` tags, writing a batch add across the group. The rest of the
   panel — detection, grouping, thresholds, the merge entry point — is unchanged.
-- **`AutoTagPanel`** loses its desktop/web branch (one runtime now) and keeps
-  the worker roster, the per-plugin run entries and the job list. It gains
-  nothing: plugin-proposed grouping is deferred, so there is no proposal section
-  to render.
+- **`AutoTagPanel`** loses its desktop/web branch (one runtime now) **and its
+  worker roster and job list**, which described a distributed queue that section
+  3.1 deletes. What remains is the per-plugin run entry and a progress display
+  for the in-process executor — and on a `--serve` bind, where plugins are not
+  installed and the models cannot run anyway, it renders nothing. It gains
+  nothing either: plugin-proposed grouping is deferred, so there is no proposal
+  section.
 - **`TrashPanel`** keeps rendering an opaque entry id. Section 3.4 explains at
   length why the id must **not** become a path: `list_trash` returns
   `{id, relative_path, file_name, deleted_at, size}` where `id` is still
@@ -2184,8 +2207,8 @@ the scrollbar indicator builders port; the window controls and the dialog calls
 go.
 
 **The rest of `lib/`, decided rather than left out.** Ported: `mediaExts`,
-`mediaPlayback`, `openAtBottom`, `clientPrefs`, `swControl` (the recovery-page
-flow depends on it), `touch`, `viewerTransition`, `wheel`, `version`, `types`.
+`mediaPlayback`, `openAtBottom`, `clientPrefs`, `touch`, `viewerTransition`,
+`wheel`, `version`, `types`.
 Rewritten: `runtime` and `memoryPressure`.
 
 `runtime` needs care rather than deletion. It is named above only as the home of
@@ -2239,20 +2262,32 @@ rather than a panic, and let the frontend hide the action when the backend
 reports it unavailable. It is an `Owner` command, so it is never offered
 remotely regardless.
 
-**Client caches**, kept with their bounds: service-worker Cache Storage for
-thumbnails (2000 entries FIFO, 1-hour revalidation, **30-day hard ceiling**),
-the sorted item list in IndexedDB (same ceiling against its own `savedAt`), and
-the in-memory decoded-image cache. `networkFirstShell` serves the cached shell
-**only when `navigator.onLine` is false**; network-up-but-origin-dead gets a
-recovery page whose *Reset connection* button unregisters the worker and
-reloads, so the next navigation is uncontrolled, reaches the network, and the
-browser can finally render its certificate prompt — with cookies and Cache
-Storage intact so the pairing survives.
+**The service worker is deleted, and with it the second cache layer.** An earlier
+draft kept Cache Storage for thumbnails (2000 entries FIFO, 1-hour revalidation,
+a 30-day hard ceiling), the sorted item list in IndexedDB with its own ceiling,
+`networkFirstShell` and its "serve the cached shell only when `navigator.onLine`
+is false" carve-out, a recovery page whose *Reset connection* button unregisters
+the worker, and the rule that the worker's version must be bumped in the same
+change or a paired phone serves the old shell forever.
 
-The service worker is versioned (`lv-thumbs-${VERSION}`), and its cache branch
-for `/thumbhash/*` goes with the route. **Bump the version in the same change**,
-or a paired phone serves the old shell across the dark period and never picks up
-the new one.
+That is an exception on section 2's permanent ledger, a deploy-time coupling, a
+recovery flow, and a second expiry policy — all to provide offline browsing that
+nothing in section 1 asks for, for a client that cannot render a single
+full-resolution photo without the server. Meanwhile section 3.5 already specifies
+`ETag` revalidation so a phone returning after `max-age` expiry refreshes its grid
+for a few hundred bytes per thumbnail: the browser's own HTTP cache does this
+job, correctly, with no code and no ceiling to get wrong.
+
+Deleted: `public/sw.js`, `lib/swControl.ts`, `lib/bootSnapshot.ts` and the
+recovery page. What breaks, named rather than discovered: opening the gallery
+while the server is unreachable shows a connection error instead of a stale grid,
+and first paint on a phone waits for the item list rather than restoring it from
+IndexedDB. Both are honest behaviour for a client whose content lives on the
+server. `ConnectionBanner` stays and now carries the whole story.
+
+The in-memory decoded-image cache in the viewer is unaffected — it is a different
+mechanism with a different lifetime, and section 3.12's `memoryPressure` note is
+what bounds it.
 
 **Mobile defaults.** `thumbnail_size` is a cell size, not a column count, so the
 200px that gives a desktop six columns gives a 390px phone one — the most
@@ -2303,7 +2338,7 @@ nicer.
 | `cache/` | 2,044 lines | three tables not seven, no migrations, relative paths, new location. (The directory is 2,552 lines; `duplicates.rs` 319 and `coalescer.rs` 86 are ported and `gif_atlas.rs` 103 is deleted, so those 508 are not what this row replaces — an earlier draft's 2,516 double-counted them.) |
 | `server/` (routes + one command table) | `commands/` 6,557 + `http_server/` 3,800 | one adapter; the `*_impl` convention has nothing left to keep in step |
 | `AppState` | `lib.rs` 479 | half its fields are Tauri, GPU, or dual-transport artifacts |
-| `tagging/` | `tagging/` 1,446 + worker bin 1,678 | one job loop over two byte sources |
+| `tagging/` | `tagging/` 1,446 + worker bin 1,678 | **one in-process executor, no queue** — the registry, the claim protocol and the two staleness clocks all go with `--remote` (section 3.1) |
 | `cli` | `main.rs` 429 + headless 434 | three modes, one binary |
 | Sets in the duplicate finder | `not_duplicates` table | derived from co-membership |
 | Trash | `commands/trash.rs` 563 | path-mirrored layout, no metadata file |
@@ -2377,9 +2412,9 @@ their `GeoBbox` cases are deleted** — the term has live code and tests
 | 2 | **`cache/`** | three tables, relative paths, `format_version`, the named indexes, the `flock` on the cache directory, the path-keyed sweep and its test | a fresh open indexes a gallery; a version bump deletes and rebuilds |
 | 3 | **Pipeline** | one render path, three tiers, the coalescer, the byte budget, the idle worker | tier bytes appear for a test gallery at all three edges |
 | 4 | **Server + command table** | routes, the two trust levels, path confinement, TLS, pairing, the launch-token session, SSE, upload | `curl` exercises every route; an unauthenticated call is 401; an `Owner` command on a non-loopback bind is 403; **and on a loopback bind, redeeming a launch token and then calling the directory-listing endpoint succeeds** |
-| 5 | **CLI** | `<dir>` and `--serve` (`--remote` lands in step 7, which builds what it attaches to) | `lightview <dir>` opens a browser; `--serve` binds and pairs |
+| 5 | **CLI** | `<dir>`, `--serve`, `pair`, `devices`, `password`, `cache` (`tag` lands in step 7 with the executor it drives) | `lightview <dir>` prints its URL and opens a browser; `--serve` binds and pairs |
 | 6 | **Frontend** | the ported SPA against the new API | the grid fills in headless Chromium |
-| 7 | **Plugins + tagging** | one job loop; `remote.toml` (server url, cookie, `cert_sha256` TOFU pin, instance id and name, poll interval) and the `remote-pair` verb that writes it; then `--remote` | the example tagger completes a job locally, and a second process attached with `--remote` completes one against a self-signed server without disabling verification — **with a clip in the test gallery**, so `?frame=` is exercised and a video's companion gains a merged tag entry rather than being silently skipped |
+| 7 | **Plugins + tagging** | one in-process executor, driven from the UI and from `lightview tag`; the periodic companion re-index in the idle worker | the example tagger completes a run from the UI and the same run from `lightview tag <dir> --plugin <name>` — **with a clip in the test gallery**, so a video's companion gains a merged tag entry rather than being silently skipped; and a companion written into the gallery by another process is picked up without a restart |
 | 8 | **Docs** | `docs/` rewritten; `_planning/rebuild/`, `refactor.md` and `todo.md` deleted; `.claude/skills/verify/SKILL.md` rewritten against the new CLI | every page describes what exists, and the verify recipe runs |
 
 ---
@@ -2461,14 +2496,14 @@ one only with a written reason.
 | Local mode is **selection-scoped**, not filesystem navigation | `path_in_gallery` needs a bypass — the one check between the server and the host filesystem |
 | Trust is derived from the bind; no flag widens `Owner` | the security model becomes configuration |
 | One grid (justified); no map, no canvas, no virtual folders | the tier collapse unwinds |
-| Three tiers, one family, all WebP | four parallel generators come back |
+| Four tiers, one family, all WebP — `js` 128 · `j` 512 · `jm` 1280 · `jh` 2560 | four parallel generators come back. (An earlier draft said three; section 3.5 explains why panel thumbnails needed the fourth rung) |
 | Scroll tuning is **not** re-measured after WebKitGTK leaves | speculative work on the part users feel most |
 | Durable = photos + companions only | `sets.json`, `gallery.json`, and an exemption for trash |
 | No migration code, anywhere, except the companion `migrate()` hook | permanent code that runs once |
 | Sets are tags; `not_duplicates` is deleted | a table, a sweep exception, and 780 rows per burst |
 | Sets are cheap and fluid — renaming rewrites members, trashing shrinks silently | a durable set object with an identity |
 | Plugin input rounds **up** to a tier edge | a decode per image per job |
-| One binary, three modes; one instance per role | a second binary and a release-skew story |
+| One binary; `<dir>`, `--serve`, and the `tag` verb; one instance per role | a second binary and a release-skew story |
 | A dark period is accepted; no compatibility shim | double the API surface for the duration |
 | Rebuild in **this** repository, one branch | history lost for no benefit |
 | `decisions/` deleted; reasoning lives in subsystem pages | eleven new records owed by this change alone |
@@ -2494,7 +2529,8 @@ one only with a written reason.
 | **The trash entry id stays opaque**; the original location travels in its own field | `restore_trash` at `Device` becomes an arbitrary-file-move primitive |
 | **The loopback bind is a random `127.x.x.x`**, not `127.0.0.1` | the session cookie reaches every other local port, where `SameSite` is same-site and does not help |
 | **`open_with` takes an index into configured apps**, never a program name | `Owner` means arbitrary code execution, which is what makes every other finding an RCE |
-| **Pin the SPKI and persist the TLS key**; the pairing code carries a fingerprint prefix | `--trust-new` on every DHCP lease change trains the operator to re-pin whatever answers |
+| **`--remote` collapses into `lightview tag <dir> --plugin <name>`**, because the desktop can mount the gallery | a distributed job broker, a second credential store, a certificate pin, and a route (`?frame=`) with one consumer |
+| **The idle worker re-runs the companion index periodically** | `inotify` does not fire for NFS or SMB writes, so tags written from another machine are invisible until restart |
 | **The PIN fails closed after ten attempts** | a million-code space with no rate limit, for a credential that is now per account |
 | **The launch URL is always printed to stdout**; no `--no-browser` flag | a headless local mode with no way to learn its own URL, and a verification recipe depending on an undefined flag |
 | **The ThumbHash moves to `media_meta`** | the items query walks the thumbnail table's overflow pages to extract 25 bytes a row |
@@ -2540,96 +2576,62 @@ Named so their absence reads as a decision rather than an oversight.
 
 ---
 
-## 9. Raised by the five-angle review, and not yet settled
+## 9. Raised by the five-angle review
 
 Five independent cold reviews — performance, security, simplicity, factual
 accuracy, and failure modes — produced findings that are folded into sections 1
-through 8 above. Six were **not** folded in, because each reverses a decision
-already taken or turns on a fact about the deployment that this document cannot
-supply. They are recorded here rather than decided quietly.
+through 8 above. Six were held here because each reversed a decision already
+taken or turned on a fact about the deployment that this document could not
+supply. **Four of those six have since been decided by the owner and folded back
+into the sections that own them**; they are summarized here so the reasoning
+is not lost. Two remain open.
 
 ### 9.1 `tag_counts` is deleted — settled
 
-Not an open question, recorded here because it removes something section 3.3
-previously listed. `tag_counts` is keyed `(namespace, tag)`, so it is **not**
-path-keyed and sits outside the sweep that section 3.3 claims has no exceptions;
-it needs its own two maintenance paths (`cache/counts.rs:1-9`), and rebuilding it
-per apply batch is section 8's open item. Autocomplete already holds every tag in
-memory with counts. Populate that from one
+`tag_counts` is keyed `(namespace, tag)`, so it is **not** path-keyed and sits
+outside the sweep that section 3.3 claims has no exceptions; it needs its own two
+maintenance paths (`cache/counts.rs:1-9`), and rebuilding it per apply batch was
+section 8's open item. Autocomplete already holds every tag in memory with
+counts. Populate that from one
 `SELECT namespace, tag, COUNT(*) FROM tag_index GROUP BY 1, 2` at refresh — one
 aggregate over an indexed table, at the moments the engine already refreshes.
 A table, two maintenance paths, an index, a sweep exception and an open item, all
 deleted, and section 3.3's sentence becomes true.
 
-### 9.2 Does the desktop mount the NAS gallery?
+### 9.2 The desktop mounts the NAS — settled, and `--remote` is gone
 
-**This is the one question whose answer could delete the most code**, and only
-you can answer it. If the Arch desktop can mount the gallery the server serves,
-then `--remote` — the worker registry, claim/announce/heartbeat, `remote.toml`,
-`remote-pair`, the SPKI pin, `--trust-new`, `?frame=`, eight of the ten rows in
-section 3.10's constants table, and the `AutoTagPanel` worker roster — can be
-replaced by one verb on the strong machine:
+Confirmed by the owner: the Arch desktop can mount the gallery the server serves.
+That single fact deletes the worker registry, claim/announce/heartbeat,
+`remote.toml`, `remote-pair`, the SPKI pin, `--trust-new`, `?frame=`, the
+`AutoTagPanel` worker roster, and the executor's byte-source/result-sink
+parameterization — roughly 3,700 Rust and 600 TypeScript lines — in favour of
+`lightview tag <dir> --plugin <name>` run over the mount. Section 3.1 carries the
+design and its two costs (tagging starts from a shell; bytes cross the network
+instead of decodes). Section 3.10 carries what the executor keeps.
 
-```
-lightview tag <dir> --plugin <name> [--filter <expr>]
-```
+The one thing that fact does *not* give for free, and section 3.1 names: `inotify`
+does not fire for NFS or SMB writes, so the server re-runs the mtime-gated
+companion index from the idle worker rather than waiting for an event that will
+never come.
 
-Companions are files; the server's watcher ingests them (section 3.5c). That is
-roughly 3,700 Rust and 600 TypeScript lines, and it is the difference between
-requirement 10 being comfortable and being a stretch (9.6).
+### 9.3 Panel thumbnails get a fourth tier — settled
 
-What it costs: you could no longer start a tagging run **from the phone UI** —
-tagging would join the password, pairing and `server.toml` as things administered
-from a shell. Given section 7 already settles that the host is administered by
-CLI, that is consistent rather than a new exception.
+`js` at 128px, unbounded, warmed with `j`. Section 3.5 carries the arithmetic
+(~7.9 MB of decoded bitmaps becoming ~84 MB at 512px, on the axis iOS kills tabs
+on) and the reason it does not violate the pipeline invariant: four edges through
+one `generate_for_path_fit` is still one pipeline. Reverses "three tiers" in
+section 7 with a written reason, which is what section 7 asks for.
 
-If the mount does not exist, `--remote` stays as designed — but the **worker
-registry** should still go, because with one attachable host there is nothing to
-schedule between, nothing to pin to, and nothing to requeue to.
+### 9.4 `?fit=` stays as a grid source — settled
 
-### 9.3 Tag-panel thumbnails are 34× larger than the panel shows
+With its eligibility gates and the never-warm rule intact. Section 3.5b carries
+the two costs that removing it would have paid without anyone pricing them.
 
-Section 3.5 assigns "tag-panel thumbs" to `j` (512px) in a table cell, and nobody
-checked the number. `TagManagerPanel` renders up to 120 thumbnails
-(`TagManagerPanel.tsx:54`) in an 88px grid (`:432`), sourced today from the 128px
-square tier (`:438`). Decoded, that is ~7.9 MB becoming **~84 MB** — and
-`lib/runtime.ts:80-90` documents that this is precisely the axis iOS kills tabs
-on. `DuplicatesPanel` and `MergeDialog` do the same thing.
+### 9.7 The service worker is deleted — settled
 
-Worse, these three panels address *arbitrary* files — typically old ones — while
-the idle backfill warms `j` **newest-first**, so each panel open can fire up to
-120 simultaneous generate-on-miss requests at the part of the library the
-backfill reaches last.
-
-Two resolutions, and the plan should not ship with neither:
-
-- **A fourth cached tier at 128px**, unbounded like `j` because the rows are ~4 KB.
-  It has three real consumers, so it passes the second-implementation test — but
-  it reverses section 7's "three tiers, one family", which is why it is here and
-  not folded in.
-- **Route panel thumbnails through `?fit=128`**, accepting an uncached resize per
-  panel open. Cheaper in concepts, more expensive per open.
-
-I lean to the fourth tier: the ladder becomes 128/512/1280/2560, which is still
-one family and one render path, and "three tiers" was never the requirement —
-"one pipeline" was.
-
-### 9.4 Removing served-original grid cells deletes measured tuning
-
-Section 3.12 removes it in one bullet. It takes with it `ORIGINAL_SRC_TOLERANCE`,
-`FIT_BUCKET`, the resolution gate and the never-warm rule
-(`JustifiedGrid.tsx:135-150,271-276,396-402`) — the last of which carries a
-recorded measurement saying that warming those cells *made things worse*. Two
-consequences nobody priced: a cell at mid detail decodes ~1750px instead of
-~768px (the same file records "four times the memory per cell" for one rung), and
-six rows of speculative precache now **generate and store** `jh` for cells that
-previously produced nothing at all.
-
-Either keep `?fit=` as a grid source with its gates intact — it costs no new
-machinery, since the route and coalescer survive for 9.3 — or remove it and
-record the memory number in section 7 as a decision. Section 7 currently says
-scroll tuning is "not re-measured", which is a different claim from "measured
-tuning is deleted".
+Nothing in section 1 asks for offline operation. Section 3.12 carries what goes,
+what breaks, and why `ETag` on the thumbnail route already does the caching job
+with no code. One exception leaves section 2's ledger.
 
 ### 9.5 Where do display preferences and the default filter live?
 
@@ -2675,6 +2677,10 @@ is a `services/` layer the Placement diagram does not name.
 
 Both need settling before step 4, and they settle together: name `services/` in
 the diagram and give it a budget, then restate requirement 10 as a number that
-can be defended. If 9.2 deletes `--remote`, the target is comfortable; if not,
-~21,000 / 15,000 is the honest figure and should be written as such rather than
-missed.
+can be defended. **9.2 has since deleted `--remote`, the job broker and the
+worker binary (~3,700 Rust), and 9.7 the service worker (~400 TypeScript)**, so
+the arithmetic now lands close to the stated targets rather than well over them —
+but "close" was reached by deletion, not by accounting, and the placement gap is
+untouched. The recommendation stands: add `services/` to section 2's Placement
+diagram with the six modules named above, give it a port-table row, and re-derive
+the two numbers from the table rather than asserting them.

@@ -10,7 +10,11 @@
 > has since moved a long way past it. Where they differ, the plan is right.
 > Delete this page when the rebuild lands.
 >
-> Part 2 now disagrees with the plan on, at least: plugin-proposed grouping
+> Part 2 now disagrees with the plan on, at least: **`--remote` and the worker
+> binary (both gone — the desktop mounts the gallery, so tagging is
+> `lightview tag <dir> --plugin <name>` over the mount, and the job broker,
+> credential store and certificate pin with them)**; the service worker
+> (deleted); plugin-proposed grouping
 > (deferred, and its result kind deleted rather than stubbed); machine-local
 > state (XDG base directories, not beside the executable); the trust model
 > (every bind authenticates, including loopback, via a one-time launch token on a
