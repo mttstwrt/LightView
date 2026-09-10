@@ -24,7 +24,8 @@
 > (`media_meta`, not the tier table); `tag_counts` (deleted); `settings.toml`
 > (only the default filter and trash retention — display preferences are
 > client-side everywhere); path confinement (two types, `RelPath` and
-> `GalleryPath`, not a per-route call); the number of
+> `GalleryPath`, not a per-route call); companion writes (one operation under an
+> `fcntl` lock, because the tagging machine reaches the gallery over Samba); the number of
 > thumbnail tiers, and whether a fourth at 128px is needed; and the exception
 > ledger, which is now maintained in the plan's section 2 rather than here.
 >

@@ -293,6 +293,15 @@ unnamed assumption is itself the defect:
     mutex, the serialization auth is supposed to avoid is moved rather than
     removed. **Decided: `devices.db` gets its own small read-only pool**, since
     auth runs on every thumbnail request.
+12. That the Samba share is exported with `posix locking = yes`. It is the
+    default, and it is what turns a `cifs` client's byte-range lock into an
+    `fcntl` lock on the server's file — without it the companion lock in section
+    3.7 holds on each machine separately and not between them. Section 6 tests
+    it rather than trusting it.
+13. That the server's own `--serve` process runs on the machine whose disk
+    holds the gallery, so `smbd`'s writes fire its `inotify`. If the server were
+    itself a client of some other share, section 3.1's primary path would not
+    exist and only the periodic sweep would.
 
 ---
 
@@ -372,12 +381,22 @@ Two consequences worth stating rather than discovering:
   runs read cached tiers locally; the cache-directory ceiling (section 3.3) is
   what stops that growing without bound.
 
-**The server must notice companions written from another machine, and `inotify`
-will not tell it.** Remote writes over NFS or SMB do not generate local
-filesystem events — a property of the protocols, not a bug to work around. So
-the idle worker **re-runs the companion index periodically**. An earlier draft
-called that "no new code", and a reviewer who read `index_companions` found three
-reasons it is not:
+**The server sees companions written over the mount, because the mount is
+Samba.** The desktop's writes arrive at `smbd`, which is an ordinary local
+process on the server writing to the local disk — and `inotify` watches are on
+inodes, so those writes fire the server's watcher exactly as a local edit would,
+bind-mounted container or not. (An earlier draft assumed they would not. That is
+true of a *client-side* mount — a viewer on the desktop over the same share never
+sees the server's writes — and false of the server's own disk.) So the primary
+path is the watcher's **companion branch** in section 3.5c: a companion event
+re-indexes that one file, refreshes autocomplete, and emits `resync` for `tags`.
+Tags written from the desktop reach the phone within the debounce window.
+
+The idle worker **also re-runs the companion index periodically**, as the
+fallback for the cases events genuinely miss: a client-side mount, an `inotify`
+queue overflow, a watch-limit exhaustion. An earlier draft called that sweep "no
+new code", and a reviewer who read `index_companions` found three reasons it is
+not:
 
 - **It holds the writer across the whole walk.** `index_companions` runs inside
   one transaction (`gallery.rs:356-484`) doing `walkdir` and a file read per
@@ -387,12 +406,10 @@ reasons it is not:
   **Split it**: a scan phase (walk, stat, read — no database handle) and a commit
   phase (one batched transaction, the lock taken only there).
 - **Nothing tells anyone.** The autocomplete refresh lives in the caller, not the
-  function; and there is no channel by which "tags changed" reaches a web client
-  at all — the watcher `continue`s on companions, and the only tags-indexed event
-  is a Tauri emit. After a run the phone's grid, filter and rating badges are
-  stale until a manual reload. The sweep **refreshes autocomplete when it indexed
-  anything, and emits the `resync` event section 3.11 specifies with `tags` as
-  its domain.**
+  function, and today the only tags-indexed event is a Tauri emit. The sweep
+  does what the watcher's companion branch does: **refreshes autocomplete when
+  it indexed anything, and emits the `resync` event section 3.11 specifies with
+  `tags` as its domain.**
 - **Cadence.** A full walk over a spun-down array every few minutes is what keeps
   the disks from ever sleeping. So `lightview tag` writes
   `<gallery>/.lightview/index-epoch` as its last act — a counter, disposable by
@@ -423,6 +440,15 @@ every run would re-read the EXIF header of every photo that has no GPS, because 
 **A re-run skips a file whose companion already carries `tags.plugins[<name>]` at
 the manifest's current `version`.** A version bump therefore re-tags everything,
 which is what a version bump means; the same run twice is a no-op.
+
+**`--filter` is the whole query language of section 3.6**, so the subsets a run
+can name are the subsets a filter can name: untagged only
+(`not has::plugin.<prefix>`, which the timer in section 3.1b uses), a year, a
+rating, a media type, a set. What it cannot name is a hand-picked selection —
+that exists only in a loopback viewer, whose plugin runner takes the current
+selection. From a phone, tagging is a filter over the gallery or nothing, and
+that is accepted: the one subset a phone user has asked for is "what isn't
+tagged yet", and a filter says it in five words.
 
 **A mount that drops mid-run kills the run.** The decoder maps the source file
 (`pipeline/thumbnailer.rs:128-132`), and a read fault on a hung mount arrives as
@@ -1542,9 +1568,18 @@ in the post-open background task. So a batch of photos arriving *with* their
 sidecars over `rsync` or Samba — the NAS case, which is this plan's headline
 deployment — appears in the grid with no tags, no rating and no colour label
 until the process restarts, and any edit made in that state overwrites a
-companion the index never read. One line in the add branch fixes it:
-`read_companion` + `reindex_tags_for_file` + `set_index_state`, exactly as
-`restore_trash_impl` already does (`commands/trash.rs:319-325`).
+companion the index never read. One line in the add branch fixes it: `read_companion` + `reindex_tags_for_file` +
+`set_index_state`, exactly as `restore_trash_impl` already does
+(`commands/trash.rs:319-325`).
+
+**And the watcher gets a companion branch of its own**, replacing today's
+`continue`. A `Create`, `Modify(Name(To))` or `Modify(Data)` on
+`*.lightview.json` re-indexes the media file it belongs to (the same three
+calls), refreshes autocomplete, and emits `resync` for `tags`. This is the
+primary path by which a `lightview tag` run on the desktop reaches the phone —
+section 3.1 explains why the server's `inotify` sees Samba writes — and it is
+the reason the periodic sweep is a fallback rather than the mechanism. Only a
+*rewritten* companion needs `Modify(Data)` watched; media files keep ignoring it.
 
 **The client half.** The SSE event racing the thumbnail is benign — the event
 carries paths, the client refetches, and the thumbnail generates on demand; the
@@ -1706,17 +1741,40 @@ companion that fails to parse in the sweep is logged at `warn`**, not skipped.
 `.lightview-tmp-<uuid>.json` into the durable tree — the same shape as the upload
 temp leak in section 3.5c, in a different directory.
 
-**Read-modify-write is one operation under `flock`.** Both writers today do a
+**Read-modify-write is one operation under a lock, and the lock is `fcntl`, on a
+per-directory lock file — three choices, each forced.** Both writers today do a
 whole-file read → mutate → serialize with no lock (`tags.rs:24-51`,
 `plugins.rs:72-101`), so a rating set from the phone is silently gone if the
-desktop's plugin run read that companion a moment earlier — and over NFS "a
-moment" is the attribute cache's `acregmin`, three seconds by default. The
-losing write is not the older one; it is whichever reader lost the race. So
-`write_companion(path, |c| …)` takes `flock(LOCK_EX)` on the target for the
-whole read-mutate-write-rename, which works locally and over NFSv4 and degrades
-to today's behaviour where locks are unsupported. `modify_companion` becomes that
-one function. Section 3.3's "last-writer-wins, no corruption, no merge" is then
-true per *operation*, which is the claim that was meant.
+desktop's plugin run read that companion a moment earlier — and over a network
+mount "a moment" is the client's attribute cache, one second on `cifs` by
+default. The losing write is not the older one; it is whichever reader lost the
+race. So `write_companion(path, |c| …)` holds a lock across the whole
+read-mutate-write-rename, and `modify_companion` becomes that one function.
+
+- **`fcntl` (OFD, `F_OFD_SETLKW`), not `flock`.** The mount is Samba. A `cifs`
+  client sends `fcntl` byte-range locks to the server as SMB locks, and `smbd`
+  with `posix locking = yes` — its default — takes the matching `fcntl` lock on
+  the server's own file. So a lock taken on the desktop and one taken by the
+  `--serve` process contend, **but only if both are `fcntl`**: on Linux `flock`
+  and `fcntl` locks do not see each other at all, so an earlier draft's `flock`
+  would have been coherent on one machine and decorative across two. (`flock`
+  stays for the cache-directory lock in section 3.3, which is local by design.)
+- **A separate lock file, `.lightview/companions/.lock`, per directory** — never
+  the companion itself. The write ends in a rename that replaces the companion's
+  inode, so a lock on the old inode covers nothing after the swap; a lock file
+  that is never replaced does. One per directory rather than per companion
+  because companions are per directory already, and contention is between two
+  machines, not two files.
+- **Over `cifs`, the rename is not atomic.** Replacing an existing target goes
+  through a fallback that unlinks it first, so a reader on the server can
+  observe the companion *absent* for an instant. Writers are serialized by the
+  lock, so this only reaches readers that do not take it — the index sweep and
+  a display read — and the rule for them is: **absence is never a deletion.**
+  The sweep removes index rows only when the media file is gone (the media
+  sweep), never because a companion was not there this pass.
+
+Section 3.3's "last-writer-wins, no corruption, no merge" is then true per
+*operation*, which is the claim that was meant.
 
 The writer stamps `modified`, not the caller.
 
@@ -2525,6 +2583,13 @@ browser is the *only* runtime.
 - trash: round-trip a nested path, refuse a restore onto an occupied
   destination, purge by age from the directory name alone
 - the tier budget: hysteresis at 1.25×, warm seeding, drain-before-evict
+- **companion locking across the Samba mount** — a lock held by a process on the
+  server blocks `write_companion` on the desktop over the share, and vice versa.
+  This is the one test in the list that needs two machines, and it is the one
+  that decides whether section 3.7's lock is real or decorative
+- a companion written over the share from the desktop is in the server's index,
+  and on the phone, within the watcher's debounce — the primary path in section
+  3.1, not the sweep
 
 **Both binds must be exercised, and the loopback one is the least-reviewed
 surface in this document.** Section 6's browser recipe pairs a device and drives
@@ -2619,10 +2684,10 @@ one only with a written reason.
 | **`tag` refuses a gallery that is open locally**, and runs the index pass only — never enrichment | the desktop's cold run rewriting every geotagged companion over the mount |
 | **On mirrored companion fields the companion wins** when present | the first fresh cache stamping its `now` onto every file's `date_added` |
 | **Companion `index_state` keys on `(mtime_nanos, size)`** | a concurrent sweep skipping a rewritten file forever |
-| **Companion read-modify-write is one operation under `flock`** | a phone's rating silently lost to a plugin run that read the file three seconds earlier |
+| **Companion read-modify-write is one operation under an `fcntl` lock on a per-directory lock file** | `flock` is invisible to `smbd`'s `fcntl` lock, so a phone's rating is silently lost to a plugin run that read the file a second earlier |
 | **Companions stay per directory**, beside the media | every companion outside the top directory orphaned on first open |
 | **`--remote` collapses into `lightview tag <dir> --plugin <name>`**, because the desktop can mount the gallery | a distributed job broker, a second credential store, a certificate pin, and a route (`?frame=`) with one consumer |
-| **The idle worker re-runs the companion index periodically** | `inotify` does not fire for NFS or SMB writes, so tags written from another machine are invisible until restart |
+| **The watcher handles companion events; the idle worker's periodic re-index is the fallback** | tags written over the share reach the phone at the next idle cycle instead of within the debounce — or, on a client-side mount, never |
 | **The PIN fails closed after ten attempts** | a million-code space with no rate limit, for a credential that is now per account |
 | **The launch URL is always printed to stdout**; no `--no-browser` flag | a headless local mode with no way to learn its own URL, and a verification recipe depending on an undefined flag |
 | **The ThumbHash moves to `media_meta`** | the items query walks the thumbnail table's overflow pages to extract 25 bytes a row |
