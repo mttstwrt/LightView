@@ -110,7 +110,8 @@ current architecture that was right. Three layers, and nothing points upward:
 ```
   pure libraries   filter · sort · autocomplete · geocode · companion · util
         ↑          (take a connection or a struct; know nothing above them)
-  services         cache · pipeline · plugin · tagging · sets
+  services         cache · pipeline · plugin · tagging
+                   media · gallery · tags · files · duplicates · trash
         ↑          (take state or pieces of it; no HTTP, no IPC types)
   adapter          server (routes + one command table) + cli
 ```
@@ -119,6 +120,18 @@ The single largest structural change is that the top layer collapses from **two
 adapters to one**. Today `commands/` (Tauri) and `http_server/api.rs` (HTTP) are
 parallel entry points kept in step by a `*_impl` naming convention; with no
 Tauri there is one dispatch and the convention disappears.
+
+**But the collapse is worth ~940 lines, not the 10,357 the port table implied.**
+An earlier draft mapped all of `commands/` (6,557) and `http_server/` (3,800)
+onto `server/`, the adapter. Two reviewers independently measured what is
+actually adapter code: 98 `*_impl` call sites of about four lines each, plus 617
+lines of dispatch in `api.rs`. The rest of `commands/` — `media.rs` 1,308,
+`gallery.rs` 1,276, `tags.rs` 723, `plugins.rs` 567, `duplicates.rs` 419,
+`files.rs` 249 — is **domain logic**: batch thumbnail orchestration, gallery open
+and fs-watch, tag writes across a selection, plugin lifecycle. Land that in the
+adapter and the plan commits the exact failure this section says it must not.
+So the second row of the diagram names those six as services, they get their own
+row in the port table, and `server/` is only what dispatches to them.
 
 The failure this plan must not commit: a lower layer learning about a higher
 one. Specifically — `cache/` must not know what a route is, and the pure
@@ -2336,7 +2349,8 @@ nicer.
 | What | Replacing | Why |
 |---|---|---|
 | `cache/` | 2,044 lines | three tables not seven, no migrations, relative paths, new location. (The directory is 2,552 lines; `duplicates.rs` 319 and `coalescer.rs` 86 are ported and `gif_atlas.rs` 103 is deleted, so those 508 are not what this row replaces — an earlier draft's 2,516 double-counted them.) |
-| `server/` (routes + one command table) | `commands/` 6,557 + `http_server/` 3,800 | one adapter; the `*_impl` convention has nothing left to keep in step |
+| `server/` (routes + one command table) | the ~940 adapter lines of `commands/` + `http_server/` — 98 `*_impl` wrappers and `api.rs`'s 617-line dispatch — plus middleware, TLS, pairing, uploads | one adapter; the `*_impl` convention has nothing left to keep in step |
+| `services/{media,gallery,tags,files,duplicates,trash}` | the domain half of `commands/` (~4,500) | **rewritten against the new cache and trust model, not ported** — but placed as services, because putting them in the adapter is the layering failure section 2 forbids. `tags` gains the `namespace` parameter and the `GalleryPath` argument; `gallery` loses Tauri lifecycle and gains the flock; `trash` is the section 3.4 layout |
 | `AppState` | `lib.rs` 479 | half its fields are Tauri, GPU, or dual-transport artifacts |
 | `tagging/` | `tagging/` 1,446 + worker bin 1,678 | **one in-process executor, no queue** — the registry, the claim protocol and the two staleness clocks all go with `--remote` (section 3.1) |
 | `cli` | `main.rs` 429 + headless 434 | three modes, one binary |
@@ -2633,28 +2647,31 @@ Nothing in section 1 asks for offline operation. Section 3.12 carries what goes,
 what breaks, and why `ETag` on the thumbnail route already does the caching job
 with no code. One exception leaves section 2's ledger.
 
-### 9.5 Where do display preferences and the default filter live?
+### 9.5 Display preferences, the default filter, and trash retention — settled
 
-Section 3.3 says display preferences are per-client, and puts `settings.toml`
-inside the gallery — where it is per-*gallery*, so two desktops mounting one NAS
-share it, which is the exact fight that paragraph exists to prevent.
+Section 3.3 said display preferences are per-client and then put `settings.toml`
+inside the gallery, where it is per-*gallery* — two desktops mounting one NAS
+would share it, which is the exact fight that paragraph exists to prevent.
 
-Display preferences should go to `clientPrefs` for **every** client, local
-included; that much is clear and removes a local-versus-remote branch the rest of
-the plan works to abolish. What is not clear is the rest of the file, and it
-interacts with section 3.2's trust model:
+Decided, with the reasoning stated so it can be reversed with a reason:
 
-- **Trash retention** must travel with the gallery (section 3.3) and must not be
-  settable by a phone — it deletes files.
-- **The default filter** is user intent and should survive a format bump, but
-  under `--serve` nothing is `Owner`, so as written *nobody can set it from the
-  only UI that deployment has*.
+- **Display preferences live in `clientPrefs` for every client, local included.**
+  One mechanism, and the local-versus-remote branch that the rest of the plan
+  works to abolish does not survive into the frontend.
+- **`.lightview/settings.toml` holds exactly two keys: `default_filter` and
+  `trash_retention_days`.** Both are per-gallery and must survive a format bump.
+- **`set_default_filter` is a `Device` command** that writes that one key. It is
+  user intent of the same class as a tag, it touches nothing outside `.lightview/`,
+  and under `--serve` the phone is the only UI the deployment has — an `Owner`
+  command here would mean nobody could set it.
+- **Trash retention is set by editing the file**, which is what "configuration is
+  a file" already means for `server.toml`. No command writes it over the wire at
+  any trust level, because it is the one key in the system that deletes files.
 
-My recommendation: the default filter becomes a `Device` command writing
-`.lightview/settings.toml`, and trash retention is set only by a CLI verb on the
-host. That is two trust levels on one file, which is an exception — the
-alternative is two files, which is a concept. I would take the exception, but it
-is your call.
+This is one file with two keys at two trust levels, which reads like an
+exception. It is not listed as one, because the distinction is between a
+*command that sets a field* and *a file nothing sets*, and that is the same
+shape as every other configuration file in the plan.
 
 ### 9.6 Requirement 10's line-count target is probably not reachable as accounted
 
