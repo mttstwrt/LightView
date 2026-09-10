@@ -81,10 +81,11 @@ target architecture, what is ported versus written fresh, the order of
 construction, and the decisions already settled. It is what an implementer
 reads.
 
-[`refactor.md`](refactor.md) is a standing proposal rather than a description:
-a complete inventory of the system as it is, and the argument for a
-substantially smaller one. Nothing in it has been built, and it is the only page
-here that describes a system that does not exist.
+[`refactor.md`](refactor.md) is **superseded by that plan** and kept for two
+things: Part 1 is a complete inventory of the system as it is today, which is
+still accurate, and Part 2 is the argument that produced the plan. Part 2 has not
+tracked the plan through three rounds of review and disagrees with it in a dozen
+places; its banner lists them. Where they differ, the plan is right.
 
 [`todo.md`](todo.md) is the running list of known gaps — things that are
 understood but not done. It is deliberately short; anything with enough shape

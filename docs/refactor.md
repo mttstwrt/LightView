@@ -3,15 +3,29 @@
 [← docs index](README.md)
 
 > **Superseded by [`_planning/rebuild/design.md`](_planning/rebuild/design.md).**
-> That plan is authoritative and self-sufficient; this page is the argument that
-> produced it, kept for the reasoning and the inventory of the system being
-> replaced. **It has not been updated since the plan was written and now
-> disagrees with it in several places** — plugin-proposed grouping is deferred
-> rather than delivered, machine-local state follows the XDG base directories
-> rather than sitting next to the executable, the trust model authenticates
-> every bind, and several sections here predate two rounds of independent
-> review. Where they differ, the plan is right. Delete this page when the
-> rebuild lands.
+> That plan is authoritative and self-sufficient. **Part 1 of this page — the
+> inventory — is still accurate**, because no code has changed: it describes the
+> system as it stands today, which is what the plan replaces. **Part 2 is not.**
+> It is the argument that produced the plan, kept for its reasoning, and the plan
+> has since moved a long way past it. Where they differ, the plan is right.
+> Delete this page when the rebuild lands.
+>
+> Part 2 now disagrees with the plan on, at least: plugin-proposed grouping
+> (deferred, and its result kind deleted rather than stubbed); machine-local
+> state (XDG base directories, not beside the executable); the trust model
+> (every bind authenticates, including loopback, via a one-time launch token on a
+> random `127.x.x.x`); duplicate suppression (`set::` co-membership, index-based,
+> not a table); the trash entry id (opaque, because a path-shaped id is an
+> arbitrary-file-move primitive at `Device` trust); the ThumbHash's home
+> (`media_meta`, not the tier table); `tag_counts` (deleted); the number of
+> thumbnail tiers, and whether a fourth at 128px is needed; and the exception
+> ledger, which is now maintained in the plan's section 2 rather than here.
+>
+> Part 2 also predates **three rounds of independent cold review** — two single
+> reads and then a five-angle pass covering performance, security, simplicity,
+> factual accuracy against the tree, and failure modes. That pass found three
+> defects that would have shipped, all of them created or hidden by the proposal
+> as it stands in Part 2 below. They are documented in the plan, not here.
 
 **Status:** proposal, not a decision. Part 1 is a complete inventory of the
 system as of this writing; Part 2 argues for a smaller one. Nothing here has
