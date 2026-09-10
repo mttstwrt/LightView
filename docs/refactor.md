@@ -21,7 +21,10 @@
 > random `127.x.x.x`); duplicate suppression (`set::` co-membership, index-based,
 > not a table); the trash entry id (opaque, because a path-shaped id is an
 > arbitrary-file-move primitive at `Device` trust); the ThumbHash's home
-> (`media_meta`, not the tier table); `tag_counts` (deleted); the number of
+> (`media_meta`, not the tier table); `tag_counts` (deleted); `settings.toml`
+> (only the default filter and trash retention — display preferences are
+> client-side everywhere); path confinement (two types, `RelPath` and
+> `GalleryPath`, not a per-route call); the number of
 > thumbnail tiers, and whether a fourth at 128px is needed; and the exception
 > ledger, which is now maintained in the plan's section 2 rather than here.
 >
