@@ -61,8 +61,11 @@ What the rebuilt system must do. Everything else in this document serves these.
 
 9. **Fewer concepts.** The measure is how many times the word *except* is needed
    to describe the system truthfully. The system being replaced needs it about
-   thirty-five times; the target is about thirteen, and the survivors must be
-   properties of the problem rather than of the history.
+   thirty-five times. **Section 2's ledger is the target, and it lists
+   fourteen** — that list is the definition, not an estimate standing beside it.
+   An earlier draft named a number here and then listed a different number
+   there, which is how a falsifiable target quietly stops being falsifiable.
+   Every survivor must be a property of the problem rather than of the history.
 10. **Smaller.** ~26,900 lines of Rust and ~19,800 of TypeScript become roughly
    18,500 and 13,000. **If the finished tree is not smaller, something was added
    that nobody asked for.**
@@ -137,32 +140,46 @@ The plan is overwhelmingly subtractive. What it *adds*:
 Nothing else is added. Every other change removes. An earlier draft also added
 a `groups` plugin result kind; it is deferred, for the reasons in section 3.10.
 
-**Cases still needing the word *except*** after this plan, all of them
-properties of the problem rather than the history:
+**Cases still needing the word *except*** after this plan — fourteen, each a
+property of the problem rather than of the history:
 
 1. Four decoders inside one decode function (formats genuinely differ)
 2. `fit_rgba` as a second entry shape, for video frames at a chosen timestamp
 3. Only `jm`/`jh` are byte-budgeted (the unbounded tier is small)
 4. The HEIC transcode cache sits in front of one decoder
-5. Companion reads fall back to the alongside location; writes do not
-6. `rating:x` is a tag, `rating>=x` is a comparison; `::` is a namespace, `:` is not
-7. Grid cells keyed by path, pruned surgically
-8. Two single-flight slots; the drain re-arms, the warm slot deliberately does not
-9. `warping` must not be cleared by `markSettled()`
-10. Speculation shares the one bounded pool, so it is gated on "nothing outstanding"
-11. `dist/` must exist before any `cargo` command
-12. Self-signed TLS behind NAT needs its SANs named by hand
-13. An offline-capable web client has caches that can lie
-14. `.safe-panel` sets all four paddings and overrides `p-*`
-15. Two files sharing a `set::` tag are never offered as a duplicate pair —
+5. `rating:x` is a tag, `rating>=x` is a comparison; `::` is a namespace, `:` is not
+6. Grid cells keyed by path, pruned surgically
+7. Two single-flight slots; the drain re-arms, the warm slot deliberately does not
+8. `warping` must not be cleared by `markSettled()`
+9. Speculation shares the one bounded pool, so it is gated on "nothing outstanding"
+10. Self-signed TLS behind NAT needs its SANs named by hand
+11. An offline-capable web client has caches that can lie
+12. `.safe-panel` sets all four paddings and overrides `p-*`
+13. Two files sharing a `set::` tag are never offered as a duplicate pair —
     **including when they genuinely are duplicates.** Two identical scans inside
     a 200-page comic will not be found. Accepted: the alternative is storing
     pairwise verdicts again.
-16. A gallery mounted at different paths on two machines gets two derived
+14. A gallery mounted at different paths on two machines gets two derived
     caches. Today the cache lives *inside* the gallery and is shared by every
     machine that mounts it; keying by hash-of-canonical-root gives that up. It
     is the price of getting the blob out of the photo folder, and it is a real
     regression for a NAS mount browsed locally as well as served.
+
+**Two entries an earlier draft carried here are gone, because neither was a
+property of the problem.** A ledger that quietly accumulates history-shaped
+entries measures nothing:
+
+- **`dist/` must exist before any `cargo` command** is a property of choosing
+  `rust-embed` with a required folder. `.gitignore` excludes `dist/`; add
+  `!dist/.gitkeep`, commit the file, and `cargo check` works on a fresh clone
+  forever. A build without `npm run build` then serves a 404 at `/` — a loud
+  runtime failure instead of a confusing build failure. Two lines for one
+  permanent exception. Step 0 had already found the trick and used it only as
+  scaffolding.
+- **Companion reads fall back to the alongside location; writes do not.** No
+  build in this repository's history ever wrote an alongside sidecar, so the
+  fallback is defensive code for a condition this application cannot produce.
+  Section 3.7 states what deleting it costs.
 
 Anything beyond this list that a plan step introduces is a regression against
 requirement 9 and needs to be argued for explicitly.
@@ -346,6 +363,16 @@ what the client cannot do, and the server enforces it regardless.
 that widens it.** This is the single security rule of the system and it must
 survive every later change.
 
+**And it is a property of the accepting *listener*, never of the peer address.**
+A `0.0.0.0` bind includes `127.0.0.1`, so a rule written as "the peer is
+loopback" hands `Owner` to any local process on a served host — including
+anything a browser on that host can be made to issue. The trust level is
+therefore decided when the listener is created and carried on the connection:
+one listener is the loopback listener and its connections are `Owner`; every
+other listener yields `Device` regardless of who dialled in. Stated here because
+prose about "a loopback bind" reads ambiguously, and the ambiguous reading is
+the exploitable one.
+
 The bootstrap routes — `/healthz`, `/cert`, `/pair/redeem`, `/auth/password`,
 `/auth/status` — are unauthenticated by necessity, since there would otherwise
 be no way past the auth layer the first time. They are a route group, **not** a
@@ -434,8 +461,20 @@ host serving galleries hold separate device lists, which is right. In a
 container it is moot: one account runs everything, so `lightview pair` and
 `lightview --serve` share a state directory by construction.
 
-**The budget and `lightview cache --prune` apply to the cache directory only** —
-which under XDG is now enforced by the path rather than by this sentence.
+**Two budgets, two names, because they are not the same mechanism** — an
+earlier draft called both "the cache budget", and section 7 then stated one of
+them as though it were the only one:
+
+| Name | Scope | Enforced |
+|---|---|---|
+| **tier budget** | `jm` and `jh` rows inside one gallery's `cache.db` | automatically, on both write paths (section 3.5) |
+| **cache-directory ceiling** | total bytes under `galleries/`, across galleries | only by `lightview cache --prune`, LRU on the cache file's mtime |
+
+The ceiling and `lightview cache --prune` apply to the cache directory only —
+which under XDG is now enforced by the path rather than by this sentence. The
+tier budget is derived from free disk and overridden by
+`LIGHTVIEW_TIER_BUDGET_MB`, never by configuration; `server.toml`'s key is the
+ceiling.
 
 Consequences, all of them currently missing:
 
@@ -460,11 +499,44 @@ moving large galleries turns out to be a habit.
 **A read-only gallery improves:** derived data goes to the local data dir, so
 only the durable half degrades rather than nothing working.
 
+#### One process per gallery, and what enforces it
+
+`cache.db` has one writer behind an in-process `tokio::Mutex`. That assumption
+holds only while there is one process, so it is enforced rather than assumed:
+**an advisory `flock` on `$XDG_CACHE_HOME/lightview/galleries/<hash>/lock`**,
+taken when the gallery is opened and held for the life of the process.
+
+**The lock is on the derived cache directory, not on the gallery.** The gallery
+tolerates any number of readers; `cache.db` is the thing that does not. Keying
+the lock the same way the cache is keyed also means the two can never disagree
+about what "the same gallery" is.
+
+**`flock` specifically, because it has no stale state to recover.** The kernel
+releases it when the file descriptor closes — on exit, on `SIGKILL`, on a
+container being torn down. A pidfile would need liveness checks, a staleness
+window and a way to break the lock, all of which are ways to get it wrong. A
+second process **exits immediately** with a message naming the gallery, rather
+than blocking on a lock a long-running server never releases.
+
+Two consequences, both stated because they are real limits rather than bugs:
+
+- **`lightview --serve <dir>` and `lightview <dir>` on the same directory are
+  mutually exclusive.** Serving a gallery and browsing it locally at the same
+  time means pointing a browser at the served URL, which needs no second
+  process. This is a narrowing against today, where the failure is silent
+  instead.
+- **The lock is per machine, so it does not coordinate two machines mounting the
+  same NAS share.** It does not need to: after section 3.3 each machine has its
+  own derived cache, which is exception 14 on section 2's ledger. What the two
+  still share is the companion files, and a concurrent metadata write from two
+  machines resolves last-writer-wins through the atomic rename in section 3.7 —
+  no corruption, no merge.
+
 #### Configuration is a file; commands are actions
 
 `server.toml` in the config directory, read at startup and on change: bind address,
 port, TLS SANs, password hash, inactivity window, upload enable and scheme,
-trash retention, cache budget.
+trash retention, the cache-directory ceiling.
 
 **There is no remote-delete flag.** Today one exists and gates the whole trash
 group plus merge; requirement 2 makes move-to-trash something a remote client
@@ -510,6 +582,16 @@ re-index.
 | `thumbs_jm` | 1280px fit — LRU byte-budgeted |
 | `thumbs_jh` | 2560px fit — LRU byte-budgeted |
 | `gallery_meta` | key/value: `format_version`, location tagger version |
+
+**Indexes are part of the schema, not an optimization to add afterwards.**
+Section 3.6's rule — a field is filterable only if it is indexed — makes them
+load-bearing, so the plan names them rather than leaving them to be discovered
+by a slow gallery: `tag_index` on `(namespace, tag)`, which serves the filter's
+`EXISTS` subqueries, autocomplete's refresh and section 3.9's `set::` scan, and
+on `(path)` for the path-keyed sweep; `media_meta` on every column the grammar
+can compare (`date_taken`, `date_added`, `last_viewed`, `rating`, `color_label`,
+`media_type`, `width`, `height`, `size`); `thumbs_jm` and `thumbs_jh` on
+`accessed_at`, which the eviction window function orders by.
 
 The location tagger version stays here despite being a stamp rather than a
 cache, and the coupling must be stated: **deleting the derived cache causes one
@@ -797,11 +879,26 @@ directory** (same filesystem, therefore an atomic rename) and rename into place.
 A reader sees the old file or the new one, never a truncated one. The writer
 stamps `modified`, not the caller.
 
-**One write location** — `.lightview/companions/`. The `companion_location`
-setting is deleted; it had a UI control and never reached a write, since every
-path called `CompanionLocation::default()`. **Keep the read fallback** to the
-alongside location, which costs nothing and means a gallery holding older
-sidecars keeps resolving them with no migration pass.
+**One companion location, read and write** — `.lightview/companions/`. The
+`companion_location` setting is deleted; it had a UI control and never reached a
+write, since every path called `CompanionLocation::default()`
+(`companion/reader.rs:32`, `commands/tags.rs:697`).
+
+**The alongside read fallback goes with it**, which is a change from an earlier
+draft that kept it "because it costs nothing". It costs one entry on a permanent
+exception ledger. `LightviewFolder` is the `#[default]` and has been since
+`reader.rs` entered the tree, so **no build in this repository's history ever
+wrote an alongside sidecar**: the fallback is defensive code for a condition this
+application cannot produce, which principle 2 says not to write. What deleting it
+costs, stated plainly: a `photo.jpg.lightview.json` placed by hand or by another
+tool is ignored. It is not destroyed — writes go to `.lightview/companions/`, so
+a stray file simply sits there — and nothing this project shipped produced one.
+
+**The alongside *form* still exists**, because section 3.4 stores the companion
+next to the media inside a trash entry. `companion_path(media, Alongside)`
+survives as a path constructor. What is deleted is the two-location *resolution*
+in the read path, and with it the both-locations loops in the copy, move and
+trash code (`commands/files.rs:221`, `commands/trash.rs:41-43`).
 
 `schema_version` is stamped on write, checked on read, and `migrate()` is called
 unconditionally on every parse. It is the identity function today. **This is the
@@ -867,9 +964,19 @@ tag-write commands all apply unchanged, and it is reconstructable from
 companions because it *is* companion content.
 
 **"Not a duplicate" is not stored.** It is derived: two files sharing any
-`set::` tag are never offered as a duplicate pair — one `EXISTS` clause in the
-finder. Forty burst frames cost forty tag rows instead of 780 pairwise ones, and
+`set::` tag are never offered as a duplicate pair. Forty burst frames cost forty tag rows instead of 780 pairwise ones, and
 the user sees a name rather than a list of negations.
+
+**Where that check goes, stated precisely, because an earlier draft called it
+"one `EXISTS` clause in the finder" and the finder is not SQL.**
+`find_duplicates` (`cache/duplicates.rs:152`) loads every `(path, phash)` row
+into memory, runs all-pairs Hamming in Rust, and today loads the whole
+`not_duplicates` table separately to suppress pairs by hash lookup
+(`duplicates.rs:181`). The replacement keeps that shape rather than inventing a
+SQL one: a single `SELECT path, tag FROM tag_index WHERE namespace = 'set'` into
+a `HashMap<path, SmallSet<tag>>`, then a set-intersection test per candidate
+pair. Most files carry no set tag, so the common case is an absent-key early-out
+and the cost is a rounding error against the Hamming loop itself.
 
 **Order comes from the gallery's own sort.** A comic strip's pages are
 `page01.jpg`, `page02.jpg`. Storing an ordinal per member would be a second
@@ -1043,7 +1150,7 @@ directly). Both already share `plan_parts`, `InputPolicy`, `PartTracker` and
 | apply batch | 32 | results per `apply_plugin_tags` |
 | `MAX_LOCAL_PENDING` | 32 | in-process executor's pending window, with the compile-time invariant `MAX_VIDEO_FRAMES * 2 <= MAX_LOCAL_PENDING` — a clip must never fill the window by itself |
 | worker TTL / announce | 45 s / 15 s | registry liveness |
-| job stall / no-progress | 90 s / 30 min | requeue vs. fail |
+| job stall / no-progress | 90 s / 30 min | a stalled *claim* is requeued; a job that stops **progressing** is failed. The prose below is authoritative — an earlier draft's "requeue vs. fail" in this cell read as though progress loss could requeue, which is the wedge-forever case |
 | finished jobs retained | 50 | |
 
 **Requests are keyed on the temp file *name*, not the full path.** A plugin that
@@ -1204,6 +1311,29 @@ not. Note also that `MediaViewer` imports `invoke` from `@tauri-apps/api/core`
 directly today, so "`ipc.ts` is the only module that talks to the backend" is a
 goal of this rebuild rather than a description of what is being ported.
 
+**The stores are the layer this plan kept forgetting, and they are where the new
+API actually lands.** Seven of the nine import `lib/ipc`, which is written fresh
+because every command name and argument shape changes — so "the components port
+near-verbatim" is true only because the stores absorb that change. Four of the
+nine were accounted for above and five were named nowhere, so all nine are named
+here:
+
+| Store | Lines | Disposition |
+|---|---|---|
+| `capabilitiesStore` | 49 | **deleted** — its entire job was the dual desktop/web default |
+| `pluginStore` · `taggingStore` · `thumbnailProgressStore` | 58 · 159 · 37 | **merged** into one activity store |
+| `galleryStore` | 261 | **rewritten** — the item list, the selection and the SSE wiring; one broadcast channel and gallery-relative paths both land here |
+| `settingsStore` | 191 | **rewritten** — `companion_location` and enabled-views go, and the default filter moves from the database to `settings.toml` |
+| `filterStore` · `viewerStore` · `uploadStore` | 87 · 90 · 35 | **ported**, following `ipc.ts` for call shapes only |
+
+**Four more files belonged to no list at all.** `index.tsx` (37) is the entry
+point and is **rewritten**: it mounts the app, routes the pairing view, and is
+where section 3.2's launch-token redemption has to run before anything else.
+`components/topbar/icons.tsx` (145) is **ported minus the orphans** — deleting
+`ViewSwitcher`, `TitleBar`, `MapView` and `GalleryGrid` strands their icons.
+`lib/haptics.ts` (17) and `components/shared/ConfirmButton.tsx` (38) are
+**ported unchanged**.
+
 **Three components in the keep list call the Tauri file dialog** — the gallery
 opener in `App.tsx`, the copy/move destination in `ContextMenu.tsx`, and the
 plugin install path in `AutoTagPanel.tsx`. A browser cannot return a filesystem
@@ -1222,9 +1352,7 @@ process that may have no display.
 **Deleted:** `GalleryGrid`, `MapView`, `ViewSwitcher`, `gridLayout`, `GifCanvas`,
 `DebugOverlay`, `Sparkline`, `DevtoolsApp`, `perfMonitor`, `metricRows`,
 `devtools.html`, `WindowResizeGrips`, `TitleBar`, and most of `SettingsMenu`
-(1,333 lines → roughly 300: Display, Thumbnails, Default Filter). Merge
-`pluginStore`, `taggingStore` and `thumbnailProgressStore` into one activity
-store.
+(1,333 lines → roughly 300: Display, Thumbnails, Default Filter).
 
 **`App.tsx` is rewritten, not ported.** It has no entry in either list because it
 is neither: it hosts every panel and imports both `@tauri-apps/api/window` and
@@ -1329,9 +1457,10 @@ nicer.
 | `geocode/` (mod, countries) | 568 | the 25 km / 100 km ceilings are measured judgement |
 | `companion/` (schema, reader, writer, migration) | 587 | the durable wire format; atomic write-and-rename |
 | `provider/local.rs`, `util/` | 233 | scan, whole-file reads, data dir, fs-watch wrapper |
-| `file_clipboard/` | 198 | self-contained per-platform selection ownership; see section 3.12 for the precondition that changes |
+| `file_clipboard/` | 230 | self-contained per-platform selection ownership; see section 3.12 for the precondition that changes. (198 of those 230 are the Linux path; `macos.rs` and `windows.rs` are 32 lines that have never been built.) |
 | `plugin/input.rs` | 1,034 | `PartTracker` + staleness rules — a year-old silent hang already fixed |
 | `plugin/{runner,manifest,install}.rs` | 833 | subprocess/NDJSON, venv-relative interpreter rewriting |
+| `plugin/mod.rs` | 209 | `PLUGIN_API_VERSION`, `check_api_version`, `RequestDelivery`, `scan_plugins` — the version gate section 3.10 relies on. **`default_dir()` is the one thing rewritten in it**, since plugins move to the XDG data directory (section 3.3) |
 | `pipeline/video.rs` | 810 | ffmpeg rotation, exact-dimension downscale, timeouts, ISO 6709 |
 | `pipeline/{exif,heic_cache}.rs` | 273 | EXIF extraction; a 12-entry transcode LRU keyed on (path, mtime) |
 | `pipeline/thumbnailer.rs` — `decode_image`, `fit_dims`, `generate_for_path_fit`, `fit_rgba`, `resize_rgba`, `compute_thumbhash`, WebP encode | ~600 of 1,149 | the one render path |
@@ -1343,7 +1472,7 @@ nicer.
 
 | What | Replacing | Why |
 |---|---|---|
-| `cache/` | 2,516 lines | three tables not seven, no migrations, relative paths, new location |
+| `cache/` | 2,044 lines | three tables not seven, no migrations, relative paths, new location. (The directory is 2,552 lines; `duplicates.rs` 319 and `coalescer.rs` 86 are ported and `gif_atlas.rs` 103 is deleted, so those 508 are not what this row replaces — an earlier draft's 2,516 double-counted them.) |
 | `server/` (routes + one command table) | `commands/` 6,557 + `http_server/` 3,800 | one adapter; the `*_impl` convention has nothing left to keep in step |
 | `AppState` | `lib.rs` 479 | half its fields are Tauri, GPU, or dual-transport artifacts |
 | `tagging/` | `tagging/` 1,446 + worker bin 1,678 | one job loop over two byte sources |
@@ -1352,6 +1481,8 @@ nicer.
 | Trash | `commands/trash.rs` 563 | path-mirrored layout, no metadata file |
 | `lib/ipc.ts` | 969 | every wrapper targets a command name and shape that changes |
 | `lib/runtime.ts`, `lib/memoryPressure.ts` | 231 | one runtime; `isMobile()` and the pressure signal both need redefining |
+| `pipeline/idle.rs` | 206 | the backfill survives but its idleness signal is replaced outright — its module doc and `idle.rs:69` both define idle as "`fs_change_tx` has no SSE subscribers **AND** no recent thumbnail activity", and section 3.5 deletes the first half. Porting the file ports the check that makes the worker never run |
+| `stores/galleryStore.ts`, `stores/settingsStore.ts` | 452 | see section 3.12 — the SSE wiring, gallery-relative paths, and settings that no longer exist |
 | A directory-picker component + its `Owner` endpoint | `tauri-plugin-dialog` | a browser cannot return a filesystem path |
 
 ### One correction to this table
@@ -1398,9 +1529,9 @@ with what each step must produce.
 
 | # | Step | Produces | Done when |
 |---|---|---|---|
-| 0 | **Branch and clear** | the old tree deleted in the same commit that adds the first new file, **plus a committed placeholder `dist/index.html`** | `cargo check` on an empty skeleton |
+| 0 | **Branch and clear** | the old tree deleted in the same commit that adds the first new file, **plus `!dist/.gitkeep` in `.gitignore` and that file committed** — permanently, not as scaffolding: it is what deletes the "`dist/` must exist before any `cargo` command" exception (section 2) | `cargo check` on an empty skeleton, from a clone that has never run `npm` |
 | 1 | **Pure modules** | `filter/`, `sort/`, `autocomplete/`, `geocode/`, `companion/`, `util/`, `provider/`, `file_clipboard/` moved across; `auto` removed and `set` added in `TagNamespace` **and its TypeScript mirror**, `#[serde(default)]` on the companion structs, quoted strings in the tokenizer | the ported tests pass **after their `auto::` cases are rewritten to `set::`** — the enum is serialized both directions, so this is a wire change, not only a parser change — plus new tests for quoting, `set::`, and an old sidecar parsing without `set` |
-| 2 | **`cache/`** | three tables, relative paths, `format_version`, the path-keyed sweep and its test | a fresh open indexes a gallery; a version bump deletes and rebuilds |
+| 2 | **`cache/`** | three tables, relative paths, `format_version`, the named indexes, the `flock` on the cache directory, the path-keyed sweep and its test | a fresh open indexes a gallery; a version bump deletes and rebuilds |
 | 3 | **Pipeline** | one render path, three tiers, the coalescer, the byte budget, the idle worker | tier bytes appear for a test gallery at all three edges |
 | 4 | **Server + command table** | routes, the two trust levels, path confinement, TLS, pairing, the launch-token session, SSE, upload | `curl` exercises every route; an unauthenticated call is 401; an `Owner` command on a non-loopback bind is 403; **and on a loopback bind, redeeming a launch token and then calling the directory-listing endpoint succeeds** |
 | 5 | **CLI** | the three modes | `lightview <dir>` opens a browser; `--serve` binds and pairs |
@@ -1510,7 +1641,7 @@ one only with a written reason.
 | **The password is a CLI verb reading stdin**, argon2id, `--serve` only | hand-editing a hash into TOML |
 | **Tag-write commands take a `namespace` of `user` or `set`** | a parallel command family for an identical operation |
 | **One broadcast channel, not two** | a second channel whose only justification was the abolished subscriber-count signal |
-| **The cache budget is enforced only by `lightview cache --prune`**; the LRU key is the cache file's mtime | a gallery discovering its thumbnails were evicted as it opens |
+| **The cache-directory *ceiling* is enforced only by `lightview cache --prune`** — a different mechanism from the per-tier budget, which is automatic (section 3.3 names both); the ceiling's LRU key is the cache file's mtime | a gallery discovering its thumbnails were evicted as it opens |
 
 ---
 
