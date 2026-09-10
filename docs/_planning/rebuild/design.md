@@ -302,6 +302,9 @@ unnamed assumption is itself the defect:
     holds the gallery, so `smbd`'s writes fire its `inotify`. If the server were
     itself a client of some other share, section 3.1's primary path would not
     exist and only the periodic sweep would.
+14. That the share maps the desktop to the container's UID, or to a group both
+    can write as. Not assumed silently: section 3.1's startup probe refuses to
+    serve until it is true.
 
 ---
 
@@ -391,6 +394,34 @@ sees the server's writes — and false of the server's own disk.) So the primary
 path is the watcher's **companion branch** in section 3.5c: a companion event
 re-indexes that one file, refreshes autocomplete, and emits `resync` for `tags`.
 Tags written from the desktop reach the phone within the debounce window.
+
+**Both writers must be able to replace each other's files, and that is a UID
+question the plan cannot answer but must check.** A companion the desktop writes
+over the share is created on disk by `smbd` as whatever user the share maps the
+client to; a companion the server writes is created by the `--serve` process as
+the container's user. Each side then has to *replace* the other's work — rename
+over a companion, open `.lock` for writing to take the `fcntl` lock, and (on the
+`cifs` fallback path) unlink a target. Rename and unlink need write permission
+on the **directory**; the write lock needs write permission on the **lock
+file**. With Samba's default `create mask = 0744` and two different UIDs, every
+one of those fails — in both directions, silently on the desktop and as a logged
+error on the server — for every directory the *other* side touched first. A phone
+could not rate a photo the desktop had tagged.
+
+Two configurations pass, and the deployment notes name both: **the share's
+`force user` is the container's user**, so there is one UID by construction; or
+**a shared group** with `force group`, `create mask = 0664` and
+`directory mask = 0775` on the share and a matching umask in the container. Which
+one this deployment uses is a fact about `smb.conf`, not about this design.
+
+**So the server probes at open, rather than trusting either.** `lightview
+--serve` creates and removes a file in `.lightview/` and in one existing
+`companions/` directory it does not own, and **refuses to start** — naming the
+directory, its owner, and the two configurations above — if it cannot. Cheap,
+once, and it turns a silent write failure discovered weeks later into a message
+at the moment the deployment is being set up. The desktop side needs no probe:
+its first `lightview tag` run fails loudly on the first companion it cannot
+replace, which is the same information a run later.
 
 The idle worker **also re-runs the companion index periodically**, as the
 fallback for the cases events genuinely miss: a client-side mount, an `inotify`
@@ -2590,6 +2621,9 @@ browser is the *only* runtime.
 - a companion written over the share from the desktop is in the server's index,
   and on the phone, within the watcher's debounce — the primary path in section
   3.1, not the sweep
+- the ownership probe: `--serve` refuses to start against a `companions/`
+  directory it cannot write into, and the message names the owner and the two
+  share configurations that fix it
 
 **Both binds must be exercised, and the loopback one is the least-reviewed
 surface in this document.** Section 6's browser recipe pairs a device and drives
@@ -2687,6 +2721,7 @@ one only with a written reason.
 | **Companion read-modify-write is one operation under an `fcntl` lock on a per-directory lock file** | `flock` is invisible to `smbd`'s `fcntl` lock, so a phone's rating is silently lost to a plugin run that read the file a second earlier |
 | **Companions stay per directory**, beside the media | every companion outside the top directory orphaned on first open |
 | **`--remote` collapses into `lightview tag <dir> --plugin <name>`**, because the desktop can mount the gallery | a distributed job broker, a second credential store, a certificate pin, and a route (`?frame=`) with one consumer |
+| **`--serve` probes at open that it can write into a `companions/` directory the desktop created**, and refuses to start if not | a phone unable to rate any photo the desktop tagged, discovered weeks later as a silent write failure |
 | **The watcher handles companion events; the idle worker's periodic re-index is the fallback** | tags written over the share reach the phone at the next idle cycle instead of within the debounce — or, on a client-side mount, never |
 | **The PIN fails closed after ten attempts** | a million-code space with no rate limit, for a credential that is now per account |
 | **The launch URL is always printed to stdout**; no `--no-browser` flag | a headless local mode with no way to learn its own URL, and a verification recipe depending on an undefined flag |
