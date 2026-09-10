@@ -252,6 +252,13 @@ The binary is `lightview`, from Cargo's package name — the `productName:
 "Gallery"` mismatch that makes today's `.desktop` file point at a binary the
 build does not produce is a Tauri bundling artifact and dies with Tauri.
 
+**Two targets, and they are the two deployments that exist.**
+
+| Target | Carries | Why |
+|---|---|---|
+| **Container image** (Arch base) | `--serve` on the Ubuntu server | The host distro is irrelevant, which is the point: the image carries current `libheif` and `ffmpeg`, sidestepping the Ubuntu 24.04 libheif-1.17 problem that forces a source build on a Debian-family *host*. |
+| **Arch package** (PKGBUILD) | the local viewer **and** the `--remote` plugin host, on one desktop | Idiomatic on Arch, current libheif and ffmpeg for free, CUDA and the plugin's own Python venv untouched, `lightview` on `PATH`, and the `.desktop` file works. |
+
 **A package is one executable and three small files.** The SPA is embedded at
 compile time, so there is nothing to install alongside it:
 
@@ -265,13 +272,56 @@ compile time, so there is nothing to install alongside it:
 **Runtime dependencies:** `ffmpeg` and `ffprobe` for video thumbnails and frame
 extraction — without them clips fall back to a placeholder rather than failing —
 and `xdg-utils` for the browser launch in local mode. `libheif` is linked, not
-shelled out to, so it is a build dependency and a shared-library dependency
-rather than a runtime binary.
+shelled out to, so it is a build and shared-library dependency rather than a
+runtime binary. Building needs Node, because `dist/` must exist before any
+`cargo` command.
 
 **Nothing is installed into a shared writable location.** All state is per-user
 under XDG (section 3.3), so the package installs read-only files and creates no
-directories at install time. That is what makes it an ordinary package rather
-than one with a post-install script.
+directories at install time — an ordinary package, with no post-install script.
+
+#### Flatpak is not a target, and the reason is specific to this deployment
+
+The XDG move above makes a Flatpak build *possible* — the sandbox's private home
+at `~/.var/app/<app-id>/` is exactly the layout, where the exe-relative one would
+have failed against a read-only `/app`. It is still the wrong choice here:
+
+- **One desktop runs two roles.** The local viewer and the `--remote` plugin
+  host are both on the Arch machine. The plugin host spawns a Python subprocess
+  with its own venv and a CUDA stack, which is genuinely painful to sandbox — so
+  a Flatpak viewer means a Flatpak *and* a native install of the same binary, on
+  two update paths. That is precisely what deleting `lightview-worker` was for.
+- **The containment buys little here.** Flatpak pays off most for applications
+  that should not touch your files. This one's entire job is touching your
+  files, so it needs `--filesystem=home` — keeping all the friction and giving
+  up most of the benefit.
+- **The document portal would break the cache key.** The "proper" Flatpak way to
+  open a folder returns a remapped path under `/run/user/<uid>/doc/<id>/`, not
+  the real one. `path_in_gallery` compares against a root canonicalized once at
+  open, and `galleries/<sha256-of-canonical-root>/` would hash differently every
+  session — every gallery re-thumbnailing on every launch. Static
+  `--filesystem=home`, never portals, if this is ever revisited.
+- **A Flatpak is invoked as `com.example.LightView`**, not `lightview`, which
+  requirement 4 asks for. Solvable with an alias; worth knowing.
+
+Flatpak's real value is distributing to other people. There is one known user,
+and principle 2 says not to build for a hypothetical second. If that changes, the
+XDG work is done and it becomes a manifest plus a filesystem permission — not a
+redesign.
+
+#### Two things this deletes
+
+**Prebuilt generic Linux binaries have no consumer.** With a container image and
+a from-source Arch package, nothing downloads a loose `lightview` tarball. That
+release artifact and its CI path go, alongside the `lightview-worker` artifact
+the single binary already removes.
+
+**The container image sheds its graphical stack.** It builds the Tauri library
+today and so pulls `webkit2gtk-4.1` transitively, for a process with no window;
+after the rebuild there is no Tauri, no GTK, no WebKit and no `wgpu` in it at
+all. The image should get materially smaller and faster to build. No target is
+stated because no baseline was measured — if one is wanted, measure the current
+image first rather than inventing a number to miss.
 
 ### 3.2 Trust is a property of the bind
 
@@ -1356,7 +1406,7 @@ with what each step must produce.
 | 5 | **CLI** | the three modes | `lightview <dir>` opens a browser; `--serve` binds and pairs |
 | 6 | **Frontend** | the ported SPA against the new API | the grid fills in headless Chromium |
 | 7 | **Plugins + tagging** | one job loop; `remote.toml` (server url, cookie, `cert_sha256` TOFU pin, instance id and name, poll interval) and the `remote-pair` verb that writes it; then `--remote` | the example tagger completes a job locally, and a second process attached with `--remote` completes one against a self-signed server without disabling verification — **with a clip in the test gallery**, so `?frame=` is exercised and a video's companion gains a merged tag entry rather than being silently skipped |
-| 8 | **Docs** | `docs/` rewritten; `_planning/rebuild/` and `refactor.md` deleted | every page describes what exists |
+| 8 | **Docs** | `docs/` rewritten; `_planning/rebuild/`, `refactor.md` and `todo.md` deleted; `.claude/skills/verify/SKILL.md` rewritten against the new CLI | every page describes what exists, and the verify recipe runs |
 
 ---
 
@@ -1389,6 +1439,13 @@ is *refused* and never that it works. Add a loopback pass: start `lightview
 and call a directory listing, a copy into a temp destination, and `purge_trash`.
 Without it the launch-token flow, the picker endpoint and the whole `Owner` half
 of the trust table ship unverified.
+
+**The `verify` skill drives the old CLI and will be wrong.**
+`.claude/skills/verify/SKILL.md` is written against `lightview-headless serve`,
+`lightview-headless pair`, `cargo tauri dev` and the per-gallery cookie name.
+None of those survive. It is the repository's own recipe for exercising the
+stack, so leaving it stale means the first person to reach for it — plausibly a
+future session — follows instructions that cannot work. Rewrite it in step 8.
 
 **End-to-end, no display required.** Build the SPA (`npm run build` — `dist/`
 is embedded at compile time, so the Rust build fails without it), start the

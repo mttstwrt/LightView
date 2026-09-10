@@ -2,6 +2,17 @@
 
 [← docs index](README.md)
 
+> **Superseded by [`_planning/rebuild/design.md`](_planning/rebuild/design.md).**
+> That plan is authoritative and self-sufficient; this page is the argument that
+> produced it, kept for the reasoning and the inventory of the system being
+> replaced. **It has not been updated since the plan was written and now
+> disagrees with it in several places** — plugin-proposed grouping is deferred
+> rather than delivered, machine-local state follows the XDG base directories
+> rather than sitting next to the executable, the trust model authenticates
+> every bind, and several sections here predate two rounds of independent
+> review. Where they differ, the plan is right. Delete this page when the
+> rebuild lands.
+
 **Status:** proposal, not a decision. Part 1 is a complete inventory of the
 system as of this writing; Part 2 argues for a smaller one. Nothing here has
 been built. Where a claim is a measurement it says so; where it is a judgement
