@@ -612,8 +612,8 @@ fails and the URL would otherwise be unknowable. It also means no
 launch, and reports if the launch failed. One fewer knob (principle 2), and
 section 6's verification recipe stops depending on a flag that was never defined.
 The cost, named rather than discovered: under a systemd user unit the URL lands
-in the journal. A 60-second single-use token on a process-private loopback
-address is an acceptable thing to have in a log; a password would not be, which
+in the journal. A single-use token that rotates on redemption, on a
+process-private loopback address, is an acceptable thing to have in a log; a password would not be, which
 is why section 3.3 reads that from stdin instead.
 
 **Redemption.** `POST /auth/launch` with the token exchanges it for the session
@@ -2599,7 +2599,7 @@ one only with a written reason.
 | **`auto` tags in old sidecars are dropped, not folded into `user::`** | machine output silently promoted to user intent |
 | **Machine-local state follows XDG**, with a `--data-dir` override | the exe-relative state directory, which makes `/usr/bin` installation impossible |
 | **Portable install is given up** | a capability deliberately built, incompatible with being packaged |
-| **A loopback client holds a process-lifetime session, not a device row**; token redeemed at `/auth/launch`, 60 s, single use | ambient authority on `127.0.0.1`, or a pairing flow where none is wanted |
+| **A loopback client holds a process-lifetime session, not a device row**; token redeemed at `/auth/launch`, single use, rotated on redemption | ambient authority on `127.0.0.1`, or a pairing flow where none is wanted |
 | **`Origin` on loopback, `Sec-Fetch-Site: same-origin` on `--serve`** | a `0.0.0.0` bind has no fixed origin to name, which is why CORS is `Any` today |
 | **Under `--serve`, nothing is `Owner`**; the host is administered by CLI and `server.toml` | a web UI that can move files on the server |
 | **One process per gallery**, enforced by an advisory lock on the cache directory | two writers on one `cache.db` behind an in-process mutex |
