@@ -445,11 +445,12 @@ not:
   it indexed anything, and emits the `resync` event section 3.11 specifies with
   `tags` as its domain.**
 - **Cadence.** A full walk over a spun-down array every few minutes is what keeps
-  the disks from ever sleeping. So `lightview tag` writes
-  `<gallery>/.lightview/index-epoch` as its last act — a counter, disposable by
-  construction, carrying no intent — and the idle cycle stats that one file and
-  sweeps only when it changes. A full sweep on a long cadence (hourly) catches
-  `rsync` and Samba drops that do not write it.
+  the disks from ever sleeping, so the fallback sweep runs **hourly**, and that is
+  the whole cadence rule. An earlier draft had `lightview tag` write a
+  `.lightview/index-epoch` stamp so the sweep could run cheaply and often; once
+  the watcher's companion branch became the primary path, the stamp's only job
+  was making a fallback faster, and a file in the durable tree with an open
+  number of writers is not worth that. Deleted.
 
 **One instance per role, still.** A machine that serves its own gallery and also
 tags a remote one runs `--serve` and `lightview tag` as separate processes, which
@@ -472,8 +473,39 @@ every run would re-read the EXIF header of every photo that has no GPS, because 
 `NULL` never becomes non-`NULL` for a file that has none.
 
 **A re-run skips a file whose companion already carries `tags.plugins[<name>]` at
-the manifest's current `version`.** A version bump therefore re-tags everything,
-which is what a version bump means; the same run twice is a no-op.
+the manifest's `version` or higher** — semver ordering, which every bundled
+manifest already uses. A version bump therefore re-tags everything, which is
+what a version bump means; the same run twice is a no-op; and *or higher* is
+what stops two machines with different tagger builds from ping-ponging a file
+between versions forever.
+
+#### Any number of tagging machines, with no coordination added
+
+There is one desktop today. The design must not lean on that, and the way it
+avoids leaning on it is one rule rather than a mechanism: **a decision about
+durable state is made from the durable file, under the lock, never from a
+derived index.** The index plans; the file decides.
+
+- `--filter` is resolved against the machine's own `tag_index`, which the index
+  pass refreshed from the companions at open. That is a *plan*: a list of files
+  worth looking at, possibly stale by the time the run reaches the end of it.
+- **Before tagging a file, and again before writing its result, the skip
+  predicate is re-evaluated against the companion itself**, under the
+  per-directory lock from section 3.7. The first check stops a machine tagging
+  what another finished since it planned; the second stops it *overwriting* a
+  newer result with an older one when both were tagging the same file at once.
+- What two overlapping runs can still cost is GPU time on the files they both
+  reached in the same window — inference happens outside the lock, as it must.
+  They cannot cost data: the write is serialized, versioned, and skipped if
+  something at least as new is already there. Reducing the wasted inference
+  would mean a claim written into the durable tree before tagging, which is the
+  broker section 3.1 deleted, wearing a companion's clothes. Not worth it for a
+  window that is one file wide per machine.
+- Everything else already holds for *N*: each machine's derived cache is
+  rebuilt from the companions it can see (exception 13), the per-directory lock
+  contends across machines through `smbd` (section 3.7), the trash reserves its
+  entry directory with an atomic `mkdir` that fails on collision
+  (section 3.4), and there is no shared file that only one writer may touch.
 
 **`--filter` is the whole query language of section 3.6**, so the subsets a run
 can name are the subsets a filter can name: untagged only
@@ -1251,9 +1283,12 @@ everything after it is the original path. There is no metadata file.
   the companion's destination, not just the media's.
 - **One delete is one directory**, which makes undoing an operation a natural
   unit. **Keep the `_<seq>` uniqueness suffix** on the timestamp segment
-  (`<epoch_ms>_<seq>/`, `commands/trash.rs:99-115`): an earlier draft dropped it,
-  and two deletes landing in the same millisecond would then merge into one
-  directory, silently breaking the invariant this bullet states.
+  (`<epoch_ms>_<seq>/`, `commands/trash.rs:99-115`): an earlier draft dropped it, and two deletes landing in the same millisecond
+  would then merge into one directory, silently breaking the invariant this
+  bullet states. The suffix is reserved by `create_dir` failing with
+  `AlreadyExists` and retrying — an atomic `mkdir`, which is why it also holds
+  for two *machines* trashing over the share in the same millisecond, with no
+  per-machine component in the name.
 - The companion sits alongside the media inside the trash, uniformly, whichever
   location it came from. **Media first, companion second** (`trash.rs:133-142`).
   Reversed, a crash between the two moves leaves the photo in the gallery with
@@ -2627,6 +2662,11 @@ browser is the *only* runtime.
 - the ownership probe: `--serve` refuses to start against a `companions/`
   directory it cannot write into, and the message names the owner and the two
   share configurations that fix it
+- **two concurrent `lightview tag` runs on one gallery** — a second machine is
+  simulated with `--data-dir`, which gives it its own cache, lock and index. End
+  state: every file carries the plugin bucket at the *highest* version either
+  run offered, none carries a lower one, and a run with an older manifest
+  against a newer bucket writes nothing
 
 **Both binds must be exercised, and the loopback one is the least-reviewed
 surface in this document.** Section 6's browser recipe pairs a device and drives
@@ -2718,6 +2758,7 @@ one only with a written reason.
 | **`devices.db` has its own read-only pool** | auth queuing behind a pairing write on every thumbnail request |
 | **Two path types, `RelPath` and `GalleryPath`**; only the second can open a file | one type with two constructors, which cannot tell the compiler which check ran |
 | **The launch token rotates on redemption and lives in `instance.json`**; no TTL | a re-mint channel nobody specified, or a token that expires before a cold browser starts |
+| **A decision about durable state is made from the file under the lock, never from an index**; the skip predicate is *version or higher*, re-checked before tagging and before writing | a design that is correct for exactly one tagging machine, and two builds of a tagger ping-ponging a file between versions |
 | **`tag` refuses a gallery that is open locally**, and runs the index pass only — never enrichment | the desktop's cold run rewriting every geotagged companion over the mount |
 | **On mirrored companion fields the companion wins** when present | the first fresh cache stamping its `now` onto every file's `date_added` |
 | **Companion `index_state` keys on `(mtime_nanos, size)`** | a concurrent sweep skipping a rewritten file forever |
