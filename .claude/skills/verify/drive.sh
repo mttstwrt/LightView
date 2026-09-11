@@ -198,6 +198,67 @@ check "a revoked device is 401" \
 
 kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
 
+
+# ---------------------------------------------------------------------------
+echo "== plugins and tagging =="
+
+# Install the bundled example into this run's state directory. That is the
+# whole install procedure: a directory whose name matches its manifest's.
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+# `--data-dir <root>` maps the three XDG roots to `<root>/{cache,data,config}`,
+# so the install root is `<root>/data/plugins`.
+mkdir -p "$D/data/plugins"
+cp -r "$REPO/plugins/example-auto-tagger" "$D/data/plugins/"
+
+# A gallery with a clip in it, so a video's companion has to gain a *merged*
+# tag entry rather than being silently skipped — the failure this codebase
+# shipped for a year.
+T="$WORK/tagged"
+mkdir -p "$T"
+ffmpeg -y -v error -f lavfi -i testsrc=size=320x240:duration=1 -frames:v 1 "$T/still.png" 2>/dev/null
+ffmpeg -y -v error -f lavfi -i "testsrc=size=320x240:duration=3:rate=10" -c:v libx264 -pix_fmt yuv420p "$T/clip.mp4" 2>/dev/null
+
+"$BIN" tag "$T" --plugin example-auto-tagger --data-dir "$D" > "$WORK/tag.log" 2>"$WORK/tag.err"
+TAG_RC=$?
+check "lightview tag exits 0" "$TAG_RC" "0"
+grep -q "tagged 2" "$WORK/tag.log" && ok "tag reported both files" || bad "tag said: $(cat "$WORK/tag.log")"
+
+STILL="$T/.lightview/companions/still.png.lightview.json"
+CLIP="$T/.lightview/companions/clip.mp4.lightview.json"
+jq -e '.tags.plugins.example.tags | index("example")' "$STILL" >/dev/null \
+  && ok "the still's companion carries the plugin bucket" || bad "still: $(cat "$STILL" 2>&1 | head -c 200)"
+jq -e '.tags.plugins.example.tags | index("example")' "$CLIP" >/dev/null \
+  && ok "the clip's companion carries a merged tag entry" || bad "clip: $(cat "$CLIP" 2>&1 | head -c 200)"
+jq -e '.tags.plugins.example.version == "1.0.0"' "$CLIP" >/dev/null \
+  && ok "the bucket records the version the skip predicate reads" || bad "no version on the clip"
+
+# A second run is a no-op at the same version — the resumability story, and
+# what makes re-running after an upload cheap.
+"$BIN" tag "$T" --plugin example-auto-tagger --data-dir "$D" > "$WORK/tag2.log" 2>/dev/null
+grep -q "tagged 0, skipped 2" "$WORK/tag2.log" \
+  && ok "a second run at the same version skips everything" || bad "rerun said: $(cat "$WORK/tag2.log")"
+
+# A version bump re-tags. This is the whole reason the predicate is
+# "version or higher" rather than "has this plugin's bucket".
+sed -i 's/"version": "1.0.0"/"version": "2.0.0"/' "$D/data/plugins/example-auto-tagger/manifest.json"
+"$BIN" tag "$T" --plugin example-auto-tagger --data-dir "$D" > "$WORK/tag3.log" 2>/dev/null
+grep -q "tagged 2" "$WORK/tag3.log" \
+  && ok "a manifest version bump re-tags the gallery" || bad "bumped run said: $(cat "$WORK/tag3.log")"
+jq -e '.tags.plugins.example.version == "2.0.0"' "$CLIP" >/dev/null \
+  && ok "the bucket now records the new version" || bad "version did not move"
+
+# A filter scopes the run.
+sed -i 's/"version": "2.0.0"/"version": "3.0.0"/' "$D/data/plugins/example-auto-tagger/manifest.json"
+"$BIN" tag "$T" --plugin example-auto-tagger --filter 'type:video' --data-dir "$D" > "$WORK/tag4.log" 2>/dev/null
+grep -q "tagged 1" "$WORK/tag4.log" \
+  && ok "--filter scopes the run to what it matches" || bad "filtered run said: $(cat "$WORK/tag4.log")"
+
+# A name that is a path selects nothing, because there is no join to abuse.
+"$BIN" tag "$T" --plugin /tmp/evil --data-dir "$D" >/dev/null 2>&1
+check "a plugin name that is a path is refused" "$?" "1"
+"$BIN" tag "$T" --plugin ../example-auto-tagger --data-dir "$D" >/dev/null 2>&1
+check "a plugin name with .. is refused" "$?" "1"
+
 echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" = "0" ] || { echo "--- open.err ---"; tail -20 "$WORK/open.err"; echo "--- serve.err ---"; tail -20 "$WORK/serve.err"; }

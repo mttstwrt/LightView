@@ -14,4 +14,7 @@
 //! against what the scan found, so a name that is not one of those selects
 //! nothing.
 
+pub mod input;
 pub mod manifest;
+pub mod run;
+pub mod runner;

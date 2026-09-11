@@ -366,6 +366,44 @@ pub async fn reindex_companions(gallery: &Gallery) -> Result<usize, OpenError> {
     Ok(count)
 }
 
+/// How often the companion sweep runs.
+///
+/// The watcher is the primary path and this is the backstop, so an hour is
+/// about how long a tag written somewhere `inotify` cannot see may take to
+/// appear. That case is real: the watcher sees writes arriving at the server's
+/// own disk — `smbd` is an ordinary local process, and inotify watches inodes —
+/// but a *client-side* mount is invisible to it, and so is a gallery on a
+/// filesystem that does not report events at all.
+const COMPANION_SWEEP: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Re-index companions on a wall clock, for as long as the gallery is open.
+///
+/// **Deliberately not folded into the idle worker**, which skips its units
+/// whenever somebody is touching the grid. That is right for thumbnail
+/// backfill, which competes for the same pool the user is waiting on, and wrong
+/// here: a companion `lightview tag` wrote over the share has to appear whether
+/// or not anyone is looking, and a busy gallery is exactly when somebody is.
+/// The sweep's own two-phase split is what keeps it from blocking the grid —
+/// it walks, stats and reads with no database handle at all.
+pub fn spawn_companion_sweep(gallery: Arc<Gallery>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(COMPANION_SWEEP).await;
+            match reindex_companions(&gallery).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    log::info!("companion sweep re-indexed {n} file(s)");
+                    gallery.refresh_autocomplete().await;
+                    // `tags`, not `items`: the vocabulary moved and so did what
+                    // a tag filter matches, but no file appeared or vanished.
+                    gallery.events.send(Event::TagsIndexed);
+                }
+                Err(e) => log::warn!("companion sweep failed: {e}"),
+            }
+        }
+    })
+}
+
 /// Write `date_added` / `last_viewed` back into sidecars that lack them.
 async fn complete_companions(gallery: &Gallery, owed: Vec<(RelPath, meta::MirrorResult)>) {
     if owed.is_empty() {

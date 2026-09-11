@@ -34,6 +34,11 @@ pub enum MediaError {
 }
 
 /// What the grid asks for.
+///
+/// `Default` matches what the `serde` defaults produce for an empty request —
+/// the whole gallery, newest first, ungrouped — so a caller that only wants a
+/// filter (`lightview tag --filter`) need not restate a sort it does not care
+/// about, and cannot drift from the wire defaults by restating it differently.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemsRequest {
     #[serde(default = "default_sort")]
@@ -49,6 +54,19 @@ pub struct ItemsRequest {
     pub filter: String,
     #[serde(default = "default_group")]
     pub group_by: GroupBy,
+}
+
+impl Default for ItemsRequest {
+    fn default() -> Self {
+        Self {
+            sort: default_sort(),
+            order: default_order(),
+            sub_sort: None,
+            sub_order: None,
+            filter: String::new(),
+            group_by: default_group(),
+        }
+    }
 }
 
 fn default_sort() -> SortField {

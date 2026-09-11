@@ -398,6 +398,68 @@ pub async fn dispatch(
             Ok(json!(listed))
         }
 
+        "run_plugin" => {
+            // `Device`, and it simply reports "no plugins installed" under
+            // `--serve` — plugins live beside the viewer, so there is nothing
+            // to refuse there, only nothing to run.
+            require(state, Trust::Device)?;
+            let a: RunPluginArgs = parse(args)?;
+            let root = state.dirs.plugins();
+            let name = a.plugin.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                crate::plugin::manifest::find(&root, &name)
+            })
+            .await
+            .map_err(failed)?;
+            let Some(plugin) = found else {
+                return Err(CommandError::BadArguments(format!(
+                    "no plugin named {:?} is installed",
+                    a.plugin
+                )));
+            };
+
+            // **The paths are intersected with the index**, so a request
+            // cannot point a plugin at an arbitrary host file: `RelPath`
+            // confines them to the gallery, and this confines them further to
+            // files that actually exist in it.
+            let known: std::collections::HashSet<crate::path::RelPath> = {
+                let conn = gallery.db.read().await;
+                crate::cache::meta::all_paths(&conn)
+                    .map_err(failed)?
+                    .into_iter()
+                    .collect()
+            };
+            let paths: Vec<crate::path::RelPath> =
+                a.paths.into_iter().filter(|p| known.contains(p)).collect();
+
+            // Started, not awaited: a run over a thousand files outlives any
+            // request, and progress is the event stream's job. The terminal
+            // `job-finished` is what a client waits on.
+            let gallery = gallery.clone();
+            tokio::spawn(async move {
+                let label = plugin.manifest.name.clone();
+                let progress = gallery.clone();
+                let reporting = label.clone();
+                let outcome = crate::plugin::run::run(&gallery, &plugin, &paths, move |done, total| {
+                    progress
+                        .events
+                        .job_progress(&reporting, done as u32, total as u32);
+                })
+                .await;
+                let error = match outcome {
+                    Ok(report) if report.failed > 0 => {
+                        Some(format!("{} file(s) could not be tagged", report.failed))
+                    }
+                    Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                };
+                gallery
+                    .events
+                    .send(crate::server::events::Event::JobFinished { plugin: label, error });
+            });
+            Ok(json!({ "started": true }))
+        }
+
         "list_dirs" => {
             require(state, Trust::Owner)?;
             let a: DirsArgs = parse(args)?;
@@ -490,6 +552,12 @@ struct TagMerge {
 struct TagDelete {
     tag: String,
     namespace: WritableNamespace,
+}
+
+#[derive(Deserialize)]
+struct RunPluginArgs {
+    plugin: String,
+    paths: Vec<RelPath>,
 }
 
 #[derive(Deserialize)]

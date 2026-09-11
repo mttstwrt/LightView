@@ -74,10 +74,7 @@ async fn dispatch(invocation: Invocation) -> Result<std::process::ExitCode, Stri
             port,
             tls_sans,
         } => serve(&dirs, &dir, port, tls_sans).await,
-        Command::Tag { .. } => Err(
-            "`lightview tag` is not built yet — it lands with the plugin executor it drives"
-                .to_string(),
-        ),
+        Command::Tag { dir, plugin, filter } => tag(&dirs, &dir, &plugin, filter.as_deref()).await,
         Command::Pair => pair(&dirs).await,
         Command::Devices => list_devices(&dirs).await,
         Command::RevokeDevice { id } => revoke_device(&dirs, &id).await,
@@ -213,6 +210,125 @@ async fn serve(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// `lightview tag <dir> --plugin <name> [--filter <expr>]`.
+///
+/// **This is why there is no `--remote` mode and no worker binary.** The
+/// problem it solves is real: the server is an N100 that cannot run the models
+/// and the desktop has the GPU. An earlier design answered it with a
+/// distributed job broker — a worker registry with liveness TTLs,
+/// announce/claim/update/complete/fail, job pinning, two staleness clocks, a
+/// credential file, a pairing verb and a certificate pin — all of it to move
+/// bytes and results between two machines over HTTP.
+///
+/// The desktop can mount the gallery. So it does not need a protocol, it needs
+/// a path: this opens the gallery the way every other mode does, runs the
+/// plugin locally and writes companions. The server's own watcher picks them
+/// up, because a write arriving over the share is `smbd` writing to the local
+/// disk and `inotify` watches inodes.
+///
+/// It takes the cache lock like any other mode, so it cannot run against a
+/// gallery this machine is already serving — the lock is what stops two
+/// processes writing one derived cache, and a tagging run is exactly the case
+/// that would.
+async fn tag(
+    dirs: &Dirs,
+    dir: &Path,
+    plugin_name: &str,
+    filter: Option<&str>,
+) -> Result<std::process::ExitCode, String> {
+    let root = Root::open(dir).map_err(|_| format!("no such directory: {}", dir.display()))?;
+    let plugins_dir = dirs.plugins();
+    let Some(plugin) = crate::plugin::manifest::find(&plugins_dir, plugin_name) else {
+        return Err(format!(
+            "no plugin named {plugin_name:?} under {}",
+            plugins_dir.display()
+        ));
+    };
+
+    let cache_dir = dirs.gallery_cache(root.as_path());
+    let db = match CacheDb::open_at(&cache_dir) {
+        Ok(db) => Arc::new(db),
+        Err(CacheError::AlreadyOpen) => {
+            return Err(
+                "this gallery is open in another LightView process; close it and try again"
+                    .to_string(),
+            )
+        }
+        Err(e) => return Err(format!("could not open the gallery cache: {e}")),
+    };
+
+    let config = load_config(dirs)?;
+    let gallery = build_gallery(root, db, cache_dir, dirs, &config)?;
+
+    // The index is what `--filter` runs against and what decides which files
+    // exist, so the scan is not optional — and the desktop builds its own
+    // derived cache for the gallery on this first run, which is what makes
+    // subsequent runs read cached tiers locally.
+    eprintln!("lightview: indexing…");
+    gallery_service::scan_and_index(&gallery)
+        .await
+        .map_err(|e| format!("could not scan the gallery: {e}"))?;
+    gallery.refresh_autocomplete().await;
+
+    let paths = select_paths(&gallery, filter).await?;
+    if paths.is_empty() {
+        eprintln!("lightview: nothing matched");
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    eprintln!(
+        "lightview: {} over {} file{}",
+        plugin.manifest.display_name,
+        paths.len(),
+        if paths.len() == 1 { "" } else { "s" }
+    );
+
+    // The progress sink, and the only thing that differs from the UI's run.
+    // One line, rewritten in place, and only when the count actually moves —
+    // a run redirected to a log should not produce one line per file.
+    let mut last = 0usize;
+    let report = crate::plugin::run::run(&gallery, &plugin, &paths, |done, total| {
+        if done == last {
+            return;
+        }
+        last = done;
+        eprint!("\rlightview: {done} / {total}");
+        let _ = std::io::stderr().flush();
+    })
+    .await
+    .map_err(|e| format!("\n{e}"))?;
+    eprintln!();
+
+    println!(
+        "tagged {}, skipped {}, failed {}",
+        report.tagged, report.skipped, report.failed
+    );
+    Ok(if report.failed > 0 {
+        std::process::ExitCode::from(1)
+    } else {
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+/// What a tagging run covers: everything, or everything a filter matches.
+///
+/// Through `get_items` rather than a second query path, so `--filter` means
+/// exactly what the same expression means in the filter bar — including its
+/// ordering, which decides which files a cancelled run got to.
+async fn select_paths(
+    gallery: &Arc<Gallery>,
+    filter: Option<&str>,
+) -> Result<Vec<crate::path::RelPath>, String> {
+    let request = crate::services::media::ItemsRequest {
+        filter: filter.unwrap_or("").to_string(),
+        ..Default::default()
+    };
+    let items = crate::services::media::get_items(gallery, &request)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(items.items.into_iter().map(|i| i.path).collect())
+}
+
 /// Everything the two serving modes do identically: scan, arm, open the gate,
 /// then enrich in the background.
 async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), String> {
@@ -272,6 +388,8 @@ async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), Stri
         }
     });
     crate::pipeline::idle::spawn(gallery.thumbs.clone());
+    // The backstop for companions written where the watcher cannot see them.
+    gallery_service::spawn_companion_sweep(gallery.clone());
     Ok(())
 }
 

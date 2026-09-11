@@ -55,6 +55,14 @@ for (let i = 0; i < 12; i++) {
 }
 ok("gallery built (12 files)");
 
+// Install the bundled example tagger into this run's state directory, so the
+// plugin path is exercised from the UI as well as from `lightview tag`.
+// `--data-dir <root>` maps the three XDG roots to `<root>/{cache,data,config}`.
+const installRoot = join(state, "data", "plugins");
+execFileSync("mkdir", ["-p", installRoot]);
+execFileSync("cp", ["-r", join(repo, "plugins", "example-auto-tagger"), installRoot]);
+ok("example tagger installed");
+
 // ---------------------------------------------------------------------------
 
 const server = spawn(BIN, [gallery, "--data-dir", state], { stdio: ["ignore", "pipe", "pipe"] });
@@ -166,6 +174,38 @@ try {
     check(`settings has a ${section} section`, (await page.locator(`text=${section}`).count()) > 0);
   }
   await page.keyboard.press("Escape");
+
+  // A plugin run, started from the UI and watched to completion.
+  //
+  // The acceptance criterion for the executor from this side: the panel lists
+  // what is installed, Run starts an in-process job, and the run reports itself
+  // finished through the same event stream everything else uses.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  await page.locator("button[title='Actions']").click();
+  await page.locator("text=Auto-tagging").click();
+  await page.waitForSelector("text=Example Auto-Tagger", { timeout: 10_000 });
+  ok("the auto-tag panel lists the installed plugin");
+
+  await page.locator("button", { hasText: /^Run$/ }).first().click();
+  // The toast appears while the run is live and goes when it finishes. Either
+  // edge is proof it ran; waiting for the *tags* is proof it worked.
+  await page.waitForFunction(
+    async () => {
+      const r = await fetch("/api/invoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          command: "get_items",
+          args: { filter: "has::plugin.example" },
+        }),
+      });
+      if (!r.ok) return false;
+      return (await r.json()).items.length >= 12;
+    },
+    { timeout: 60_000 },
+  );
+  ok("the run tagged every file, and the index sees the new namespace");
 
   // A phone-width viewport, which is the layout most likely to break silently.
   await page.setViewportSize({ width: 390, height: 844 });
