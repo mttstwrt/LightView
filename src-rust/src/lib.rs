@@ -16,6 +16,7 @@
 
 pub mod autocomplete;
 pub mod cache;
+pub mod cli;
 pub mod companion;
 pub mod file_clipboard;
 pub mod filter;

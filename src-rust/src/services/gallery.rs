@@ -60,7 +60,7 @@ use crate::cache::{db, index, meta};
 use crate::companion::reader::{self, CompanionLocation};
 use crate::companion::schema::{CompanionFile, MediaType, PluginTagEntry};
 use crate::companion::writer::{modify_companion, Outcome};
-use crate::path::RelPath;
+use crate::path::{RelPath, Root};
 use crate::provider::local::LocalProvider;
 use crate::server::events::Event;
 use crate::services::settings::GallerySettings;
@@ -421,6 +421,107 @@ pub async fn index_one(gallery: &Gallery, path: &RelPath) -> Result<(), OpenErro
     Ok(())
 }
 
+/// Check that this process can replace companions another machine wrote.
+///
+/// **A UID question the design cannot answer and must not assume.** A companion
+/// the desktop writes over the share is created on disk by `smbd` as whatever
+/// user the share maps the client to; a companion the server writes is created
+/// as the container's user. Each side then has to *replace* the other's work:
+/// rename over a companion, open `.lock` for writing to take the `fcntl` lock,
+/// and on the `cifs` fallback path unlink a target. Rename and unlink need
+/// write permission on the **directory**; the write lock needs it on the **lock
+/// file**. With Samba's default `create mask = 0744` and two different UIDs
+/// every one of those fails — in both directions, silently on the desktop and
+/// as a logged error on the server — for every directory the other side touched
+/// first. A phone could not rate a photo the desktop had tagged.
+///
+/// Two configurations pass, and which one applies is a fact about `smb.conf`
+/// rather than about this design, so `--serve` checks rather than trusting
+/// either. Cheap, once, and it turns a silent write failure discovered weeks
+/// later into a message at the moment the deployment is being set up.
+///
+/// The desktop side needs no probe: its first `lightview tag` run fails loudly
+/// on the first companion it cannot replace, which is the same information a
+/// run later.
+pub fn probe_write_access(root: &Root) -> Result<(), String> {
+    let lightview = root.as_path().join(".lightview");
+    std::fs::create_dir_all(&lightview)
+        .map_err(|e| refusal(&lightview, &format!("could not be created: {e}")))?;
+    probe_directory(&lightview)?;
+
+    // One existing companions/ directory this process does not own is the
+    // interesting case; a tree where every directory is ours proves nothing
+    // about the other writer.
+    let Some(foreign) = foreign_companions_dir(root) else {
+        return Ok(());
+    };
+    probe_directory(&foreign)?;
+
+    // And the lock file specifically, which needs write permission on the file
+    // rather than on the directory.
+    let lock = foreign.join(".lock");
+    if lock.exists() {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .map_err(|e| refusal(&lock, &format!("could not be opened for writing: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Create and remove a file in `dir`, which is what rename and unlink need.
+fn probe_directory(dir: &Path) -> Result<(), String> {
+    let probe = dir.join(format!(".lv-probe-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&probe, b"")
+        .map_err(|e| refusal(dir, &format!("is not writable by this process: {e}")))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// The first `companions/` directory owned by somebody else.
+fn foreign_companions_dir(root: &Root) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let me = unsafe { libc::geteuid() };
+    for entry in walkdir::WalkDir::new(root.as_path())
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_dir() && e.file_name() == "companions")
+    {
+        if entry.metadata().map(|m| m.uid()).ok() != Some(me) {
+            return Some(entry.path().to_path_buf());
+        }
+    }
+    None
+}
+
+/// The refusal message: what, who owns it, and the two lines that fix it.
+fn refusal(path: &Path, problem: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(path)
+        .map(|m| format!("uid {}", m.uid()))
+        .unwrap_or_else(|_| "an unknown user".to_string());
+    let me = unsafe { libc::geteuid() };
+
+    format!(
+        "Refusing to serve: {} {problem}\n\
+         \n\
+         It is owned by {owner}; this process runs as uid {me}. Both writers have to \n\
+         be able to replace each other's companion files, or a phone will not be able \n\
+         to rate a photo the desktop tagged — silently on the desktop, and as a logged \n\
+         error here.\n\
+         \n\
+         Two Samba configurations fix it:\n\
+         \n\
+         1. Connect as the account this process runs as, so there is one UID by \n\
+            construction. Add `force user = <that account>` to the share if it has \n\
+            more than one login.\n\
+         2. For a share that must stay multi-user: `force group`, `create mask = 0664` \n\
+            and `directory mask = 0775` on the share, and a matching umask here.",
+        path.display()
+    )
+}
+
 /// Why the watcher stopped. Both are fatal for a serving process.
 #[derive(Debug)]
 pub enum WatcherExit {
@@ -430,18 +531,25 @@ pub enum WatcherExit {
     WatcherFailed(String),
 }
 
-/// Arm the watcher and run its loop until the root vanishes.
+/// Arm the watcher.
 ///
-/// Returns the reason it stopped. The caller exits non-zero naming it: a
-/// serving process can do nothing useful without its gallery, an unmount under
-/// it is an operator event, and re-arming in place would be a second lifecycle
-/// to get right.
-pub async fn watch(gallery: Arc<Gallery>) -> WatcherExit {
-    let watcher = match crate::util::fs_watch::FsWatcher::new(gallery.root.as_path(), true) {
-        Ok(w) => w,
-        Err(e) => return WatcherExit::WatcherFailed(e.to_string()),
-    };
+/// Fails only if `notify` itself cannot start; the caller exits non-zero.
+pub fn arm(gallery: &Gallery) -> Result<crate::util::fs_watch::FsWatcher, WatcherExit> {
+    crate::util::fs_watch::FsWatcher::new(gallery.root.as_path(), true)
+        .map_err(|e| WatcherExit::WatcherFailed(e.to_string()))
+}
 
+/// Run the watcher loop over an already-armed watcher.
+///
+/// Arming is separate from running because **the readiness gate must not open
+/// until the watcher is listening**. A file arriving between "the gallery is
+/// set" and "the watcher is armed" is in neither the completed scan nor the
+/// watcher, and nothing ever notices it; with the two steps fused, that window
+/// is the entire initial scan.
+pub async fn watch(
+    gallery: Arc<Gallery>,
+    watcher: crate::util::fs_watch::FsWatcher,
+) -> WatcherExit {
     let mut added: HashSet<RelPath> = HashSet::new();
     let mut removed: HashSet<RelPath> = HashSet::new();
     let mut companions: HashSet<RelPath> = HashSet::new();
@@ -793,7 +901,6 @@ mod tests {
     fn test_gallery(root: &Path) -> Gallery {
         use crate::autocomplete::engine::AutocompleteEngine;
         use crate::cache::db::CacheDb;
-        use crate::path::Root;
         use crate::pipeline::serve::ThumbService;
         use crate::server::events::Events;
 
