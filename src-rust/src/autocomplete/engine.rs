@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 /// it. Defined here rather than in `cache` because a pure library must not
 /// learn about the services above it — the aggregate query produces this shape,
 /// it does not own it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TagCount {
     pub namespace: String,
     pub tag: String,
@@ -173,6 +173,27 @@ impl AutocompleteEngine {
         });
         results.truncate(limit);
         results
+    }
+
+    /// Every tag in one namespace, most-used first then alphabetical.
+    ///
+    /// The tag manager's list, answered from the same in-memory vocabulary the
+    /// filter bar queries rather than from a `SELECT`: it is already grouped
+    /// and counted, and it is refreshed at exactly the moments a tag edit
+    /// would make it stale.
+    pub async fn list(&self, namespace: &str) -> Vec<TagCount> {
+        let tags = self.tags.read().await;
+        let mut out: Vec<TagCount> = tags
+            .iter()
+            .filter(|e| e.namespace == namespace)
+            .map(|e| TagCount {
+                namespace: e.namespace.clone(),
+                tag: e.tag.clone(),
+                count: e.count,
+            })
+            .collect();
+        out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tag.cmp(&b.tag)));
+        out
     }
 
     /// Get the total number of unique tags in the cache.

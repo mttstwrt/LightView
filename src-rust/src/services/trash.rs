@@ -251,8 +251,18 @@ pub fn auto_purge(gallery: &Root, retention_secs: i64) -> Result<usize, TrashErr
     if retention_secs <= 0 {
         return Ok(0);
     }
+    purge_older_than(gallery, (now_secs() - retention_secs) * 1000)
+}
+
+/// Empty the trash: every entry, whatever its age. **`Owner` only** — this is
+/// the one place a person can destroy what the retention window was still
+/// holding for them.
+pub fn purge_all(gallery: &Root) -> Result<usize, TrashError> {
+    purge_older_than(gallery, i64::MAX)
+}
+
+fn purge_older_than(gallery: &Root, cutoff_ms: i64) -> Result<usize, TrashError> {
     let trash = gallery.as_path().join(TRASH_DIR);
-    let cutoff_ms = (now_secs() - retention_secs) * 1000;
     let mut removed = 0;
 
     let entries = match std::fs::read_dir(&trash) {
@@ -488,6 +498,18 @@ mod tests {
         move_to_trash(&root, &[RelPath::new("2026/january/a.jpg").unwrap()]).unwrap();
         assert_eq!(auto_purge(&root, 0).unwrap(), 0);
         assert_eq!(list(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn emptying_the_trash_takes_entries_the_retention_window_still_holds() {
+        let (_d, root) = gallery();
+        move_to_trash(&root, &[RelPath::new("2026/january/a.jpg").unwrap()]).unwrap();
+
+        // A generous window keeps it; emptying deliberately does not care —
+        // that difference is the whole reason the command exists.
+        assert_eq!(auto_purge(&root, 365 * 24 * 3600).unwrap(), 0);
+        assert_eq!(purge_all(&root).unwrap(), 1);
+        assert!(list(&root).unwrap().is_empty());
     }
 
     #[test]

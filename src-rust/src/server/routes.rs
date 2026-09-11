@@ -439,7 +439,9 @@ async fn dirs(
 
 #[derive(Deserialize)]
 struct DirsQuery {
-    path: std::path::PathBuf,
+    /// Absent means "the gallery root", the same as the command it dispatches
+    /// to — so `curl .../api/dirs` with no query is a working first call.
+    path: Option<std::path::PathBuf>,
 }
 
 // ---------------------------------------------------------------------------

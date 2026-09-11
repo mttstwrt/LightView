@@ -24,6 +24,7 @@ pub mod geocode;
 pub mod hardware;
 pub mod path;
 pub mod pipeline;
+pub mod plugin;
 pub mod provider;
 pub mod server;
 pub mod services;

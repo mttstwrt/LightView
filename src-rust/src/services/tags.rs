@@ -25,6 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::autocomplete::engine::TagCount;
 use crate::cache::{index, meta};
 use crate::companion::schema::{CompanionFile, CoreMeta, MediaType};
 use crate::companion::writer::{modify_companion, Outcome, WriteError};
@@ -175,44 +176,46 @@ pub async fn delete(
     remove(gallery, &members, std::slice::from_ref(&tag.to_string()), namespace).await
 }
 
-/// Set or clear a rating, mirroring it into the indexed column.
+/// Set or clear a rating over a selection, mirroring it into the indexed column.
 pub async fn set_rating(
     gallery: &Gallery,
-    path: &RelPath,
+    paths: &[RelPath],
     rating: Option<u8>,
 ) -> Result<(), TagError> {
-    write_core(gallery, path, move |core| {
-        core.rating = rating;
-        core.date_rated = Some(chrono::Utc::now().to_rfc3339());
-    })
-    .await?;
+    for path in paths {
+        write_core(gallery, path, move |core| {
+            core.rating = rating;
+            core.date_rated = Some(chrono::Utc::now().to_rfc3339());
+        })
+        .await?;
 
-    let conn = gallery.db.writer().await;
-    meta::set_rating(&conn, path, rating)?;
-    drop(conn);
-    gallery.events.send(Event::ItemChanged { path: path.clone() });
+        let conn = gallery.db.writer().await;
+        meta::set_rating(&conn, path, rating)?;
+    }
+    gallery.events.send(Event::ItemsChanged { paths: paths.to_vec() });
     Ok(())
 }
 
-/// Set or clear a colour label.
+/// Set or clear a colour label over a selection.
 pub async fn set_color_label(
     gallery: &Gallery,
-    path: &RelPath,
+    paths: &[RelPath],
     label: Option<String>,
 ) -> Result<(), TagError> {
     let normalized = label
         .map(|l| l.trim().to_lowercase())
         .filter(|l| !l.is_empty());
-    let stored = normalized.clone();
-    write_core(gallery, path, move |core| {
-        core.color_label = stored.clone();
-    })
-    .await?;
+    for path in paths {
+        let stored = normalized.clone();
+        write_core(gallery, path, move |core| {
+            core.color_label = stored.clone();
+        })
+        .await?;
 
-    let conn = gallery.db.writer().await;
-    meta::set_color_label(&conn, path, normalized.as_deref())?;
-    drop(conn);
-    gallery.events.send(Event::ItemChanged { path: path.clone() });
+        let conn = gallery.db.writer().await;
+        meta::set_color_label(&conn, path, normalized.as_deref())?;
+    }
+    gallery.events.send(Event::ItemsChanged { paths: paths.to_vec() });
     Ok(())
 }
 
@@ -228,7 +231,9 @@ pub async fn set_notes(
         core.notes = notes.clone();
     })
     .await?;
-    gallery.events.send(Event::ItemChanged { path: path.clone() });
+    gallery
+        .events
+        .send(Event::ItemsChanged { paths: vec![path.clone()] });
     Ok(())
 }
 
@@ -259,7 +264,7 @@ async fn edit(
     namespace: WritableNamespace,
     edit: impl Fn(&mut Vec<String>) -> bool + Send + Sync + 'static + Clone,
 ) -> Result<usize, TagError> {
-    let mut changed = 0;
+    let mut touched = Vec::new();
     for path in paths {
         let absolute = gallery.root.resolve(path)?;
         let edit = edit.clone();
@@ -281,14 +286,17 @@ async fn edit(
         if !updated {
             continue;
         }
-        changed += 1;
+        touched.push(path.clone());
         reindex(gallery, path).await?;
     }
 
-    if changed > 0 {
+    if !touched.is_empty() {
         gallery.refresh_autocomplete().await;
+        let changed = touched.len();
+        gallery.events.send(Event::ItemsChanged { paths: touched });
+        return Ok(changed);
     }
-    Ok(changed)
+    Ok(0)
 }
 
 /// Mutate `meta.core`, creating it if absent.
@@ -339,8 +347,38 @@ async fn reindex(gallery: &Gallery, path: &RelPath) -> Result<(), TagError> {
         index::set_state(&conn, path, state)?;
     }
     drop(conn);
-    gallery.events.send(Event::ItemChanged { path: path.clone() });
     Ok(())
+}
+
+/// Every tag in a writable namespace, with how many files carry it.
+pub async fn list(gallery: &Gallery, namespace: WritableNamespace) -> Vec<TagCount> {
+    gallery.autocomplete.list(namespace.as_str()).await
+}
+
+/// A sample of the files a tag selection covers, for the manager to show
+/// before a gallery-wide rewrite.
+///
+/// Capped rather than complete: a tag covering the whole library would
+/// otherwise pull tens of thousands of paths back to fill a preview strip.
+pub async fn paths_with_tags(
+    gallery: &Gallery,
+    tags: &[String],
+    namespace: WritableNamespace,
+    limit: usize,
+) -> Result<Vec<RelPath>, TagError> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tag in tags {
+        for path in members_of(gallery, tag, namespace).await? {
+            if out.len() >= limit {
+                return Ok(out);
+            }
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Every file carrying `tag` in `namespace`, from the index.

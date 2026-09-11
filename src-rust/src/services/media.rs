@@ -187,6 +187,30 @@ pub async fn get_media_meta(
     }))
 }
 
+/// Every copy in a duplicate group, for the merge dialog to resolve.
+///
+/// Deliberately the same [`MediaMeta`] the info panel reads rather than a
+/// second shape: a merge candidate is a row plus its tags and notes, which is
+/// exactly that. What it adds is one round trip for the whole group instead of
+/// one per copy.
+///
+/// There is no separate "EXIF location" beside the companion's. The companion's
+/// coordinates are mirrored over the indexed ones at index time, so a file has
+/// one effective location and the dialog chooses between the distinct locations
+/// *across copies* — which is the choice a person was actually making.
+pub async fn merge_candidates(
+    gallery: &Gallery,
+    paths: &[RelPath],
+) -> Result<Vec<MediaMeta>, MediaError> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        if let Some(meta) = get_media_meta(gallery, path).await? {
+            out.push(meta);
+        }
+    }
+    Ok(out)
+}
+
 /// Which tiers are cached for one file, and how big each is.
 #[derive(Debug, Serialize)]
 pub struct TierPresence {

@@ -1,0 +1,172 @@
+@import "tailwindcss";
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: var(--bg-color, #0a0a0a);
+  color: #e5e5e5;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  /* iOS Safari: no system callout/preview on long-press — the app has its own
+     long-press → context menu gesture (grid cells and the viewer). Inherits. */
+  -webkit-touch-callout: none;
+  scroll-behavior: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* iOS Safari auto-zooms when a focused form control has a font-size below 16px
+   — and it does this even when the viewport is pinned at maximum-scale=1. The
+   only reliable defeat is a 16px minimum on the control itself. Scope it to
+   touch devices so the desktop web client keeps its intended input sizing
+   (WebKitGTK/Tauri never does this focus-zoom, so desktop is unaffected). */
+@media (hover: none) and (pointer: coarse) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
+/* Map view marker styling. Leaflet injects these via divIcon HTML so the
+   classes need to be globally available rather than scoped/Tailwind-only. */
+@keyframes lv-marker-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.lv-marker {
+  width: 100%;
+  height: 100%;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  background: #1a1a1a;
+  cursor: pointer;
+  position: relative;
+  transition: transform 120ms ease-out;
+  /* Pair with the JS-side opacity-0 fade on the outgoing layer to crossfade
+     between cluster LODs when zoom/filter changes the marker set. */
+  animation: lv-marker-fade-in 250ms ease-out;
+}
+.lv-marker:hover {
+  transform: scale(1.08);
+  z-index: 1000;
+}
+.lv-marker img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.lv-marker-cluster {
+  border-color: #14b8a6;
+}
+.lv-marker-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: #14b8a6;
+  color: #0a0a0a;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+/* Leaflet attribution text needs to be readable on the dark theme. */
+.leaflet-container .leaflet-control-attribution {
+  background: rgba(10, 10, 10, 0.75) !important;
+  color: #a3a3a3 !important;
+  font-size: 10px !important;
+}
+.leaflet-container .leaflet-control-attribution a {
+  color: #14b8a6 !important;
+}
+
+/* Hide native scrollbar — replaced by custom ScrollBar component */
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* Utility for elements that need hidden native scrollbar */
+.hide-scrollbar {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE/Edge */
+}
+.hide-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* Thin scrollbar for the duplicates panel */
+.dupes-scroll {
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: rgba(255,255,255,0.15) transparent;
+}
+.dupes-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.dupes-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.dupes-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.15);
+  border-radius: 3px;
+}
+.dupes-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.25);
+}
+
+/* Full-screen overlays: keep their content clear of the notch, the home
+   indicator and the rounded corners.
+
+   Padding rather than a smaller box, deliberately. Padding sits inside the
+   background box, so the overlay still paints edge to edge — inset the element
+   itself instead and the gallery shows through the strip behind the status bar.
+
+   Without this a panel header's close button renders *under* the phone's
+   forehead: visible, but every tap there goes to the system rather than the
+   page, so the panel looks unclosable. Left/right matter in landscape, where
+   the notch takes a side.
+
+   For edge-to-edge overlays only. It sets all four paddings outright, so it
+   would silently drop a `p-*` utility on the same element — the centered
+   dialogs keep their own padding instead, which is already wider than any
+   inset. */
+.safe-panel {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+/* Inset box-shadow (not outline) so it doesn't collide with the inline
+   `outline` that ThumbnailCell sets for selection. */
+.thumb-cell:hover {
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.7);
+}
+
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.12; }
+}
+
+.skeleton-pulse {
+  background: #2a2a2a;
+  animation: skeleton-pulse 1.8s ease-in-out infinite;
+}

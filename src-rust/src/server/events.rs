@@ -64,8 +64,15 @@ pub enum Event {
         added: Vec<RelPath>,
         removed: Vec<RelPath>,
     },
-    /// One file's metadata changed — a rating, a colour label, a tag write.
-    ItemChanged { path: RelPath },
+    /// Files' metadata changed — a rating, a colour label, a tag write.
+    ///
+    /// **Plural, and emitted once per operation rather than once per file.**
+    /// Every write in the system takes a selection: tagging 500 photos, or
+    /// rating them, used to be 500 events, and a client that splices one row
+    /// per event answers them with 500 `get_media_meta` calls. One event
+    /// carrying the whole list lets a receiver decide — splice one row, or
+    /// re-fetch once — which is the same reasoning as [`Event::FsChanged`].
+    ItemsChanged { paths: Vec<RelPath> },
     /// Tags were re-indexed from companions; the vocabulary may have moved.
     TagsIndexed,
     /// A plugin run advanced. Throttled; see [`Events::job_progress`].
@@ -86,7 +93,7 @@ impl Event {
     /// `Resync` payload without the receiver having to guess.
     pub fn domain(&self) -> Domain {
         match self {
-            Event::FsChanged { .. } | Event::ItemChanged { .. } => Domain::Items,
+            Event::FsChanged { .. } | Event::ItemsChanged { .. } => Domain::Items,
             Event::TagsIndexed => Domain::Tags,
             Event::JobProgress { .. } | Event::JobFinished { .. } => Domain::Jobs,
             // A resync that is itself lagged is still a resync.
@@ -229,7 +236,7 @@ mod tests {
             Event::FsChanged { added: vec![p.clone()], removed: vec![] }.domain(),
             Domain::Items
         );
-        assert_eq!(Event::ItemChanged { path: p }.domain(), Domain::Items);
+        assert_eq!(Event::ItemsChanged { paths: vec![p] }.domain(), Domain::Items);
         assert_eq!(Event::TagsIndexed.domain(), Domain::Tags);
         assert_eq!(
             Event::JobFinished { plugin: "x".into(), error: None }.domain(),

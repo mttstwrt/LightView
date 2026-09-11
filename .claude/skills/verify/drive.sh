@@ -76,8 +76,9 @@ CAPS=$(inv get_capabilities)
 echo "$CAPS" | jq -e '.trust == "owner"' >/dev/null && ok "capabilities report owner" || bad "caps: $CAPS"
 
 # The Owner half: the picker.
-DIRS=$(inv list_dirs "{\"path\":\"$G\"}")
-echo "$DIRS" | jq -e 'map(.name) | index("2026")' >/dev/null && ok "list_dirs works on a loopback bind" || bad "dirs: $DIRS"
+DIRS=$(inv list_dirs)
+echo "$DIRS" | jq -e '[.entries[].name] | index("2026")' >/dev/null && ok "list_dirs defaults to the gallery root" || bad "dirs: $DIRS"
+echo "$DIRS" | jq -e '.parent != null' >/dev/null && ok "the listing carries its parent, so the picker walks up" || bad "no parent: $DIRS"
 
 for tier in js j jm jh; do
   ct=$(curl -s -b "$J" -o "$WORK/t.webp" -w '%{content_type}' "$BASE/thumb/$tier/tall.png")
@@ -92,8 +93,21 @@ ETAG=$(curl -s -b "$J" -D - -o /dev/null "$BASE/thumb/j/tall.png" | grep -i '^et
 check "a matching ETag is 304" "$(code -b "$J" -H "if-none-match: $ETAG" "$BASE/thumb/j/tall.png")" "304"
 
 check "a range request is 206" "$(code -b "$J" -H 'range: bytes=0-9' "$BASE/media/tall.png")" "206"
-check "a traversal is 404" "$(code -b "$J" "$BASE/media/../../../../etc/passwd")" "404"
-check "an unbuilt SPA is a loud 404 at /" "$(code -b "$J" "$BASE/")" "404"
+# `--path-as-is` is load-bearing: without it curl collapses the `..` segments
+# itself and sends `GET /etc/passwd`, which never reaches the media route at
+# all — so the check passed for years while testing nothing. Both spellings are
+# here because they fail differently: the raw one is rejected by `RelPath`, the
+# encoded one by axum before routing.
+check "a raw traversal is 404" \
+  "$(code -b "$J" --path-as-is "$BASE/media/../../../../etc/passwd")" "404"
+check "an encoded traversal is 404" \
+  "$(code -b "$J" "$BASE/media/..%2f..%2f..%2f..%2fetc%2fpasswd")" "404"
+grep -q "root:" "$WORK/body" && bad "a traversal returned /etc/passwd" || ok "no host file came back"
+
+# The SPA is embedded in the binary, so `/` serves the real app.
+check "the SPA is served at /" "$(code -b "$J" "$BASE/")" "200"
+grep -q '<div id="root">' "$WORK/body" && ok "/ is the built SPA, not a placeholder" || bad "/ served: $(head -c 120 "$WORK/body")"
+check "an unknown route falls back to the SPA" "$(code -b "$J" "$BASE/pair")" "200"
 
 # The video decoder, with ffmpeg present.
 curl -s -b "$J" -o "$WORK/clip.webp" "$BASE/thumb/j/clip.mp4"
@@ -164,7 +178,7 @@ sinv get_items | jq -e '.items | length >= 3' >/dev/null && ok "a paired phone s
 sinv get_capabilities | jq -e '.trust == "device" and .clipboard == false' >/dev/null \
   && ok "a phone is told it has no clipboard" || bad "served caps"
 
-for cmd in list_dirs copy_files purge_trash merge_duplicates get_recent_galleries; do
+for cmd in list_dirs copy_files purge_trash merge_duplicates; do
   st=$(curl -sk -b "$PJ" -o /dev/null -w '%{http_code}' -H 'content-type: application/json' \
        -H 'sec-fetch-site: same-origin' -d "{\"command\":\"$cmd\",\"args\":{\"path\":\"/tmp\"}}" \
        https://127.0.0.1:18443/api/invoke)

@@ -117,7 +117,6 @@ async fn open(dirs: &Dirs, dir: &Path) -> Result<std::process::ExitCode, String>
     let url = format!("{}/?t={}", state.origin, launch.token());
     Instance::write(&cache_dir, &url)
         .map_err(|e| format!("could not write instance.json: {e}"))?;
-    let _ = crate::services::files::Recent::record(&dirs.recent_json(), root_path(&gallery));
 
     start(&state, &gallery).await?;
 
@@ -307,10 +306,6 @@ fn build_gallery(
         settings: std::sync::RwLock::new(settings),
         cache_dir,
     }))
-}
-
-fn root_path(gallery: &Gallery) -> &Path {
-    gallery.root.as_path()
 }
 
 // ---------------------------------------------------------------------------

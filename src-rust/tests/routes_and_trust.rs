@@ -259,7 +259,6 @@ async fn an_owner_command_is_refused_on_a_served_bind() {
         "open_with",
         "purge_trash",
         "merge_duplicates",
-        "get_recent_galleries",
     ] {
         let request = Harness::with_cookie(
             h.invoke(command, serde_json::json!({ "path": "/tmp" })),

@@ -149,6 +149,19 @@ pub struct DirEntry {
     pub path: PathBuf,
 }
 
+/// One level of the picker: where it is, where "up" goes, and what is here.
+///
+/// The parent travels with the listing because the client must not compute it
+/// — a browser doing its own string surgery on a path is how a picker ends up
+/// asking for something that is not a directory, and the answer is one field.
+#[derive(Debug, Serialize)]
+pub struct DirListing {
+    pub path: PathBuf,
+    /// `None` at the filesystem root.
+    pub parent: Option<PathBuf>,
+    pub entries: Vec<DirEntry>,
+}
+
 /// List the subdirectories of a path. **`Owner` only.**
 ///
 /// Returns directory names and nothing else — never media, never file
@@ -161,9 +174,13 @@ pub struct DirEntry {
 /// Access API yields a handle, not a path, and only in Chromium. The
 /// alternative was `rfd`, which links GTK or a desktop portal on a process that
 /// may have no display.
-pub fn list_dirs(path: &Path) -> Result<Vec<DirEntry>, FileError> {
+pub fn list_dirs(path: &Path) -> Result<DirListing, FileError> {
+    // Canonicalized so the listing is in the same terms the next request will
+    // be, and so `..` and symlinks do not accumulate in the path the picker
+    // displays.
+    let path = path.canonicalize()?;
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(path)? {
+    for entry in std::fs::read_dir(&path)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -178,45 +195,13 @@ pub fn list_dirs(path: &Path) -> Result<Vec<DirEntry>, FileError> {
         });
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    Ok(out)
+    Ok(DirListing {
+        parent: path.parent().map(std::path::Path::to_path_buf),
+        path,
+        entries: out,
+    })
 }
 
-/// Recently opened galleries, for the opener. Local mode only.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Recent {
-    #[serde(default)]
-    pub galleries: Vec<PathBuf>,
-}
-
-impl Recent {
-    const LIMIT: usize = 12;
-
-    pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
-    }
-
-    /// Move `gallery` to the front, bounded.
-    pub fn record(path: &Path, gallery: &Path) -> std::io::Result<Self> {
-        let mut recent = Self::load(path);
-        recent.galleries.retain(|g| g != gallery);
-        recent.galleries.insert(0, gallery.to_path_buf());
-        recent.galleries.truncate(Self::LIMIT);
-        let body = serde_json::to_vec_pretty(&recent)?;
-        crate::util::fs_atomic::write_durable(path, &body)?;
-        Ok(recent)
-    }
-
-    pub fn remove(path: &Path, gallery: &Path) -> std::io::Result<Self> {
-        let mut recent = Self::load(path);
-        recent.galleries.retain(|g| g != gallery);
-        let body = serde_json::to_vec_pretty(&recent)?;
-        crate::util::fs_atomic::write_durable(path, &body)?;
-        Ok(recent)
-    }
-}
 
 /// `name`, or `name (2)`, `name (3)`… if taken.
 ///
@@ -278,12 +263,15 @@ mod tests {
         std::fs::create_dir_all(d.path().join(".hidden")).unwrap();
         std::fs::write(d.path().join("photo.jpg"), b"x").unwrap();
 
-        let listed: Vec<String> = list_dirs(d.path())
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
+        let listing = list_dirs(d.path()).unwrap();
+        let listed: Vec<String> = listing.entries.into_iter().map(|e| e.name).collect();
         assert_eq!(listed, vec!["2026"]);
+        // The parent travels with the listing so the picker never does its own
+        // string surgery on a path to walk up.
+        assert_eq!(
+            listing.parent.as_deref(),
+            d.path().canonicalize().unwrap().parent()
+        );
     }
 
     #[test]
@@ -302,30 +290,4 @@ mod tests {
         assert!(one.get(1).is_none());
     }
 
-    #[test]
-    fn recent_galleries_are_bounded_and_most_recent_first() {
-        let d = tempfile::tempdir().unwrap();
-        let store = d.path().join("recent.json");
-        for i in 0..(Recent::LIMIT + 5) {
-            Recent::record(&store, Path::new(&format!("/g/{i}"))).unwrap();
-        }
-        let recent = Recent::load(&store);
-        assert_eq!(recent.galleries.len(), Recent::LIMIT);
-        assert_eq!(
-            recent.galleries[0],
-            PathBuf::from(format!("/g/{}", Recent::LIMIT + 4))
-        );
-
-        // Re-recording moves rather than duplicates.
-        Recent::record(&store, Path::new("/g/0")).unwrap();
-        let recent = Recent::load(&store);
-        assert_eq!(recent.galleries[0], PathBuf::from("/g/0"));
-        assert_eq!(
-            recent.galleries.iter().filter(|g| *g == Path::new("/g/0")).count(),
-            1
-        );
-
-        Recent::remove(&store, Path::new("/g/0")).unwrap();
-        assert!(!Recent::load(&store).galleries.contains(&PathBuf::from("/g/0")));
-    }
 }

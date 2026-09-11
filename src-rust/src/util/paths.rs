@@ -19,7 +19,7 @@
 //!                                   lock        the one-writer flock
 //!                                   instance.json  pid + live launch URL
 //!                                   last_opened    the cross-gallery LRU key
-//! $XDG_DATA_HOME/lightview/         tls/ devices.db recent.json plugins/<name>/
+//! $XDG_DATA_HOME/lightview/         tls/ devices.db plugins/<name>/
 //! $XDG_CONFIG_HOME/lightview/       server.toml
 //! ```
 //!
@@ -117,10 +117,6 @@ impl Dirs {
         self.data.join("devices.db")
     }
 
-    /// Recently opened galleries, for the opener. Local mode only.
-    pub fn recent_json(&self) -> PathBuf {
-        self.data.join("recent.json")
-    }
 
     /// `server.toml`, read at startup and on change.
     pub fn server_toml(&self) -> PathBuf {

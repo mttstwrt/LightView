@@ -119,6 +119,20 @@ pub async fn dispatch(
         }
 
         // ---- Writing metadata ----------------------------------------------
+        "list_tags" => {
+            require(state, Trust::Device)?;
+            let a: NamespaceArg = parse(args)?;
+            Ok(json!(tags::list(&gallery, a.namespace).await))
+        }
+        "paths_with_tags" => {
+            require(state, Trust::Device)?;
+            let a: PathsForTagsArgs = parse(args)?;
+            Ok(json!(
+                tags::paths_with_tags(&gallery, &a.tags, a.namespace, a.limit)
+                    .await
+                    .map_err(failed)?
+            ))
+        }
         "add_tags" => {
             require(state, Trust::Device)?;
             let a: TagWrite = parse(args)?;
@@ -162,7 +176,7 @@ pub async fn dispatch(
         "set_rating" => {
             require(state, Trust::Device)?;
             let a: RatingArgs = parse(args)?;
-            tags::set_rating(&gallery, &a.path, a.rating)
+            tags::set_rating(&gallery, &a.paths, a.rating)
                 .await
                 .map_err(failed)?;
             Ok(json!({ "ok": true }))
@@ -170,7 +184,7 @@ pub async fn dispatch(
         "set_color_label" => {
             require(state, Trust::Device)?;
             let a: ColorArgs = parse(args)?;
-            tags::set_color_label(&gallery, &a.path, a.color_label)
+            tags::set_color_label(&gallery, &a.paths, a.color_label)
                 .await
                 .map_err(failed)?;
             Ok(json!({ "ok": true }))
@@ -271,14 +285,16 @@ pub async fn dispatch(
                         .map_err(failed)?;
                     Ok(json!({ "purged": 1 }))
                 }
+                // No entry named: empty the trash. Not "purge what the
+                // retention window has expired" — that sweep runs once when
+                // the gallery opens and needs no command, and a button called
+                // Empty Trash that left last week's deletions in place would
+                // be lying about what it did.
                 None => {
-                    let retention = gallery.settings().trash_retention_secs();
-                    let n = tokio::task::spawn_blocking(move || {
-                        trash::auto_purge(&root, retention)
-                    })
-                    .await
-                    .map_err(failed)?
-                    .map_err(failed)?;
+                    let n = tokio::task::spawn_blocking(move || trash::purge_all(&root))
+                        .await
+                        .map_err(failed)?
+                        .map_err(failed)?;
                     Ok(json!({ "purged": n }))
                 }
             }
@@ -292,6 +308,15 @@ pub async fn dispatch(
                 .await
                 .map_err(failed)?;
             Ok(json!(groups))
+        }
+        "get_merge_candidates" => {
+            require(state, Trust::Device)?;
+            let a: PathsArg = parse(args)?;
+            Ok(json!(
+                media::merge_candidates(&gallery, &a.paths)
+                    .await
+                    .map_err(failed)?
+            ))
         }
         "merge_duplicates" => {
             // `Owner`: it rewrites a companion, stamps an mtime on disk and
@@ -353,21 +378,38 @@ pub async fn dispatch(
                 .map(|a| json!({ "label": a.label }))
                 .collect::<Vec<_>>()))
         }
+        // ---- Plugins ---------------------------------------------------------
+        "list_plugins" => {
+            // `Device`: a paired client may see what is installed, and under
+            // `--serve` the honest answer is an empty list — plugins live
+            // beside the viewer, and the server could not run the models
+            // anyway. Labels only; no command, path or argument crosses the
+            // wire in either direction.
+            require(state, Trust::Device)?;
+            let root = state.dirs.plugins();
+            let listed = tokio::task::spawn_blocking(move || {
+                crate::plugin::manifest::installed(&root)
+                    .iter()
+                    .map(crate::plugin::manifest::PluginInfo::from)
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(failed)?;
+            Ok(json!(listed))
+        }
+
         "list_dirs" => {
             require(state, Trust::Owner)?;
             let a: DirsArgs = parse(args)?;
-            Ok(json!(files::list_dirs(&a.path).map_err(failed)?))
-        }
-        "get_recent_galleries" => {
-            require(state, Trust::Owner)?;
-            Ok(json!(files::Recent::load(&state.dirs.recent_json())))
-        }
-        "remove_recent_gallery" => {
-            require(state, Trust::Owner)?;
-            let a: DirsArgs = parse(args)?;
-            Ok(json!(
-                files::Recent::remove(&state.dirs.recent_json(), &a.path).map_err(failed)?
-            ))
+            // No path means the gallery root: it is the one directory the
+            // server always has, and it is where a copy or move destination is
+            // usually picked from. The client walks up from there through the
+            // `parent` the listing carries, so it never has to know an
+            // absolute path to start.
+            let start = a
+                .path
+                .unwrap_or_else(|| gallery.root.as_path().to_path_buf());
+            Ok(json!(files::list_dirs(&start).map_err(failed)?))
         }
 
         other => Err(CommandError::UnknownCommand(other.to_string())),
@@ -451,14 +493,33 @@ struct TagDelete {
 }
 
 #[derive(Deserialize)]
+struct NamespaceArg {
+    namespace: WritableNamespace,
+}
+
+#[derive(Deserialize)]
+struct PathsForTagsArgs {
+    tags: Vec<String>,
+    namespace: WritableNamespace,
+    #[serde(default = "default_preview_limit")]
+    limit: usize,
+}
+
+fn default_preview_limit() -> usize {
+    120
+}
+
+#[derive(Deserialize)]
 struct RatingArgs {
-    path: RelPath,
+    /// A selection, because every write in the system takes one — rating one
+    /// photo is a selection of one.
+    paths: Vec<RelPath>,
     rating: Option<u8>,
 }
 
 #[derive(Deserialize)]
 struct ColorArgs {
-    path: RelPath,
+    paths: Vec<RelPath>,
     color_label: Option<String>,
 }
 
@@ -523,7 +584,9 @@ struct OpenWithArgs {
 
 #[derive(Deserialize)]
 struct DirsArgs {
-    path: std::path::PathBuf,
+    /// Absent means "the gallery root" — see the command arm.
+    #[serde(default)]
+    path: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]
