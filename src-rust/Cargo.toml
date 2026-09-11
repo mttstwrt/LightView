@@ -60,6 +60,9 @@ tower-http = { version = "0.6", features = ["trace"] }
 # folder must exist at compile time, which is why `dist/.gitkeep` is committed.
 rust-embed = { version = "8", features = ["mime-guess"] }
 tokio-util = { version = "0.7", features = ["io"] }
+# One macro, for the SSE relay: turning a broadcast receiver into a Stream by
+# hand is a hand-rolled poll_next with a pinned future inside it.
+async-stream = "0.3"
 argon2 = "0.5"
 rand = "0.8"
 # Three syscalls the standard library does not expose and the design requires:
@@ -81,6 +84,12 @@ opt-level = 2
 
 [dev-dependencies]
 tempfile = "3"
+# Drives the router directly in tests, with no socket and no HTTP client: axum's
+# Router is a tower Service, so `oneshot` exercises real routing, middleware and
+# extractors. A client crate would test the same paths more slowly and would
+# also be testing the client.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 incremental = false # Disable incremental builds for a "cleaner" optimization

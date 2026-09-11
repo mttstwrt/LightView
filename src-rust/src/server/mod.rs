@@ -7,6 +7,12 @@
 //! agree with it by hand.
 
 pub mod auth;
+pub mod commands;
 pub mod config;
 pub mod devices;
 pub mod events;
+pub mod listen;
+pub mod routes;
+pub mod tls;
+pub mod upload;
+pub mod web_assets;

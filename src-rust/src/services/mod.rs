@@ -9,7 +9,10 @@
 //! selection, plugin lifecycle — those are ~4,500 lines of domain code, not
 //! adapter code, and they live here.
 
+pub mod duplicates;
+pub mod files;
 pub mod gallery;
+pub mod media;
 pub mod settings;
 pub mod tags;
 pub mod trash;

@@ -63,6 +63,13 @@ pub struct ServerConfig {
     pub upload_dir: String,
     /// Cross-gallery derived-cache ceiling, in gigabytes.
     pub cache_ceiling_gb: u64,
+    /// Applications `open_with` may launch, by index.
+    ///
+    /// **Server-side configuration, never wire input.** The command that used
+    /// to take a program name and arguments straight off the wire and spawn
+    /// them is what turned every path finding in this system into code
+    /// execution; a request now carries an integer into this list.
+    pub external_apps: Vec<crate::services::files::ExternalApp>,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +83,7 @@ impl Default for ServerConfig {
             uploads_enabled: true,
             upload_dir: "Uploads".to_string(),
             cache_ceiling_gb: DEFAULT_CACHE_CEILING_GB,
+            external_apps: Vec::new(),
         }
     }
 }
