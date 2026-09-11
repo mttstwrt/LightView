@@ -123,6 +123,52 @@ pub fn prune_to_ceiling(
     Ok(report)
 }
 
+/// Per-tier byte budget for the two bounded tiers.
+///
+/// 10% of free disk, floored and capped, and **the floor respects free disk**.
+/// The computation this replaces was `share.clamp(floor, ceiling)`, which
+/// *raises* a near-zero share up to the 512 MiB floor — and with the 1.25x
+/// hysteresis each bounded tier could then reach 640 MiB before its first
+/// eviction. That is a guaranteed ~1.25 GiB of bounded tiers plus an unbounded
+/// `j`, per gallery, and this design **moves** all of it from the gallery's own
+/// filesystem — a NAS with terabytes — to `~/.cache` on the OS disk.
+///
+/// What a full disk looks like, because it is loud in the log and invisible in
+/// the UI: the tier write fails, the serve path logs a warning and returns a
+/// miss, the route answers 404, the browser caches nothing because the response
+/// is not `ok`, and the grid re-requests and re-decodes the same file on every
+/// scroll pass forever.
+pub fn tier_budget_bytes(cache_dir: &Path) -> i64 {
+    if let Some(mb) = std::env::var("LIGHTVIEW_TIER_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|mb| *mb > 0)
+    {
+        return mb * 1024 * 1024;
+    }
+
+    const FLOOR: i64 = 512 * 1024 * 1024;
+    const CEILING: i64 = 8 * 1024 * 1024 * 1024;
+    let free = free_bytes(cache_dir).unwrap_or(0) as i64;
+    let share = free / 10;
+    // min(FLOOR, free / 4) — never hand out half a gigabyte per tier on a disk
+    // that does not have it.
+    let floor = FLOOR.min(free / 4);
+    share.clamp(floor.max(0), CEILING)
+}
+
+/// Free bytes on the filesystem holding `path`.
+fn free_bytes(path: &Path) -> Option<u64> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        // The longest matching mount point is the filesystem the path is on.
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
 fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0;
     for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
@@ -237,6 +283,21 @@ mod tests {
 
         let report = prune_to_ceiling(root.path(), 1500, None).unwrap();
         assert_eq!(report.removed, vec![stray]);
+    }
+
+    #[test]
+    fn an_explicit_budget_overrides_the_disk_entirely() {
+        unsafe { std::env::set_var("LIGHTVIEW_TIER_BUDGET_MB", "7") };
+        assert_eq!(tier_budget_bytes(Path::new("/")), 7 * 1024 * 1024);
+        unsafe { std::env::remove_var("LIGHTVIEW_TIER_BUDGET_MB") };
+    }
+
+    #[test]
+    fn the_budget_is_bounded_and_non_negative() {
+        unsafe { std::env::remove_var("LIGHTVIEW_TIER_BUDGET_MB") };
+        let b = tier_budget_bytes(Path::new("/"));
+        assert!(b >= 0, "a negative budget would evict everything");
+        assert!(b <= 8 * 1024 * 1024 * 1024);
     }
 
     #[test]
