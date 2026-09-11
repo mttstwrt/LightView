@@ -13,3 +13,13 @@
 //!
 //! The rule that keeps the layering honest: `cache/` must not learn what a
 //! route is, and the pure libraries must not learn what application state is.
+
+pub mod autocomplete;
+pub mod companion;
+pub mod file_clipboard;
+pub mod filter;
+pub mod geocode;
+pub mod path;
+pub mod provider;
+pub mod sort;
+pub mod util;
