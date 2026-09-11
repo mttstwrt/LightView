@@ -408,11 +408,14 @@ one of those fails — in both directions, silently on the desktop and as a logg
 error on the server — for every directory the *other* side touched first. A phone
 could not rate a photo the desktop had tagged.
 
-Two configurations pass, and the deployment notes name both: **the share's
-`force user` is the container's user**, so there is one UID by construction; or
-**a shared group** with `force group`, `create mask = 0664` and
-`directory mask = 0775` on the share and a matching umask in the container. Which
-one this deployment uses is a fact about `smb.conf`, not about this design.
+Two configurations pass. **This deployment uses the first: the Samba login the
+desktop connects as is the same account the container runs as**, so there is one
+UID by construction and no `force user` is needed — the deployment notes state it
+as the default, with `force user = <that account>` as the line to add if the
+share ever gains a second login. The second, for a share that must stay
+multi-user, is **a shared group**: `force group`, `create mask = 0664` and
+`directory mask = 0775` on the share, and a matching umask in the container.
+Which one applies is a fact about `smb.conf`, not about this design.
 
 **So the server probes at open, rather than trusting either.** `lightview
 --serve` creates and removes a file in `.lightview/` and in one existing
