@@ -15,6 +15,7 @@
 //! route is, and the pure libraries must not learn what application state is.
 
 pub mod autocomplete;
+pub mod cache;
 pub mod companion;
 pub mod file_clipboard;
 pub mod filter;
