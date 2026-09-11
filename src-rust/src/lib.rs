@@ -24,5 +24,7 @@ pub mod hardware;
 pub mod path;
 pub mod pipeline;
 pub mod provider;
+pub mod server;
+pub mod services;
 pub mod sort;
 pub mod util;
