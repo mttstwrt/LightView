@@ -152,21 +152,19 @@ impl Events {
 /// events from subscription onward — a reconnecting phone re-fetches boot
 /// state rather than replaying history, which is what its `onopen` is for.
 pub async fn next_for_client(rx: &mut broadcast::Receiver<Event>) -> Option<Event> {
-    loop {
-        match rx.recv().await {
-            Ok(event) => return Some(event),
-            Err(broadcast::error::RecvError::Closed) => return None,
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                // We do not know *which* events were dropped, only how many, so
-                // the honest answer names every domain. That is the expensive
-                // answer, which is why the throttle above exists: the domain
-                // that produces enough traffic to cause lag is the one that
-                // does not need per-message delivery.
-                log::warn!("an SSE subscriber lagged by {skipped} events; sending a resync");
-                return Some(Event::Resync {
-                    domains: vec![Domain::Items, Domain::Tags, Domain::Jobs],
-                });
-            }
+    match rx.recv().await {
+        Ok(event) => Some(event),
+        Err(broadcast::error::RecvError::Closed) => None,
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            // We do not know *which* events were dropped, only how many, so the
+            // honest answer names every domain. That is the expensive answer,
+            // which is why the throttle above exists: the domain that produces
+            // enough traffic to cause lag is the one that does not need
+            // per-message delivery.
+            log::warn!("an SSE subscriber lagged by {skipped} events; sending a resync");
+            Some(Event::Resync {
+                domains: vec![Domain::Items, Domain::Tags, Domain::Jobs],
+            })
         }
     }
 }

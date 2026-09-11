@@ -6,5 +6,7 @@
 //! and with it the 78-command registration and the 46-arm allowlist that had to
 //! agree with it by hand.
 
+pub mod auth;
 pub mod config;
+pub mod devices;
 pub mod events;

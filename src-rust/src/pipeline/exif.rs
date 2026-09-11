@@ -54,6 +54,42 @@ fn parse_exif_datetime(text: &str) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(trimmed, "%Y:%m:%d %H:%M:%S").ok()
 }
 
+/// What one header read tells the index about a file.
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    /// Capture time as Unix seconds, from the EXIF block.
+    pub date_taken: Option<i64>,
+    pub location: Option<Location>,
+}
+
+/// Read both facts a still contributes, without decoding it.
+///
+/// Best-effort throughout: a file with no EXIF block, an unknown container, or
+/// an unreadable header all yield an empty [`Facts`] rather than an error. The
+/// caller's gate treats "don't know" as "nothing learned", which is what keeps
+/// a missing answer from being mistaken for a negative one.
+pub fn read(path: &Path) -> Facts {
+    // The EXIF block is at the head of every container this supports, so a
+    // bounded read is enough for the timestamp and avoids paging in a 50 MB
+    // raw file to find a date.
+    let head = read_head(path, 1 << 20);
+    Facts {
+        date_taken: head
+            .as_deref()
+            .and_then(capture_datetime_from_bytes)
+            .map(|d| d.and_utc().timestamp()),
+        location: extract_location(path),
+    }
+}
+
+fn read_head(path: &Path, limit: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(limit.min(1 << 16));
+    file.take(limit as u64).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
 /// Extract a GPS location from a still-image file's EXIF metadata.
 /// Returns `None` if the file has no EXIF block, no GPS fields, or
 /// the values fail to parse. Never errors — callers treat this as best-effort.

@@ -171,9 +171,11 @@ mod tests {
     fn round_trips_through_the_file() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("server.toml");
-        let mut c = ServerConfig::default();
-        c.password_hash = "$argon2id$v=19$m=19456,t=2,p=1$abc$def".into();
-        c.tls_sans = vec!["nas.local".into(), "192.168.1.10".into()];
+        let c = ServerConfig {
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$abc$def".into(),
+            tls_sans: vec!["nas.local".into(), "192.168.1.10".into()],
+            ..Default::default()
+        };
         c.save(&p).unwrap();
 
         let back = ServerConfig::load(&p).unwrap();

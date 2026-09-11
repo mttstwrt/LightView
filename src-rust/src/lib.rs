@@ -26,5 +26,6 @@ pub mod pipeline;
 pub mod provider;
 pub mod server;
 pub mod services;
+pub mod state;
 pub mod sort;
 pub mod util;
