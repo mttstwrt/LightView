@@ -4,56 +4,76 @@ The single guidance file for this repository. `CLAUDE.md` is a symlink to it —
 there is no second copy to drift.
 
 LightView is a local media gallery: it opens a folder of images and videos,
-indexes it into SQLite, generates thumbnails at several resolutions, and
-presents a browsable grid plus a full-resolution viewer. The same application
-serves that gallery to phones and laptops on the LAN. Rust backend, SolidJS
-frontend in a webview, three binaries out of one crate.
+indexes it into SQLite, generates thumbnails at four resolutions, and presents a
+browsable grid plus a full-resolution viewer. The same process serves that
+gallery to phones and laptops on the LAN. **One Rust binary, with a SolidJS
+bundle compiled into it.**
 
-**Stack:** Rust 2024 · Tauri 2 · rusqlite (bundled SQLite) · rayon · tokio ·
-wgpu · image · fast_image_resize · libheif-rs — and TypeScript · SolidJS ·
-Tailwind v4 · Vite 5.
+**Stack:** Rust 2024 · axum · rusqlite (bundled SQLite) · rayon · tokio · image ·
+fast_image_resize · libheif-rs — and TypeScript · SolidJS · Tailwind v4 · Vite 5.
 
-## Development Commands
-- **Full App (Dev):** `cargo tauri dev`
-- **Frontend Dev:** `npm run dev`
-- **Build (Production):** `npm run tauri build`
-- **Rust Checks:** `cargo check` (from `src-tauri/`)
-- **Rust Tests:** `cargo test` (use `-- --exact` for single tests)
-- **Benchmarks:** `cargo bench --bench <name>` (from `src-tauri/`) or `npm run bench` (frontend)
+## Layout
 
-## Quality & Verification
-- **Rust Linting:** `cargo clippy --all-targets --all-features` (clean of errors; ~60 style warnings remain)
-- **Frontend Types:** `npx tsc --noEmit`
-- **Note:** There is no `npm run lint` script.
-- **`cargo fmt --check` currently FAILS** on ~70 files — the tree has never been rustfmt-formatted. Do not run `cargo fmt` inside an unrelated change, and avoid `cargo clippy --fix` (its let-chain rewrites need a reformat you can't scope). See [`docs/build-and-verify.md`](docs/build-and-verify.md).
-- **Build prerequisites:** `cargo check` fails in a build script without GTK/WebKitGTK and `libheif >= 1.21` (Ubuntu 24.04 ships 1.17 — needs a source build), and every Rust target additionally needs `dist/` to exist (`npm run build`) — the SPA is embedded into the library, not just read by the `lightview` binary. Same doc.
+```
+src-rust/      the crate: one library, one binary
+src-solidjs/   the SPA, built into dist/ and embedded at compile time
+plugins/       the example tagger, and the protocol a plugin author reads
+docs/          how the system works, and why
+```
 
-## Deeper Reference
-[`docs/`](docs/README.md) — subsystem maps and cross-module invariants. Start at [`docs/architecture.md`](docs/architecture.md); each subsystem README states the invariants its callers must uphold, so read the one covering whatever you are about to change.
+## Development commands
 
-Driving the whole stack without a display — headless server, `curl` against every route, real SPA in headless Chromium — is [`docs/build-and-verify.md`](docs/build-and-verify.md). It is the only way to exercise the grid, which `tsc` cannot cover.
+- **Build:** `npm ci && npm run build` then
+  `cargo build --manifest-path src-rust/Cargo.toml`
+- **Frontend dev server:** `npm run dev`
+- **Rust checks:** `cargo check` / `cargo test` (from `src-rust/`; `-- --exact`
+  for a single test)
+- **Run it:** `lightview <dir>` prints a URL and opens a browser at it
 
-**A rebuild is planned, and the plan is written.**
-[`docs/_planning/rebuild/design.md`](docs/_planning/rebuild/design.md) is the
-single, self-sufficient plan — requirements, target architecture, the port
-table, construction order, and every decision already taken. It is written to be
-executed with no other context. Read it before designing anything large; most
-subsystems described elsewhere in `docs/` are slated to be replaced rather than
-extended.
-[`docs/refactor.md`](docs/refactor.md) is the argument behind it and the
-inventory of the system being replaced — useful background, not required to
-execute.
+## Quality and verification
 
-## Core Architecture
-- **Boundary:** Frontend calls Rust via `src-solidjs/lib/ipc.ts` (canonical IPC).
-- **Protocol:** Media/thumbnails are served via `lightview://` (custom URI protocol).
-- **State:** Global state is in `src-tauri/src/lib.rs` (`AppState`) via `tauri::State`.
-- **Lifecycle:** `commands/gallery.rs::open_gallery` manages provider registration, DB connection, and FS watching.
+- **Rust linting:** `cargo clippy --all-targets --all-features` — clean, and
+  expected to stay clean.
+- **Frontend types:** `npx tsc --noEmit` from `src-solidjs/` — clean. There is
+  no `npm run lint` script.
+- **`cargo fmt --check` FAILS** on most files — the tree has never been
+  rustfmt-formatted. Do not run `cargo fmt` inside an unrelated change, and
+  avoid `cargo clippy --fix` (its let-chain rewrites need a reformat you cannot
+  scope).
+- **`dist/` must exist before any `cargo` command.** Not just `build` — the SPA
+  is embedded into the *library*, so `check`, `test` and `clippy` fail without
+  it. This is the first thing to check when a fresh clone will not compile.
+- **`libheif` >= 1.21** is a build dependency and Ubuntu 24.04 ships 1.17, so a
+  Debian-family host needs a source build. `ffmpeg` is a runtime dependency for
+  video. See [`docs/build-and-verify.md`](docs/build-and-verify.md).
 
-## Critical Implementation Notes
-- **Cargo Features:** Default features include `gpu` and `custom-protocol`.
-- **Linux Stability:** `main.rs` sets `GDK_BACKEND=x11` and `WEBKIT_DISABLE_DMABUF_RENDERER=1` for WebKit stability.
-- **Performance:** `[profile.dev.package."*"] opt-level = 2` is intentional for image/DB workloads. Do not change.
+**Driving the whole stack without a display** is two scripts, and it is the only
+way to exercise the grid, which `tsc` cannot cover:
+
+```sh
+bash .claude/skills/verify/drive.sh    # the real binary, over curl
+node .claude/skills/verify/grid.mjs    # the built SPA, in headless Chromium
+```
+
+## Deeper reference
+
+[`docs/`](docs/README.md) — subsystem maps and cross-module invariants. Start at
+[`docs/architecture.md`](docs/architecture.md); each subsystem README states the
+invariants its callers must uphold, so read the one covering whatever you are
+about to change.
+
+## Things that are true and easy to get wrong
+
+- **Trust is a property of the bind, never of the peer.** `0.0.0.0` includes
+  `127.0.0.1`, so "is this peer local?" is the wrong question.
+- **A process has one gallery, bound at startup.** There is no command that
+  moves it to another folder.
+- **Paths on the wire are gallery-relative, percent-encoded per segment**, `/`
+  left literal.
+- **The cache is outside the gallery and fully derived.** A `format_version`
+  bump deletes and rebuilds it; that is the only migration mechanism.
+- **Companion sidecars are the only durable data.** Never write one outside
+  `modify_companion`, and never drop a field without keeping `extra`.
 
 ## Engineering Principles
 

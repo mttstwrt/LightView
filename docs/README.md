@@ -1,95 +1,59 @@
-# LightView documentation
+# LightView
 
-LightView is a local media gallery: it opens a folder of images and videos,
-indexes it into a per-gallery SQLite cache, generates thumbnails at several
-resolutions, and presents a browsable grid plus a full-resolution viewer. The
-same application can serve that gallery to phones and laptops on the LAN.
+A local media gallery. It opens a folder of images and videos, indexes it,
+generates thumbnails, and presents a browsable grid and a full-resolution
+viewer — to a browser on the same machine, or to phones and laptops on the LAN.
 
-These pages describe how the system works and why it is shaped the way it is.
-Per-file explanation lives in the module doc comments in the source; these
-pages describe subsystems, the contracts between them, and the reasoning that
-is not recoverable from reading any single file.
+One Rust binary, one SolidJS bundle compiled into it.
 
 ## Start here
 
-[`architecture.md`](architecture.md) is the map: the component inventory, how
-data flows through it, and which direction the dependencies point. Read it
-before the subsystem pages — they assume you know where they sit.
+**[architecture.md](architecture.md)** — the three modes, the trust model, the
+layers, and where a request and a file each go. Everything else is a subsystem
+underneath it.
 
-[`build-and-verify.md`](build-and-verify.md) is the practical companion: the
-system libraries a checkout needs before `cargo check` reaches any of our code,
-the current state of the quality gates, and how to drive the whole stack —
-server, web client, real browser — without a display.
+**[build-and-verify.md](build-and-verify.md)** — what to install, the build
+order that is not optional, and how to drive the whole stack with no display.
 
 ## Subsystems
 
-| Page | Responsibility |
-|---|---|
-| [`cache/`](cache/README.md) | The per-gallery SQLite database: schema, migrations, connection strategy, and what happens when the gallery moves. |
-| [`pipeline/`](pipeline/README.md) | Thumbnail generation and serving: the tier ladder, the four entry points, coalescing, and the disk budget. |
-| [`query/`](query/README.md) | Turning a filter string into a set of paths, then ordering and grouping them. Also tag autocomplete. |
-| [`companion/`](companion/README.md) | The `.lightview` sidecar files that hold user metadata, and their relationship to the cache index. |
-| [`geocode/`](geocode/README.md) | Turning cached GPS coordinates into the country, region, and city names people type into the filter bar. |
-| [`remote/`](remote/README.md) | The axum HTTP server, device pairing, TLS, and the `/api/invoke` allowlist that bounds what a remote client may do. |
-| [`plugins/`](plugins/README.md) | The subprocess/NDJSON plugin protocol, what it can and cannot express today, and the path to a real extension host. |
-| [`duplicates/`](duplicates/README.md) | Perceptual-hash duplicate detection and the metadata-preserving merge. |
-| [`frontend/`](frontend/README.md) | The SolidJS SPA: stores, the IPC boundary, and the desktop/web split. |
+Each page states what its subsystem is responsible for, what it deliberately is
+*not*, its public interface, what it depends on, what depends on it, and the
+invariants a caller has to uphold.
 
-Deeper topics that outgrew their subsystem page:
+- **[server/](server/README.md)** — the HTTP surface: routes, the two trust
+  levels, the one command table, the launch-token session, pairing, TLS, the
+  event stream, uploads.
+- **[storage/](storage/README.md)** — where everything lives and why: the
+  gallery tree, the XDG directories, the trash, the cache ceiling.
+- **[cache/](cache/README.md)** — SQLite: the schema, the four tier tables,
+  `format_version` instead of migrations, the path-keyed sweep.
+- **[pipeline/](pipeline/README.md)** — turning a file into bytes a browser can
+  show: one render path, four tiers, the coalescer, the byte budget, the idle
+  worker.
+- **[gallery/](gallery/README.md)** — how a new file becomes a grid cell: the
+  initial scan, the filesystem watcher, the enrichment pass.
+- **[companion/](companion/README.md)** — the sidecar files that hold tags,
+  ratings and notes, and how two machines write one directory safely.
+- **[query/](query/README.md)** — the filter language, sort, grouping,
+  autocomplete, and what a *set* is.
+- **[duplicates/](duplicates/README.md)** — perceptual hashing, grouping, and
+  merging a group onto one keeper.
+- **[plugins/](plugins/README.md)** — the tagging protocol and the executor that
+  speaks it. The author-facing version is [`plugins/README.md`](../plugins/README.md)
+  in the repository root.
+- **[geocode/](geocode/README.md)** — coordinates to place names.
+- **[frontend/](frontend/README.md)** — the SPA: boot, the stores, the grid, the
+  viewer, the chrome. Plus
+  **[grid-loading.md](frontend/grid-loading.md)** for how the grid decides what
+  to request and when.
 
-- [`pipeline/jpeg-decode.md`](pipeline/jpeg-decode.md) — where thumbnail
-  generation actually spends its time, and the options for making it faster.
-- [`remote/worker-tagging.md`](remote/worker-tagging.md) — the job queue and
-  worker protocol that let a capable machine run taggers for a weak server.
-- [`frontend/grid-loading.md`](frontend/grid-loading.md) — the machinery both
-  grids use to stream thumbnails into a virtual scroller.
-- [`frontend/chrome.md`](frontend/chrome.md) — the planned split between
-  commands and settings, and the space they compete for on a phone.
-- [`plugins/findings-and-ui.md`](plugins/findings-and-ui.md) — the plugins the
-  one-verb protocol cannot express (recognising faces, finding an image's
-  source), the three-shape contract they get, and the screens that resolve it.
+## Conventions
 
-## Decisions
+These pages describe **how the system works now, and why**. Anything that
+explains a single file lives in that file's module doc comment instead — if a
+page here restates code, it is drifting and should be deleted rather than
+maintained.
 
-[`decisions/`](decisions/) records choices that had real alternatives, one file
-per decision, numbered and append-only. A decision file is never edited after
-the fact; if a decision is reversed, a new file supersedes it. The subsystem
-pages describe what the system does today, and link to the decision when the
-answer to "why not the obvious thing?" is longer than a sentence.
-
-- [0001 — One SQLite cache per gallery, not one global index](decisions/0001-one-cache-per-gallery.md)
-- [0002 — Seven thumbnail tiers in two families](decisions/0002-two-families-of-thumbnail-tiers.md)
-- [0003 — Derive the schema version from the migration list](decisions/0003-derive-schema-version-from-migrations.md)
-- [0004 — Bound the zoom tiers by bytes, not rows](decisions/0004-byte-budgeted-lru-for-zoom-tiers.md)
-- [0005 — Remote command dispatch is an allowlist](decisions/0005-remote-invoke-is-an-allowlist.md)
-- [0006 — Plugins are subprocesses speaking NDJSON](decisions/0006-plugins-are-ndjson-subprocesses.md)
-- [0007 — Two nested render windows in the grids](decisions/0007-two-zone-render-window.md)
-- [0008 — No view-module API; enablement plus code-splitting instead](decisions/0008-no-view-module-api.md)
-- [0009 — Three kinds of chrome: commands, panels, and configuration](decisions/0009-commands-panels-and-configuration.md)
-- [0010 — Re-arm the thumbnail drain on completion, not widen it](decisions/0010-re-arm-the-drain-not-widen-it.md)
-- [0011 — Location names are companion tags, written by the host](decisions/0011-location-names-are-companion-tags.md)
-- [0012 — Plugins declare the host contract they were built for](decisions/0012-plugins-declare-the-contract-they-were-built-for.md)
-- [0013 — The host samples video frames; plugins only ever see stills](decisions/0013-the-host-samples-video-frames.md)
-- [0014 — Ship `lightview-worker` with the release](decisions/0014-ship-the-worker-with-the-release.md)
-- [0015 — Plugin UI is a fixed set of host-drawn shapes, not a declared layout](decisions/0015-plugin-ui-is-fixed-shapes-not-a-declared-layout.md)
-
-## Open work
-
-[`_planning/rebuild/design.md`](_planning/rebuild/design.md) is the approved-pending
-plan for the rebuild: a single self-sufficient document covering requirements,
-target architecture, what is ported versus written fresh, the order of
-construction, and the decisions already settled. It is what an implementer
-reads.
-
-[`refactor.md`](refactor.md) is **superseded by that plan** and kept for two
-things: Part 1 is a complete inventory of the system as it is today, which is
-still accurate, and Part 2 is the argument that produced the plan. Part 2 has not
-tracked the plan through three rounds of review and disagrees with it in a dozen
-places; its banner lists them. Where they differ, the plan is right.
-
-[`todo.md`](todo.md) is the running list of known gaps — things that are
-understood but not done. It is deliberately short; anything with enough shape
-to be designed belongs in a subsystem page instead. Items are grouped by the
-part of the system they touch and ordered *within* a group by the sequence they
-should be done in, with the reasoning for that sequence stated; the groups
-themselves are independent of one another.
+Prose over bullet fragments, relative links only, and every page links back
+here. An outdated page is a bug, fixed in the change that caused it.

@@ -1,212 +1,110 @@
-# The cache
+# cache/
 
-[← docs index](../README.md) · [architecture](../architecture.md)
+[← docs](../README.md)
 
-One SQLite file per gallery, at `<gallery>/.lightview/cache.db`. It is a
-*cache* in the sense that it can be deleted and rebuilt, but it also holds
-state that exists nowhere else until a companion file is written — ratings,
-view history, dedup decisions, device pairings — so "just delete it" is not
-free. Why per-gallery rather than one global index is
-[decision 0001](../decisions/0001-one-cache-per-gallery.md).
+**Responsible for** the derived SQLite database: the schema, the connections,
+the four thumbnail tier tables, the tag index, the perceptual hashes, and the
+maintenance that spans every table.
 
-**Responsible for:** the schema and its migrations; the connection strategy
-(one writer, a read-only pool); every SQL statement in the process; the tier
-tables and their byte budget; keeping the stored absolute paths valid when the
-gallery directory moves.
+**Not responsible for** deciding what belongs in it. It takes a connection or a
+struct and knows nothing about routes, application state or who asked — a rule
+the [layering](../architecture.md#the-layers-and-which-way-they-point) depends
+on.
 
-**Not responsible for:** deciding *what* to store. It does not generate
-thumbnails ([`pipeline/`](../pipeline/README.md)), parse filters
-([`query/`](../query/README.md)), or read companion files
-([`companion/`](../companion/README.md)) — it stores what those hand it. It
-also owns no policy about when to write: callers decide, and callers are
-responsible for not holding the writer lock while they do something slow.
+**Depends on** `rusqlite` and [`path/`](../architecture.md). **Depended on by**
+every service, [`pipeline/`](../pipeline/README.md), and the idle worker.
 
-**Public interface:** `CacheDb` (the writer), `ThumbProtocolPool` (declared in
-`lib.rs`, read-only), `cache::thumbnails::ThumbTier` and its `ALL`, and the
-per-area helper modules `index`, `counts`, `duplicates`, `gif_atlas`, and
-`coalescer`.
+## There are no migrations
 
-**Depends on:** `rusqlite` (bundled SQLite) and nothing else in the tree except
-the `MediaType` vocabulary from `companion/`.
+One `format_version` integer in `gallery_meta`. If it does not match the build's,
+the file is **deleted and re-indexed**.
 
-**Depended on by:** effectively everything —
-[`pipeline/`](../pipeline/README.md), [`query/`](../query/README.md),
-[`remote/`](../remote/README.md), [`duplicates/`](../duplicates/README.md), and
-every command handler.
+The database is fully derived from the photos and their companions, so migrating
+it would be permanent code that runs once — and the migration list this replaces
+had already drifted from its own derived version constant, which is the failure
+mode of the thing rather than an argument against it in principle.
 
-## Invariants callers must uphold
+The cost, stated because it is real: a schema mistake is not a patch later, it is
+a version bump that re-thumbnails every library. Two things make that survivable
+— it costs **time and nothing else**, because `date_added` and `last_viewed` are
+mirrored into the companion, so the two fields a rebuild could not otherwise
+recover come back from the sidecars.
 
-**Never hold the writer lock across an expensive non-DB operation.** The
-pattern throughout `commands/media.rs` is: do the work (decode, encode,
-`ffprobe`), *then* take the lock and commit. `generate_and_store_tier` spells
-this out for `ffprobe` specifically — running a subprocess under the lock kept
-every other DB user queued for hundreds of milliseconds per video.
+## The schema, and why the indexes are part of it
 
-**The thumbnail read path cannot write.** It goes through
-`AppState::thumb_protocol_db`, a pool of read-only connections. That is why LRU
-access marks are buffered in `AppState::pending_tier_accesses` instead of
-written through, and why `enforce_tier_budget` must drain them via
-`take_tier_accesses` *immediately before* the eviction pass. Reordering those
-two steps makes eviction drop exactly the rows the user is looking at.
+```
+gallery_meta   key/value — format_version lives here
+media_meta     path PK · type · size · mtime · dates · rating · dimensions
+               · duration · gps · colour label · thumbhash
+tag_index      (path, namespace, tag) PK
+index_state    path PK · companion_mtime_nanos · companion_size
+thumbs_js      path PK · bytes · dimensions            128px
+thumbs_j       path PK · bytes · dimensions · phash     512px
+thumbs_jm      path PK · bytes · dimensions            1280px
+thumbs_jh      path PK · bytes · dimensions            2560px
+```
 
-**Every path-keyed table must be swept together.** `cache::db::path_keyed_tables()`
-is the single source of truth, derived from `ThumbTier::ALL`. Any operation
-that removes or relocates a file — trash, fs-watch removal, stale-row pruning
-in `populate_media_meta`, `rebase_root` — iterates it. When a site spells the
-list out itself, the failure mode is a multi-megabyte blob keyed to a path that
-no longer exists and can never be reached again.
-`remove_media_rows_clears_every_path_keyed_table` guards this. `not_duplicates`
-is deliberately outside the list: its paths live in `path_a`/`path_b`, so
-callers handle it separately.
+The indexes are written in the schema rather than added afterwards as an
+optimization, because **the query language is shaped by them: a field is
+filterable only if it is indexed.** Naming them here is what stops them being
+discovered by a slow gallery.
 
-**Bulk callers use the batch forms**, `remove_media_rows_batch` and
-`rename_media_rows_batch`, and the reason is the connection rather than the SQL.
-Every path-keyed sweep is twelve statements, and outside a transaction each one
-auto-commits — so trashing a thousand-file selection was twelve thousand WAL
-commits with the gallery's single writer held for all of them. The batch forms
-open one transaction and iterate tables on the outside, so a statement is
-prepared once for the whole batch instead of once per file. A loop calling the
-single-path form is still correct; it is just the shape that made a large
-selection feel like a hang.
+Two placements worth their own sentence:
 
-**More than one statement means a transaction.** The point above is a specific
-case of the rule, and the rule is worth stating because nothing in the types
-enforces it: SQLite in autocommit mode commits *per statement*, so any function
-issuing a variable number of writes pays a WAL commit for each one while holding
-the writer. `reindex_tags_for_file` (one delete plus a row per tag, called in a
-loop by every tagging path) and `touch_accessed` (one update per buffered access
-mark, up to twenty thousand in a drained batch) both open their own. Where a
-caller has already opened one — `reindex_gallery` wraps its whole walk, the way
-`index_companions` always has — the inner attempt fails, because SQLite has no
-nested transactions, and the statements simply join the outer one. That is why
-those functions treat a failed `unchecked_transaction()` as "someone else owns
-the commit" rather than as an error.
+- **`thumbhash` is on `media_meta`, not on a tier.** It is ~25 bytes, and the
+  items query would otherwise walk a thumbnail row's overflow pages to reach it.
+- **`phash` is a column on `thumbs_j`**, so a perceptual hash is discarded and
+  recomputed along with the thumbnail it describes — exactly the lifetime it
+  should have.
 
-**Adding a tier is a schema change *and* a maintenance change.** Add the
-variant to `ThumbTier`, add it to `ThumbTier::ALL`, and add its `CREATE TABLE`
-migration. `ALL` then propagates it to `path_keyed_tables()`,
-`clear_thumbnails`, `get_all_tier_info`, and the per-file delete.
+### `index_state` stores nanoseconds, not seconds
+
+A gate that truncates to whole seconds and compares for equality was tolerable
+for one pass at open. It is not once the companion sweep runs concurrently with
+an hours-long stream of writes from another machine: a companion read at T.2 and
+rewritten at T.6 has the same second, is skipped forever, and both caches
+confidently disagree with the durable file in opposite directions. NFSv3+ and
+SMB2 both carry sub-second mtimes.
+
+## Every path-keyed table is swept together
+
+`path_keyed_tables()` is the single source of truth, and it is *derived* from
+`ThumbTier::ALL` rather than restating it. A test asserts it matches every table
+in the schema that actually has a `path` column, by reading `sqlite_master` and
+`pragma_table_info` — so adding a table and forgetting the sweep fails the build
+rather than leaking.
+
+What that prevents: a multi-megabyte blob keyed to a path nothing can reach
+again. Nothing sits outside the sweep — notably there is no `not_duplicates`
+table, because [a set does that job](../query/README.md#sets) and a set is a tag.
+
+A prune refuses to act on an empty scan of a populated gallery. An unreadable
+mount reports zero files, and "delete every row" is the wrong response to "I
+could not look".
 
 ## Connections
 
-Three kinds, deliberately:
+**One writer behind a `tokio::Mutex`**, because `rusqlite::Connection` is `Send`
+but not `Sync`, and a **read-only pool** (2–6) for the serve path. WAL with
+`synchronous = NORMAL`.
 
-| Handle | Where | Mode | Purpose |
-|---|---|---|---|
-| `AppState::cache_db` | `Arc<tokio::Mutex<Option<CacheDb>>>` | read/write | every command that writes |
-| `AppState::thumb_protocol_db` | `Arc<std::sync::RwLock<Option<Arc<ThumbProtocolPool>>>>` | read-only, N connections | the thumbnail serve hot path |
-| per-worker | `lightview-worker` | over HTTP | no direct DB access |
+The rule that matters more than the shape: **the writer is held for statements
+only.** Never across filesystem I/O, an image decode or encode, a subprocess, or
+a loop whose length scales with the library. Every one of those was a real hold
+in the code this replaces, and each of them blocked every thumbnail the grid was
+waiting on. Where a pass needs both — the companion sweep, the hashing loop —
+it splits in two: a phase that reads and decodes with no connection at all, and
+a phase that takes the writer once and runs batched statements.
 
-`CacheDb` uses a `Mutex` rather than an `RwLock` because `rusqlite::Connection`
-is `Send` but not `Sync`. The read-only pool exists because WAL mode allows
-many simultaneous readers but a single `Connection` behind a `Mutex`
-serializes them; the pool hands each request one of N (2–6, from
-`available_parallelism`) so grid reads fan out.
+## Invariants a caller must uphold
 
-The pool's connections **block WAL checkpointing**, which is why
-`close_gallery_impl` drops them *before* checkpointing the writer. That function
-is also the process's shutdown path — the desktop runs it on exit and
-`lightview-headless` on SIGTERM — because it is the only place the buffered
-tier-access marks get landed. See
-[`architecture.md`](../architecture.md#shutdown).
-
-### PRAGMA choices
-
-Both the writer and each pool connection set `journal_mode=WAL`,
-`temp_store=MEMORY` (keeps ORDER BY and IN-list temp B-trees out of a disk temp
-file), and `mmap_size=268435456` (thumbnail blobs come from a mapped page
-rather than `read()` plus a buffer copy — mmap is per-connection, hence the
-repetition). Cache size differs: 64 MB for the writer, 8 MB per pool connection
-since N of them exist and the OS page cache backs the WAL underneath.
-
-## The migration contract
-
-`SCHEMA_VERSION` is **derived** from `MIGRATIONS` by a `const fn`, not
-maintained by hand. It drifted once (the constant said 14 while a v15 migration
-existed), and the drift is silent in the dangerous direction — see below.
-
-To add a migration:
-
-1. Append a `Migration { version: N + 1, sql: "..." }` to `MIGRATIONS`. Versions
-   must be strictly increasing; `fresh_db_reaches_the_latest_migration` asserts
-   this, because `run_migrations` skips anything `<= version` and an
-   out-of-order entry would never run.
-2. **Make it idempotent.** `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT
-   EXISTS`, and `ALTER TABLE ... ADD COLUMN` (the loop tolerates "duplicate
-   column" so a crash mid-migration can be retried). `migrations_are_idempotent`
-   asserts a full re-run over a current database is a no-op.
-3. Statements are executed one at a time, split on `;`, so a partially-applied
-   migration does not abort the rest of the batch.
-4. If it adds a thumbnail tier, also add the `ThumbTier` variant and put it in
-   `ThumbTier::ALL` — see the invariants at the top of this page.
-
-`SCHEMA_VERSION` needs no edit; it follows.
-
-### A database with no version stamp
-
-`run_migrations` treats "no `schema_version` in `gallery_meta`" as version 0 and
-handles it in one branch: apply `BASE_SCHEMA` (every statement is
-`IF NOT EXISTS`, so it is a no-op on a populated database), claim v1, and let
-the loop re-run every migration.
-
-There used to be a ten-rung `detect_legacy_version` ladder that probed for
-schema features and *guessed* an unstamped database's version. Guessing is all
-downside: the loop skips everything at or below the version it is handed, so an
-over-estimate silently leaves tables uncreated — the exact failure
-[decision 0003](../decisions/0003-derive-schema-version-from-migrations.md)
-records. Under-estimating costs one idempotent re-run. The ladder was deleted
-once its premise was confirmed dead: versioning has been in place since v1 of
-the schema, so no unstamped database exists.
-
-`run_migrations` still warns if the final version does not equal
-`SCHEMA_VERSION`. The only way to land short is a database stamped ahead of this
-build — opened by a newer LightView, then downgraded.
-
-## Tables
-
-Path-keyed (all swept together by `path_keyed_tables()`):
-
-- `media_meta` — the index. Path, media type, size, `date_taken`, `date_added`,
-  `last_viewed`, `last_rated`, rating, dimensions, duration, GPS. This is what
-  sorting and the grid read from; it is populated from the recursive scan at
-  gallery open so the grid renders before any tagging or thumbnailing happens.
-- `tag_index` — `(path, namespace, tag)`. Rebuilt from companion files.
-- `index_state` — companion mtime per path, so re-indexing skips unchanged
-  companions.
-- `gif_atlas` — pre-rendered GIF frame sprite sheets, keyed `(path, tier)`.
-- the seven `thumbnails*` tables, one of which (`thumbnails`) also
-  carries the `phash` column duplicate detection reads — see
-  [`pipeline/`](../pipeline/README.md).
-
-Not path-keyed:
-
-- `gallery_meta` — key/value. Holds `schema_version`, `gallery_root`, the
-  remote-access settings, the default filter, upload config, trash retention.
-- `tag_counts` — `(namespace, tag) → count`, rebuilt from `tag_index`; feeds
-  autocomplete.
-- `not_duplicates` — user-confirmed non-duplicate pairs, stored with
-  `path_a < path_b` so lookups are canonical. Handled separately by every sweep
-  because its paths are not in a `path` column.
-- `remote_devices`, `remote_pairing` — per-device cookie hashes (argon2, so a
-  database leak alone grants nothing) and short-lived enrollment codes.
-
-## Paths are absolute, and that is a liability
-
-Every path-keyed row stores an absolute path, so moving the gallery directory
-orphans the entire cache. `adopt_gallery_root` handles this at open:
-
-1. Compare the current root against `gallery_meta.gallery_root`. Unchanged is
-   the common case and returns immediately.
-2. If it changed, `rebase_root` rewrites the prefix across every path-keyed
-   table plus both `not_duplicates` columns, in one transaction. The match is
-   on `old_root || '/'` so a sibling directory like `/data/photos2` is never
-   rewritten when the old root is `/data/photos`. `UPDATE OR REPLACE`, because
-   a bare row may already exist under the new root — the relocated row wins,
-   since it carries the accumulated history.
-3. If the cache predates root tracking, `infer_old_root` matches a few on-disk
-   files against cached rows by gallery-relative suffix and requires every
-   sample (up to 5) to agree on one foreign prefix. Ambiguity means no rebase —
-   a safe no-op.
-
-This must run **before** `populate_media_meta`, which would otherwise insert
-bare rows under the new root and shadow the relocated history.
+- **Keys are gallery-relative `RelPath`**, in exactly one spelling. The newtype
+  is what guarantees that; a raw string key is a second spelling waiting to
+  happen.
+- **A new path-keyed table goes in `path_keyed_tables()`** in the same change.
+  The test will tell you, but the sweep is the reason.
+- **Do not hold the writer across anything slow.** If a pass needs to decode,
+  read a file or wait on a process, split it.
+- **Bump `FORMAT_VERSION` for any schema change**, including an added column.
+  There is no other mechanism, and a silently mismatched schema is worse than a
+  rebuild.

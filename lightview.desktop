@@ -1,4 +1,3 @@
-#!/usr/bin/env xdg-open
 [Desktop Entry]
 Name=LightView
 Comment=Fast, plugin-extensible media gallery viewer
@@ -6,5 +5,13 @@ Exec=lightview %f
 Icon=lightview
 Type=Application
 Categories=Graphics;Viewer;Photography;
+# A folder, not a file: LightView opens a gallery, and a gallery is a directory.
+# This is what puts "Open with LightView" in a file manager's context menu on
+# one, and what makes `Actions=OpenHere` below work on a folder's background.
 MimeType=inode/directory;
 Terminal=false
+Actions=OpenHere;
+
+[Desktop Action OpenHere]
+Name=Open this folder in LightView
+Exec=lightview %f

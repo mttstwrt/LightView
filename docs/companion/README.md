@@ -1,113 +1,124 @@
-# Companion files
+# companion/
 
-[← docs index](../README.md) · [architecture](../architecture.md)
+[← docs](../README.md)
 
-A companion file is a JSON sidecar named `<media>.lightview.json` holding
-everything the user has said about a media file: tags, rating, colour label,
-notes, location, and whatever plugins have contributed. It is the **record of
-intent**. The [cache](../cache/README.md) indexes it so queries are fast, but
-the cache is derived — delete it and re-open the gallery and it is rebuilt from
-these files.
+**Responsible for** the sidecar files that hold everything a person put into
+the gallery — tags, sets, plugin results, rating, colour label, notes, location
+— and for the locking and atomicity that let two machines write one directory.
 
-**Responsible for:** the on-disk format (`schema.rs`), reading and locating it
-(`reader.rs`), writing it atomically (`writer.rs`), and version migration
-(`migration.rs`). Also the `MediaType` vocabulary, which lives here because
-media type is a companion field — extension-to-type inference has exactly one
-definition and this is it.
+**Not responsible for** the *index* built from them
+([cache/](../cache/README.md)), or for deciding when to write one (the services
+do that).
 
-**Not responsible for:** deciding when to write. Callers
-(`commands/tags.rs`, `commands/duplicates.rs`, `plugin/runner.rs`) own that,
-and all of them go through the shared `modify_companion` helper so a hand-edit
-and a plugin write produce identical files. Not responsible for the tag index
-either — that is [`cache/`](../cache/README.md), refreshed by the caller after a
-write.
+**Depends on** `serde_json` and [`util/`](../architecture.md) for the lock and
+the durable write. **Depended on by** every write path, the indexer, and
+[plugins/](../plugins/README.md).
 
-**Depends on:** `serde_json`, `chrono`, `uuid`. Nothing else in the tree.
+## This is the only durable data in the system
 
-**Depended on by:** [`query/`](../query/README.md) (for `MediaType` and the tag
-namespaces), [`plugins/`](../plugins/README.md),
-[`duplicates/`](../duplicates/README.md), `commands/tags.rs`, and the indexer.
-
-## The shape of the file
+Everything else is reconstructable from the photos and these files. That makes
+the schema **the largest commitment in the design**: it is written into the
+user's gallery and read back by other LightView installations, so changing a
+name or a type is a breaking change.
 
 ```
+<dir>/.lightview/companions/<file name>.lightview.json
+```
+
+Per directory, so each subfolder carries its own tree and moving a folder moves
+its metadata with it. A sidecar sitting *alongside* the media is still read, for
+galleries written by older versions — but never written.
+
+```json
 {
   "schema_version": 1,
-  "file": "sunset.jpg",
-  "file_hash": "...",
+  "file": "IMG_0001.jpg",
+  "file_hash": "…",
   "media_type": "image",
-  "created": "<rfc3339>",
-  "modified": "<rfc3339>",
-  "tags":  { "user": [...], "auto": [...], "plugins": { "<name>": {...} } },
-  "meta":  { "core":  {...},              "plugins": { "<name>": {...} } }
+  "created": "2026-01-04T10:22:31Z",
+  "modified": "2026-01-04T10:22:31Z",
+  "tags": {
+    "user":    ["vacation"],
+    "set":     ["burst-2026-01-04"],
+    "plugins": { "wd": { "version": "2.0.0", "tags": ["beach", "dog"] } }
+  },
+  "meta": { "core": { "rating": 4, "notes": "…" }, "plugins": {} }
 }
 ```
 
-Both `tags` and `meta` are split the same way, and the split is the important
-part of the design: **`user` is never overwritten by anything but the user.**
-A plugin writes only under its own key in `tags.plugins` / `meta.plugins`, so
-re-running a tagger replaces that tagger's output and touches nothing else. A
-plugin entry carries the plugin `version` alongside its tags, plus arbitrary
-flattened extras (confidence scores and the like) that LightView stores and
-returns without interpreting.
+### Two serde attributes carry the compatibility weight
 
-That namespacing is what the filter language's `user::`, `auto::`, and
-`plugin.<name>::` prefixes address — see [`query/`](../query/README.md).
+**`#[serde(default)]` on every field** is what makes an old sidecar without
+`set`, and a new one without `auto`, parse rather than fail. Not the schema
+version — the version says what to *migrate*, and a file that will not
+deserialize never reaches the migration.
 
-One `tags.plugins` bucket is written by the host rather than by a plugin:
-`location`, holding the place names [`geocode/`](../geocode/README.md) derives
-from the file's GPS coordinates (spaces joined with underscores, since the
-filter language cannot name a tag containing whitespace). It reuses this
-container because a `PluginTagEntry` is exactly a named, versioned set of tags
-that a re-run replaces wholesale — which is what re-geocoding needs, and the
-`version` field is what tells a gallery tagged by an older build that it is due
-one — and doing so kept the wire format unchanged. Note the asymmetry with `meta.core.location` below: the
-*coordinate* is already in the media file's own EXIF and is cached rather than
-duplicated here, while the *name* exists nowhere else and so is written to disk.
+**`#[serde(flatten)] extra` on the two collections** is what stops the next
+write from erasing what the struct no longer models. Removing the `auto` field
+means the first rating change would otherwise silently delete a user's `auto`
+tags from the one file that cannot be regenerated. Dropping `auto` from the
+*index* is a decision; dropping it from the *file* is data loss, and this is the
+line between them.
 
-`meta.core` holds the fields the app itself owns: `rating`, `date_rated`,
-`color_label`, `notes`, `media` (dimensions, duration, codec), and `location`
-(decimal degrees, WGS-84, optional altitude in metres).
+### Two fields are mirrored from the database on purpose
 
-Two of those — `rating` and `color_label` — are also **mirrored into
-`media_meta`** columns, because filtering and sorting run in SQLite and never
-open a sidecar. The companion stays the source of truth: the mirror is written
-by every path that sets the field, and rebuilt from the companion by the
-indexing pass at gallery open, so deleting the cache loses nothing. Adding a
-third filterable `meta.core` field means adding a column and a mirror in the
-same places — see [`query/`](../query/README.md).
+`date_added` and `last_viewed` live in the index, and are also written here.
+Without that, a `format_version` bump would silently empty them — and "a rebuild
+loses time and nothing else" would be false. The mirror runs both ways: the
+indexer writes them back into sidecars that lack them.
 
-## Where the file lives
+## One read-modify-write, under one lock
 
-`CompanionLocation` has two variants: `Alongside` (next to the media file) and
-`LightviewFolder` (under `<gallery>/.lightview/companions/`). Reads try the
-requested location first and then fall back to the other one, so a gallery
-whose preference changed keeps resolving old sidecars without a migration pass.
-Writes go to the requested location only — the fallback is a read affordance,
-not a two-way sync.
+**The lock is the point.** Both writers used to read the whole file, mutate, and
+serialize with no lock at all, so a rating set from the phone was silently gone
+if the desktop's plugin run had read that companion a moment earlier — and over
+a network mount "a moment" is the client's attribute cache, one second on `cifs`
+by default. The losing write is not the older one; it is whichever reader lost
+the race.
 
-## Writing is atomic
+So the whole operation happens inside `modify_companion`, and **there is no
+public way to write a companion without it.**
 
-`write_companion_at` serializes to a uniquely-named temp file **in the target
-directory** and renames it into place. Same directory, therefore same
-filesystem, therefore the rename is atomic: a reader either sees the old file or
-the new one, never a truncated one. This matters more than it looks — companion
-writes happen during batch tagging while the indexer may be reading the same
-tree.
+### `fcntl(F_OFD_SETLKW)`, and neither of the two obvious alternatives
 
-`modified` is stamped by the writer, not by the caller, so every write carries
-an accurate timestamp regardless of which path produced it.
+- **`flock` is invisible to `smbd`.** It would be coherent on one machine and
+  decorative across the share — which is the deployment.
+- **Classic `F_SETLKW` is process-owned.** Two tasks inside one `--serve`
+  process would not contend at all, and closing *any* descriptor for the file
+  drops every lock the process holds on it. Open-file-description locks are
+  per-descriptor, which is what makes both cases correct.
 
-## Versioning
+`rustix` does not expose the OFD commands, which is why this calls `libc`
+directly.
 
-`schema_version` is stamped on write and checked on read;
-`migration::migrate` upgrades an older file to the current shape. Only version 1
-exists today, so `migrate` is an identity function with the extension point
-written out. It is called unconditionally on every read, which is what makes
-adding version 2 a change to one function rather than an audit of every reader.
+### Atomic **and** durable
 
-Note that this is a *different* version number from the cache's
-`SCHEMA_VERSION`: this one describes a file format that lives in the user's
-gallery and must be readable by other installations; the cache's describes a
-local database that can be rebuilt. They move independently and should not be
-conflated.
+Write to a temp file in the same directory, `fsync` the file, rename, `fsync`
+the parent directory. Atomic alone was the old behaviour and it is not enough
+for a file on a NAS: the rename can reach the directory entry before the data
+reaches the disk, and the crash window between them is where a companion becomes
+zero bytes.
+
+The temp file is removed on **every** error path, or a failed write leaves
+litter in the one tree this design tells the user is safe to grep and back up.
+
+## The skip check happens under the lock
+
+`Outcome::Leave` exists for one reason: a tagging run that finds a newer result
+already in the file must not overwrite it. A run over twenty thousand files
+takes hours, and whatever it decided while planning is a guess by the time it
+holds the lock — another process may have written in between. The answer under
+the lock is the decision. See
+[plugins/](../plugins/README.md#the-skip-predicate-is-version-or-higher).
+
+## Invariants a caller must uphold
+
+- **Never write a companion outside `modify_companion`.** The one exception is
+  the trash, which deposits a companion into an entry directory it has just
+  created and nobody else can reach.
+- **Never remove a field without keeping `extra`.** The struct not modelling
+  something is not permission to delete it from a user's file.
+- **Bump `CURRENT_SCHEMA_VERSION` for any breaking change**, and add a
+  migration. Other installations read these files.
+- **Both writers need write permission on the directory and the lock file.**
+  See [gallery/](../gallery/README.md#two-machines-one-directory-the-uid-question).

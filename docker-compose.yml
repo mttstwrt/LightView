@@ -1,22 +1,25 @@
-# LightView headless gallery server.
+# LightView, serving a gallery over the LAN.
 #
 #   1. Point the gallery bind mount below at your photo/video folder.
 #   2. docker compose up -d --build
-#   3. Pair a device (mints a one-time PIN):
-#        docker compose exec lightview \
-#          /opt/lightview/lightview-headless pair /gallery
-#      then open https://<host>:8787/pair on the device and enter the PIN.
+#   3. Mint a one-time pairing code:
+#        docker compose exec lightview lightview pair --data-dir /state
+#      then open https://<host>:8443/pair on the device and enter the PIN.
+#   4. Optionally add a password, read from stdin so it never lands in shell
+#      history or `ps`:
+#        docker compose exec -T lightview lightview password --data-dir /state
 #
-# The server is HTTPS with a self-signed cert, so the browser will warn once —
-# that's expected (a secure context is required for clipboard/upload APIs).
+# The server is HTTPS with a self-signed certificate, so a browser warns once —
+# expected, and required: browsers gate the clipboard and upload APIs behind a
+# secure context. Settings → Connection offers the certificate for install,
+# which replaces the temporary exception with real trust.
 #
-# IMPORTANT: set LIGHTVIEW_TLS_SAN below to this host's LAN IP (or DNS name).
-# The container can only detect its own bridge address (172.x.y.z), so without
-# it the cert never covers the address your devices actually dial and every
+# IMPORTANT: add `--tls-san <this host's LAN address>` to the command below. The
+# container can only detect its own bridge address (172.x.y.z), so without it
+# the certificate never covers the address devices actually dial and every
 # client fails hostname verification. Desktop browsers survive that on a
-# click-through exception, but iOS drops the exception readily and a
-# home-screen PWA can't display the prompt to re-accept it — the app then opens
-# from its cached shell and silently loads no thumbnails or full images.
+# click-through exception; iOS drops the exception readily, and a home-screen
+# PWA cannot display the prompt to re-accept it.
 
 services:
   lightview:
@@ -25,34 +28,45 @@ services:
       # Optional: stamp the built SPA with the source commit so Settings → About
       # shows it. Supply via env, e.g.:
       #   GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
-      # Unset, the per-build timestamp still distinguishes rebuilds.
       args:
         GIT_SHA: ${GIT_SHA:-}
-    image: lightview-headless
+    image: lightview
     container_name: lightview
     restart: unless-stopped
     ports:
-      - "8787:8787"
+      - "8443:8443"
     volumes:
-      # Your media folder. Read-write: uploads land here and the gallery's
-      # .lightview/cache.db (thumbnails, tags, device pairings) lives inside it.
+      # Your media folder. Read-write: uploads land here, and so do the
+      # companion sidecars that hold tags, ratings and notes.
       - ./photos:/gallery
-      # Persists the self-signed TLS cert + any server-side plugins across
-      # rebuilds (data/ is resolved next to the binary at /opt/lightview).
-      - lightview-data:/opt/lightview/data
+      # Cache, data and config. Keeping this across rebuilds keeps the TLS
+      # certificate (and every device's trust in it) and the pairings, and
+      # saves re-generating every thumbnail.
+      - lightview-state:/state
     environment:
       - RUST_LOG=info
-      # Addresses the TLS cert must cover, beyond loopback and the container's
-      # own (useless) bridge IP. Set this to the LAN IP or DNS name devices use
-      # to reach this host; comma-separate to list several. Changing it re-mints
-      # the cert, so every browser shows the trust prompt once more.
-      #   - LIGHTVIEW_TLS_SAN=192.168.1.2,gallery.lan
-      - LIGHTVIEW_TLS_SAN=${LIGHTVIEW_TLS_SAN:-}
-    # To change the port, update BOTH the mapping above and this command's port.
-    command: ["serve", "/gallery", "--port", "8787"]
-    # The SSE change-stream holds connections open; without this, `down` waits
+    # To change the port, update BOTH the mapping above and this command.
+    #
+    # `--tls-san` is repeatable — one flag per name or address the certificate
+    # must cover, beyond loopback. Changing the list re-mints the certificate,
+    # so every browser shows the trust prompt once more. There is no
+    # environment variable for it on purpose: `server.toml` in the state volume
+    # and this flag are already two ways to say it, and a third would be one
+    # more place to look when the certificate covers the wrong name.
+    command:
+      - "--serve"
+      - "/gallery"
+      - "--port"
+      - "8443"
+      - "--data-dir"
+      - "/state"
+      # - "--tls-san"
+      # - "192.168.1.2"
+      # - "--tls-san"
+      # - "gallery.lan"
+    # The SSE change stream holds connections open; without this, `down` waits
     # the full 10s SIGTERM timeout before killing the container.
     stop_grace_period: 3s
 
 volumes:
-  lightview-data:
+  lightview-state:
