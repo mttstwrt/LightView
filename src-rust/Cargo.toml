@@ -1,0 +1,89 @@
+[package]
+name = "lightview"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, plugin-extensible media gallery"
+
+# One binary out of one crate. The library exists so integration tests and
+# benches can reach the modules; `main.rs` is argument parsing and mode
+# dispatch and nothing else.
+[lib]
+name = "lightview"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lightview"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+image = "0.25"
+sha2 = "0.10"
+rayon = "1.10"
+tokio = { version = "1", features = ["full"] }
+notify = "6"
+walkdir = "2"
+bytes = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+filetime = "0.2"
+sysinfo = "0.30"
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+futures = "0.3"
+fast_image_resize = "6"
+jpeg-decoder = "0.3"
+memmap2 = "0.9"
+percent-encoding = "2"
+bytemuck = { version = "1", features = ["derive"] }
+libheif-rs = "2"
+kamadak-exif = "0.6"
+# Offline reverse geocoding (GeoNames cities1000, ~7.9 MB embedded in the
+# binary). Replaces a gazetteer download, a CSV parser, and a k-d tree we would
+# otherwise maintain ourselves; see src/geocode.
+reverse_geocoder = "4.1.1"
+thumbhash = "0.1"
+webp = "0.3"
+http-range = "0.1.5"
+axum = { version = "0.8", features = ["multipart"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+rcgen = "0.13"
+time = "0.3"
+tower-http = { version = "0.6", features = ["trace"] }
+# The built SPA, compiled into the binary so a deployment is one file. The
+# folder must exist at compile time, which is why `dist/.gitkeep` is committed.
+rust-embed = { version = "8", features = ["mime-guess"] }
+tokio-util = { version = "0.7", features = ["io"] }
+argon2 = "0.5"
+rand = "0.8"
+# Three syscalls the standard library does not expose and the design requires:
+# `fcntl` OFD locks on the companion lock file (section 3.7 — `flock` is
+# invisible to smbd), `flock` on the cache directory, and `renameat2` with
+# RENAME_NOREPLACE so an upload cannot lose its collision race.
+rustix = { version = "0.38", features = ["fs", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-clipboard = "0.9"
+x11rb = "0.13"
+
+# Optimize dependencies even in dev builds — image codecs, SIMD resize,
+# and SQLite are unusably slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+incremental = false # Disable incremental builds for a "cleaner" optimization
+opt-level = 3       # Maximize speed (default for release, but good to be explicit)
+lto = "thin"        # Link Time Optimization (massively improves cross-crate speed)
+codegen-units = 1   # Reduces parallel compilation to allow deeper optimization
+panic = "abort"     # Removes stack unwinding code, making the binary smaller and faster
+strip = true        # Removes symbols to shrink the file size

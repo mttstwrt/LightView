@@ -1,23 +1,22 @@
 # --- Rust/Cargo ---
-/src-tauri/target/
+/src-rust/target/
 **/*.rs.bk
 Cargo.lock
 
 # --- Node/Frontend ---
 node_modules/
-dist/
-dist-tauri/
 .env
 .env.*
 .DS_Store
 
-# --- Tauri Bundler ---
-src-tauri/binaries/
-src-tauri/gen/
-*.AppImage
-*.deb
-*.msi
-*.exe
+# The SPA is embedded at compile time, so `dist/` must exist before any cargo
+# command. Excluding the directory outright would make that a permanent
+# "run npm first" exception — and git cannot re-include a file whose parent
+# directory is excluded, so the exclusion is on the contents and .gitkeep is
+# committed. A build without `npm run build` then serves a 404 at `/`: a loud
+# runtime failure instead of a confusing build failure.
+dist/*
+!dist/.gitkeep
 
 # --- Log files ---
 npm-debug.log*
