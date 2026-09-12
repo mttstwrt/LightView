@@ -125,7 +125,14 @@ pub struct MediaMeta {
     pub path: RelPath,
     pub media_type: String,
     pub file_size: i64,
+    /// The camera's `DateTimeOriginal`, and NULL when the file has none.
+    /// Stays strict: the panel labels it "Taken" and says nothing when absent.
     pub date_taken: Option<i64>,
+    /// The file's modification time, always present. The panel falls back to
+    /// it — labelled "Modified", so a reader is never shown a copy date
+    /// dressed up as a capture date — and it is what the grid sorts by when
+    /// `date_taken` is NULL.
+    pub mtime: i64,
     pub date_added: Option<i64>,
     pub last_viewed: Option<i64>,
     pub rating: Option<u8>,
@@ -146,7 +153,7 @@ pub async fn get_media_meta(
     let conn = gallery.db.read().await;
     let row = conn.query_row(
         "SELECT media_type, file_size, date_taken, date_added, last_viewed, rating,
-                color_label, width, height, duration, gps_lat, gps_lon
+                color_label, width, height, duration, gps_lat, gps_lon, mtime
          FROM media_meta WHERE path = ?1",
         [path.as_str()],
         |r| {
@@ -163,6 +170,7 @@ pub async fn get_media_meta(
                 r.get::<_, Option<f64>>(9)?,
                 r.get::<_, Option<f64>>(10)?,
                 r.get::<_, Option<f64>>(11)?,
+                r.get::<_, i64>(12)?,
             ))
         },
     );
@@ -189,6 +197,7 @@ pub async fn get_media_meta(
         media_type: row.0,
         file_size: row.1,
         date_taken: row.2,
+        mtime: row.12,
         date_added: row.3,
         last_viewed: row.4,
         rating: row.5,

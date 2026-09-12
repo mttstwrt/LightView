@@ -157,7 +157,7 @@ fn group_by_time(items: &[SortedItem], granularity: &Granularity) -> Vec<GroupHe
     let mut count = 0;
 
     for (i, item) in items.iter().enumerate() {
-        let item_key = period_key(item.date_taken, granularity);
+        let item_key = period_key(item.date, granularity);
         if count == 0 || item_key != key {
             if count > 0 {
                 groups.push(GroupHeader {
@@ -167,7 +167,7 @@ fn group_by_time(items: &[SortedItem], granularity: &Granularity) -> Vec<GroupHe
                 });
             }
             key = item_key;
-            label = period_label(item.date_taken, granularity);
+            label = period_label(item.date, granularity);
             start = i;
             count = 0;
         }
@@ -203,9 +203,9 @@ mod tests {
         [Some(1709596800), Some(1710892800), Some(1730419200), None]
             .into_iter()
             .enumerate()
-            .map(|(i, date_taken)| SortedItem {
+            .map(|(i, date)| SortedItem {
                 path: crate::path::RelPath::new(&format!("{i}.jpg")).unwrap(),
-                date_taken,
+                date,
                 file_size: 1,
                 media_type: "image".to_string(),
                 rating: None,

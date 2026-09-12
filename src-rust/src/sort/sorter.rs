@@ -64,7 +64,12 @@ impl SortOrder {
 #[derive(Debug, Clone, Serialize)]
 pub struct SortedItem {
     pub path: RelPath,
-    pub date_taken: Option<i64>,
+    /// The date the grid orders and groups by: the capture time when the file
+    /// has one, its modification time when it does not. **Not `date_taken`** —
+    /// that field is the camera's `DateTimeOriginal` and is what the `date=`
+    /// filters compile against; this one is never NULL. The name is the
+    /// distinction: a screenshot has a date here and no capture time anywhere.
+    pub date: Option<i64>,
     pub file_size: i64,
     pub media_type: String,
     pub rating: Option<u8>,
@@ -86,18 +91,41 @@ pub struct SortedItem {
     pub thumbhash: Option<String>,
 }
 
+/// What the grid orders, groups and labels a file by.
+///
+/// **Capture time when there is one, file mtime when there is not.** EXIF only
+/// answers for photographs straight out of a camera; a screenshot, an export,
+/// an image out of a messaging app and every video carry no
+/// `DateTimeOriginal`, and ordering by `date_taken` alone swept all of them
+/// into one undated heap at the end of the library.
+///
+/// The filters deliberately do **not** coalesce: `date=2024` means *taken* in
+/// 2024, and answering it with files merely copied in 2024 would be a worse
+/// wrong than the heap. Ordering has to total-order everything; filtering has
+/// to mean what it says.
+///
+/// Assumes the `media_meta m` alias, which both call sites use. It is a
+/// constant so the second one — the idle warmer, whose whole justification is
+/// warming the order the grid presents — cannot drift from the first.
+pub const SORT_DATE: &str = "COALESCE(m.date_taken, m.mtime)";
+
 /// The column list, kept beside the row mapper because the mapper is
 /// positional: inserting a column here without shifting every index there
 /// silently moves every field one place along.
-const COLS: &str = "m.path, m.date_taken, m.file_size, m.media_type, m.rating, \
-                    m.color_label, m.last_viewed, m.date_added, m.last_rated, \
-                    m.duration, m.width, m.height, m.thumbhash";
+fn cols() -> String {
+    format!(
+        "m.path, {SORT_DATE}, m.file_size, m.media_type, m.rating, \
+         m.color_label, m.last_viewed, m.date_added, m.last_rated, \
+         m.duration, m.width, m.height, m.thumbhash"
+    )
+}
 
 /// The `ORDER BY` expression for one field and direction.
 fn order_expr(field: SortField, order: SortOrder) -> String {
     let o = order.as_sql();
     match field {
-        SortField::Date => format!("m.date_taken {o} NULLS LAST"),
+        // No `NULLS LAST`: `mtime` is NOT NULL, so the coalesced value never is.
+        SortField::Date => format!("{SORT_DATE} {o}"),
         SortField::Size => format!("m.file_size {o}"),
         SortField::Name => format!("m.path {o}"),
         SortField::Rating => format!("m.rating {o} NULLS LAST"),
@@ -126,9 +154,10 @@ pub fn items_sql(spec: &SortSpec, where_sql: Option<&str>) -> String {
         order_clause.push_str(", ");
         order_clause.push_str(&order_expr(sub, spec.sub_order.unwrap_or(SortOrder::Desc)));
     }
+    let cols = cols();
     match where_sql {
-        Some(w) => format!("SELECT {COLS} FROM media_meta m WHERE {w} ORDER BY {order_clause}"),
-        None => format!("SELECT {COLS} FROM media_meta m ORDER BY {order_clause}"),
+        Some(w) => format!("SELECT {cols} FROM media_meta m WHERE {w} ORDER BY {order_clause}"),
+        None => format!("SELECT {cols} FROM media_meta m ORDER BY {order_clause}"),
     }
 }
 
@@ -146,7 +175,7 @@ pub fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
     let thumbhash: Option<Vec<u8>> = row.get(12)?;
     Ok(SortedItem {
         path,
-        date_taken: row.get(1)?,
+        date: row.get(1)?,
         file_size: row.get(2)?,
         media_type: row.get(3)?,
         rating: row.get(4)?,
@@ -176,17 +205,69 @@ mod tests {
         SortField::LastRated,
     ];
 
+    /// Every `media_meta` column the ordering names, so the test below can
+    /// check each one is alias-qualified wherever it appears.
+    const COLUMNS: [&str; 10] = [
+        "path",
+        "date_taken",
+        "mtime",
+        "file_size",
+        "media_type",
+        "rating",
+        "color_label",
+        "last_viewed",
+        "date_added",
+        "last_rated",
+    ];
+
     #[test]
     fn every_column_in_the_order_by_is_alias_qualified() {
         // A bare column name must never appear. The failure it prevents is
         // "ambiguous column name" from a join a later change adds — which does
         // not degrade the sort, it rejects the statement.
+        //
+        // Checked per occurrence rather than by prefix: the date arm is a
+        // `COALESCE` over two columns, so the expression no longer *starts*
+        // with the alias and a prefix test would pass while leaving the second
+        // column bare.
         for field in ALL_FIELDS {
             for order in [SortOrder::Asc, SortOrder::Desc] {
                 let e = order_expr(field, order);
-                assert!(e.starts_with("m."), "unqualified order expression: {e}");
+                for col in COLUMNS {
+                    let mut from = 0;
+                    while let Some(i) = e[from..].find(col) {
+                        let at = from + i;
+                        assert!(
+                            at >= 2 && &e[at - 2..at] == "m.",
+                            "unqualified `{col}` in order expression: {e}"
+                        );
+                        from = at + col.len();
+                    }
+                }
             }
         }
+    }
+
+    /// The grid must order by the same expression it selects and the idle
+    /// warmer warms by, or the scrollbar's labels, the group headers and the
+    /// warm-up order all disagree with the order on screen.
+    #[test]
+    fn the_date_sort_falls_back_to_the_file_time() {
+        let spec = SortSpec {
+            field: SortField::Date,
+            order: SortOrder::Desc,
+            sub_field: None,
+            sub_order: None,
+        };
+        let sql = items_sql(&spec, None);
+        assert!(sql.contains(&format!("ORDER BY {SORT_DATE} DESC")), "{sql}");
+        assert!(sql.contains(SORT_DATE), "the selected date must be the sorted one");
+        // `mtime` is NOT NULL, so the coalesced value never is and a null
+        // ordering clause on this arm would be dead code pretending to matter.
+        assert!(
+            !order_expr(SortField::Date, SortOrder::Desc).contains("NULLS LAST"),
+            "the coalesced date is never null"
+        );
     }
 
     #[test]
@@ -199,7 +280,7 @@ mod tests {
         };
         let sql = items_sql(&spec, Some("m.rating >= ?1"));
         assert!(sql.contains("WHERE m.rating >= ?1"));
-        assert!(sql.contains("ORDER BY m.date_taken DESC"));
+        assert!(sql.contains(&format!("ORDER BY {SORT_DATE} DESC")));
         // No join, and no path list round-tripping through the client.
         assert!(!sql.contains("JOIN"));
         assert!(!sql.contains("json_each"));

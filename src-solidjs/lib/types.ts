@@ -139,7 +139,12 @@ export interface Items {
 export interface SortedItem {
   /** Gallery-relative, because the database is keyed that way. */
   path: string;
-  date_taken: number | null;
+  /** What the grid is ordered and grouped by: capture time when the file has
+   *  one, file modification time when it does not — so it is never null. This
+   *  is deliberately *not* `date_taken`; that is the camera's timestamp and is
+   *  what `date=` filters mean. A screenshot has a date here and no capture
+   *  time anywhere. */
+  date: number | null;
   file_size: number;
   media_type: string;
   rating: number | null;
@@ -165,7 +170,11 @@ export interface MediaMeta {
   path: string;
   media_type: string;
   file_size: number;
+  /** The camera's capture time, or null when the file carries none. */
   date_taken: number | null;
+  /** The file's modification time — always present, and what the panel shows
+   *  (labelled as such) when there is no capture time to show instead. */
+  mtime: number;
   date_added: number | null;
   last_viewed: number | null;
   rating: number | null;

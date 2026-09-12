@@ -82,6 +82,13 @@ field of the plan rather than a side effect. Restoring a file with a rewritten
 mtime is silent data loss, so the operation that legitimately rewrites one says
 so out loud.
 
+**The stamp moves the row too, in the same breath.** `index_one` afterwards
+re-reads the *companion*, not the file, so the indexed `mtime` would otherwise
+keep its old value — and since the grid's date sort falls back to `mtime` (see
+[`query/`](../query/README.md)), the keeper would sit in its old place until the
+next open and then move without being asked. Invisible while only `date_taken`
+drove the order; a silent reorder on restart once it does not.
+
 There is no "companion location versus EXIF location" choice. The companion's
 coordinates are mirrored over the indexed ones at index time, so a file has one
 effective location and the real question is *which copy's*.

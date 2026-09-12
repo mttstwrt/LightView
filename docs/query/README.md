@@ -15,6 +15,33 @@ tag.
 **Depended on by** the items command, `lightview tag --filter`, and the tag
 manager.
 
+## The date a file sorts by is not the date it was taken
+
+`media_meta` keeps both and they mean different things.
+
+- **`date_taken`** is the camera's EXIF `DateTimeOriginal`, and NULL when the
+  file has none — which is most of a library. Screenshots, exports, anything
+  out of a messaging app and every video carry no capture time.
+- **`mtime`** is the file's modification time. Always present.
+
+**Sorting and grouping coalesce; filtering does not.** The `date` sort orders by
+`COALESCE(date_taken, mtime)` — see `SORT_DATE` in
+[`sort/sorter.rs`](../../src-rust/src/sort/sorter.rs), which both the sort and
+the idle warmer read so the warm-up order cannot drift from the order on screen.
+The `date=2024` family in [`filter/`](../../src-rust/src/filter/) compiles
+against `date_taken` alone.
+
+That asymmetry is the one *except* in this area, and it is deliberate in both
+directions. Ordering has to place every file somewhere, and `date_taken` alone
+swept most of the library into one undated heap at the end. Filtering has to
+mean what it says: `date=2024` asks for photographs *taken* in 2024, and
+answering it with files merely *copied* in 2024 would be a worse wrong than the
+heap — silently, since a filter gives no sign of what it included.
+
+The viewer's info panel resolves the ambiguity for the reader rather than
+hiding it: it prints `Taken …` when there is a capture time and `Modified …`
+when there is not, so a file's position in the grid is always explainable.
+
 ## One query, filter and sort together
 
 The filter compiles into the same statement the sort orders. The round trip it

@@ -115,9 +115,10 @@ async fn missing(
         "SELECT m.path FROM media_meta m
          LEFT JOIN {} t ON t.path = m.path
          WHERE t.path IS NULL
-         ORDER BY m.date_taken DESC NULLS LAST, m.path DESC
+         ORDER BY {} DESC, m.path DESC
          LIMIT ?1",
-        tier.table()
+        tier.table(),
+        crate::sort::sorter::SORT_DATE
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([limit], |r| r.get::<_, String>(0))?;

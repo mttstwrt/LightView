@@ -150,3 +150,17 @@ and why a scrub assigns nothing.
   flicker, while one that briefly offers an action the server will refuse is a
   403 the user caused.
 - **Paths are gallery-relative strings**, encoded per segment at the boundary.
+
+## The item payload carries a sort date, not a capture date
+
+`SortedItem.date` — the field the grid, the group headers and the scrollbar's
+date labels all read — is `COALESCE(date_taken, mtime)`, computed server-side.
+It is deliberately not named `date_taken`: `MediaMeta.date_taken`, which the
+info panel shows, is the camera's timestamp and is frequently null, and the two
+must not be confused by a reader of either. A scrubber labelled from a
+different value than the list is ordered by is a scrubber that lies, so both
+come from the one expression named in
+[`query/`](../query/README.md#the-date-a-file-sorts-by-is-not-the-date-it-was-taken).
+
+The info panel prints `Taken …` or `Modified …` accordingly, which is also the
+explanation for where a file sits in the scroll.

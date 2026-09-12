@@ -35,7 +35,7 @@ recover come back from the sidecars.
 ```
 gallery_meta   key/value — format_version lives here
 media_meta     path PK · type · size · mtime · dates · rating · dimensions
-               · duration · gps · colour label · thumbhash
+               · duration · gps · colour label · thumbhash · exif_read
 tag_index      (path, namespace, tag) PK
 index_state    path PK · companion_mtime_nanos · companion_size
 thumbs_js      path PK · bytes · dimensions            128px
@@ -49,13 +49,27 @@ optimization, because **the query language is shaped by them: a field is
 filterable only if it is indexed.** Naming them here is what stops them being
 discovered by a slow gallery.
 
-Two placements worth their own sentence:
+Three placements worth their own sentence:
+
+- **`exif_read` records that a header was read, not what was in it.** A photo
+  with no GPS and a screenshot with no EXIF block at all leave every result
+  column NULL, so a gate phrased over those columns cannot tell "probed, found
+  nothing" from "never probed" — it either re-reads them on every open forever
+  or excludes them forever. Its partial index (`WHERE exif_read = 0`) holds
+  only the rows still owed, so it is empty on a warm gallery and the pass costs
+  a lookup rather than a scan of the library.
 
 - **`thumbhash` is on `media_meta`, not on a tier.** It is ~25 bytes, and the
   items query would otherwise walk a thumbnail row's overflow pages to reach it.
 - **`phash` is a column on `thumbs_j`**, so a perceptual hash is discarded and
   recomputed along with the thumbnail it describes — exactly the lifetime it
   should have.
+
+There are two date indexes and they are not redundant. `idx_meta_date_taken`
+serves the `date=` filters, which mean capture time. `idx_meta_sort_date` is an
+expression index over `COALESCE(date_taken, mtime)` and serves the grid's own
+ordering, which falls back to the file time so that every file has a place —
+see [`query/`](../query/README.md) for why the two differ.
 
 ### `index_state` stores nanoseconds, not seconds
 

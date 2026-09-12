@@ -31,6 +31,21 @@ emits events, and stops there.
 finished" and "the watcher is armed" is in neither, and nothing ever notices it.
 Reversed, that window is the entire initial scan.
 
+**Seven is a resume, not the only pass.** The watcher's ingest reads a new
+file's metadata header itself, in the same breath as its companion — otherwise a
+batch arriving over rsync or Samba is dateless and placeless until a restart.
+Step 7 exists for whatever that missed.
+
+**What decides whether a header still needs reading is `media_meta.exif_read`,
+and nothing else.** It is set whenever a header is read, found or not, because
+a photo with no GPS and a screenshot with no EXIF block leave identical rows:
+any gate phrased over the *result* columns either re-reads them on every open
+forever or excludes them forever. The version this replaces chose the second by
+accident — it asked whether anything was known about the file yet, and a
+thumbnail answered yes, so a file the grid had drawn before its header was read
+never got one. See [`cache/`](../cache/README.md) for the column and the partial
+index that makes the warm-gallery pass free.
+
 Trash retention comes from the **gallery's own** `settings.toml`, never from
 `server.toml` — otherwise a desktop's default would delete a served gallery's
 trash.

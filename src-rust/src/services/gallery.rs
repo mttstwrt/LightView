@@ -66,6 +66,14 @@ use crate::server::events::Event;
 use crate::services::settings::GallerySettings;
 use crate::state::Gallery;
 
+/// Wall clock, Unix seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 /// How often the watcher drains the transport.
 const POLL: Duration = Duration::from_millis(300);
 /// Quiet period before a burst is flushed. Reset by every event.
@@ -783,12 +791,17 @@ async fn flush(
                     Some(meta::ScannedFile {
                         media_type: media_type_str(&path),
                         file_size: metadata.len() as i64,
+                        // Now, not 0, when the filesystem will not say. The
+                        // mtime is the grid's fallback sort date, and 0 files
+                        // the photo under January 1970 with a group header of
+                        // its own. "It arrived just now" is both truer and
+                        // less conspicuous.
                         mtime: metadata
                             .modified()
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0),
+                            .unwrap_or_else(now_secs),
                         path,
                     })
                 })

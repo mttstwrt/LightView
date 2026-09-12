@@ -29,15 +29,6 @@ function formatDate(unixTimestamp: number): string {
   });
 }
 
-interface MetaInfo {
-  media_type: string;
-  file_size: number;
-  date_taken: number | null;
-  width: number | null;
-  height: number | null;
-  duration_seconds: number | null;
-}
-
 export function InfoPanel(props: {
   path: string;
   filename: string;
@@ -232,6 +223,21 @@ export function InfoPanel(props: {
   };
 
   // One compact line instead of a label:value row per fact.
+  /** The capture time when the file has one, its modification time when it
+   *  does not — and **labelled**, because they are different facts. Most of a
+   *  library has no EXIF: screenshots, exports, anything out of a messaging
+   *  app, every video. Showing a copy date unlabelled as a capture date would
+   *  be a confident lie, and the grid sorts by the same fallback, so the panel
+   *  saying which one it is doubles as the explanation for where the file sat
+   *  in the scroll. */
+  const dateLine = () => {
+    const m = meta();
+    if (!m) return null;
+    return m.date_taken !== null
+      ? `Taken ${formatDate(m.date_taken)}`
+      : `Modified ${formatDate(m.mtime)}`;
+  };
+
   const metaLine = () => {
     const m = meta();
     if (!m) return "";
@@ -249,8 +255,8 @@ export function InfoPanel(props: {
             <div class="text-[11px] text-neutral-600 break-all mt-0.5">{props.path}</div>
             <Show when={meta()}>
               <div class="text-neutral-300 mt-1.5">{metaLine()}</div>
-              <Show when={meta()!.date_taken}>
-                <div class="text-neutral-500 mt-0.5">{formatDate(meta()!.date_taken!)}</div>
+              <Show when={dateLine()}>
+                {(line) => <div class="text-neutral-500 mt-0.5">{line()}</div>}
               </Show>
             </Show>
           </div>

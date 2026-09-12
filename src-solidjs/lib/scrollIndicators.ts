@@ -16,7 +16,7 @@ import type { SortedItem, SortField } from "./types";
 function dateAccessor(field: SortField): ((item: SortedItem) => number | null) | null {
   switch (field) {
     case "date":
-      return (it) => it.date_taken;
+      return (it) => it.date;
     case "lastviewed":
       return (it) => it.last_viewed;
     case "dateadded":
@@ -168,6 +168,8 @@ export function getThumbLabelForItems(items: SortedItem[], field: SortField, fra
     const ts = getDate(item);
     // "Never" reads right for the un-stamped tail of viewed/rated/added sorts,
     // which SQL parks at the end via NULLS LAST.
+    // The date sort coalesces to the file time server-side, so every item has
+    // one; "No date" survives only for a row the server could not date at all.
     if (!ts) return field === "date" ? "No date" : "Never";
     return dayFormat(new Date(ts * 1000));
   }

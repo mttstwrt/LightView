@@ -148,10 +148,22 @@ pub async fn merge(gallery: &Gallery, plan: MergePlan) -> Result<MergeResult, Du
     // The survivor's mtime is the group's agreed capture time. Restoring a file
     // with a rewritten mtime is silent data loss, which is why this is the one
     // place that writes one and why it is an explicit field of the plan.
+    //
+    // **The row follows the file.** `index_one` below re-reads the companion,
+    // not the file, so without this the grid would keep sorting the survivor by
+    // its old mtime until the next open and then move it without being asked —
+    // invisible while only `date_taken` drove the order, a silent reorder on
+    // restart now that the mtime is the fallback.
     if let Some(mtime) = plan.mtime {
         let keeper = gallery.root.resolve(&plan.keeper)?;
         let stamp = filetime::FileTime::from_unix_time(mtime, 0);
         filetime::set_file_mtime(keeper.as_path(), stamp)?;
+        let conn = gallery.db.writer().await;
+        conn.execute(
+            "UPDATE media_meta SET mtime = ?2 WHERE path = ?1",
+            rusqlite::params![plan.keeper.as_str(), mtime],
+        )
+        .map_err(crate::cache::db::CacheError::from)?;
     }
 
     let trash_entry = {

@@ -125,6 +125,10 @@ fn schema_sql() -> String {
     -- warm gallery, which is what makes the backfill's candidate query free
     -- rather than a full scan of the library on every open.
     CREATE INDEX IF NOT EXISTS idx_meta_unprobed     ON media_meta(exif_read) WHERE exif_read = 0;
+    -- The grid orders by the coalesced sort date, which the plain
+    -- `date_taken` index above cannot serve. That one stays: the `date=`
+    -- filters compile against the raw capture time and still want it.
+    CREATE INDEX IF NOT EXISTS idx_meta_sort_date   ON media_meta(COALESCE(date_taken, mtime) DESC);
     CREATE INDEX IF NOT EXISTS idx_meta_date_added  ON media_meta(date_added DESC);
     CREATE INDEX IF NOT EXISTS idx_meta_last_viewed ON media_meta(last_viewed DESC);
     CREATE INDEX IF NOT EXISTS idx_meta_rating      ON media_meta(rating);
