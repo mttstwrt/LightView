@@ -340,14 +340,17 @@ export const api = {
 
   externalApps: () => invoke<{ label: string }[]>("list_external_apps"),
 
-  /** One level of the directory picker. The parent comes back with the
-   *  listing rather than being computed here — a browser doing its own string
-   *  surgery on a path is how a picker ends up asking for a file. */
+  /** One level of the directory picker. The parent and the sidebar's places
+   *  come back with the listing rather than being computed here — a browser
+   *  doing its own string surgery on a path is how a picker ends up asking
+   *  for a file. `places` is constant for the process and rides along rather
+   *  than costing a second call. */
   listDirs: (path?: string) =>
     invoke<{
       path: string;
       parent: string | null;
       entries: { name: string; path: string }[];
+      places: { label: string; path: string }[];
     }>("list_dirs", { path }),
 
   // --- Plugins ---

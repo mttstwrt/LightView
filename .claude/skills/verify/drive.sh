@@ -78,6 +78,17 @@ echo "$CAPS" | jq -e '.trust == "owner"' >/dev/null && ok "capabilities report o
 # The Owner half: the picker.
 DIRS=$(inv list_dirs)
 echo "$DIRS" | jq -e '[.entries[].name] | index("2026")' >/dev/null && ok "list_dirs defaults to the gallery root" || bad "dirs: $DIRS"
+
+# The picker's sidebar. Every entry must be a directory that exists, or the
+# shortcut is a dead end -- which is the whole reason the server builds this
+# list rather than the client guessing at conventional names.
+echo "$DIRS" | jq -e '.places[0].label == "Gallery"' >/dev/null \
+  && ok "the sidebar leads with the gallery" || bad "places: $(echo "$DIRS" | jq -c .places)"
+MISSING=0
+for pl in $(echo "$DIRS" | jq -r '.places[].path'); do
+  [ -d "$pl" ] || { MISSING=1; echo "    not a directory: $pl"; }
+done
+[ "$MISSING" = "0" ] && ok "every pinned place exists" || bad "the sidebar offers a dead end"
 echo "$DIRS" | jq -e '.parent != null' >/dev/null && ok "the listing carries its parent, so the picker walks up" || bad "no parent: $DIRS"
 
 for tier in js j jm jh; do

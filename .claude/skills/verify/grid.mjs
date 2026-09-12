@@ -207,6 +207,40 @@ try {
   );
   ok("the run tagged every file, and the index sees the new namespace");
 
+  // The destination picker, opened the way a person opens it. Its sidebar is
+  // the whole of finding C, and neither `tsc` nor a curl check can say whether
+  // it renders -- the shortcuts come from the server but the layout does not.
+  // The auto-tag panel from the check above is a full-screen overlay and will
+  // swallow the click otherwise.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+  await page.locator("img[src*='/thumb/']").first().click({ button: "right" });
+  await page.waitForTimeout(300);
+  const copyTo = page.locator("text=/^Copy .*to\\.\\.\\.$/").first();
+  if (await copyTo.count()) {
+    await copyTo.click();
+    await page.waitForSelector("text=Parent folder", { timeout: 10_000 });
+    const pinned = await page
+      .locator("button[title^='/']")
+      .evaluateAll((els) => els.map((e) => e.textContent.trim()));
+    check(
+      `the picker pins places (${pinned.join(", ") || "none"})`,
+      pinned.includes("Gallery"),
+    );
+    // A shortcut that goes nowhere is worse than no shortcut, so the one the
+    // server always knows must actually navigate.
+    await page.locator("button[title^='/']", { hasText: "Gallery" }).first().click();
+    await page.waitForTimeout(500);
+    check(
+      "clicking a pinned place navigates",
+      (await page.locator("text=Parent folder").count()) > 0,
+    );
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+  } else {
+    bad("the context menu had no copy-to entry, so the picker was unreachable");
+  }
+
   // A phone-width viewport, which is the layout most likely to break silently.
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(800);

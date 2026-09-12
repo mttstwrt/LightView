@@ -60,7 +60,7 @@ display at all.
 | `GET /thumb/{tier}/{*rel}` | `Device` | `js` · `j` · `jm` · `jh` |
 | `GET /media/{*rel}` | `Device` | Range/206, HEIC transcode, `?fit=` |
 | `POST /api/upload` | `Device` | streamed, staged, renamed |
-| `GET /api/dirs?path=` | **`Owner`** | the directory picker: subdirectory names only, never media, never file contents |
+| `GET /api/dirs?path=` | **`Owner`** | the directory picker: subdirectory names only, never media, never file contents. Carries `parent` and `places` so the client never assembles a path |
 | `GET /healthz` · `GET /cert` | bootstrap | unauthenticated |
 | `POST /pair/redeem` · `POST /auth/launch` · `POST /auth/password` · `GET /auth/status` | bootstrap | unauthenticated |
 | *everything above the bootstrap group* | — | **503 until the initial scan has completed and the watcher is armed** |
@@ -222,6 +222,26 @@ Four things, each load-bearing, and each a bug the previous implementation had:
 - **Nothing a client sends may name a program.** `open_with` takes an *index*
   into server-side configuration; `run_plugin` takes a plugin *name*, which the
   installer scan either matches or does not.
+
+### The picker's sidebar
+
+A listing carries three things the client could not work out for itself: the
+entries, the `parent` to walk up through, and `places` — the gallery root,
+`$HOME`, and whichever XDG user directories exist. Without them a destination
+three folders away is seven clicks, because one level at a time is the only
+navigation a browser can be given.
+
+The server builds the list because it is the only side that can **check a
+directory exists** — a shortcut to a folder that is not there is worse than no
+shortcut — and the only side allowed to name a path at all. It reads
+`~/.config/user-dirs.dirs` where that exists, since a localized desktop has
+`Bilder` rather than `Pictures` and guessing the English name would quietly
+drop the one shortcut that matters. The label stays the English role name, so a
+reader scanning for "Pictures" finds it whatever the folder is called.
+
+It rides on the listing rather than a second command: the set is constant for
+the process, so it is resolved once and costs six short strings per
+navigation.
 
 ## A local session ends with its last window
 

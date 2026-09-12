@@ -471,7 +471,9 @@ pub async fn dispatch(
             let start = a
                 .path
                 .unwrap_or_else(|| gallery.root.as_path().to_path_buf());
-            Ok(json!(files::list_dirs(&start).map_err(failed)?))
+            Ok(json!(
+                files::list_dirs(&start, gallery.root.as_path()).map_err(failed)?
+            ))
         }
 
         other => Err(CommandError::UnknownCommand(other.to_string())),
