@@ -39,7 +39,15 @@ use crate::path::RelPath;
 use crate::util::lock::DirLock;
 
 /// Bumping this deletes and rebuilds every cache. There is no other mechanism.
-pub const FORMAT_VERSION: i64 = 1;
+///
+/// 2 adds `media_meta.exif_read`. The rebuild is the point rather than a cost:
+/// version 1 decided whether to read a file's header by asking whether anything
+/// was known about it yet, and a thumbnail answers yes — so every file the grid
+/// had drawn before its header was read was excluded from the EXIF pass
+/// permanently. Those rows cannot be repaired in place, because nothing
+/// distinguishes "probed, found nothing" from "never probed"; that is the
+/// distinction the new column exists to record.
+pub const FORMAT_VERSION: i64 = 2;
 
 /// How many read connections, at most.
 const READ_POOL_MAX: usize = 6;
@@ -101,12 +109,22 @@ fn schema_sql() -> String {
         duration     REAL,
         gps_lat      REAL,
         gps_lon      REAL,
+        -- Whether this file's metadata header has been read, which is **not**
+        -- the same as whether it had anything in it. A photo with no GPS and a
+        -- screenshot with no EXIF block at all both leave every column above
+        -- NULL, so any gate phrased over those columns re-reads them on every
+        -- open, forever. This is the only honest spelling of already-looked.
+        exif_read    INTEGER NOT NULL DEFAULT 0,
         color_label  TEXT,
         -- ~25 bytes, and it lives here rather than on a tier so the items
         -- query never walks a thumbnail row's overflow pages to reach it.
         thumbhash    BLOB
     );
     CREATE INDEX IF NOT EXISTS idx_meta_date_taken  ON media_meta(date_taken DESC);
+    -- Partial, so it holds only the rows still owing a header read: empty on a
+    -- warm gallery, which is what makes the backfill's candidate query free
+    -- rather than a full scan of the library on every open.
+    CREATE INDEX IF NOT EXISTS idx_meta_unprobed     ON media_meta(exif_read) WHERE exif_read = 0;
     CREATE INDEX IF NOT EXISTS idx_meta_date_added  ON media_meta(date_added DESC);
     CREATE INDEX IF NOT EXISTS idx_meta_last_viewed ON media_meta(last_viewed DESC);
     CREATE INDEX IF NOT EXISTS idx_meta_rating      ON media_meta(rating);
@@ -535,9 +553,11 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM media_meta", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "a stale cache survived a format bump");
+        // Against the constant, not a literal: a bump should not need this
+        // test edited, or the edit becomes the place the bump is forgotten.
         assert_eq!(
             meta_get(&conn, "format_version").unwrap().as_deref(),
-            Some("1")
+            Some(FORMAT_VERSION.to_string().as_str())
         );
     }
 

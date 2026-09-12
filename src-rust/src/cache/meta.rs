@@ -110,6 +110,22 @@ pub fn set_probed(conn: &Connection, path: &RelPath, m: &ProbedMedia) -> Result<
     Ok(())
 }
 
+/// Record that this file's metadata header has been read.
+///
+/// Separate from [`set_probed`] on purpose, and the separation is the whole
+/// fix: `set_probed` is also how the thumbnailer reports dimensions, and a
+/// decode is not a header read. Folding the two together is how "has anything
+/// been learned about this file?" came to stand in for "has its header been
+/// read?", and a thumbnail answered yes.
+///
+/// Set whether or not anything was found — a file with no EXIF block has been
+/// looked at exactly once and must not be looked at again.
+pub fn mark_header_read(conn: &Connection, path: &RelPath) -> Result<(), CacheError> {
+    conn.prepare_cached("UPDATE media_meta SET exif_read = 1 WHERE path = ?1")?
+        .execute([path.as_str()])?;
+    Ok(())
+}
+
 /// Store the ThumbHash for a file.
 pub fn set_thumbhash(conn: &Connection, path: &RelPath, hash: &[u8]) -> Result<(), CacheError> {
     conn.prepare_cached("UPDATE media_meta SET thumbhash = ?2 WHERE path = ?1")?
@@ -254,6 +270,53 @@ mod tests {
             file_size: 100,
             mtime: 42,
         }
+    }
+
+    /// The regression this column exists for.
+    ///
+    /// The gate it replaces was `date_taken IS NULL AND gps_lat IS NULL AND
+    /// width IS NULL`, standing in for "nothing has been learned about this
+    /// file yet". A thumbnail sets `width`, and the grid thumbnails on sight —
+    /// so a file drawn before its header was read was excluded from the EXIF
+    /// pass permanently, and no amount of reopening the gallery brought it
+    /// back. Measured against a real gallery before the fix: 40 files with
+    /// readable EXIF, 0 recovered on reopen.
+    #[test]
+    fn a_thumbnailed_file_is_still_owed_a_header_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CacheDb::open_at(dir.path()).unwrap();
+        let conn = db.writer_blocking();
+        let path = RelPath::new("a.jpg").unwrap();
+        insert_scanned(&conn, &[scanned("a.jpg")]).unwrap();
+
+        // The grid draws it, which is all a decode reports.
+        set_probed(
+            &conn,
+            &path,
+            &ProbedMedia { width: Some(4000), height: Some(3000), ..Default::default() },
+        )
+        .unwrap();
+
+        let owed = |c: &Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM media_meta WHERE exif_read = 0", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(owed(&conn), 1, "a decode is not a header read");
+
+        // The old gate, for contrast: it would have skipped this file forever.
+        let under_the_old_gate: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_meta
+                 WHERE date_taken IS NULL AND gps_lat IS NULL AND width IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(under_the_old_gate, 0, "the gate this replaces");
+
+        // Reading the header settles it, even though it found nothing.
+        mark_header_read(&conn, &path).unwrap();
+        assert_eq!(owed(&conn), 0, "a file with no EXIF must not be re-read forever");
     }
 
     #[test]

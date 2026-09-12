@@ -135,20 +135,25 @@ pub async fn enrich_and_index(gallery: &Gallery) -> Result<(), OpenError> {
     Ok(())
 }
 
-/// Read capture time and GPS out of headers for files nothing is known about.
+/// Read capture time and GPS out of headers for files whose headers have not
+/// been read.
 ///
-/// The gate is "nothing has been learned about this file yet" rather than
-/// "`gps_lat` is NULL", because a `NULL` never becomes non-`NULL` for a photo
-/// that has no GPS — so the narrower gate would re-read every such header on
-/// every open, forever. Any decode sets `width`, so once the backfill has
-/// warmed a gallery this pass is a no-op.
+/// **The gate is `exif_read = 0`, and the column exists because nothing else
+/// answers the question.** A `NULL` never becomes non-`NULL` for a photo that
+/// has no GPS, so a gate phrased over the result columns re-reads every such
+/// header on every open forever. The gate this replaces dodged that by adding
+/// `width IS NULL` — "nothing has been learned about this file yet" — on the
+/// reasoning that any decode sets `width`. But the grid decodes on sight, so a
+/// file drawn before its header was read was excluded from this pass
+/// permanently, and no amount of reopening the gallery brought it back. Worse
+/// than a slow pass: a silent one.
+///
+/// On a warm gallery the candidate query is served by a partial index holding
+/// only the rows still owed, so a no-op pass costs a lookup rather than a scan.
 async fn backfill_exif(gallery: &Gallery) -> Result<(), OpenError> {
     let candidates: Vec<RelPath> = {
         let conn = gallery.db.read().await;
-        let mut stmt = conn.prepare(
-            "SELECT path FROM media_meta
-             WHERE date_taken IS NULL AND gps_lat IS NULL AND width IS NULL",
-        )?;
+        let mut stmt = conn.prepare("SELECT path FROM media_meta WHERE exif_read = 0")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -156,38 +161,65 @@ async fn backfill_exif(gallery: &Gallery) -> Result<(), OpenError> {
         }
         out
     };
-    if candidates.is_empty() {
-        return Ok(());
-    }
+    probe_and_store(gallery, &candidates).await
+}
 
-    let root = gallery.root.clone();
-    let probed = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::new();
-        for path in candidates {
-            let Ok(absolute) = root.resolve(&path) else {
-                continue;
-            };
-            let exif = crate::pipeline::exif::read(absolute.as_path());
-            out.push((
-                path,
-                meta::ProbedMedia {
-                    date_taken: exif.date_taken,
-                    location: exif.location,
-                    ..Default::default()
-                },
-            ));
+/// How many headers are read before the batch is committed.
+///
+/// The pass used to hold every result in memory and commit once at the end, so
+/// an interruption lost all of it. That is no longer a rare case: a local
+/// session now exits when its last window closes, and a first open of a large
+/// library is still enriching long after the user has looked at the first
+/// screen. Committing as it goes means an interrupted pass keeps what it read,
+/// and `exif_read` means the next open resumes instead of starting over.
+const PROBE_BATCH: usize = 256;
+
+/// Read `paths`' metadata headers and record both what they said and that they
+/// were read.
+///
+/// **Both facts are recorded, and they are different facts.** A file with no
+/// EXIF block leaves `date_taken` and the coordinates NULL, which is
+/// indistinguishable from never having looked — so the looking is written down
+/// separately. That is the whole of why [`meta::mark_header_read`] is not
+/// folded into [`meta::set_probed`].
+///
+/// Reads happen off the writer lock, a batch at a time, and the lock is taken
+/// only to commit — so a gallery being enriched can still warm thumbnails.
+async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), OpenError> {
+    for chunk in paths.chunks(PROBE_BATCH) {
+        let root = gallery.root.clone();
+        let batch: Vec<RelPath> = chunk.to_vec();
+        let probed = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for path in batch {
+                // A path that will not resolve is still a path that has been
+                // looked at: leaving it unmarked would retry it every open.
+                let facts = match root.resolve(&path) {
+                    Ok(absolute) => crate::pipeline::exif::read(absolute.as_path()),
+                    Err(_) => crate::pipeline::exif::Facts::default(),
+                };
+                out.push((
+                    path,
+                    meta::ProbedMedia {
+                        date_taken: facts.date_taken,
+                        location: facts.location,
+                        ..Default::default()
+                    },
+                ));
+            }
+            out
+        })
+        .await
+        .map_err(|e| OpenError::Io(std::io::Error::other(e.to_string())))?;
+
+        let conn = gallery.db.writer().await;
+        let tx = conn.unchecked_transaction()?;
+        for (path, m) in &probed {
+            meta::set_probed(&conn, path, m)?;
+            meta::mark_header_read(&conn, path)?;
         }
-        out
-    })
-    .await
-    .map_err(|e| OpenError::Io(std::io::Error::other(e.to_string())))?;
-
-    let conn = gallery.db.writer().await;
-    let tx = conn.unchecked_transaction()?;
-    for (path, m) in &probed {
-        meta::set_probed(&conn, path, m)?;
+        tx.commit()?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -777,6 +809,15 @@ async fn flush(
             if let Err(e) = index_one(gallery, &file.path).await {
                 log::warn!("could not index the companion for {}: {e}", file.path);
             }
+        }
+        // And its header read, for the same reason. A file arriving over rsync
+        // or Samba is otherwise dateless and placeless until the next open —
+        // and under the gate this replaces, the grid drawing it in the meantime
+        // made that permanent. The backfill at open is now only the resume path
+        // for whatever this missed.
+        let arrived: Vec<RelPath> = scanned.iter().map(|f| f.path.clone()).collect();
+        if let Err(e) = probe_and_store(gallery, &arrived).await {
+            log::warn!("could not read headers for newly added files: {e}");
         }
     }
 

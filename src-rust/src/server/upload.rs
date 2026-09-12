@@ -21,7 +21,10 @@
 //!    `date_taken = <upload time>` — and because it is `INSERT OR IGNORE`,
 //!    nothing ever corrects them. The thumbnail self-heals; the metadata does
 //!    not, so size sort, `size>=10mb` and date sort are permanently wrong for
-//!    that file.
+//!    that file. The capture time is read from the staged file by `commit`
+//!    itself: it used to be a parameter, and the one caller passed `None` on
+//!    every upload, so this paragraph described something that was not
+//!    happening.
 //! 4. **`RENAME_NOREPLACE`.** The dedupe loop checked `!candidate.exists()` and
 //!    then renamed unconditionally; between those two steps, two phones
 //!    uploading `IMG_0001.jpg` clobber each other — the exact thing the loop's
@@ -151,23 +154,26 @@ impl StagedUpload {
         Ok(())
     }
 
-    /// Flush, stamp the mtime, and rename into place.
+    /// Flush, stamp the mtime from the photo's own capture time, and rename
+    /// into place.
     ///
     /// The mtime is stamped **before** the rename, or the indexer records the
-    /// upload time as the capture time and every uploaded photo sorts as
-    /// "today" forever.
-    pub fn commit(
-        mut self,
-        destination_dir: &Path,
-        name: &str,
-        mtime: Option<i64>,
-    ) -> Result<PathBuf, UploadError> {
+    /// upload time and every uploaded photo sorts as "today" forever.
+    ///
+    /// **The capture time is read here rather than passed in**, because this is
+    /// the only place that has the flushed bytes and a path to read them from.
+    /// The parameter it replaces was the bug: the one caller passed `None` on
+    /// every upload, so nothing was ever stamped and the module's own doc
+    /// comment described a fix that was not running. A photo with no EXIF date
+    /// — and every video — keeps the upload time, which is the best available
+    /// answer rather than a guess.
+    pub fn commit(mut self, destination_dir: &Path, name: &str) -> Result<PathBuf, UploadError> {
         if let Some(mut file) = self.file.take() {
             file.flush()?;
             file.sync_all()?;
         }
-        if let Some(mtime) = mtime {
-            let stamp = filetime::FileTime::from_unix_time(mtime, 0);
+        if let Some(taken) = crate::pipeline::exif::read(&self.temp).date_taken {
+            let stamp = filetime::FileTime::from_unix_time(taken, 0);
             filetime::set_file_mtime(&self.temp, stamp)?;
         }
 
@@ -293,19 +299,49 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_renames_into_place_and_stamps_the_mtime() {
+    fn a_commit_renames_into_place_and_stamps_the_capture_time() {
         let d = tempfile::tempdir().unwrap();
+        let jpeg =
+            crate::pipeline::exif::tests_support::jpeg_with_exif(Some("2020:09:13 12:26:40"), None);
         let mut staged = StagedUpload::create(d.path()).unwrap();
-        staged.write(b"jpeg-bytes").unwrap();
-        let landed = staged.commit(d.path(), "a.jpg", Some(1_600_000_000)).unwrap();
+        staged.write(&jpeg).unwrap();
+        let landed = staged.commit(d.path(), "a.jpg").unwrap();
 
-        assert_eq!(std::fs::read(&landed).unwrap(), b"jpeg-bytes");
+        assert_eq!(std::fs::read(&landed).unwrap(), jpeg);
         let mtime = filetime::FileTime::from_last_modification_time(
             &std::fs::metadata(&landed).unwrap(),
         );
-        assert_eq!(mtime.unix_seconds(), 1_600_000_000);
+        assert_eq!(
+            mtime.unix_seconds(),
+            1_600_000_000,
+            "the uploaded file should carry its own capture time, not the upload time"
+        );
         // And no temp file survived.
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+    }
+
+    /// The regression that shipped: `commit` took the capture time as a
+    /// parameter and its one caller always passed `None`, so an upload filed
+    /// under "today" forever and the module doc above described a fix that was
+    /// not running.
+    #[test]
+    fn an_upload_with_no_capture_time_keeps_the_upload_time() {
+        let d = tempfile::tempdir().unwrap();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut staged = StagedUpload::create(d.path()).unwrap();
+        staged.write(b"no exif here at all").unwrap();
+        let landed = staged.commit(d.path(), "a.jpg").unwrap();
+
+        let mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&landed).unwrap(),
+        );
+        assert!(
+            mtime.unix_seconds() >= before - 5,
+            "a file with no capture time should keep the upload time"
+        );
     }
 
     #[test]
@@ -315,11 +351,11 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut first = StagedUpload::create(d.path()).unwrap();
         first.write(b"first").unwrap();
-        first.commit(d.path(), "IMG_0001.jpg", None).unwrap();
+        first.commit(d.path(), "IMG_0001.jpg").unwrap();
 
         let mut second = StagedUpload::create(d.path()).unwrap();
         second.write(b"second").unwrap();
-        let landed = second.commit(d.path(), "IMG_0001.jpg", None).unwrap();
+        let landed = second.commit(d.path(), "IMG_0001.jpg").unwrap();
 
         assert_eq!(landed.file_name().unwrap(), "IMG_0001 (2).jpg");
         assert_eq!(

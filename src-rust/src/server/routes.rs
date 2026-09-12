@@ -748,7 +748,7 @@ async fn upload_route(State(state): State<Arc<AppState>>, mut multipart: axum::e
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         }
-        match staged.commit(directory.as_path(), &name, None) {
+        match staged.commit(directory.as_path(), &name) {
             Ok(path) => landed.push(path.display().to_string()),
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
