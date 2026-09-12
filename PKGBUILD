@@ -32,6 +32,14 @@ depends=('libheif' 'ffmpeg' 'xdg-utils')
 # command: the SPA is embedded into the library, not read from disk at runtime.
 makedepends=('rust' 'nodejs' 'npm')
 
+# aws-lc-sys (pulled in by axum-server's tls-rustls feature) compiles AWS-LC's
+# C/assembly crypto sources through its own build script, which picks up
+# makepkg's injected CFLAGS/LDFLAGS. Under this system's default LTO option
+# that adds -flto=auto, producing LTO-bytecode objects that rust-lld (no GCC-LTO
+# plugin) cannot resolve symbols from at final link — every AWS-LC symbol comes
+# up undefined. Opt out for this package rather than hand-stripping CFLAGS.
+options=('!lto')
+
 source=()
 
 build() {

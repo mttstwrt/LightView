@@ -39,6 +39,14 @@ The SPA is embedded into the **library**, not read from disk by the binary, so
 **every** Rust target — `check`, `test`, `clippy`, `build` — fails without
 `dist/`. It is the first thing to check when a fresh clone will not compile.
 
+**`Cargo.lock` is committed.** This crate ships a binary, and the package
+build, the container image and the release workflow all start from a clean
+checkout — without the lock file each of them re-resolves every dependency,
+and a semver-compatible upstream release can break a build with no change here
+and nothing in git to bisect. `PKGBUILD` passes `--locked`, which fails
+outright rather than quietly resolving something else, so a lock file that
+drifts from `Cargo.toml` is a build error and not a surprise later.
+
 ## Checks
 
 ```sh

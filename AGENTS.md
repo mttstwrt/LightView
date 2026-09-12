@@ -74,6 +74,14 @@ about to change.
   bump deletes and rebuilds it; that is the only migration mechanism.
 - **Companion sidecars are the only durable data.** Never write one outside
   `modify_companion`, and never drop a field without keeping `extra`.
+- **A header read is recorded separately from what it found.** `exif_read`
+  means "looked", not "found something" — a photo with no GPS and a screenshot
+  with no EXIF block leave identical rows, so any gate phrased over the result
+  columns either re-reads forever or excludes forever.
+- **Sort and group use `COALESCE(date_taken, mtime)`; filters use
+  `date_taken`.** Ordering has to place every file somewhere; `date=2024` has
+  to mean *taken* in 2024.
+- **`Cargo.lock` is committed**, and `PKGBUILD` builds `--locked`.
 
 ## Engineering Principles
 

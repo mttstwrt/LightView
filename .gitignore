@@ -1,7 +1,13 @@
 # --- Rust/Cargo ---
 /src-rust/target/
 **/*.rs.bk
-Cargo.lock
+# `Cargo.lock` is **committed**, not ignored. This crate ships a [[bin]], and
+# the package build, the container image and the release workflow all build
+# from a clean checkout — so without it every one of them re-resolves
+# dependencies from scratch and a semver-compatible upstream release can break
+# a build with no change here and nothing in git to bisect. `PKGBUILD` already
+# passes `--locked`, which fails outright on a fresh clone if the lock file is
+# not there.
 
 # --- Node/Frontend ---
 node_modules/
