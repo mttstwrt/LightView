@@ -222,3 +222,55 @@ Four things, each load-bearing, and each a bug the previous implementation had:
 - **Nothing a client sends may name a program.** `open_with` takes an *index*
   into server-side configuration; `run_plugin` takes a plugin *name*, which the
   installer scan either matches or does not.
+
+## A local session ends with its last window
+
+`lightview <dir>` is started by a click nobody associates with a process
+lifetime — "Open with LightView" in a file manager. Closing the window used to
+leave it serving nothing while holding the gallery lock, its watcher, its idle
+worker and its thread pool, until someone went looking for it.
+
+**The signal already existed: the SSE stream.** A browser tears the `/api/events`
+connection down when its tab closes, so a count of live streams is a count of
+open windows — see [`util/presence`](../../src-rust/src/util/presence.rs), which
+lives in `util` rather than here because both layers report into it: this one
+counts windows, and the background services count durable work in flight.
+
+Four things decide whether that is right rather than merely clever:
+
+- **Local mode only.** `--serve` passes a future that never resolves. A
+  deployment must outlive every client, and a phone locking its screen is not a
+  shutdown request.
+- **Armed only after a first window has ever opened**, or the process races the
+  browser it was started for.
+- **Five minutes of continuous zero, re-checked each tick.** Not thirty
+  seconds: browsers discard backgrounded tabs under memory pressure, closing
+  the socket while the tab stays in the strip. Waiting longer costs nothing,
+  because a second `lightview <dir>` inside the window attaches to the running
+  process. The *other* direction is safe only because the bind is loopback — a
+  suspended laptop does not drop a connection whose endpoints are both local,
+  so a closed lid is not a closed window.
+- **Never mid-write.** Graceful HTTP shutdown covers requests and *not* the
+  writes that matter: the open-time enrichment pass and the hourly companion
+  sweep run detached and write sidecars for minutes after the first screen is
+  painted. Both hold a busy guard, and the watchdog waits for it.
+
+`instance.json` is removed before the listener stops, so a launch racing the
+exit starts its own session rather than opening a tab at a dying port.
+
+A count of streams is not *exactly* a count of windows, and the two places it
+differs are both harmless here. `/pair` renders before the main app mounts and
+holds no stream, but it belongs to the `--serve` flow, where the watchdog does
+not run. A window whose stream has 401'd sits in the "session ended" state
+holding none either — but that state only arises across a restart, so it can
+never be the last window of the process it would end. Anything transient (a
+reload, an `EventSource` reconnect) dips the count and is absorbed by the
+grace.
+
+**Presence is not activity.** There is already an idle signal —
+[`pipeline::serve::Activity`](../pipeline/README.md), the time of the last
+user-driven request — and reusing it here would end a session under someone
+reading a page, since a tab parked on a grid makes no requests for hours. That
+module's own doc warns against the mirror of the mistake, reading the
+subscriber count as activity. Both directions are named where someone would
+reach for the wrong one.

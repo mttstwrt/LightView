@@ -450,7 +450,14 @@ struct DirsQuery {
 
 async fn sse(State(state): State<Arc<AppState>>) -> Sse<impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
     let mut rx = state.gallery.events.subscribe();
+    // Counted for the life of the *stream*, not of this function: the guard is
+    // moved into the generator below, so it drops when the response body does
+    // — which is what a closed tab looks like from here. See
+    // `util::presence`, and note that the keep-alive is load-bearing for it:
+    // without periodic writes a dead connection is never noticed.
+    let window = state.presence.window();
     let stream = async_stream::stream! {
+        let _window = window;
         while let Some(event) = events::next_for_client(&mut rx).await {
             if let Ok(data) = serde_json::to_string(&event) {
                 yield Ok(SseEvent::default().data(data));

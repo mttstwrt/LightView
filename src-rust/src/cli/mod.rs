@@ -125,7 +125,20 @@ async fn open(dirs: &Dirs, dir: &Path) -> Result<std::process::ExitCode, String>
         eprintln!("lightview: could not launch a browser ({e}); open the URL above");
     }
 
-    listen::serve(bound, state)
+    // **The session ends with its last window.** `lightview <dir>` is started
+    // by a click nobody associates with a process lifetime -- "Open with
+    // LightView" from a file manager -- and closing the window used to leave
+    // it serving nothing while holding the gallery lock.
+    let shutdown = {
+        let presence = state.presence.clone();
+        let cache_dir = cache_dir.clone();
+        async move {
+            crate::util::presence::last_window_closed(presence).await;
+            Instance::remove(&cache_dir);
+            eprintln!("lightview: the last window closed.");
+        }
+    };
+    listen::serve(bound, state, shutdown)
         .await
         .map_err(|e| format!("server stopped: {e}"))?;
     Ok(std::process::ExitCode::SUCCESS)
@@ -204,7 +217,9 @@ async fn serve(
     }
     eprintln!("lightview: run `lightview pair` to add a device.");
 
-    listen::serve(bound, state)
+    // Never stops on its own. A phone locking its screen is not a shutdown
+    // request, and a deployment with no client is still a deployment.
+    listen::serve(bound, state, std::future::pending())
         .await
         .map_err(|e| format!("server stopped: {e}"))?;
     Ok(std::process::ExitCode::SUCCESS)
@@ -380,16 +395,25 @@ async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), Stri
     });
     state.mark_ready();
 
-    // Enrichment is slow and the grid does not need it to paint.
+    // Enrichment is slow and the grid does not need it to paint. It also
+    // writes companions -- the geocoder's, and the mirror's date_added --
+    // which is why it holds a busy guard: a local session exits when its last
+    // window closes, and on a first open of a large library that happens while
+    // this is still running. HTTP graceful shutdown does not cover a detached
+    // task, so the guard is what keeps the exit from landing between a
+    // `modify_companion`'s lock and its rename.
     let enriching = gallery.clone();
+    let enrich_guard = state.presence.busy();
     tokio::spawn(async move {
+        let _busy = enrich_guard;
         if let Err(e) = gallery_service::enrich_and_index(&enriching).await {
             log::warn!("the open-time enrichment pass failed: {e}");
         }
     });
     crate::pipeline::idle::spawn(gallery.thumbs.clone());
     // The backstop for companions written where the watcher cannot see them.
-    gallery_service::spawn_companion_sweep(gallery.clone());
+    // Same guard, for the same reason: the sweep writes sidecars too.
+    gallery_service::spawn_companion_sweep(gallery.clone(), state.presence.clone());
     Ok(())
 }
 

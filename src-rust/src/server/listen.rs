@@ -103,12 +103,33 @@ pub fn advertised_address(bound: &Bound) -> String {
 }
 
 /// Serve until the process ends.
-pub async fn serve(bound: Bound, state: Arc<AppState>) -> Result<(), ListenError> {
+/// How long in-flight requests have to finish once shutdown begins.
+///
+/// Requests, not background work: a companion write that is not inside a
+/// request is waited on by `util::presence`'s busy count instead, before the
+/// shutdown signal is ever produced.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Serve until `shutdown` resolves.
+///
+/// **Both branches honour it**, by different mechanisms: `axum::serve` takes a
+/// future and `axum_server` takes a handle. A parameter one branch quietly
+/// ignored would be a trap inside the one function whose whole subject is that
+/// there is exactly one listener. Callers with nothing to wait for — every
+/// `--serve` deployment, which must outlive its clients — pass
+/// `std::future::pending()`.
+pub async fn serve(
+    bound: Bound,
+    state: Arc<AppState>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), ListenError> {
     let router = crate::server::routes::router(state.clone());
 
     if !bound.tls {
         let listener = tokio::net::TcpListener::from_std(bound.listener)?;
-        axum::serve(listener, router).await?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown)
+            .await?;
         return Ok(());
     }
 
@@ -121,7 +142,16 @@ pub async fn serve(bound: Bound, state: Arc<AppState>) -> Result<(), ListenError
     .await
     .map_err(|e| ListenError::Tls(e.to_string()))?;
 
+    let handle = axum_server::Handle::new();
+    {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            handle.graceful_shutdown(Some(DRAIN));
+        });
+    }
     axum_server::from_tcp_rustls(bound.listener, config)
+        .handle(handle)
         .serve(router.into_make_service())
         .await?;
     Ok(())

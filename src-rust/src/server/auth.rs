@@ -153,6 +153,17 @@ impl Instance {
         let body = std::fs::read(dir.join("instance.json")).ok()?;
         serde_json::from_slice(&body).ok()
     }
+
+    /// Remove it, on the way out of a local session.
+    ///
+    /// **Before the listener stops, not after.** A second `lightview <dir>`
+    /// that finds the lock still held reads this file and opens a browser at
+    /// the URL in it; racing the exit, that tab would land on a port that has
+    /// stopped answering. Deleting it first makes the race resolve the other
+    /// way — the launcher finds nothing, and starts a session of its own.
+    pub fn remove(dir: &Path) {
+        let _ = std::fs::remove_file(dir.join("instance.json"));
+    }
 }
 
 /// Pick the loopback address this process will own.

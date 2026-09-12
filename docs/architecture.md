@@ -46,6 +46,8 @@ rather than a lookup in a second list. See [server/](server/README.md).
 
 ```
   pure libraries   filter · sort · autocomplete · geocode · companion · util · path
+                   util holds presence: open windows and durable work in flight,
+                   counted by the server and by the services, read by the CLI
         ↑          take a connection or a struct; know nothing above them
   services         cache · pipeline · plugin
                    media · gallery · tags · files · duplicates · trash · settings

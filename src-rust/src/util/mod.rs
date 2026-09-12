@@ -4,3 +4,4 @@ pub mod fs_atomic;
 pub mod fs_watch;
 pub mod lock;
 pub mod paths;
+pub mod presence;

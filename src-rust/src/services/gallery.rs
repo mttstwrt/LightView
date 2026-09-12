@@ -425,10 +425,21 @@ const COMPANION_SWEEP: std::time::Duration = std::time::Duration::from_secs(3600
 /// or not anyone is looking, and a busy gallery is exactly when somebody is.
 /// The sweep's own two-phase split is what keeps it from blocking the grid —
 /// it walks, stats and reads with no database handle at all.
-pub fn spawn_companion_sweep(gallery: Arc<Gallery>) -> tokio::task::JoinHandle<()> {
+///
+/// Holds a [`crate::util::presence::Busy`] guard **around each sweep, not for
+/// the life of the task** — the mirror writes sidecars via
+/// `complete_companions`, and a local session exiting between a
+/// `modify_companion`'s lock and its rename leaves a temp file in the user's
+/// gallery. Held across the sleep instead, it would keep the process alive
+/// forever.
+pub fn spawn_companion_sweep(
+    gallery: Arc<Gallery>,
+    presence: Arc<crate::util::presence::Presence>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(COMPANION_SWEEP).await;
+            let _busy = presence.busy();
             match reindex_companions(&gallery).await {
                 Ok(0) => {}
                 Ok(n) => {

@@ -25,6 +25,7 @@ use crate::server::devices::Devices;
 use crate::server::events::Events;
 use crate::services::settings::GallerySettings;
 use crate::util::paths::Dirs;
+use crate::util::presence::Presence;
 
 /// The open gallery. Everything a service needs, and nothing about HTTP.
 pub struct Gallery {
@@ -97,6 +98,12 @@ pub struct AppState {
     /// started right after; a fresh implementation without the gate would make
     /// it the entire initial scan.
     ready: AtomicBool,
+    /// Open windows and durable work in flight. Every process keeps the count;
+    /// only `lightview <dir>` acts on it, by awaiting
+    /// [`crate::util::presence::last_window_closed`]. A `--serve` deployment
+    /// counts the same things and ignores them, which is one branch fewer than
+    /// making the field optional.
+    pub presence: Arc<Presence>,
 }
 
 impl AppState {
@@ -115,6 +122,7 @@ impl AppState {
             launch: None,
             origin: String::new(),
             ready: AtomicBool::new(false),
+            presence: Arc::new(Presence::default()),
         }
     }
 

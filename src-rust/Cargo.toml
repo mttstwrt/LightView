@@ -95,6 +95,9 @@ opt-level = 2
 # also be testing the client.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `start_paused` for the presence watchdog's tests: its grace period is five
+# minutes, and a test that actually waited that out would not be run.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [profile.release]
 incremental = false # Disable incremental builds for a "cleaner" optimization

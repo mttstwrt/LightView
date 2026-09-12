@@ -259,6 +259,27 @@ check "a plugin name that is a path is refused" "$?" "1"
 "$BIN" tag "$T" --plugin ../example-auto-tagger --data-dir "$D" >/dev/null 2>&1
 check "a plugin name with .. is refused" "$?" "1"
 
+# ---------------------------------------------------------------------------
+# The session's own lifetime
+# ---------------------------------------------------------------------------
+echo "== session lifetime =="
+
+# A local process that no browser ever reached must not exit. The watchdog is
+# armed by the first window, and without that rule it races the browser it was
+# just started for -- which on a slow desktop is the common case, not the edge.
+LONE="$WORK/lone"; mkdir -p "$LONE/gallery" "$LONE/state"
+cp "$T/tall.png" "$LONE/gallery/" 2>/dev/null || true
+"$BIN" "$LONE/gallery" --data-dir "$LONE/state" > "$WORK/lone.out" 2> "$WORK/lone.err" &
+LONE_PID=$!
+sleep 20
+if kill -0 "$LONE_PID" 2>/dev/null; then
+  ok "a local session with no window yet stays up"
+else
+  bad "the process exited before any browser reached it"
+fi
+kill "$LONE_PID" 2>/dev/null || true
+wait "$LONE_PID" 2>/dev/null || true
+
 echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" = "0" ] || { echo "--- open.err ---"; tail -20 "$WORK/open.err"; echo "--- serve.err ---"; tail -20 "$WORK/serve.err"; }
