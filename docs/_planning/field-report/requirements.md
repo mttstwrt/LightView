@@ -61,3 +61,12 @@ can predict, not something that happens partway down a scroll.
   date. Nothing reported asks for it and it is a durable-format commitment.
 - A typed-path entry in the picker. Pins were what was asked for.
 - Any new configuration. None of the five is a preference.
+- **Indexing anything a video probe knows.** Reviewing finding 4 turned up that
+  `set_probed` has two callers and neither passes a `VideoInfo`, so
+  `media_meta.duration` is NULL for every clip in the tree and the video GPS
+  parser and its five tests are dead as far as the index is concerned. Real, and
+  not this. Fixing it means running `ffprobe` — a subprocess, two to three
+  orders of magnitude more than a header read — from the indexing path, which
+  needs its own placement and cost argument. Under finding 4's fix every video
+  gets a date from `mtime` like any other file without EXIF, so nothing here
+  depends on it. Recorded, deferred.
