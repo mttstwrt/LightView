@@ -45,6 +45,35 @@ Four defects stack into "almost nothing has a date".
    box sits past the first megabyte yields coordinates but no date. The 1 MB cap
    never bounded anything either, because the unbounded read is on the next line.
 
+### Measured, not assumed
+
+The reporter's reading — "the date is not present in the info panel either,
+which makes me think it just never got loaded" — is right, and it reorders this
+section. Run against a synthetic gallery of 63 files (40 JPEGs carrying a real
+`DateTimeOriginal`, 10 GPS-only, 10 with no EXIF block, 3 clips):
+
+- **On a fresh cache the backfill works.** 40 of 40 dated, correctly. Header
+  reading is not broken, so "these files have no EXIF" is not the explanation.
+- **Once `width` is set the exclusion is permanent.** Clearing `date_taken`
+  while leaving `width` — the state any interrupted or older enrichment leaves —
+  and reopening the gallery in full recovers **0 of 40**. Defect 3 is not a
+  contributing factor; it is a trap with no exit.
+- **The single end-of-pass commit is not the main mechanism.** 3,150 files
+  probed and committed inside six seconds in a debug build. It remains
+  all-or-nothing and a slow enough library could still lose the lot, but it is
+  not what the reporter hit.
+
+So the ordering in the first draft was backwards. **The gate is the headline
+fix**; the `mtime` fallback is the safety net for files that genuinely have no
+capture time — screenshots, exports, every video — not the repair for a library
+of photographs that do.
+
+One consequence worth stating: `FORMAT_VERSION` has stayed at 1 across the
+rebuild, so a cache built by the previous codebase was adopted as-is. Every row
+it had already thumbnailed arrived in the new code with `width` set, and the new
+gate has been excluding all of them since. The bump this change makes is what
+repairs that, and is the only thing that can.
+
 ### The fix
 
 **1. Sorting and grouping coalesce; the column keeps its meaning.**
@@ -172,15 +201,17 @@ Against it, the `width IS NULL` proxy and one duplicated read path are deleted.
   could return the paths it actually inserted. That deletes `backfill_exif`, its
   gate, the `exif_read` column and the bump together — four concepts for one.
 
-  **Rejected because of section B.** A first open of a large library enriches
-  for minutes; adding "exit when the last window closes" makes an interrupted
-  enrichment a routine event rather than a crash. Probe-on-insert alone is not
-  resumable: a file inserted and not yet probed when the process exits is never
-  probed again, because it is never inserted again. The column is what makes the
-  pass a genuine no-op on a warm cache *and* a correct resume on a cold one.
-  That is the named requirement principle 2 asks for, and it only exists because
-  the two changes ship together — worth stating, since either alone would make
-  the other's design wrong.
+  **Rejected because of section B, and because the measurement says the failure
+  is exactly this shape.** A first open of a large library enriches for a while;
+  adding "exit when the last window closes" makes an interrupted enrichment a
+  routine event rather than a crash. Probe-on-insert alone is not resumable — a
+  file inserted and not yet probed when the process exits is never probed again,
+  because it is never inserted again — and "not resumable" is precisely the
+  state the reporter's library is stuck in today, for the same structural
+  reason one gate up. The column is what makes the pass a genuine no-op on a
+  warm cache *and* a correct resume on a cold one. That is the named requirement
+  principle 2 asks for, and it exists only because the two changes ship
+  together: either alone would make the other's design wrong.
 - **Have the thumbnailer read EXIF while it has the file open.** It is already
   paying the open. Rejected: it puts a metadata policy inside the decode path,
   which then owes it to every caller including the on-demand serve inside a
@@ -188,9 +219,11 @@ Against it, the `width IS NULL` proxy and one duplicated read path are deleted.
 
 ### Assumptions
 
-- **`mtime` is meaningful on this library.** Unmeasured. `rsync -a` and most
-  camera imports preserve it; plain `cp` does not. Where it is wrong it is wrong
-  in a way the panel now discloses, which is the most this can honestly offer.
+- **`mtime` is meaningful on this library.** Answered by the reporter: the
+  library was built more or less in place and its file times are evenly spread
+  from 2019 to now, so the fallback orders it correctly rather than collapsing
+  it into an import date. It stays an assumption for libraries copied with a
+  plain `cp`, and there it is wrong in a way the panel discloses.
 - **`read_from_container` seeks to the metadata block rather than reading the
   file whole.** True for JPEG and TIFF, approximately true for HEIF and for
   PNG/WebP chunk-walking, and asserted rather than measured. It is why deleting
@@ -235,7 +268,9 @@ Policy:
   window was backgrounded" are the same observation. Five minutes costs nothing
   — the process is idle, and a `lightview <dir>` inside the window is a fast
   attach to the running one, which is the correct outcome anyway.
-- **Never mid-durable-write.** HTTP graceful shutdown covers requests, and
+- **Never mid-durable-write** — confirmed as the wanted behaviour by the
+  reporter: detect the last window, then exit gracefully rather than interrupt.
+  HTTP graceful shutdown covers requests, and
   **does not cover the writes that matter**: `cli/mod.rs:384` spawns
   `enrich_and_index` detached, `backfill_locations` runs `modify_companion` per
   geotagged file on a blocking thread, and `spawn_companion_sweep` keeps
