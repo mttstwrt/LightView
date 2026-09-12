@@ -10,6 +10,28 @@ Its problem: stream thumbnails into a virtual scroller fast enough that a fling
 lands on pictures rather than skeletons, without asking the server for a
 screenful of full-resolution decodes every frame.
 
+## Rows, and the one that ends a group
+
+Items are placed in order and wrapped into rows; a row commits the moment
+justifying it to the full width would shrink it to its target height, so every
+committed row fills the width exactly.
+
+The rows that *don't* commit are the last of the content and the last of each
+group, and grouping is monthly by default — so a rule that leaves them at their
+target height leaves a ragged right edge a dozen times down a scroll, not once
+at the end. Such a row is stretched to fill the width when that costs little
+height, and left short when it would not: `FINAL_ROW_STRETCH` in
+[`justifiedLayout.ts`](../../src-solidjs/lib/justifiedLayout.ts) is where the
+line sits, at one and a half times the row's natural height.
+
+The trade is not symmetric, which is why there is a ceiling rather than a plain
+"always justify". A group's last row has fewer items than a full one, so filling
+the width means growing taller, and the fewer the items the more growth it
+takes: at the usual geometry three landscapes need 1.48× and fill, while one
+needs 4.4× and does not. Stretching regardless turns a short row into a
+double-height row that is *still* short of the width — worse on both counts
+than leaving it alone.
+
 ## The machine, in seven parts
 
 1. **A virtual range.** A `recalcRange` reads the scroll host's offset each

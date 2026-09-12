@@ -74,6 +74,24 @@ export interface JustifiedLayoutOptions {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
+/**
+ * How much taller than its natural height a row ending a group may be stretched
+ * to fill the width.
+ *
+ * A row that ends a group or the content never reached its commit height, so
+ * justifying it to the full width always makes it taller than the rows above —
+ * the only question is by how much. Up to about half again reads as one of
+ * them; beyond that it reads as a mistake, and the row is better left short.
+ *
+ * Measured at the real defaults (container 1600, gap 4, target 240): a row of
+ * four landscapes needs 1.10× and a row of three needs 1.48×, so both fill the
+ * width; two squares would need 2.7× and one landscape 4.4×, so both stay put.
+ * Rows of three or more close up, which is where the ragged edge was
+ * conspicuous, and the cases that cannot close up keep today's rendering
+ * rather than becoming double-height *and* still ragged.
+ */
+export const FINAL_ROW_STRETCH = 1.5;
+
 /** Default cap on the portrait row-height boost (see `orientationBoost`). */
 export const DEFAULT_ORIENTATION_BOOST = 1.6;
 /** Default aspect at/above which a row is unboosted (see `boostRefAspect`). */
@@ -135,18 +153,30 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
   let rowStart = 0; // first item index of the current row
   let sumAspect = 0;
 
-  // Emit a row covering items [rowStart, end). `justify=false` keeps the row at
-  // the target height (used for the trailing row of the content and of each
-  // group, so 1–2 leftover items aren't stretched grotesquely wide).
-  const flush = (end: number, justify: boolean) => {
+  // Emit a row covering items [rowStart, end). `isFinal` marks the row that
+  // ends the content or a group — the one that never reached its commit
+  // height, and so the only one where filling the width is a choice.
+  const flush = (end: number, isFinal: boolean) => {
     const n = end - rowStart;
     if (n <= 0) return;
     const totalGap = gap * (n - 1);
     const avail = containerWidth - totalGap;
-    // Trailing/group-final rows aren't justified to full width, but still honor
-    // the portrait boost so a leftover portrait row matches the boosted rows
-    // above it rather than snapping back to the base target.
-    let h = justify ? avail / sumAspect : targetFor(sumAspect / n);
+    const justifiedH = avail / sumAspect;
+    // A final row used to sit at its target height unconditionally, which left
+    // a ragged edge at **every group boundary** — and with monthly grouping on
+    // by default, that is not the end of the library, it is a dozen times down
+    // a scroll. It fills the width when doing so costs little height, and
+    // otherwise stays short: a lone image stretched to a full-width banner is
+    // worse than the gap it closes. `FINAL_ROW_STRETCH` is where that line is.
+    //
+    // The unstretched fallback keeps the portrait boost, so a leftover
+    // portrait row matches the boosted rows above it rather than snapping back
+    // to the base target.
+    let h = justifiedH;
+    if (isFinal) {
+      const natural = targetFor(sumAspect / n);
+      h = justifiedH <= natural * FINAL_ROW_STRETCH ? justifiedH : natural;
+    }
     h = clamp(h, minRowHeight, maxRowHeight);
 
     const cells: LayoutCell[] = [];
@@ -168,7 +198,7 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
   for (let i = 0; i < aspects.length; i++) {
     // Force a break before an item that starts a new group.
     if (groupBreak && groupBreak.has(i) && i > rowStart) {
-      flush(i, false);
+      flush(i, true);
     }
 
     const a = clamp(aspects[i] > 0 ? aspects[i] : 1, minAspect, maxAspect);
@@ -183,12 +213,13 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
     // row has a taller target (see `targetFor`), so it commits earlier: fewer,
     // bigger images instead of many narrow slivers.
     if (justifiedH <= targetFor(sumAspect / n)) {
-      flush(i + 1, true);
+      flush(i + 1, false);
     }
   }
 
-  // Trailing partial row, left-aligned at target height.
-  flush(aspects.length, false);
+  // Trailing partial row: filled to the width when that is cheap, left short
+  // when it is not.
+  flush(aspects.length, true);
 
   const totalHeight = rows.length > 0 ? y - gap : 0;
   return { rows, rowTops, totalHeight };

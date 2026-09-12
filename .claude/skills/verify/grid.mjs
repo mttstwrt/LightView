@@ -207,6 +207,57 @@ try {
   );
   ok("the run tagged every file, and the index sees the new namespace");
 
+  // Row geometry, measured off the real DOM.
+  //
+  // The bug was a ragged right edge at every group boundary. The fix stretches
+  // a group's last row to fill the width when that costs little height, and
+  // leaves it short when it would not — so the thing to catch is the *other*
+  // failure, the one an earlier draft of this fix would have shipped: a short
+  // row that is also much taller than the rows above it, which is worse than
+  // the gap it was trying to close.
+  const rows = await page.evaluate(() => {
+    // The layout positions one absolutely-placed div per cell inside a
+    // `position: relative` track. Measure those, not the images inside them:
+    // a thumbnail is letterboxed within its cell and its own box says nothing
+    // about where the row ends.
+    const imgs = [...document.querySelectorAll("img[src*='/thumb/']")];
+    const placed = imgs
+      .map((i) => i.closest("div[style*='position: absolute']"))
+      .filter(Boolean);
+    if (!placed.length) return { width: 0, rows: [] };
+    const track = placed[0].parentElement;
+    const width = track.getBoundingClientRect().width;
+    const trackLeft = track.getBoundingClientRect().left;
+    const byTop = new Map();
+    for (const el of placed) {
+      const r = el.getBoundingClientRect();
+      const key = Math.round(r.top);
+      const row = byTop.get(key) ?? { right: 0, height: r.height };
+      row.right = Math.max(row.right, r.right);
+      byTop.set(key, row);
+    }
+    return {
+      width,
+      rows: [...byTop.values()].map((r) => ({
+        fill: (r.right - trackLeft) / width,
+        height: r.height,
+      })),
+    };
+  });
+  const fills = rows.rows.map((r) => `${(r.fill * 100).toFixed(0)}%`).join(" ");
+  check(
+    `no row overflows its ${rows.width.toFixed(0)}px track (${rows.rows.length} rows: ${fills})`,
+    rows.rows.length > 0 && rows.rows.every((r) => r.fill <= 1.02),
+  );
+  const full = rows.rows.filter((r) => r.fill >= 0.98);
+  const short = rows.rows.filter((r) => r.fill < 0.98);
+  const tallestFull = Math.max(0, ...full.map((r) => r.height));
+  const tallestShort = Math.max(0, ...short.map((r) => r.height));
+  check(
+    `a short row is not a tall row (${short.length} short, tallest ${tallestShort.toFixed(0)}px vs ${tallestFull.toFixed(0)}px full)`,
+    short.length === 0 || tallestFull === 0 || tallestShort <= tallestFull * 1.7,
+  );
+
   // The destination picker, opened the way a person opens it. Its sidebar is
   // the whole of finding C, and neither `tsc` nor a curl check can say whether
   // it renders -- the shortcuts come from the server but the layout does not.
