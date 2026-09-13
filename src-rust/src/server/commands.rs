@@ -436,11 +436,12 @@ pub async fn dispatch(
             // request, and progress is the event stream's job. The terminal
             // `job-finished` is what a client waits on.
             let gallery = gallery.clone();
+            let presence = state.presence.clone();
             tokio::spawn(async move {
                 let label = plugin.manifest.name.clone();
                 let progress = gallery.clone();
                 let reporting = label.clone();
-                let outcome = crate::plugin::run::run(&gallery, &plugin, &paths, move |done, total| {
+                let outcome = crate::plugin::run::run(&gallery, &plugin, &paths, &presence, move |done, total| {
                     progress
                         .events
                         .job_progress(&reporting, done as u32, total as u32);

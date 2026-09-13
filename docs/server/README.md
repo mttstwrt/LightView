@@ -271,9 +271,19 @@ Four things decide whether that is right rather than merely clever:
   suspended laptop does not drop a connection whose endpoints are both local,
   so a closed lid is not a closed window.
 - **Never mid-write.** Graceful HTTP shutdown covers requests and *not* the
-  writes that matter: the open-time enrichment pass and the hourly companion
-  sweep run detached and write sidecars for minutes after the first screen is
-  painted. Both hold a busy guard, and the watchdog waits for it.
+  writes that matter. Three things run detached and write sidecars long after
+  the first screen is painted: the open-time enrichment pass, the hourly
+  companion sweep, and a plugin run, which the command handler starts without
+  awaiting because a job over a thousand files outlives any request.
+
+  Each takes a busy guard **around its `modify_companion` call and nothing
+  else**, and the watchdog waits for it. The scope is the whole of the rule.
+  Held around a pass instead, the guard covers a header read over every file in
+  the library, and a session whose window closed stays alive until that
+  finishes — which is the opposite of what the guard was added to do. Held
+  around the write, an exit can land anywhere else, and it costs nothing because
+  everything else those passes touch is derived: `exif_read` makes the next open
+  resume where this one stopped.
 
 `instance.json` is removed before the listener stops, so a launch racing the
 exit starts its own session rather than opening a tab at a dying port.

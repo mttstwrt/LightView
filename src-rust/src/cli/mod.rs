@@ -302,7 +302,11 @@ async fn tag(
     // One line, rewritten in place, and only when the count actually moves —
     // a run redirected to a log should not produce one line per file.
     let mut last = 0usize;
-    let report = crate::plugin::run::run(&gallery, &plugin, &paths, |done, total| {
+    // `lightview tag` runs in the foreground and ends when the work does, so
+    // there is no window whose closing could cut a companion write in half.
+    // The guard is inert here; the parameter exists for the serving modes.
+    let presence = Arc::<crate::util::presence::Presence>::default();
+    let report = crate::plugin::run::run(&gallery, &plugin, &paths, &presence, |done, total| {
         if done == last {
             return;
         }
@@ -395,24 +399,25 @@ async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), Stri
     });
     state.mark_ready();
 
-    // Enrichment is slow and the grid does not need it to paint. It also
-    // writes companions -- the geocoder's, and the mirror's date_added --
-    // which is why it holds a busy guard: a local session exits when its last
-    // window closes, and on a first open of a large library that happens while
-    // this is still running. HTTP graceful shutdown does not cover a detached
-    // task, so the guard is what keeps the exit from landing between a
-    // `modify_companion`'s lock and its rename.
+    // Enrichment is slow and the grid does not need it to paint. **No guard is
+    // taken here.** It used to hold one for the life of the pass, on the
+    // grounds that the pass writes companions — but three of its four phases
+    // write only the derived cache, and the longest of them reads every header
+    // in the library. Holding a guard across all of that meant a session whose
+    // window had closed stayed alive until the whole library was enriched,
+    // which is the opposite of the rule it was serving. The guard now spans
+    // each `modify_companion` and nothing else, inside the two functions that
+    // call one, so an exit can land anywhere else in the pass — and
+    // `exif_read` makes the next open resume rather than restart.
     let enriching = gallery.clone();
-    let enrich_guard = state.presence.busy();
+    let enrich_presence = state.presence.clone();
     tokio::spawn(async move {
-        let _busy = enrich_guard;
-        if let Err(e) = gallery_service::enrich_and_index(&enriching).await {
+        if let Err(e) = gallery_service::enrich_and_index(&enriching, &enrich_presence).await {
             log::warn!("the open-time enrichment pass failed: {e}");
         }
     });
     crate::pipeline::idle::spawn(gallery.thumbs.clone());
     // The backstop for companions written where the watcher cannot see them.
-    // Same guard, for the same reason: the sweep writes sidecars too.
     gallery_service::spawn_companion_sweep(gallery.clone(), state.presence.clone());
     Ok(())
 }

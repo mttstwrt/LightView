@@ -135,11 +135,14 @@ pub async fn scan_and_index(gallery: &Gallery) -> Result<usize, OpenError> {
 /// writer across the whole walk — a `walkdir`, a file read per changed
 /// companion, a rayon read-modify-write over every geotagged file, and a
 /// checkpoint — during which the grid could not warm a single thumbnail.
-pub async fn enrich_and_index(gallery: &Gallery) -> Result<(), OpenError> {
+pub async fn enrich_and_index(
+    gallery: &Gallery,
+    presence: &Arc<crate::util::presence::Presence>,
+) -> Result<(), OpenError> {
     reprobe_videos_if_the_reader_changed(gallery).await?;
     backfill_exif(gallery).await?;
-    backfill_locations(gallery).await?;
-    reindex_companions(gallery).await?;
+    backfill_locations(gallery, presence).await?;
+    reindex_companions(gallery, presence).await?;
     gallery.refresh_autocomplete().await;
     Ok(())
 }
@@ -283,11 +286,18 @@ async fn reprobe_videos_if_the_reader_changed(gallery: &Gallery) -> Result<(), O
     if db::meta_get(&conn, VIDEO_PROBE_KEY)?.as_deref() == Some(current) {
         return Ok(());
     }
+    // One transaction, because the clear and the stamp are one decision. Split,
+    // an exit landing between them repeats the clear on the next open and
+    // re-reads containers that were already re-read — and now that a session
+    // ends with its last window, landing between two statements is ordinary
+    // rather than a crash.
+    let tx = conn.unchecked_transaction()?;
     let owed = conn.execute(
         "UPDATE media_meta SET exif_read = 0 WHERE media_type = 'video' AND exif_read = 1",
         [],
     )?;
     db::meta_set(&conn, VIDEO_PROBE_KEY, current)?;
+    tx.commit()?;
     if owed > 0 {
         log::info!("the container reader changed: {owed} video(s) owed another look");
     }
@@ -349,7 +359,10 @@ fn video_facts(absolute: &Path, ffprobe_available: bool) -> Option<meta::ProbedM
 /// companion's own recorded version makes the pass a genuine no-op on a
 /// rebuilt cache, which is what makes "nothing is lost but time" true rather
 /// than "nothing but time, and every sidecar's mtime".
-async fn backfill_locations(gallery: &Gallery) -> Result<(), OpenError> {
+async fn backfill_locations(
+    gallery: &Gallery,
+    presence: &Arc<crate::util::presence::Presence>,
+) -> Result<(), OpenError> {
     let geotagged: Vec<(RelPath, f64, f64)> = {
         let conn = gallery.db.read().await;
         let mut stmt = conn.prepare(
@@ -370,6 +383,7 @@ async fn backfill_locations(gallery: &Gallery) -> Result<(), OpenError> {
     }
 
     let root = gallery.root.clone();
+    let presence = presence.clone();
     let written = tokio::task::spawn_blocking(move || {
         let mut written = Vec::new();
         for (path, lat, lon) in geotagged {
@@ -378,6 +392,11 @@ async fn backfill_locations(gallery: &Gallery) -> Result<(), OpenError> {
             };
             let version = crate::geocode::TAGGER_VERSION;
 
+            // **The guard spans this write and nothing else.** Held around the
+            // whole loop it would keep a session alive until the last file in
+            // the library was geocoded; held here it only stops an exit landing
+            // between the lock and the rename. The scope is the point.
+            let _busy = presence.busy();
             let outcome = modify_companion(
                 absolute.as_path(),
                 media_type_of(&path),
@@ -445,7 +464,10 @@ async fn backfill_locations(gallery: &Gallery) -> Result<(), OpenError> {
 /// and runs batched statements. Held as one pass, this blocked every thumbnail
 /// the grid was waiting on — tolerable once per open, and not once it runs
 /// every hour beside an hours-long stream of writes from another machine.
-pub async fn reindex_companions(gallery: &Gallery) -> Result<usize, OpenError> {
+pub async fn reindex_companions(
+    gallery: &Gallery,
+    presence: &Arc<crate::util::presence::Presence>,
+) -> Result<usize, OpenError> {
     let known = {
         let conn = gallery.db.read().await;
         index::load_state(&conn)?
@@ -509,7 +531,7 @@ pub async fn reindex_companions(gallery: &Gallery) -> Result<usize, OpenError> {
     // The other direction of the mirror: fields the database knows and the
     // companion does not. Written back outside the lock, because each one takes
     // the companion's own lock.
-    complete_companions(gallery, owed).await;
+    complete_companions(gallery, owed, presence).await;
     Ok(count)
 }
 
@@ -533,12 +555,11 @@ const COMPANION_SWEEP: std::time::Duration = std::time::Duration::from_secs(3600
 /// The sweep's own two-phase split is what keeps it from blocking the grid —
 /// it walks, stats and reads with no database handle at all.
 ///
-/// Holds a [`crate::util::presence::Busy`] guard **around each sweep, not for
-/// the life of the task** — the mirror writes sidecars via
-/// `complete_companions`, and a local session exiting between a
-/// `modify_companion`'s lock and its rename leaves a temp file in the user's
-/// gallery. Held across the sleep instead, it would keep the process alive
-/// forever.
+/// The [`crate::util::presence::Busy`] guard is not taken here at all: it is
+/// taken around each `modify_companion` inside `complete_companions`, which is
+/// the only part of a sweep that writes anything durable. Held around the whole
+/// sweep it would also cover the walk, the stat and the index write — work an
+/// exit is welcome to interrupt, because the next open rebuilds it.
 pub fn spawn_companion_sweep(
     gallery: Arc<Gallery>,
     presence: Arc<crate::util::presence::Presence>,
@@ -546,8 +567,7 @@ pub fn spawn_companion_sweep(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(COMPANION_SWEEP).await;
-            let _busy = presence.busy();
-            match reindex_companions(&gallery).await {
+            match reindex_companions(&gallery, &presence).await {
                 Ok(0) => {}
                 Ok(n) => {
                     log::info!("companion sweep re-indexed {n} file(s)");
@@ -563,11 +583,16 @@ pub fn spawn_companion_sweep(
 }
 
 /// Write `date_added` / `last_viewed` back into sidecars that lack them.
-async fn complete_companions(gallery: &Gallery, owed: Vec<(RelPath, meta::MirrorResult)>) {
+async fn complete_companions(
+    gallery: &Gallery,
+    owed: Vec<(RelPath, meta::MirrorResult)>,
+    presence: &Arc<crate::util::presence::Presence>,
+) {
     if owed.is_empty() {
         return;
     }
     let root = gallery.root.clone();
+    let presence = presence.clone();
     let _ = tokio::task::spawn_blocking(move || {
         for (path, mirror) in owed {
             let Ok(absolute) = root.resolve(&path) else {
@@ -575,6 +600,9 @@ async fn complete_companions(gallery: &Gallery, owed: Vec<(RelPath, meta::Mirror
             };
             let added = mirror.missing_date_added.map(meta::to_rfc3339);
             let viewed = mirror.missing_last_viewed.map(meta::to_rfc3339);
+            // The mirror is the sweep's durable half, and the reason this
+            // function is not just an index write.
+            let _busy = presence.busy();
             let _ = modify_companion(absolute.as_path(), media_type_of(&path), |companion| {
                 let mut core = companion.meta.core.take().unwrap_or_default();
                 if core.date_added.is_none() {
@@ -1066,6 +1094,51 @@ mod tests {
         // through COALESCE, which is the whole reason that fallback exists.
         assert_eq!(facts.date_taken, None);
         assert_eq!(facts.location, None);
+    }
+
+    /// The interaction between the stamp and an interrupted pass, which is the
+    /// half neither mechanism can be trusted on alone. The stamp is written up
+    /// front for every video at once; the reading happens in batches afterwards
+    /// and a session now ends with its last window, so the pass can stop
+    /// part-way. What must survive that is the *rows*, not the stamp: resume is
+    /// `exif_read` and always was.
+    #[tokio::test]
+    async fn a_pass_cut_short_resumes_where_it_stopped() {
+        let d = tempfile::tempdir().unwrap();
+        let gallery = test_gallery(d.path());
+        {
+            let conn = gallery.db.writer().await;
+            for path in ["a.mp4", "b.mp4", "c.mp4"] {
+                conn.execute(
+                    "INSERT INTO media_meta (path, media_type, file_size, mtime, exif_read)
+                     VALUES (?1, 'video', 0, 0, 1)",
+                    rusqlite::params![path],
+                )
+                .unwrap();
+            }
+        }
+
+        reprobe_videos_if_the_reader_changed(&gallery).await.unwrap();
+
+        // The pass reaches one file and the window closes.
+        {
+            let conn = gallery.db.writer().await;
+            conn.execute("UPDATE media_meta SET exif_read = 1 WHERE path = 'a.mp4'", [])
+                .unwrap();
+        }
+
+        // Next open. The stamp matches now, so the reset stands aside entirely —
+        // and the two files it never reached are still owed by their own rows.
+        reprobe_videos_if_the_reader_changed(&gallery).await.unwrap();
+        let still_owed: Vec<String> = {
+            let conn = gallery.db.read().await;
+            let mut stmt = conn
+                .prepare("SELECT path FROM media_meta WHERE exif_read = 0 ORDER BY path")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(still_owed, vec!["b.mp4", "c.mp4"], "an interrupted pass must resume");
     }
 
     /// The stamp is what lets a cache built by an older reader catch up without

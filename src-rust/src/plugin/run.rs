@@ -68,6 +68,7 @@ pub async fn run(
     gallery: &Arc<Gallery>,
     plugin: &Installed,
     paths: &[RelPath],
+    presence: &Arc<crate::util::presence::Presence>,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Report, RunError> {
     let mut report = Report::default();
@@ -183,13 +184,13 @@ pub async fn run(
         progress(finished, total);
 
         if applied.len() >= APPLY_BATCH {
-            report.tagged += apply(gallery, plugin, std::mem::take(&mut applied)).await;
+            report.tagged += apply(gallery, plugin, std::mem::take(&mut applied), presence).await;
         }
     };
 
     // Whatever happened, what finished is written: a stalled run still keeps
     // the work it did, which is the whole resumability argument.
-    report.tagged += apply(gallery, plugin, applied).await;
+    report.tagged += apply(gallery, plugin, applied, presence).await;
     session.shutdown().await;
     gallery.refresh_autocomplete().await;
 
@@ -237,6 +238,7 @@ async fn apply(
     gallery: &Arc<Gallery>,
     plugin: &Installed,
     batch: Vec<(RelPath, MergedItem)>,
+    presence: &Arc<crate::util::presence::Presence>,
 ) -> usize {
     let mut written = 0;
     for (path, merged) in batch {
@@ -250,7 +252,15 @@ async fn apply(
         let tags = merged.tags.clone();
         let meta = merged.meta.clone();
 
+        // **A run outlives the request that started it**, so nothing upstream is
+        // holding this process open on its behalf: the command handler spawns
+        // it detached, and axum's graceful shutdown only waits for requests
+        // still in flight. Without this guard a session whose last window
+        // closed mid-run could exit between a `modify_companion`'s lock and its
+        // rename, leaving a temp file in the user's gallery.
+        let busy = presence.busy();
         let wrote = tokio::task::spawn_blocking(move || {
+            let _busy = busy;
             modify_companion(&absolute, media_type, |companion| {
                 // The second check, under the lock. The plan's answer is
                 // hours old by now on a large run.
