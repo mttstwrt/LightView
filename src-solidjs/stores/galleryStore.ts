@@ -1,74 +1,63 @@
-// The open gallery: its items, the current sort/filter result, and selection.
+// The open gallery: its items, its groups, and what is selected.
 //
-// `sortedItems` is the full ordered list from the backend; `displayPaths` is
-// what the grid actually renders after filtering. They are separate signals so
-// changing the filter does not invalidate everything derived from the sort.
+// **One list, one query.** `displayPaths` used to be a client-side filter over
+// `sortedItems`, kept separate so changing the sort did not re-run the filter.
+// The filter now compiles into the same statement the sort orders, so there is
+// one payload and the two signals collapse into one — which also deletes the
+// round trip where the client handed a list of matched paths straight back to
+// the server to be re-expanded.
+//
+// **One view.** `viewMode`, `enabledViews` and the switcher go with the square
+// grid and the map: there is one grid and it is justified.
 
-import { createSignal, createMemo } from "solid-js";
-import type {
-  GroupHeader,
-  SortedItem,
-} from "../lib/types";
-import { loadPref, savePref } from "../lib/clientPrefs";
-import {
-  setRating as setRatingIpc,
-  setColorLabel as setColorLabelIpc,
-  getEnabledViews,
-} from "../lib/ipc";
+import { createMemo, createSignal } from "solid-js";
 
-// ---------------------------------------------------------------------------
-// Gallery state
-// ---------------------------------------------------------------------------
+import { api } from "../lib/ipc";
+import type { GroupBy, GroupHeader, ServerEvent, SortedItem } from "../lib/types";
 
 const [galleryPath, setGalleryPath] = createSignal<string | null>(null);
-const [thumbnailsReady, setThumbnailsReady] = createSignal(0);
-const [indexingProgress, setIndexingProgress] = createSignal(0);
 const [loading, setLoading] = createSignal(false);
+const [items, setItems] = createSignal<SortedItem[]>([]);
+const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 
-// Sorted + filtered items (paths in display order)
-const [displayPaths, setDisplayPaths] = createSignal<string[]>([]);
+/** What the grid renders, in order. */
+const displayPaths = createMemo(() => items().map((item) => item.path));
 
-// Full sorted item metadata (for scrollbar indicators, etc.)
-const [sortedItems, setSortedItems] = createSignal<SortedItem[]>([]);
-
-// Per-path video duration (seconds) derived from the sorted items, for the grid
-// to gate short-video autoplay without changing its `paths: string[]` contract.
-// Paths with unknown (NULL) duration are simply absent from the map.
+/** Per-path video duration, for the grid to gate short-video autoplay without
+ *  changing its `paths: string[]` contract. Unknown durations are absent. */
 const durationByPath = createMemo(() => {
   const map = new Map<string, number>();
-  for (const item of sortedItems()) {
+  for (const item of items()) {
     if (item.duration != null) map.set(item.path, item.duration);
   }
   return map;
 });
 
-// Per-path aspect ratio (width / height) derived from the sorted items, for the
-// justified view to lay out cells before thumbnail bytes exist. Paths with
-// unknown dimensions are absent; the layout falls back to 1:1 for those.
+/** Per-path aspect ratio, so the justified layout can place a cell before any
+ *  thumbnail bytes exist. Unknown dimensions are absent and the layout falls
+ *  back to 1:1. */
 const aspectByPath = createMemo(() => {
   const map = new Map<string, number>();
-  for (const item of sortedItems()) {
-    if (item.width != null && item.height != null && item.width > 0 && item.height > 0) {
+  for (const item of items()) {
+    if (item.width && item.height && item.width > 0 && item.height > 0) {
       map.set(item.path, item.width / item.height);
     }
   }
   return map;
 });
 
-// Per-path file size + media type, for the justified view to decide whether a
-// cell can be served as its original file (cheap, native formats) instead of a
-// generated high-detail thumbnail when zoomed in.
-export interface MediaMeta {
+export interface CellMeta {
   size: number;
   media_type: string;
-  /** Source pixel dimensions, when known. Used to gate "serve original" on the
-   *  decode cost (megapixels), not just file bytes. */
   width: number | null;
   height: number | null;
 }
+
+/** Size, type and dimensions, for the grid's decision about whether a cell can
+ *  be served as its original file rather than as a generated tier. */
 const mediaMetaByPath = createMemo(() => {
-  const map = new Map<string, MediaMeta>();
-  for (const item of sortedItems()) {
+  const map = new Map<string, CellMeta>();
+  for (const item of items()) {
     map.set(item.path, {
       size: item.file_size,
       media_type: item.media_type,
@@ -79,128 +68,176 @@ const mediaMetaByPath = createMemo(() => {
   return map;
 });
 
-/** Path → colour label, for the cell marker and the context menu's tick. A
- *  memo rather than a scan per lookup: both callers ask once per rendered cell. */
 const colorLabelByPath = createMemo(() => {
   const map = new Map<string, string>();
-  for (const item of sortedItems()) {
+  for (const item of items()) {
     if (item.color_label) map.set(item.path, item.color_label);
   }
   return map;
 });
 
-// Group headers for the current sort/group
-const [groups, setGroups] = createSignal<GroupHeader[]>([]);
-
-// Timeline data for scrollbar
-
-// Selected items (multi-select)
 const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
 
-// Explicit multi-select mode. Desktop reaches selection through Ctrl/Cmd+click,
-// which touch has no equivalent for — so a phone flips this on from the Select
-// button and every tap toggles a cell instead of opening the viewer.
+/** Explicit multi-select. Desktop reaches selection through Ctrl/Cmd+click,
+ *  which touch has no equivalent for — so a phone flips this on and every tap
+ *  toggles a cell instead of opening the viewer. */
 const [selectionMode, setSelectionMode] = createSignal(false);
-
-// View mode: grid (uniform squares), justified (aspect-preserving rows), or
-// map (geographic browsing).
-export type ViewMode = "grid" | "justified" | "map";
-
-/** The views, in switcher order, with the labels every switcher uses. One
- *  table rather than a literal per call site: the top bar, the mobile settings
- *  panel and the desktop enable/disable list all render the same three. */
-export const VIEW_CHOICES: { mode: ViewMode; label: string; title: string }[] = [
-  { mode: "grid", label: "Grid", title: "Uniform square grid" },
-  { mode: "justified", label: "Justified", title: "Aspect-preserving rows" },
-  { mode: "map", label: "Map", title: "Geographic map" },
-];
-
-// Persist the chosen layout per client so the last-used view is restored on the
-// next open (localStorage — per browser/device, matching per-client settings).
-const VIEW_MODE_PREF = "viewMode";
-const savedViewMode = loadPref<ViewMode>(VIEW_MODE_PREF);
-const [viewMode, setViewModeRaw] = createSignal<ViewMode>(
-  savedViewMode === "grid" || savedViewMode === "justified" || savedViewMode === "map"
-    ? savedViewMode
-    : "grid",
-);
-const setViewMode = ((value) => {
-  const next = setViewModeRaw(value as any);
-  savePref(VIEW_MODE_PREF, next);
-  return next;
-}) as typeof setViewModeRaw;
-
-// Which views the *gallery* offers, as opposed to which one this client last
-// used. A view the gallery has turned off generates no thumbnails for its tier
-// (see the Rust `views` module), so offering it in the switcher would show a
-// grid that has to decode the whole library on the spot. Optimistically all
-// three until the backend answers — the same reasoning as capabilitiesStore's
-// baseline: assuming none makes the switcher flash empty.
-const ALL_VIEWS: ViewMode[] = ["grid", "justified", "map"];
-const [enabledViews, setEnabledViewsRaw] = createSignal<ViewMode[]>(ALL_VIEWS);
-
-/** Apply the gallery's enabled-view list, falling back to a view that exists
- *  if the one this client last used has since been turned off. A gallery with
- *  every view disabled is left on the stored view rather than on nothing —
- *  App renders a grid either way, and stranding the user on a blank screen
- *  they cannot navigate out of is worse than honouring a stale preference. */
-export function applyEnabledViews(views: string[]) {
-  const next = ALL_VIEWS.filter((v) => views.includes(v));
-  setEnabledViewsRaw(next);
-  if (next.length > 0 && !next.includes(viewMode())) setViewMode(next[0]);
-}
-
-/** Fetch the gallery's enabled views. Called once per gallery open on desktop
- *  and once at boot on the web client. A failure leaves the optimistic
- *  all-views default: the switcher offering a view whose tier isn't pre-warmed
- *  is a slow grid, while hiding one the gallery does offer is a feature the
- *  user cannot reach. */
-export async function loadEnabledViews() {
-  try {
-    applyEnabledViews(await getEnabledViews());
-  } catch (e) {
-    console.warn("Failed to load enabled views:", e);
-  }
-}
-
-export { enabledViews };
-
-// Whether the settings panel is open. On mobile the panel is a full-screen
-// page, so App uses this to stop rendering the grid behind it.
 const [settingsOpen, setSettingsOpen] = createSignal(false);
 
 export {
-  galleryPath, setGalleryPath,
-  thumbnailsReady, setThumbnailsReady,
-  indexingProgress, setIndexingProgress,
-  loading, setLoading,
-  displayPaths, setDisplayPaths,
-  sortedItems, setSortedItems,
+  galleryPath,
+  setGalleryPath,
+  loading,
+  setLoading,
+  items,
+  setItems,
+  displayPaths,
   durationByPath,
   aspectByPath,
   mediaMetaByPath,
   colorLabelByPath,
-  groups, setGroups,
-  selectedPaths, setSelectedPaths,
+  groups,
+  setGroups,
+  selectedPaths,
+  setSelectedPaths,
   selectionMode,
-  viewMode, setViewMode,
-  settingsOpen, setSettingsOpen,
+  settingsOpen,
+  setSettingsOpen,
 };
 
 // ---------------------------------------------------------------------------
-// Rating
+// Fetching
 // ---------------------------------------------------------------------------
 
-/** Persist a rating and keep every consumer in sync: the backend (IPC), the
- *  in-memory sorted items, and any listener on the
- *  `lightview:rating-changed` event (info panel). All rating writes —
- *  keyboard 0–5, info panel, context menu — go through here. */
+export interface Query {
+  sort: string;
+  order: string;
+  sub_sort?: string | null;
+  sub_order?: string | null;
+  filter: string;
+  group_by: GroupBy;
+}
+
+let current: Query = {
+  sort: "date",
+  order: "desc",
+  filter: "",
+  group_by: { type: "none" },
+};
+
+export function currentQuery(): Query {
+  return current;
+}
+
+/** Run the one query and replace the list. */
+export async function refresh(next?: Partial<Query>) {
+  current = { ...current, ...next };
+  setLoading(true);
+  try {
+    const result = await api.items(current);
+    setItems(result.items);
+    setGroups(result.groups);
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/** Apply one server event.
+ *
+ *  **A filesystem change sends what changed, not everything.** Re-fetching the
+ *  whole sorted list on any addition cost every connected client a
+ *  full-library payload per phone upload — and dropped the active filter on
+ *  the way, because the refetch passed no filter at all. Removals splice; an
+ *  addition the client cannot place (it does not know where the new item sorts,
+ *  and it may not match the filter) falls back to one refetch. */
+export async function applyEvent(event: ServerEvent) {
+  switch (event.kind) {
+    case "fs-changed": {
+      if (event.removed.length > 0) {
+        const gone = new Set(event.removed);
+        setItems((list) => list.filter((item) => !gone.has(item.path)));
+        setSelectedPaths((prev) => {
+          const next = new Set(prev);
+          for (const path of gone) next.delete(path);
+          return next;
+        });
+      }
+      if (event.added.length > 0) await refresh();
+      break;
+    }
+    case "items-changed":
+      // The grid draws rating and colour per cell, so re-fetching the list for
+      // one changed field would be a full payload for a star. A batch big
+      // enough that patching row by row would cost more than one query takes
+      // the query instead — the crossover is where the per-row calls stop
+      // being cheaper than the payload they avoid.
+      if (event.paths.length > PATCH_LIMIT) await refresh();
+      else await Promise.all(event.paths.map(patchItem));
+      break;
+    case "tags-indexed":
+      // The vocabulary moved. The item *list* moves with it only when the
+      // active filter names a tag — which the client cannot tell without
+      // parsing the query, so any active filter re-runs and no filter does
+      // nothing. Autocomplete refreshes itself on the next keystroke.
+      if (current.filter.trim()) await refresh();
+      break;
+    case "resync":
+      // Typed lag recovery: re-fetch exactly the domains named. `tags` alone
+      // moves the list only under an active filter, same as above.
+      if (
+        event.domains.includes("items") ||
+        (event.domains.includes("tags") && current.filter.trim())
+      ) {
+        await refresh();
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/** Above this many changed rows, one query beats N metadata calls. Not
+ *  measured: a round trip is a round trip, and a dozen is where the payload a
+ *  refetch costs stops being the larger number on any connection. */
+const PATCH_LIMIT = 12;
+
+/** Re-read one item's row and splice it in place. */
+async function patchItem(path: string) {
+  const meta = await api.mediaMeta(path).catch(() => null);
+  if (!meta) return;
+  setItems((list) =>
+    list.map((item) =>
+      item.path === path
+        ? {
+            ...item,
+            rating: meta.rating,
+            color_label: meta.color_label,
+            last_viewed: meta.last_viewed,
+          }
+        : item,
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Writes that every caller shares
+// ---------------------------------------------------------------------------
+
+/** Persist a rating and keep every consumer in step: the backend, the in-memory
+ *  list, and any listener on `lightview:rating-changed`. Every rating write —
+ *  keyboard 0–5, info panel, context menu — goes through here. */
 export async function rateItem(path: string, rating: number) {
-  await setRatingIpc(path, rating);
+  await api.setRating([path], rating > 0 ? rating : null);
   const lastRated = rating > 0 ? Math.floor(Date.now() / 1000) : null;
-  setSortedItems((items) =>
-    items.map((it) =>
-      it.path === path ? { ...it, rating: rating > 0 ? rating : null, last_rated: lastRated } : it,
+  setItems((list) =>
+    list.map((item) =>
+      item.path === path
+        ? { ...item, rating: rating > 0 ? rating : null, last_rated: lastRated }
+        : item,
     ),
   );
   window.dispatchEvent(
@@ -208,28 +245,24 @@ export async function rateItem(path: string, rating: number) {
   );
 }
 
-/** Set a colour label and keep `sortedItems` in step, so a `color:` filter and
- *  the cell marker update without a refetch — the same reason `rateItem`
- *  exists rather than calling the IPC wrapper directly. */
+/** Set a colour label and keep the list in step, so a `color:` filter and the
+ *  cell marker update without a refetch. */
 export async function setItemColorLabel(path: string, label: string | null) {
-  await setColorLabelIpc(path, label);
-  setSortedItems((items) =>
-    items.map((it) => (it.path === path ? { ...it, color_label: label } : it)),
+  await api.setColorLabel([path], label);
+  setItems((list) =>
+    list.map((item) => (item.path === path ? { ...item, color_label: label } : item)),
   );
 }
 
 // ---------------------------------------------------------------------------
-// Selection helpers
+// Selection
 // ---------------------------------------------------------------------------
 
 export function toggleSelection(path: string) {
   setSelectedPaths((prev) => {
     const next = new Set(prev);
-    if (next.has(path)) {
-      next.delete(path);
-    } else {
-      next.add(path);
-    }
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
     return next;
   });
 }
@@ -238,13 +271,8 @@ export function clearSelection() {
   setSelectedPaths(new Set<string>());
 }
 
-/** Enter multi-select mode (tap-to-toggle). */
-function enterSelectionMode() {
-  setSelectionMode(true);
-}
-
-/** Leave multi-select mode, dropping whatever was selected — the two always
- *  go together, so no caller has to remember to do both. */
+/** Leave multi-select mode, dropping whatever was selected — the two always go
+ *  together, so no caller has to remember both. */
 export function exitSelectionMode() {
   setSelectionMode(false);
   clearSelection();
@@ -252,10 +280,9 @@ export function exitSelectionMode() {
 
 export function toggleSelectionMode() {
   if (selectionMode()) exitSelectionMode();
-  else enterSelectionMode();
+  else setSelectionMode(true);
 }
 
 export function selectAll(paths: string[]) {
   setSelectedPaths(new Set<string>(paths));
 }
-

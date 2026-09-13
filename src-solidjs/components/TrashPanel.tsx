@@ -1,5 +1,7 @@
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
-import { listTrash, restoreTrash, purgeTrash, type TrashEntry } from "../lib/ipc";
+import { api } from "../lib/ipc";
+import { isOwner } from "../stores/settingsStore";
+import type { TrashEntry } from "../lib/types";
 import { ConfirmButton } from "./shared/ConfirmButton";
 
 function formatSize(bytes: number): string {
@@ -17,10 +19,21 @@ function formatDate(ts: number): string {
   });
 }
 
-/** Overlay listing app-trash entries with restore / permanent-delete actions.
- * No thumbnails: trashing drops the cached thumbnail rows, so entries render
- * as name + origin + date. Restores refresh the grid via the fs-changed
- * broadcast — nothing to update here beyond the local list. */
+/** Overlay listing trash entries with restore / permanent-delete actions.
+ *
+ *  No thumbnails: trashing drops the cached thumbnail rows, so entries render
+ *  as name + origin + date. Restores refresh the grid via the `fs-changed`
+ *  broadcast — nothing to update here beyond the local list.
+ *
+ *  **The entry id is opaque and the original location travels in its own
+ *  field.** Both go back to `restore_trash`, and neither is derived from the
+ *  other: an id that could carry slashes would force the removal of the check
+ *  that stops a restore escaping the trash directory, which is an
+ *  arbitrary-file-write primitive at `Device` trust.
+ *
+ *  Restoring is `Device` — the inverse of a delete this client could make.
+ *  Permanent deletion is `Owner`, so the two destructive controls are hidden
+ *  rather than offered and refused on a phone. */
 export function TrashPanel(props: { onClose: () => void }) {
   const [entries, setEntries] = createSignal<TrashEntry[]>([]);
   const [loading, setLoading] = createSignal(true);
@@ -30,7 +43,7 @@ export function TrashPanel(props: { onClose: () => void }) {
     setLoading(true);
     setError(null);
     try {
-      setEntries(await listTrash());
+      setEntries(await api.listTrash());
     } catch (e) {
       setError(String(e));
     }
@@ -47,14 +60,10 @@ export function TrashPanel(props: { onClose: () => void }) {
   window.addEventListener("keydown", handleKey, true);
   onCleanup(() => window.removeEventListener("keydown", handleKey, true));
 
-  const handleRestore = async (id: string) => {
+  const handleRestore = async (entry: TrashEntry) => {
     try {
-      const result = await restoreTrash([id]);
-      if (result.failed.length > 0) {
-        setError(`Restore failed: ${result.failed[0].error}`);
-        return;
-      }
-      setEntries((prev) => prev.filter((e) => e.id !== id));
+      await api.restoreTrash(entry.id, entry.relative_path);
+      setEntries((prev) => prev.filter((e) => e.id !== entry.id));
     } catch (e) {
       setError(String(e));
     }
@@ -62,7 +71,7 @@ export function TrashPanel(props: { onClose: () => void }) {
 
   const handlePurge = async (id: string) => {
     try {
-      await purgeTrash([id]);
+      await api.purgeTrash(id);
       setEntries((prev) => prev.filter((e) => e.id !== id));
     } catch (e) {
       setError(String(e));
@@ -71,7 +80,7 @@ export function TrashPanel(props: { onClose: () => void }) {
 
   const handleEmpty = async () => {
     try {
-      await purgeTrash();
+      await api.purgeTrash();
       setEntries([]);
     } catch (e) {
       setError(String(e));
@@ -101,7 +110,7 @@ export function TrashPanel(props: { onClose: () => void }) {
           </Show>
         </div>
         <div class="flex items-center gap-3">
-          <Show when={entries().length > 0}>
+          <Show when={entries().length > 0 && isOwner()}>
             <ConfirmButton label="Empty Trash" confirmLabel="Really delete all?" onConfirm={handleEmpty} />
           </Show>
           <button
@@ -144,11 +153,11 @@ export function TrashPanel(props: { onClose: () => void }) {
                   style={{ border: "1px solid rgba(255,255,255,0.04)" }}
                 >
                   <div class="flex-1 min-w-0 flex flex-col">
-                    <span class="text-xs text-neutral-200 truncate" title={entry.original_path}>
+                    <span class="text-xs text-neutral-200 truncate" title={entry.relative_path}>
                       {entry.file_name}
                     </span>
                     <span class="text-[10px] text-neutral-500 truncate">
-                      {entry.original_path}
+                      {entry.relative_path}
                     </span>
                   </div>
                   <span class="text-[10px] text-neutral-500 whitespace-nowrap">
@@ -158,16 +167,18 @@ export function TrashPanel(props: { onClose: () => void }) {
                     deleted {formatDate(entry.deleted_at)}
                   </span>
                   <button
-                    onClick={() => handleRestore(entry.id)}
+                    onClick={() => handleRestore(entry)}
                     class="px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors bg-teal-700/50 text-teal-200 hover:bg-teal-600/60"
                   >
                     Restore
                   </button>
-                  <ConfirmButton
-                    label="Delete Forever"
-                    confirmLabel="Confirm?"
-                    onConfirm={() => handlePurge(entry.id)}
-                  />
+                  <Show when={isOwner()}>
+                    <ConfirmButton
+                      label="Delete Forever"
+                      confirmLabel="Confirm?"
+                      onConfirm={() => handlePurge(entry.id)}
+                    />
+                  </Show>
                 </div>
               )}
             </For>

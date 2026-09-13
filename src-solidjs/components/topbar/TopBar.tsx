@@ -2,14 +2,12 @@ import { Show, For, createSignal, createEffect, onCleanup, onMount } from "solid
 import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
-import { TitleBar } from "./TitleBar";
 import { CommandMenu, CommandFab, commandsOpen, setCommandsOpen, type CommandHandlers } from "./CommandMenu";
-import { ViewSwitcher } from "./ViewSwitcher";
 import { CloseIcon, SearchIcon, SelectIcon } from "./icons";
-import { viewMode, setViewMode, enabledViews, VIEW_CHOICES, displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode, selectedPaths } from "../../stores/galleryStore";
+import { displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode, selectedPaths } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
-import { settings } from "../../stores/settingsStore";
-import { isMobile, isTauri } from "../../lib/runtime";
+import { prefs } from "../../stores/settingsStore";
+import { isMobile } from "../../lib/runtime";
 import { onScrollHost, scrollTop } from "../../lib/scrollHost";
 
 interface TopBarProps {
@@ -36,7 +34,7 @@ export function TopBar(props: TopBarProps) {
 
   // Mobile filter/sort sheet: pinned to the top under the safe-area inset, or a
   // thumb-reachable sheet sliding up from the bottom (user preference).
-  const sheetAtBottom = () => settings().display.mobile_filter_sheet === "bottom";
+  const sheetAtBottom = () => prefs().mobile_filter_sheet === "bottom";
   // Drives the slide-in transition: the sheet mounts offscreen (entered=false),
   // then flips after a paint so the transform transitions instead of snapping.
   const [sheetEntered, setSheetEntered] = createSignal(false);
@@ -106,10 +104,6 @@ export function TopBar(props: TopBarProps) {
       if (history.state?.lvOverlay) history.back();
     }
   });
-
-  // Frameless (decorations: false) desktop gets a custom titlebar row above the
-  // filter row; both reveal together off the same hover state.
-  const frameless = () => isTauri() && !isMobile();
 
   // Debounce the hide so the pointer can travel across the gap between the
   // titlebar and filter rows without the chrome collapsing mid-move.
@@ -197,15 +191,6 @@ export function TopBar(props: TopBarProps) {
           onMouseEnter={handleMouseEnter}
         />
 
-        {/* Custom window titlebar — only when the native frame is hidden. */}
-        <Show when={frameless()}>
-          <TitleBar
-            visible={visible()}
-            onMouseEnter={handleMouseEnter}
-            onMouseLeave={handleMouseLeave}
-          />
-        </Show>
-
         {/* The bar itself. We slide via `top` (not `transform`) so the bar
             doesn't establish a containing block for fixed descendants —
             otherwise SettingsMenu's drawer would be confined to it. */}
@@ -214,7 +199,7 @@ export function TopBar(props: TopBarProps) {
           style={{
             background: "rgba(10, 10, 10, 0.85)",
             "backdrop-filter": "blur(12px)",
-            top: visible() ? (frameless() ? "2rem" : "0") : "-3rem",
+            top: visible() ? "0" : "-3rem",
             opacity: visible() ? "1" : "0",
           }}
           onMouseEnter={handleMouseEnter}
@@ -228,23 +213,6 @@ export function TopBar(props: TopBarProps) {
             title="Images in the current filter"
           >
             {displayPaths().length.toLocaleString()}
-          </div>
-          {/* View-mode selector. Only the views this gallery has enabled —
-              a disabled view generates no thumbnails, so offering it would
-              open onto a grid decoding the library on the spot. */}
-          <div class="shrink-0 flex items-center gap-0.5 p-0.5 rounded bg-neutral-800/60">
-            <For each={VIEW_CHOICES.filter((v) => enabledViews().includes(v.mode))}>
-              {(v) => (
-                <button
-                  onClick={() => setViewMode(v.mode)}
-                  class="px-2 py-0.5 text-xs rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
-                  classList={{ "bg-neutral-700 text-white": viewMode() === v.mode }}
-                  title={v.title}
-                >
-                  {v.label}
-                </button>
-              )}
-            </For>
           </div>
           {/* Actions and settings drop from the same anchor: only one of them
               is ever open, and sharing the wrapper keeps the settings panel
@@ -318,8 +286,6 @@ export function TopBar(props: TopBarProps) {
           >
             <SelectIcon size={20} />
           </button>
-
-          <ViewSwitcher visible={visible()} />
         </div>
 
         {/* Filter + sort sheet */}

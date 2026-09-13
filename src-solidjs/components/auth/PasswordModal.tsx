@@ -1,13 +1,18 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
-import { PASSWORD_CHALLENGE_EVENT } from "../../lib/runtime";
 
-/** Modal shown to the remote web client when the server returns 401 with
- *  `WWW-Authenticate: LV-Password`, i.e. the device cookie is valid but
- *  too much time has passed since the last password check.
+import {
+  answerPasswordChallenge,
+  onAuthInterruption,
+  submitPassword,
+} from "../../lib/ipc";
+
+/** Shown when the server returns 401 with `WWW-Authenticate: LV-Password` —
+ *  the device cookie is valid but too much time has passed since the last
+ *  password check.
  *
- *  Listens for `PASSWORD_CHALLENGE_EVENT`; on submit, POSTs to
- *  `/auth/password` and emits `lightview:password-resolved` so the pending
- *  fetch in `_httpInvoke` can retry. */
+ *  One modal however many requests hit the challenge at once: `ipc.ts` holds a
+ *  single pending promise and this answers it, so a grid firing twenty
+ *  requests raises one prompt and all twenty retry behind it. */
 export function PasswordModal() {
   const [open, setOpen] = createSignal(false);
   const [password, setPassword] = createSignal("");
@@ -27,9 +32,7 @@ export function PasswordModal() {
   const resolve = (accepted: boolean) => {
     setOpen(false);
     setBusy(false);
-    window.dispatchEvent(
-      new CustomEvent<boolean>("lightview:password-resolved", { detail: accepted }),
-    );
+    answerPasswordChallenge(accepted);
   };
 
   const submit = async (e?: Event) => {
@@ -38,18 +41,12 @@ export function PasswordModal() {
     setBusy(true);
     setError("");
     try {
-      const res = await fetch("/auth/password", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: password() }),
-      });
-      if (res.ok) {
+      if (await submitPassword(password())) {
         resolve(true);
-      } else if (res.status === 403) {
-        setError("Wrong password.");
-        setBusy(false);
       } else {
-        setError(`Auth failed (${res.status})`);
+        // One message for every refusal shape: a wrong password and a pairing
+        // that went away in the meantime are the same thing to type into.
+        setError("Wrong password.");
         setBusy(false);
       }
     } catch (err) {
@@ -59,10 +56,10 @@ export function PasswordModal() {
   };
 
   onMount(() => {
-    window.addEventListener(PASSWORD_CHALLENGE_EVENT, onChallenge);
-  });
-  onCleanup(() => {
-    window.removeEventListener(PASSWORD_CHALLENGE_EVENT, onChallenge);
+    const stop = onAuthInterruption((interruption) => {
+      if (interruption.kind === "password") onChallenge();
+    });
+    onCleanup(stop);
   });
 
   return (

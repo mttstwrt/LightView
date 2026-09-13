@@ -8,9 +8,7 @@
 import { createSignal, Show, For, onCleanup } from "solid-js";
 import { isMobile } from "../../lib/runtime";
 import { sortField, setSortField, sortOrder, setSortOrder, subSortField, setSubSortField, subSortOrder, setSubSortOrder, groupBy } from "../../stores/settingsStore";
-import { setDisplayPaths, setSortedItems } from "../../stores/galleryStore";
-import { buildFilterQuery } from "../../stores/filterStore";
-import { getSortedItems, applyFilter } from "../../lib/ipc";
+import { refresh } from "../../stores/galleryStore";
 import type { SortField, SortOrder } from "../../lib/types";
 
 const SORT_OPTIONS: { field: SortField; label: string }[] = [
@@ -18,14 +16,14 @@ const SORT_OPTIONS: { field: SortField; label: string }[] = [
   { field: "name", label: "Name" },
   { field: "size", label: "Size" },
   { field: "rating", label: "Rating" },
-  { field: "media_type", label: "Type" },
+  { field: "mediatype", label: "Type" },
   { field: "lastviewed", label: "Recently Viewed" },
   { field: "dateadded", label: "Date Added" },
   { field: "lastrated", label: "Recently Rated" },
 ];
 
 function defaultOrder(field: SortField): SortOrder {
-  return field === "name" || field === "media_type" ? "asc" : "desc";
+  return field === "name" || field === "mediatype" ? "asc" : "desc";
 }
 
 export function SortMenu(props: { dropUp?: boolean }) {
@@ -53,17 +51,16 @@ export function SortMenu(props: { dropUp?: boolean }) {
     setSubSortField(subField);
     setSubSortOrder(subOrder);
     try {
-      const query = buildFilterQuery();
-      if (query) {
-        const filteredPaths = await applyFilter(query);
-        const sorted = await getSortedItems(field, order, groupBy(), filteredPaths, subField, subOrder);
-        setSortedItems(sorted.items);
-        setDisplayPaths(sorted.items.map((item) => item.path));
-      } else {
-        const sorted = await getSortedItems(field, order, groupBy(), undefined, subField, subOrder);
-        setSortedItems(sorted.items);
-        setDisplayPaths(sorted.items.map((item) => item.path));
-      }
+      // The filter travels with the sort in one statement, so changing the
+      // order no longer means re-running the filter as a separate call whose
+      // result is handed straight back to be re-expanded.
+      await refresh({
+        sort: field,
+        order,
+        sub_sort: subField,
+        sub_order: subOrder,
+        group_by: groupBy(),
+      });
     } catch (e) {
       console.error("Sort error:", e);
     }

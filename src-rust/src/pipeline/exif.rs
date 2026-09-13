@@ -1,0 +1,349 @@
+//! EXIF extraction: capture time and GPS.
+//!
+//! Both are read from the metadata block alone — no image decode — which is
+//! what makes it affordable to run over a whole gallery during the backfill
+//! pass after gallery open.
+//!
+//! **One open, one parse, both facts.** The pair this replaces read the file
+//! twice: a 1 MB head slurped into a `Vec` for the timestamp, then the whole
+//! file again through a `BufReader` for GPS. The cap protected nothing — the
+//! unbounded read was on the next line — and it made the two facts disagree
+//! about the same file, because a container whose metadata sits past the first
+//! megabyte yielded coordinates and no date. `read_from_container` seeks to the
+//! metadata block rather than reading the file whole, so dropping the cap costs
+//! nothing on the containers that matter.
+//!
+//! Two units to keep straight. Capture time is the camera's local wall clock:
+//! EXIF carries no timezone, so this returns a `NaiveDateTime` and the caller
+//! decides what to do about that. GPS is decimal degrees, WGS-84, converted
+//! from EXIF's degrees/minutes/seconds rationals and signed by the N/S and E/W
+//! reference tags — dropping those references silently mirrors half the planet.
+
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+
+use exif::{Exif, In, Tag, Value};
+
+use crate::companion::schema::Location;
+
+/// What one header read tells the index about a file.
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    /// Capture time as Unix seconds, from the EXIF block.
+    pub date_taken: Option<i64>,
+    pub location: Option<Location>,
+}
+
+/// Read both facts a still contributes, without decoding it.
+///
+/// Best-effort throughout: a file with no EXIF block, an unknown container, or
+/// an unreadable header all yield an empty [`Facts`] rather than an error. The
+/// caller's gate treats "don't know" as "nothing learned", which is what keeps
+/// a missing answer from being mistaken for a negative one — and is why the
+/// caller records *that it looked* separately from what it found.
+pub fn read(path: &Path) -> Facts {
+    let Some(exif) = read_container(path) else {
+        return Facts::default();
+    };
+    Facts {
+        date_taken: capture_datetime(&exif).map(|d| d.and_utc().timestamp()),
+        location: location(&exif),
+    }
+}
+
+/// Container support comes from `kamadak-exif`'s `read_from_container`, which
+/// handles JPEG, TIFF, HEIF/HEIC, PNG and WebP. Unknown containers and files
+/// with no EXIF block are both `None`.
+fn read_container(path: &Path) -> Option<Exif> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    exif::Reader::new().read_from_container(&mut reader).ok()
+}
+
+/// `DateTimeOriginal`, falling back to `DateTime`. Returns the camera's local
+/// wall-clock time — EXIF carries no timezone.
+fn capture_datetime(exif: &Exif) -> Option<chrono::NaiveDateTime> {
+    let field = exif
+        .get_field(Tag::DateTimeOriginal, In::PRIMARY)
+        .or_else(|| exif.get_field(Tag::DateTime, In::PRIMARY))?;
+
+    // EXIF datetimes are ASCII "YYYY:MM:DD HH:MM:SS".
+    let text = match &field.value {
+        Value::Ascii(parts) => parts
+            .first()
+            .map(|p| String::from_utf8_lossy(p).into_owned())?,
+        _ => return None,
+    };
+    parse_exif_datetime(&text)
+}
+
+/// Parse an EXIF `YYYY:MM:DD HH:MM:SS` string. `parse_from_str` validates the
+/// field ranges, so a corrupt value (`0000:00:00 …`) yields `None` rather than
+/// a bogus date.
+fn parse_exif_datetime(text: &str) -> Option<chrono::NaiveDateTime> {
+    let trimmed = text.trim().trim_end_matches('\0').trim();
+    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y:%m:%d %H:%M:%S").ok()
+}
+
+/// A GPS location, or `None` when the block has no GPS fields or they fail to
+/// parse. Never errors — callers treat this as best-effort.
+fn location(exif: &Exif) -> Option<Location> {
+    let lat_field = exif.get_field(Tag::GPSLatitude, In::PRIMARY)?;
+    let lat_ref = exif.get_field(Tag::GPSLatitudeRef, In::PRIMARY)?;
+    let lon_field = exif.get_field(Tag::GPSLongitude, In::PRIMARY)?;
+    let lon_ref = exif.get_field(Tag::GPSLongitudeRef, In::PRIMARY)?;
+
+    let lat = dms_to_decimal(&lat_field.value)?;
+    let lon = dms_to_decimal(&lon_field.value)?;
+
+    let lat = apply_hemisphere(lat, &lat_ref.value, b'S');
+    let lon = apply_hemisphere(lon, &lon_ref.value, b'W');
+
+    if !is_plausible(lat, lon) {
+        return None;
+    }
+
+    let alt = exif
+        .get_field(Tag::GPSAltitude, In::PRIMARY)
+        .and_then(|f| rational_at(&f.value, 0))
+        .map(|metres| {
+            // GPSAltitudeRef = 1 means below sea level.
+            let below = exif
+                .get_field(Tag::GPSAltitudeRef, In::PRIMARY)
+                .and_then(|f| match &f.value {
+                    Value::Byte(v) => v.first().copied(),
+                    _ => None,
+                })
+                .map(|b| b == 1)
+                .unwrap_or(false);
+            if below { -metres } else { metres }
+        });
+
+    Some(Location { lat, lon, alt })
+}
+
+/// Convert an EXIF rational triplet `[deg, min, sec]` to decimal degrees.
+fn dms_to_decimal(value: &Value) -> Option<f64> {
+    let d = rational_at(value, 0)?;
+    let m = rational_at(value, 1).unwrap_or(0.0);
+    let s = rational_at(value, 2).unwrap_or(0.0);
+    Some(d + m / 60.0 + s / 3600.0)
+}
+
+fn rational_at(value: &Value, idx: usize) -> Option<f64> {
+    match value {
+        Value::Rational(v) => v.get(idx).map(|r| r.to_f64()),
+        Value::SRational(v) => v.get(idx).map(|r| r.to_f64()),
+        _ => None,
+    }
+}
+
+/// Negate the magnitude when the hemisphere ref byte matches `negative_ref`
+/// (`b'S'` for latitude, `b'W'` for longitude). EXIF stores the ref as a
+/// 2-byte ASCII string ("N\0", "S\0", etc.).
+fn apply_hemisphere(magnitude: f64, ref_value: &Value, negative_ref: u8) -> f64 {
+    let first = match ref_value {
+        Value::Ascii(parts) => parts.first().and_then(|p| p.first()).copied(),
+        _ => None,
+    };
+    if first == Some(negative_ref) || first == Some(negative_ref.to_ascii_lowercase()) {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+fn is_plausible(lat: f64, lon: f64) -> bool {
+    lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
+        // Many cameras write 0,0 when GPS lock failed. Treat as missing.
+        && !(lat.abs() < 1e-9 && lon.abs() < 1e-9)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn parses_standard_exif_datetime() {
+        let dt = parse_exif_datetime("2023:07:14 09:31:05").expect("parses");
+        assert_eq!((dt.year(), dt.month(), dt.day()), (2023, 7, 14));
+        assert_eq!((dt.hour(), dt.minute(), dt.second()), (9, 31, 5));
+    }
+
+    #[test]
+    fn tolerates_trailing_null_and_whitespace() {
+        let dt = parse_exif_datetime(" 2020:01:02 03:04:05\0 ").expect("parses");
+        assert_eq!((dt.year(), dt.month(), dt.day()), (2020, 1, 2));
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_garbage() {
+        assert!(parse_exif_datetime("0000:00:00 00:00:00").is_none());
+        assert!(parse_exif_datetime("2023:13:01 00:00:00").is_none());
+        assert!(parse_exif_datetime("not a date").is_none());
+        assert!(parse_exif_datetime("").is_none());
+    }
+
+    #[test]
+    fn a_file_with_no_exif_block_yields_empty_facts_rather_than_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.bin");
+        std::fs::write(&path, b"not an image at all").expect("write");
+        let facts = read(&path);
+        assert!(facts.date_taken.is_none());
+        assert!(facts.location.is_none());
+    }
+
+    #[test]
+    fn a_missing_file_yields_empty_facts_rather_than_an_error() {
+        let facts = read(Path::new("/nonexistent/definitely-not-here.jpg"));
+        assert!(facts.date_taken.is_none());
+        assert!(facts.location.is_none());
+    }
+
+    /// Both facts come from one parse, so a file cannot report coordinates and
+    /// no date because the two reads disagreed about how much of it to look at.
+    #[test]
+    fn both_facts_come_from_the_same_parse() {
+        let jpeg = crate::pipeline::exif::tests_support::jpeg_with_exif(
+            Some("2021:06:05 04:03:02"),
+            Some((48.8583, 2.2945)),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("both.jpg");
+        std::fs::write(&path, &jpeg).expect("write");
+
+        let facts = read(&path);
+        let date = facts.date_taken.expect("a date");
+        let place = facts.location.expect("a location");
+        assert_eq!(
+            chrono::DateTime::from_timestamp(date, 0)
+                .expect("in range")
+                .format("%Y-%m-%d")
+                .to_string(),
+            "2021-06-05"
+        );
+        assert!((place.lat - 48.8583).abs() < 0.01, "lat was {}", place.lat);
+        assert!((place.lon - 2.2945).abs() < 0.01, "lon was {}", place.lon);
+    }
+
+}
+
+/// Minimal EXIF-bearing JPEGs, for tests in this crate. Hand-assembled rather
+/// than checked in as binary fixtures so the bytes that matter are readable.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// A JPEG carrying an APP1 EXIF block with the given `DateTimeOriginal`
+    /// (`"YYYY:MM:DD HH:MM:SS"`) and/or GPS position, and nothing else.
+    pub fn jpeg_with_exif(datetime: Option<&str>, gps: Option<(f64, f64)>) -> Vec<u8> {
+        let mut ifd0: Vec<u8> = Vec::new();
+        let mut sub: Vec<u8> = Vec::new();
+        let mut gps_ifd: Vec<u8> = Vec::new();
+        let mut data: Vec<u8> = Vec::new();
+
+        let n0 = datetime.is_some() as u16 + gps.is_some() as u16;
+        let ne = datetime.is_some() as u16;
+        let ng = if gps.is_some() { 4u16 } else { 0 };
+
+        // TIFF offsets are from the start of the TIFF header.
+        let off_ifd0: u32 = 8;
+        let off_sub: u32 = off_ifd0 + 2 + 12 * n0 as u32 + 4;
+        let off_gps: u32 = off_sub + 2 + 12 * ne as u32 + 4;
+        let off_data: u32 = off_gps + if ng > 0 { 2 + 12 * ng as u32 + 4 } else { 0 };
+
+        let entry = |tag: u16, typ: u16, count: u32, value: [u8; 4]| {
+            let mut e = Vec::with_capacity(12);
+            e.extend_from_slice(&tag.to_le_bytes());
+            e.extend_from_slice(&typ.to_le_bytes());
+            e.extend_from_slice(&count.to_le_bytes());
+            e.extend_from_slice(&value);
+            e
+        };
+
+        if let Some(dt) = datetime {
+            let mut s = dt.as_bytes().to_vec();
+            s.push(0);
+            sub.extend(entry(
+                0x9003,
+                2,
+                s.len() as u32,
+                (off_data + data.len() as u32).to_le_bytes(),
+            ));
+            data.extend_from_slice(&s);
+            ifd0.extend(entry(0x8769, 4, 1, off_sub.to_le_bytes()));
+        }
+
+        if let Some((lat, lon)) = gps {
+            let dms = |v: f64| {
+                let v = v.abs();
+                let d = v.trunc() as u32;
+                let m = ((v - v.trunc()) * 60.0).trunc() as u32;
+                let s = ((((v - v.trunc()) * 60.0) - m as f64) * 60.0 * 100.0).round() as u32;
+                let mut out = Vec::with_capacity(24);
+                for (num, den) in [(d, 1u32), (m, 1), (s, 100)] {
+                    out.extend_from_slice(&num.to_le_bytes());
+                    out.extend_from_slice(&den.to_le_bytes());
+                }
+                out
+            };
+            gps_ifd.extend(entry(0x0001, 2, 2, *b"N\0\0\0"));
+            gps_ifd.extend(entry(
+                0x0002,
+                5,
+                3,
+                (off_data + data.len() as u32).to_le_bytes(),
+            ));
+            data.extend_from_slice(&dms(lat));
+            gps_ifd.extend(entry(0x0003, 2, 2, *b"E\0\0\0"));
+            gps_ifd.extend(entry(
+                0x0004,
+                5,
+                3,
+                (off_data + data.len() as u32).to_le_bytes(),
+            ));
+            data.extend_from_slice(&dms(lon));
+            ifd0.extend(entry(0x8825, 4, 1, off_gps.to_le_bytes()));
+        }
+
+        let mut tiff: Vec<u8> = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&off_ifd0.to_le_bytes());
+        tiff.extend_from_slice(&n0.to_le_bytes());
+        tiff.extend_from_slice(&ifd0);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&ne.to_le_bytes());
+        tiff.extend_from_slice(&sub);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        if ng > 0 {
+            tiff.extend_from_slice(&ng.to_le_bytes());
+            tiff.extend_from_slice(&gps_ifd);
+            tiff.extend_from_slice(&0u32.to_le_bytes());
+        }
+        tiff.extend_from_slice(&data);
+
+        let mut payload: Vec<u8> = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+
+        let mut out: Vec<u8> = vec![0xFF, 0xD8];
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        // A 1x1 grey JPEG body: enough that the file is a real JPEG.
+        out.extend_from_slice(&MINIMAL_JPEG_BODY);
+        out
+    }
+
+    /// SOF0/DHT/DQT/SOS/EOI for a 1x1 image, taken from a libjpeg encode.
+    const MINIMAL_JPEG_BODY: [u8; 59] = [
+        0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07,
+        0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F,
+        0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4,
+        0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0xFF, 0xD9,
+    ];
+}

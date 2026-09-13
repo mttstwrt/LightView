@@ -7,9 +7,7 @@
 
 import { createSignal } from "solid-js";
 import type { TagSuggestion } from "../lib/types";
-import { applyFilter, getSortedItems } from "../lib/ipc";
-import { setDisplayPaths, setSortedItems } from "./galleryStore";
-import { sortField, sortOrder, subSortField, subSortOrder, groupBy } from "./settingsStore";
+import { refresh } from "./galleryStore";
 
 // The raw filter query string (e.g. "user AND example OR rating>=3")
 const [filterQuery, setFilterQuery] = createSignal("");
@@ -49,18 +47,14 @@ export function buildFilterQuery(): string {
   return parts.join(" AND ");
 }
 
-/// Apply the current filter state (query + rating) to the gallery: filter on
-/// the backend, re-sort, and swap the displayed items. With no active filter
-/// this just re-sorts the full gallery.
+/// Apply the current filter state (query + rating) to the gallery.
+///
+/// One query does it: the filter compiles into the same statement the sort
+/// orders, so the round trip that handed a list of matched paths back to the
+/// server to be re-expanded is gone.
 export async function refreshFilteredItems() {
-  const query = buildFilterQuery();
   try {
-    const filteredPaths = query ? await applyFilter(query) : undefined;
-    const sorted = await getSortedItems(
-      sortField(), sortOrder(), groupBy(), filteredPaths, subSortField(), subSortOrder(),
-    );
-    setSortedItems(sorted.items);
-    setDisplayPaths(sorted.items.map((item) => item.path));
+    await refresh({ filter: buildFilterQuery() });
   } catch (e) {
     console.error("Filter error:", e);
   }

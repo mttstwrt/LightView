@@ -15,8 +15,7 @@
 // gallery. It reports its size to perfMonitor.
 
 import { Show, For, createSignal, createEffect, on, onMount, onCleanup, batch } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
-import { isWeb, hasTouch, isTauri, isMobile } from "../../lib/runtime";
+import { hasTouch, isMobile } from "../../lib/runtime";
 import { wheelPxPerUnit } from "../../lib/wheel";
 import {
   findCellImage,
@@ -27,9 +26,8 @@ import {
   VIEWER_CLOSE_REQUEST_EVENT,
   type Rect,
 } from "../../lib/viewerTransition";
-import { aspectByPath, mediaMetaByPath, sortedItems, rateItem } from "../../stores/galleryStore";
+import { aspectByPath, mediaMetaByPath, items, rateItem } from "../../stores/galleryStore";
 import { applyQueryAndRefresh } from "../../stores/filterStore";
-import { TitleBar } from "../topbar/TitleBar";
 import {
   pointerDistance,
   pointerMidpoint,
@@ -48,13 +46,11 @@ import {
 } from "../../lib/touch";
 import { hapticTick } from "../../lib/haptics";
 import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
-import { settings } from "../../stores/settingsStore";
-import { mediaUrl, thumbUrl, ensureTierThumbnails, gifAtlasUrl } from "../../lib/ipc";
+import { prefs } from "../../stores/settingsStore";
+import { api, mediaUrl, thumbUrl } from "../../lib/ipc";
 import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
 import { isVideoPath, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
-import { GifCanvas } from "../GifCanvas";
 import { ViewerImageCache } from "../../lib/viewerCache";
-import { setViewerCacheCountSource } from "../../lib/perfMonitor";
 import { InfoPanel } from "./InfoPanel";
 import { VideoPlayer } from "./VideoPlayer";
 
@@ -71,9 +67,7 @@ export function MediaViewer(props: MediaViewerProps) {
   const [loaded, setLoaded] = createSignal(false);
 
   const cache = new ViewerImageCache();
-  setViewerCacheCountSource(() => cache.size);
   onCleanup(() => {
-    setViewerCacheCountSource(null);
     cache.destroy();
     // Release the grid's full-resolution pin on the item we were showing.
     window.dispatchEvent(new CustomEvent<string | null>(VIEWER_PATH_EVENT, { detail: null }));
@@ -108,21 +102,6 @@ export function MediaViewer(props: MediaViewerProps) {
   const [backdropAlpha, setBackdropAlpha] = createSignal(1);
   const [chromeVisible, setChromeVisible] = createSignal(true);
 
-  // Frameless desktop window: the custom titlebar lives outside this overlay,
-  // so reveal a copy on the top edge here so window controls stay reachable
-  // while viewing an image. Mirrors the hover-reveal used in the grid.
-  const frameless = () => isTauri() && !isMobile();
-  const [titlebarVisible, setTitlebarVisible] = createSignal(false);
-  let titlebarHideTimer: number | undefined;
-  const revealTitlebar = () => {
-    if (titlebarHideTimer) { clearTimeout(titlebarHideTimer); titlebarHideTimer = undefined; }
-    setTitlebarVisible(true);
-  };
-  const hideTitlebar = () => {
-    if (titlebarHideTimer) clearTimeout(titlebarHideTimer);
-    titlebarHideTimer = window.setTimeout(() => setTitlebarVisible(false), 100);
-  };
-  onCleanup(() => { if (titlebarHideTimer) clearTimeout(titlebarHideTimer); });
   // True while a horizontal swipe (or its commit animation) is in flight. Gates
   // the prev/next filmstrip slides so the (pressure-managed) full-res neighbour
   // images are only mounted in the DOM during navigation, not while idle.
@@ -150,7 +129,7 @@ export function MediaViewer(props: MediaViewerProps) {
   const [rating, setRatingSignal] = createSignal(0);
   createEffect(
     on(currentPath, (path) => {
-      setRatingSignal(path ? (sortedItems().find((it) => it.path === path)?.rating ?? 0) : 0);
+      setRatingSignal(path ? (items().find((it) => it.path === path)?.rating ?? 0) : 0);
     }),
   );
   const onRatingChanged = (e: Event) => {
@@ -183,7 +162,6 @@ export function MediaViewer(props: MediaViewerProps) {
   // WebKitGTK's <img> GIF animation is broken (too fast + leaks). A real
   // browser (web client) animates GIFs fine, so it uses the normal <img> path.
   const isGif = () => ext() === "gif";
-  const useGifCanvas = () => isTauri() && isGif();
 
   // Adjacent paths for the filmstrip neighbour slots (undefined past the ends).
   const prevPath = () => props.paths[props.currentIndex - 1];
@@ -191,7 +169,7 @@ export function MediaViewer(props: MediaViewerProps) {
   // What to render in a neighbour slide: the full image, or a poster thumb for
   // videos (which can't be swiped into anyway, but want a preview while sliding).
   const neighbourSrc = (path: string) =>
-    isVideoPath(path) ? thumbUrl(path, "p") : mediaUrl(path);
+    isVideoPath(path) ? thumbUrl(path, "jm") : mediaUrl(path);
 
   // Neighbour slides sit one viewport-width to either side of the current one.
   const neighbourTransform = (dir: number): string => `translateX(${dir * 100}vw)`;
@@ -223,16 +201,12 @@ export function MediaViewer(props: MediaViewerProps) {
   const openVideoExternal = () => {
     const path = currentPath();
     if (!path) return;
-    // On the desktop, hand the file to the host's default player. The web
-    // client has no host to launch, so open the streamed media URL in a new
-    // tab and let the browser download or play it.
-    if (isWeb()) {
-      window.open(mediaUrl(path), "_blank", "noopener");
-      return;
-    }
-    invoke("open_with", { command: "xdg-open", args: [path] }).catch((err) =>
-      console.error("Failed to open video:", err)
-    );
+    // Open the streamed media URL in a new tab and let the browser download or
+    // play it. Handing the file to a *host* application is a different thing
+    // with a different trust level — `open_with`, `Owner`, named by index into
+    // server-side configuration — and it lives in the context menu, where the
+    // client already knows whether it may offer it.
+    window.open(mediaUrl(path), "_blank", "noopener");
   };
 
   // --- Loading placeholder ------------------------------------------------
@@ -286,7 +260,7 @@ export function MediaViewer(props: MediaViewerProps) {
   };
   /** Best real pixels available before the full image lands. */
   const placeholderSrc = (): string | null =>
-    gridSrc() ?? (currentPath() ? thumbUrl(currentPath(), "p") : null);
+    gridSrc() ?? (currentPath() ? thumbUrl(currentPath(), "jm") : null);
 
   /** Mount an image element into the container. `path` is captured at call
    *  time — the async reveal below can outlive a navigation. */
@@ -313,9 +287,8 @@ export function MediaViewer(props: MediaViewerProps) {
       // onload means fetched, not decoded. Revealing here tears the
       // placeholder down a frame or more before the real pixels can paint,
       // which is the flash of empty backdrop between the open transition and
-      // the photo. Wait for the decode (skipped on WebKitGTK, which decodes
-      // on the main thread at paint time — there's no gap to cover).
-      if (isTauri() || !img.decode) {
+      // the photo. Wait for the decode.
+      if (!img.decode) {
         reveal();
         return;
       }
@@ -489,7 +462,7 @@ export function MediaViewer(props: MediaViewerProps) {
       const src =
         mediaEl instanceof HTMLImageElement && mediaEl.naturalWidth > 0
           ? mediaEl.currentSrc || mediaEl.src
-          : thumbUrl(path, "p");
+          : thumbUrl(path, "jm");
       // One batch so the track hides in the same frame the clone appears.
       batch(() => {
         setClosing(true);
@@ -581,11 +554,6 @@ export function MediaViewer(props: MediaViewerProps) {
   };
 
   const handleMouseMove = (e: MouseEvent) => {
-    // Reveal the window titlebar when the cursor nears the top edge.
-    if (frameless()) {
-      if (e.clientY < 40) revealTitlebar();
-      else if (titlebarVisible()) hideTitlebar();
-    }
     if (!isDragging) return;
     const dx = e.clientX - dragStartX;
     const dy = e.clientY - dragStartY;
@@ -1109,7 +1077,7 @@ export function MediaViewer(props: MediaViewerProps) {
           if (
             path &&
             isBrowserPlayableVideo() &&
-            settings().display.video_autoplay_viewer
+            prefs().video_autoplay_viewer
           ) {
             autoplayTimer = window.setTimeout(() => {
               autoplayTimer = null;
@@ -1120,38 +1088,38 @@ export function MediaViewer(props: MediaViewerProps) {
           return;
         }
 
-        // GIFs (desktop) are drawn declaratively on a <canvas>; skip the
-        // imperative <img> swap and mark loaded so the spinner/underlay clear.
-        if (useGifCanvas()) {
-          if (imageContainerRef) imageContainerRef.replaceChildren();
-          setLoaded(true);
+        // GIFs go down this path too. They used to be drawn on a <canvas>
+        // from a backend frame atlas, because WebKitGTK's own `<img>` GIF
+        // animation ran too fast and leaked; that engine is gone and an
+        // `<img>` animates correctly, which also restores zoom and pan on a
+        // GIF — the canvas never had them.
+        const cached = cache.get(path);
+        if (cached) {
+          mountImage(cached, true, path);
         } else {
-          // Mount the current image first, before queueing background work.
-          const cached = cache.get(path);
-          if (cached) {
-            mountImage(cached, true, path);
-          } else {
-            const img = new Image();
-            img.style.maxWidth = "100vw";
-            img.style.maxHeight = "100vh";
-            img.style.objectFit = "contain";
-            img.draggable = false;
-            img.alt = filename();
-            img.src = mediaUrl(path);
-            mountImage(img, false, path);
-          }
+          const img = new Image();
+          img.style.maxWidth = "100vw";
+          img.style.maxHeight = "100vh";
+          img.style.objectFit = "contain";
+          img.draggable = false;
+          img.alt = filename();
+          img.src = mediaUrl(path);
+          mountImage(img, false, path);
         }
 
         // Defer neighbour preloading + preview-tier generation to idle so
         // they don't contend with the current image's decode.
         scheduleIdle(() => {
           cache.preload(props.paths, idx);
-          // P5: preview tier first-paint. Lazy 1600 px generation for this
-          // image and its neighbours; the underlay <img src={thumbUrl(path, 'p')}>
-          // 404s until the tier is ready, then a natural re-render swaps it in.
+          // Underlay tier first-paint. `jm` (1280 px) for this image and its
+          // neighbours; the underlay <img src={thumbUrl(path, "jm")}> 404s
+          // until the tier exists, then a natural re-render swaps it in. Not
+          // `jh`: the underlay is on screen for the length of one decode, and
+          // a 2560 px generation is nearly the cost of the full image it is
+          // covering for.
           const previewPaths = [props.paths[idx], props.paths[idx - 1], props.paths[idx + 1]]
             .filter((p): p is string => !!p);
-          ensureTierThumbnails(previewPaths, "p").catch(() => {});
+          api.precache("jm", previewPaths).catch(() => {});
         });
       },
     ),
@@ -1349,18 +1317,6 @@ export function MediaViewer(props: MediaViewerProps) {
                     doesn't fall through to the backdrop's click-to-close. */}
                 <div ref={imageContainerRef} class="flex items-center justify-center pointer-events-auto" onClick={handleMediaClick} />
 
-                {/* Canvas GIF playback (desktop) — replaces the imperative
-                    <img> for GIFs. Zoom/pan don't apply here (the transform
-                    targets the image container); acceptable for GIFs. */}
-                <Show when={useGifCanvas()}>
-                  <GifCanvas
-                    url={gifAtlasUrl(currentPath(), "p")}
-                    class="max-w-[100vw] max-h-[100vh] pointer-events-auto"
-                    style={{ "object-fit": "contain" }}
-                    onClick={handleMediaClick}
-                  />
-                </Show>
-
                 {/* Spinner — suppressed while the open-transition clone is
                     flying so it doesn't flash behind it, and whenever a
                     placeholder is already showing the photo (a spinner over a
@@ -1393,14 +1349,14 @@ export function MediaViewer(props: MediaViewerProps) {
                 >
                   <span class="text-white/80 text-3xl ml-1">&#9654;</span>
                 </button>
-                <div>{isWeb() ? "Open / download video" : "Open in external player"}</div>
+                <div>Open / download video</div>
                 <div class="text-neutral-600 mt-1">{filename()}</div>
               </div>
             }>
               <Show when={videoStarted()} fallback={
                 <div class="relative max-w-[100vw] max-h-[100vh] flex items-center justify-center pointer-events-auto">
                   <img
-                    src={thumbUrl(currentPath(), "p")}
+                    src={thumbUrl(currentPath(), "jm")}
                     class="max-w-[100vw] max-h-[100vh] object-contain"
                     draggable={false}
                     onError={(e) => {
@@ -1453,16 +1409,6 @@ export function MediaViewer(props: MediaViewerProps) {
         </button>
       </Show>
 
-      {/* Window titlebar for the frameless desktop window — reveals on the top
-          edge so min/maximize/close + dragging stay reachable while viewing. */}
-      <Show when={frameless()}>
-        <TitleBar
-          visible={titlebarVisible()}
-          onMouseEnter={revealTitlebar}
-          onMouseLeave={hideTitlebar}
-        />
-      </Show>
-
       {/* Bottom info bar — fades with the chrome on a touch tap. Lifted clear
           of the video control bar (including its safe-area padding) when the
           player is active. The row itself is never interactive (pointer-events
@@ -1510,11 +1456,10 @@ export function MediaViewer(props: MediaViewerProps) {
           "text-3xl p-1": hasTouch(),
         }}
         style={{
-          // Clear the frameless titlebar so it isn't covered (and so the image
-          // close isn't confused with the window close), and clear the phone's
-          // notch, which otherwise swallows every tap on this button — it is
-          // the only close affordance besides the swipe-down gesture.
-          top: frameless() ? "3rem" : "calc(env(safe-area-inset-top, 0px) + 1rem)",
+          // Clear the phone's notch, which otherwise swallows every tap on this
+          // button — it is the only close affordance besides the swipe-down
+          // gesture.
+          top: "calc(env(safe-area-inset-top, 0px) + 1rem)",
           opacity: chromeVisible() ? undefined : "0",
           "pointer-events": chromeVisible() ? undefined : "none",
         }}

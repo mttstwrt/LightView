@@ -7,11 +7,7 @@
 // from every one of them, because any of them can be the one that empties the
 // queue. Missing it leaves the indicator stuck on screen forever.
 
-import {
-  thumbGenStarted,
-  thumbGenProgress,
-  thumbGenFinished,
-} from "../stores/thumbnailProgressStore";
+import { setThumbWork } from "../stores/activityStore";
 
 export interface ThumbProgress {
   /** A cell missed and was queued for generation. */
@@ -38,19 +34,18 @@ export function createThumbProgress(isIdle: () => boolean): ThumbProgress {
   /** Close out the indicator if the grid has gone quiet, else report progress. */
   const settle = () => {
     if (isIdle()) {
-      thumbGenFinished(done);
+      setThumbWork(null);
       total = 0;
       done = 0;
     } else {
-      thumbGenProgress(done, total);
+      setThumbWork({ done, total });
     }
   };
 
   return {
     queued() {
       total++;
-      if (total === 1) thumbGenStarted(total);
-      else thumbGenProgress(done, total);
+      setThumbWork({ done, total });
     },
     dropped(n) {
       if (n <= 0) return;
@@ -60,7 +55,7 @@ export function createThumbProgress(isIdle: () => boolean): ThumbProgress {
       // Dropping may have emptied the queue, and the dropped items were counted
       // when they were queued — so the indicator is showing and needs closing.
       if (isIdle()) {
-        thumbGenFinished(done);
+        setThumbWork(null);
         total = 0;
         done = 0;
       }
@@ -72,6 +67,7 @@ export function createThumbProgress(isIdle: () => boolean): ThumbProgress {
     reset() {
       total = 0;
       done = 0;
+      setThumbWork(null);
     },
   };
 }

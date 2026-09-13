@@ -1,8 +1,7 @@
-// Scroll velocity, direction, and the decode gate — shared by both grids.
+// Scroll velocity, direction, and the settle/warp state the grid renders by.
 
 import { createSignal, untrack, type Accessor } from "solid-js";
-import { isTauri } from "./runtime";
-import { ewmaImageLoadMs } from "./perfMonitor";
+import { ewmaImageLoadMs } from "./loadLatency";
 import { maxScroll, onScrollHost, scrollTop, viewportHeight } from "./scrollHost";
 
 // ---------------------------------------------------------------------------
@@ -14,24 +13,18 @@ import { maxScroll, onScrollHost, scrollTop, viewportHeight } from "./scrollHost
 // JustifiedGrid so both share one implementation and one set of tuning
 // constants (same pattern as galleryControls.ts).
 //
-// The decode gate exists for exactly one reason: WebKitGTK decodes images on
-// the webview's main thread, so assigning a wall of new <img> srcs mid-scroll
-// buries the thread and scrolling chokes. Real browsers (the web client)
-// decode async off-thread, so the gate never engages there — new cells load
-// while the scroll is still moving, which is what keeps the virtual-scroll
-// buffer useful on touch flings (docs/decisions/0007-two-zone-render-window.md).
+// The decode gate is gone with WebKitGTK. It existed because that engine
+// decoded images on the webview's main thread, so assigning a wall of new <img>
+// srcs mid-scroll buried the thread; its own contract said it was "always false
+// outside WebKitGTK", and outside is now everywhere. Browsers decode async off
+// the main thread, so new cells load while the scroll is still moving — which
+// is what keeps the virtual-scroll buffer useful on touch flings.
+//
+// `settled` and `warping` are *not* that gate and stay: they are about how many
+// cells are turning over, not about the cost of decoding one, and they are what
+// stop a scrub from assigning a source to every cell it flies past.
 // ---------------------------------------------------------------------------
 
-// Decode-work rate above which the gate engages, in decoded pixels per second
-// (velocity/rowHeight × cellsPerRow × per-cell decoded pixels). Pixel-weighted
-// rather than cells/s so a dense wall of tiny 128px thumbs isn't gated as
-// aggressively as a few huge 1024px ones. Calibrated to the old 2500 px/s
-// threshold at default desktop settings (~250px cells, ~7 columns, 512px
-// tier): 2500/258 × 7 × 512² ≈ 18M px/s.
-const GATE_DECODE_PX_PER_SEC = 18_000_000;
-// Idle gap (ms) after the last gated frame before scrolling is considered
-// settled and the gate releases (in case `scrollend` doesn't fire).
-const SCROLL_SETTLE_MS = 120;
 // A scroll frame older than this means scrolling has stopped — velocity()
 // reads 0 rather than the stale last-frame value.
 const VELOCITY_STALE_MS = 150;
@@ -102,15 +95,9 @@ const SCROLLBAR_RELEASE_MS = 900;
 // fling self-corrects.
 const FLING_PROJECTION_S = 0.35;
 
-// Cheap-rung experiment on WebKitGTK: when true, gated frames assign the tiny
-// "s" tier instead of nothing (128px decodes are ~16× cheaper than 512px).
-// Off until measured with the debug overlay — WebKitGTK decodes on the main
-// thread, which is the reason the hard gate exists at all.
-export const CHEAP_RUNG_DURING_GATE = false;
-
 /**
  * True when the browser reports a constrained network: Save-Data enabled or a
- * 2g-class effective connection. Progressive — Safari and WebKitGTK lack
+ * 2g-class effective connection. Progressive — Safari lacks
  * `navigator.connection`, so this is false there and nothing changes. While
  * constrained, the grids hold cells at the cheap rung (skip tier upgrades)
  * and `bufferAheadRows` stops deepening the prefetch window, both of which
@@ -178,24 +165,17 @@ export interface ScrollDynamics {
   /** Last scroll direction: 1 = down, -1 = up. */
   direction: () => 1 | -1;
   /**
-   * Reactive: true while src assignment should be deferred to protect the
-   * webview's main-thread decoding. Always false outside WebKitGTK.
-   */
-  decodeGate: Accessor<boolean>;
-  /**
    * Reactive: false while a fling is in progress (velocity above the
    * viewport-relative threshold), flipping back true shortly after it calms.
    * Also false for the whole of a scrollbar gesture and its release tail.
-   * Drives cheap-rung assignment and the upgrade pass on all platforms.
+   * Drives cheap-rung assignment and the upgrade pass.
    */
   settled: Accessor<boolean>;
   /**
    * Reactive: true while the view is moving faster than any loading could keep
    * up with — an iOS scroll-indicator scrub, mainly. The grids assign no new
    * sources and start no speculation while it is set; see
-   * [`WARP_VIEWPORTS_PER_SEC`]. Unlike `decodeGate` this is not
-   * WebKitGTK-specific — it is about the number of cells turning over, not the
-   * cost of decoding one.
+   * [`WARP_VIEWPORTS_PER_SEC`].
    */
   warping: Accessor<boolean>;
   /**
@@ -216,7 +196,7 @@ export interface ScrollDynamics {
    * is meaningless.
    */
   bufferAheadRows: (base: number, max: number) => number;
-  /** Release the gate / mark settled now (scrollend, wheel animation done). */
+  /** Mark settled now (scrollend, wheel animation done). */
   markSettled: () => void;
   dispose: () => void;
 }
@@ -224,20 +204,15 @@ export interface ScrollDynamics {
 export function createScrollDynamics(opts: {
   /** Current row pitch (px) — converts px/s into rows/s. */
   rowHeight: () => number;
-  /** Cells revealed per row scrolled (an estimate is fine). */
-  cellsPerRow: () => number;
-  /** Approximate decoded pixels per newly revealed cell (tier size²). */
-  cellCostPx: () => number;
   /** Called once per animation frame while scrolling, after state updates. */
   onFrame: (frame: ScrollFrame) => void;
 }): ScrollDynamics {
-  const [decodeGate, setDecodeGate] = createSignal(false);
   const [warping, setWarping] = createSignal(false);
   const [rested, setRested] = createSignal(true);
   // A scrollbar gesture keeps the view unsettled for its whole duration, so a
   // burst of scrollbar stops costs one tier upgrade at the end rather than one
   // per stop (see SCROLLBAR_RELEASE_MS). Everything downstream — the cheap-rung
-  // assignment in both grids and the drain-on-settle effect — reads this.
+  // assignment and the drain-on-settle effect — reads this.
   const settled = () => rested() && !scrollBarActive();
   const setSettled = setRested;
 
@@ -246,7 +221,6 @@ export function createScrollDynamics(opts: {
   let vel = 0;
   let dir: 1 | -1 = 1;
   let rafId = 0;
-  let settleTimer: ReturnType<typeof setTimeout> | undefined;
   let settleDebounce: ReturnType<typeof setTimeout> | undefined;
   let warpTimer: ReturnType<typeof setTimeout> | undefined;
   /** When the last positional jump landed; 0 = none this session. */
@@ -285,7 +259,6 @@ export function createScrollDynamics(opts: {
     // the fling actually landed on. That left hard flicks with blank/late cells
     // until the next 500ms poll or a manual scroll (docs/decisions/0007-two-zone-render-window.md).
     vel = 0;
-    if (untrack(decodeGate)) setDecodeGate(false);
     // `warping` is deliberately NOT cleared here. Its own timer owns it, and
     // this function is not the reliable "scrolling stopped" signal it looks
     // like: `scrollend` fires after *every* programmatic scroll, so during a
@@ -319,17 +292,6 @@ export function createScrollDynamics(opts: {
       dir = y >= lastY ? 1 : -1;
       lastY = y;
       lastTs = now;
-
-      if (isTauri()) {
-        const rh = opts.rowHeight();
-        const decodePxPerSec =
-          rh > 0 ? (vel / rh) * opts.cellsPerRow() * opts.cellCostPx() : 0;
-        if (decodePxPerSec > GATE_DECODE_PX_PER_SEC) {
-          if (!untrack(decodeGate)) setDecodeGate(true);
-          if (settleTimer) clearTimeout(settleTimer);
-          settleTimer = setTimeout(markSettled, SCROLL_SETTLE_MS);
-        }
-      }
 
       // Sustained warp speed — a scrub, not a fling. Held with its own short
       // timer rather than read from `velocity()` at consumption time, so the
@@ -369,13 +331,11 @@ export function createScrollDynamics(opts: {
     warping,
     projectedLandingY,
     bufferAheadRows,
-    decodeGate,
     settled,
     markSettled,
     dispose: () => {
       detachScroll();
       if (rafId) cancelAnimationFrame(rafId);
-      if (settleTimer) clearTimeout(settleTimer);
       if (settleDebounce) clearTimeout(settleDebounce);
       if (warpTimer) clearTimeout(warpTimer);
     },

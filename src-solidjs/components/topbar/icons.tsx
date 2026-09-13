@@ -109,37 +109,10 @@ export const UploadIcon: Icon = (props) => (
   </Stroke>
 );
 
-export const FolderIcon: Icon = (props) => (
-  <Stroke size={props.size}>
-    <path d="M3 7v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2z" />
-  </Stroke>
-);
 
 // ── View-mode glyphs ────────────────────────────────────────────────────────
 // One per `VIEW_CHOICES` entry, so the mobile view switcher's button can show
 // which view is current without spending a label on it.
 
-export const GridViewIcon: Icon = (props) => (
-  <Stroke size={props.size}>
-    <rect x="3" y="3" width="7.5" height="7.5" rx="1" />
-    <rect x="13.5" y="3" width="7.5" height="7.5" rx="1" />
-    <rect x="3" y="13.5" width="7.5" height="7.5" rx="1" />
-    <rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1" />
-  </Stroke>
-);
 
-export const JustifiedViewIcon: Icon = (props) => (
-  <Stroke size={props.size}>
-    <rect x="3" y="4" width="11" height="6" rx="1" />
-    <rect x="16" y="4" width="5" height="6" rx="1" />
-    <rect x="3" y="14" width="5" height="6" rx="1" />
-    <rect x="10" y="14" width="11" height="6" rx="1" />
-  </Stroke>
-);
 
-export const MapViewIcon: Icon = (props) => (
-  <Stroke size={props.size}>
-    <path d="M9 3L3 5.5v15L9 18l6 3 6-2.5v-15L15 6z" />
-    <path d="M9 3v15M15 6v15" />
-  </Stroke>
-);

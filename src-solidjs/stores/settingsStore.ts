@@ -1,191 +1,205 @@
-// Application settings, and the sort/group controls that travel with them.
+// Settings, in the two places they actually belong.
 //
-// Settings have two homes and the split is deliberate: on the desktop they
-// persist per gallery through the backend (and are mirrored to a hand-editable
-// settings.toml the fs-watcher hot-reloads), while the web client keeps its own
-// copy in local storage. A phone and the desktop looking at the same gallery
-// should not fight over thumbnail size.
+// **Display preferences are per client, for every client including the local
+// one.** They used to be per gallery on the desktop and per client on the web —
+// but a file inside the gallery is per *gallery*, not per client, so two
+// desktops mounting one share would fight over thumbnail size, which is the
+// exact thing a per-client preference exists to prevent. One mechanism, and no
+// local-versus-remote branch survives into the frontend.
+//
+// **The gallery's own settings file holds exactly two keys**: the default
+// filter, which is user intent and must survive a cache format bump, and trash
+// retention, which is hand-edited only because it is the one setting in the
+// system that deletes data.
 
 import { createSignal } from "solid-js";
-import type { AppSettings, SortField, SortOrder, GroupBy } from "../lib/types";
-import { saveGallerySettings, loadGallerySettings } from "../lib/ipc";
-import { isWeb, isMobile } from "../lib/runtime";
+
+import { api } from "../lib/ipc";
 import { loadPref, savePref } from "../lib/clientPrefs";
+import { isMobile } from "../lib/runtime";
+import type {
+  Capabilities,
+  GallerySettings,
+  GroupBy,
+  SortField,
+  SortOrder,
+} from "../lib/types";
 
-const SETTINGS_PREF = "settings";
+const PREFS_KEY = "prefs";
 
-/** Desktop default cell size. On a wide window this is around six columns. */
+/** Desktop default cell size: about six columns on a wide window. */
 const DESKTOP_THUMBNAIL_SIZE = 200;
-
 /** Columns a phone should open on. */
 const MOBILE_COLUMNS = 2;
+const DEFAULT_GRID_GAP = 2;
 
 /**
  * The default cell size, which on a phone is a *column count* in disguise.
  *
  * `thumbnail_size` is a size, not a count, so the same 200px that gives a
- * desktop window six columns gives a 390px phone exactly one — a "grid" one
- * photo wide, and one whose 390px cells ask for the largest thumbnail tier,
- * which is the most expensive thing the grid can do on the device least able
- * to afford it (see docs/frontend/grid-loading.md).
+ * desktop six columns gives a 390px phone exactly one — a grid one photo wide,
+ * whose 390px cells then ask for the largest tier: the most expensive thing the
+ * grid can do, on the device least able to afford it.
  *
- * So on mobile, derive the size that yields MOBILE_COLUMNS instead, using the
- * same bucket-midpoint arithmetic as the Ctrl+wheel/pinch column stepper, so
- * the layout has room to breathe either side of the target before it snaps to
- * a different count. Measured against the *short* edge, so a phone opened in
- * landscape still gets a portrait-sensible size rather than two enormous cells
- * that become one on rotation.
- *
- * Only ever consulted when nothing is stored, and only the web client can be
- * mobile (`isMobile` is false in the Tauri build), so the desktop's per-gallery
- * settings.toml can never be seeded from this branch.
+ * Measured against the **short** edge, so a phone opened in landscape gets a
+ * portrait-sensible size rather than two enormous cells that become one on
+ * rotation. Bucket-midpoint arithmetic, matching the pinch/Ctrl-wheel stepper,
+ * so the layout has room either side of the target before it snaps.
  */
 function defaultThumbnailSize(gap: number): number {
   if (!isMobile() || typeof window === "undefined") return DESKTOP_THUMBNAIL_SIZE;
-  const w = Math.min(window.innerWidth, window.innerHeight);
-  const upper = (w + gap) / MOBILE_COLUMNS - gap;
-  const lower = (w + gap) / (MOBILE_COLUMNS + 1) - gap;
+  const short = Math.min(window.innerWidth, window.innerHeight);
+  const upper = (short + gap) / MOBILE_COLUMNS - gap;
+  const lower = (short + gap) / (MOBILE_COLUMNS + 1) - gap;
   return Math.round((upper + lower) / 2);
 }
 
-const DEFAULT_GRID_GAP = 2;
-
-const DEFAULT_SETTINGS: AppSettings = {
-  display: {
-    thumbnail_size: defaultThumbnailSize(DEFAULT_GRID_GAP),
-    thumb_size_min: 120,
-    thumb_size_max: 700,
-    grid_gap: DEFAULT_GRID_GAP,
-    background_color: "#0a0a0a",
-    video_hover_preview: false,
-    video_autoplay_loop: false,
-    gif_autoplay_grid: false,
-    video_autoplay_grid: false,
-    video_autoplay_max_seconds: 30,
-    scroll_blur: false,
-    map_dark_mode: true,
-    justified_high_detail: true,
-    mobile_filter_sheet: "top",
-    video_autoplay_viewer: true,
-    start_at_bottom: false,
-  },
-  performance: {
-    preload_count: 3,
-    lru_cache_size: 5,
-    thumbnail_threads: 6,
-  },
-  storage: {
-    companion_location: "lightview_folder",
-  },
-  default_filter: {
-    enabled: false,
-    query: "",
-  },
-  external_apps: [
-    { label: "Gwenview", command: "gwenview", args: ["{file}"] },
-    { label: "GIMP", command: "gimp", args: ["{file}"] },
-  ],
-};
-
-/** Merge stored settings over the defaults section-by-section. Settings saved
- *  by an older build lack keys added since; a shallow top-level spread would
- *  let a stored `display` object wipe out new display defaults entirely, so
- *  every setting added later had to be read with an ad-hoc `?? fallback`.
- *  Merging per section keeps new defaults present and the AppSettings type
- *  honest (no key is ever undefined at runtime). */
-function mergeSettings(stored: Partial<AppSettings>): AppSettings {
-  return {
-    display: { ...DEFAULT_SETTINGS.display, ...stored.display },
-    performance: { ...DEFAULT_SETTINGS.performance, ...stored.performance },
-    storage: { ...DEFAULT_SETTINGS.storage, ...stored.storage },
-    default_filter: { ...DEFAULT_SETTINGS.default_filter, ...stored.default_filter },
-    external_apps: stored.external_apps ?? DEFAULT_SETTINGS.external_apps,
-  };
+/** Everything a client decides for itself. Nothing here reaches the server. */
+export interface DisplayPrefs {
+  thumbnail_size: number;
+  thumb_size_min: number;
+  thumb_size_max: number;
+  grid_gap: number;
+  background_color: string;
+  video_hover_preview: boolean;
+  video_autoplay_loop: boolean;
+  gif_autoplay_grid: boolean;
+  video_autoplay_grid: boolean;
+  video_autoplay_max_seconds: number;
+  scroll_blur: boolean;
+  /** Serve a larger aspect-preserving tier when zoomed in, rather than
+   *  upscaling the base rung. Generated for visible cells only. */
+  justified_high_detail: boolean;
+  /** Where the mobile filter/sort sheet appears: pinned under the safe-area
+   *  inset, or as a thumb-reachable sheet from the bottom. */
+  mobile_filter_sheet: "top" | "bottom";
+  video_autoplay_viewer: boolean;
+  /** Open scrolled to the end of the grid rather than the start. Only changes
+   *  where the view lands; the sort order itself is unaffected. */
+  start_at_bottom: boolean;
+  preload_count: number;
+  lru_cache_size: number;
 }
 
-// ---------------------------------------------------------------------------
-// Exported reactive store
-// ---------------------------------------------------------------------------
-//
-// Settings are persisted per-gallery in each gallery's
-// `.lightview/settings.toml` (the source of truth) and loaded by
-// loadSettingsFromGallery() when a gallery opens. There is no global store:
-// before a gallery is open the only screen is the gallery selector, which no
-// setting affects, so we simply start from in-memory defaults.
+const DEFAULT_PREFS: DisplayPrefs = {
+  thumbnail_size: defaultThumbnailSize(DEFAULT_GRID_GAP),
+  thumb_size_min: 120,
+  thumb_size_max: 700,
+  grid_gap: DEFAULT_GRID_GAP,
+  background_color: "#0a0a0a",
+  video_hover_preview: false,
+  video_autoplay_loop: false,
+  gif_autoplay_grid: false,
+  video_autoplay_grid: false,
+  video_autoplay_max_seconds: 30,
+  scroll_blur: false,
+  justified_high_detail: true,
+  mobile_filter_sheet: "top",
+  video_autoplay_viewer: true,
+  start_at_bottom: false,
+  preload_count: 3,
+  lru_cache_size: 5,
+};
 
-const [settings, setSettingsRaw] = createSignal<AppSettings>(DEFAULT_SETTINGS);
+/** Merge stored preferences over the defaults.
+ *
+ *  A flat merge is safe here because the shape is flat — the sectioned version
+ *  it replaces needed per-section merging precisely because a shallow spread
+ *  let one stored section wipe out every default added since. */
+function merge(stored: Partial<DisplayPrefs> | null): DisplayPrefs {
+  return { ...DEFAULT_PREFS, ...(stored ?? {}) };
+}
 
-/** Whether a gallery is currently open (enables backend persistence). */
-let galleryOpen = false;
+const [prefs, setPrefsRaw] = createSignal<DisplayPrefs>(merge(loadPref(PREFS_KEY)));
 
-export function setSettings(update: Partial<AppSettings> | ((prev: AppSettings) => AppSettings)) {
-  setSettingsRaw((prev) => {
+export function setPrefs(
+  update: Partial<DisplayPrefs> | ((prev: DisplayPrefs) => DisplayPrefs),
+) {
+  setPrefsRaw((prev) => {
     const next = typeof update === "function" ? update(prev) : { ...prev, ...update };
-    // The web client has no local gallery settings.toml (every browser talks to
-    // the same host), so it persists per-client in localStorage. Desktop
-    // persists to the open gallery's settings.toml; with no gallery open there's
-    // nothing to persist for (the selector screen uses no settings).
-    if (isWeb()) {
-      savePref(SETTINGS_PREF, next);
-    } else if (galleryOpen) {
-      saveGallerySettings(JSON.stringify(next)).catch(() => {});
-    }
+    savePref(PREFS_KEY, next);
     return next;
   });
 }
 
-/** Apply settings pushed from the backend because `settings.toml` was edited
- *  outside the app (hand edit). Updates the in-memory store only — it must NOT
- *  write back, or it would clobber the user's edit and fight the fs watcher. */
-export function applyExternalSettings(json: string) {
-  try {
-    const stored = JSON.parse(json) as Partial<AppSettings>;
-    setSettingsRaw(() => mergeSettings(stored));
-  } catch {}
-}
+export { prefs };
 
-/** Load settings stored in the current gallery's .lightview/settings.toml and
- *  apply them. A gallery with no saved settings starts from the hard defaults,
- *  independent of any other gallery's configuration. */
-export async function loadSettingsFromGallery() {
-  galleryOpen = true;
-  try {
-    const json = await loadGallerySettings();
-    if (json) {
-      const stored = JSON.parse(json) as Partial<AppSettings>;
-      setSettingsRaw(() => mergeSettings(stored));
-    } else {
-      // First open of this gallery — start from hard defaults and seed the
-      // gallery's settings.toml with them, so each gallery is self-contained.
-      setSettingsRaw(() => DEFAULT_SETTINGS);
-      await saveGallerySettings(JSON.stringify(DEFAULT_SETTINGS)).catch(() => {});
-    }
-  } catch {}
-}
+// ---------------------------------------------------------------------------
+// The gallery's own two settings
+// ---------------------------------------------------------------------------
 
-/** Load the web client's per-client settings from localStorage. The web client
- *  has no gallery settings.toml, so this restores each browser's own display
- *  preferences (e.g. GIF-in-grid playback) on open. No-op values simply fall
- *  back to the hard defaults. */
-export function loadWebSettings() {
-  const stored = loadPref<Partial<AppSettings>>(SETTINGS_PREF);
-  if (stored) {
-    setSettingsRaw(() => mergeSettings(stored));
+const [gallerySettings, setGallerySettings] = createSignal<GallerySettings>({
+  default_filter: "",
+  trash_retention_days: 30,
+});
+
+export { gallerySettings };
+
+export async function loadGallerySettings() {
+  try {
+    setGallerySettings(await api.settings());
+  } catch {
+    // A gallery whose settings file is unreadable opens with the defaults; the
+    // server logs it, and refusing to open would be a worse failure.
   }
 }
 
-/** Called when gallery is closed to stop backend persistence. */
-
-export { settings };
+/** Write the default filter. A `Device` command, because under `--serve` the
+ *  phone is the only UI there is. */
+export async function saveDefaultFilter(filter: string) {
+  setGallerySettings(await api.setDefaultFilter(filter));
+}
 
 // ---------------------------------------------------------------------------
-// Sort state (not persisted, resets on gallery open)
+// Capabilities
+// ---------------------------------------------------------------------------
+
+// Optimistically `device`, which is the *narrower* answer: a UI that briefly
+// hides an action it turns out to have is a flicker, while one that briefly
+// offers an action the server will refuse is a 403 the user caused.
+const [capabilities, setCapabilities] = createSignal<Capabilities>({
+  trust: "device",
+  upload: false,
+  clipboard: false,
+});
+
+export { capabilities };
+
+export async function loadCapabilities() {
+  try {
+    setCapabilities(await api.capabilities());
+  } catch {
+    // Leave the narrow default.
+  }
+}
+
+/** Whether this client may reach the `Owner` half of the command table. */
+export function isOwner(): boolean {
+  return capabilities().trust === "owner";
+}
+
+// ---------------------------------------------------------------------------
+// Sort state — not persisted, and reset on gallery open
 // ---------------------------------------------------------------------------
 
 const [sortField, setSortField] = createSignal<SortField>("date");
 const [sortOrder, setSortOrder] = createSignal<SortOrder>("desc");
 const [subSortField, setSubSortField] = createSignal<SortField>("date");
 const [subSortOrder, setSubSortOrder] = createSignal<SortOrder>("desc");
-const [groupBy, setGroupBy] = createSignal<GroupBy>({ type: "time_period", granularity: "month" });
+const [groupBy, setGroupBy] = createSignal<GroupBy>({
+  type: "time_period",
+  granularity: "month",
+});
 
-export { sortField, setSortField, sortOrder, setSortOrder, subSortField, setSubSortField, subSortOrder, setSubSortOrder, groupBy, setGroupBy };
+export {
+  sortField,
+  setSortField,
+  sortOrder,
+  setSortOrder,
+  subSortField,
+  setSubSortField,
+  subSortOrder,
+  setSubSortOrder,
+  groupBy,
+  setGroupBy,
+};

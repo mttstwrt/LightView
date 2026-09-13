@@ -1,118 +1,103 @@
-# Duplicates
+# duplicates/
 
-[← docs index](../README.md) · [architecture](../architecture.md)
+[← docs](../README.md)
 
-**Responsible for:** finding near-identical copies of the same image, and
-resolving a group down to one file without losing the metadata the other copies
-carried. Detection lives in `cache/duplicates.rs`; the user-facing operations —
-`find_duplicates`, `mark_not_duplicates`, `get_merge_candidates`,
-`merge_duplicates` — live in `commands/duplicates.rs`.
+**Responsible for** finding near-identical images and folding a group onto one
+keeper: perceptual hashing, all-pairs grouping, and the merge.
 
-**Not responsible for:** deleting files (`commands/trash.rs`), writing the
-`.lightview` sidecar ([`companion/`](../companion/README.md)), or generating the
-thumbnails detection reads from ([`pipeline/`](../pipeline/README.md)).
+**Not responsible for** deciding *which* copy to keep — the dialog resolves the
+conflicts and the backend applies the answer, without second-guessing it.
 
-**Depends on:** [`cache/`](../cache/README.md) for the `thumbnails` and
-`not_duplicates` tables, `companion/` for reading and merging metadata, and the
-trash path for discarding. **Depended on by:** `DuplicatesPanel.tsx` and
-`MergeDialog.tsx`, and four arms of the
-[`/api/invoke` allowlist](../remote/README.md).
+**Depends on** [`cache/`](../cache/README.md) for hashes and rows, the
+[trash](../storage/README.md#the-trash) for what a merge discards, and
+[companion/](../companion/README.md) for what it folds in. **Depended on by** the
+duplicates panel and the merge dialog.
 
-**Invariant:** a merge writes the keeper's *companion* file and, optionally, its
-mtime. It never rewrites image bytes. See the EXIF boundary below — this is the
-reason the feature is shaped the way it is.
+## Hashes come from the cached `j` tier, never the original
 
-## Detection
+Those bytes are already decoded and already in the database, so hashing a whole
+gallery costs **no source decodes**. The hash lives in a `phash` column on
+`thumbs_j`, so it is discarded and recomputed along with the thumbnail it
+describes — exactly the lifetime it should have. The idle worker computes them
+in the background.
 
-Detection is perceptual, not byte-exact, because the interesting duplicates are
-re-encodes and re-exports rather than literal copies.
+dHash: downscale to 9×8 greyscale, compare each pixel to its right neighbour,
+produce 64 bits. Downsampling to 9×8 regardless is why moving the source bytes
+from square-cropped to aspect-preserving did not change what this measures.
 
-Each cached Standard thumbnail gets a 64-bit **dHash**: downscale to 9×8
-greyscale, compare each pixel to its right neighbour, and emit the 8×8 = 64
-comparison bits. Working from the *thumbnail* rather than the original is the
-whole trick — the bytes are already decoded and already in the cache, so
-hashing an entire gallery costs no source decodes at all. The hash is stored in
-a `phash` column on the `thumbnails` table, so it is discarded and recomputed
-along with the thumbnail it describes.
+### `NULL` means "not hashed", never a sentinel `0`
 
-`compute_phashes_batch` fills in missing hashes a bounded batch at a time. It is
-called from two places: the duplicate finder itself (so opening the panel makes
-progress even on a cold gallery) and the idle backfill worker (so on a headless
-server the work is already done by the time anyone asks).
+The hasher this replaces matched on a stored codec string and fell through to
+`hash.unwrap_or(0)`. It read a JPEG tier; the `j` tier is WebP. **Ported
+unchanged, every row would have stored `0`** — every row would have passed
+`WHERE phash IS NOT NULL`, `hamming(0, 0)` is `0`, and the all-pairs loop would
+have unioned **the entire library into one duplicate group**, with no error, no
+log line and no failing test, for the merge to then trash.
 
-`find_duplicates(threshold)` then compares every pair by Hamming distance —
-0 is byte-identical pixels, ~10 is loose. This is quadratic in the number of
-hashed files, which is acceptable at gallery scale and is the reason the
-threshold is a parameter rather than a constant: a tighter threshold is not
-cheaper, so the knob exists for precision, not for cost.
+A genuinely flat image legitimately hashes to zero, which is why the two cases
+cannot share a value.
 
-Pairs the user has explicitly rejected are recorded in `not_duplicates` with
-`path_a < path_b` so lookups are canonical. That table is deliberately *outside*
-`path_keyed_tables()` — its paths are not in a `path` column — so every sweep
-that removes or relocates files handles it separately. See the
-[cache invariants](../cache/README.md#invariants-callers-must-uphold).
+## Grouping is quadratic, and that is why `threshold` is about precision
 
-## Merge
+An all-pairs Hamming comparison over every hashed file, in Rust, with the
+connection released first. **A tighter threshold is not cheaper** — the loop runs
+either way — so the control is about how loose a match counts, not about cost.
 
-Trashing a duplicate discards whatever metadata that copy carried. Near-identical
-duplicates usually differ *only* in metadata: one copy has user tags, another has
-a rating or the original file timestamp, a third has GPS. Merge lets the user
-pick one file to keep, fold the others' metadata into its companion, and trash
-the rest.
+The version this replaces held the *writer* across the entire comparison, on an
+async worker with no `spawn_blocking` at all.
 
-### What is mergeable
+## Sets are what "not a duplicate" means now
 
-| Field | Source | Merge rule | Write target |
-|---|---|---|---|
-| User tags | companion `tags.user` | union, editable (drop via checkbox) | keeper companion |
-| Auto / plugin tags | companion `tags.auto`, `tags.plugins` | union, auto-folded (no per-tag UI) | keeper companion |
-| Rating | companion `meta.core.rating` | per-field pick (default keeper, else sole non-empty) | keeper companion |
-| Color label | companion `meta.core.color_label` | per-field pick | keeper companion |
-| Notes | companion `meta.core.notes` | **pick one** (non-chosen shown so nothing is lost silently) | keeper companion |
-| Companion location | `meta.core.location` | per-field pick | keeper companion |
-| File mtime | filesystem / `media_meta.mtime` | per-field pick (default: earliest) | `filetime` on the keeper file |
-| Embedded EXIF GPS | `media_meta.gps_lat/lon` | read-only; if the keeper has no companion location, offer to promote a copy's GPS into it | keeper companion |
-| Embedded EXIF (date, camera, …) | image bytes | **not touched** — shown as read-only context | — |
+Two files sharing any `set::` tag are never offered as a pair. Derived from
+co-membership rather than from a table of pairwise verdicts, so a forty-frame
+burst costs **forty tag rows instead of 780 pairwise ones**, and the user sees a
+name rather than a list of negations. Naming a group is the gesture the panel
+offers where "not duplicates" used to be.
 
-### The EXIF boundary
+The accepted cost, stated: two genuinely identical scans inside a 200-page comic
+will not be found, because they share the comic's set.
 
-LightView has no EXIF *write* path, and acquiring one to inject a discarded
-copy's metadata would mean rewriting the keeper's image bytes — risking the
-original in exchange for fields nothing in the app reads back. GPS is the single
-exception, and only because it can be captured *without* touching image bytes:
-it is written into the keeper's companion `location` instead.
+The suppression check is **index-based, not path-keyed**. Probing a set keyed by
+paths meant building an owned `(String, String)` for every near-match just to
+ask whether it had been dismissed — two allocations and a string comparison per
+candidate. Interned set ids make it two integers and no allocation, and that
+matters more here than it did for the table it replaces: dismissed pairs were
+rare, so the old check almost never fired, while set co-membership is the
+**common** case and is now the inner loop of the one quadratic algorithm in the
+tree.
 
-That asymmetry is the thing to understand before extending this feature. Anything
-that can be expressed in the companion is mergeable; anything that would require
-re-encoding the file is not.
+## The merge
 
-### The operation
+The dialog resolves the conflicts; the backend applies the answer. It gathers
+what the others contribute, applies everything to the keeper in **one locked
+read-modify-write**, stamps the agreed capture time onto the keeper's file, and
+trashes the rest as **one trash entry** — so one merge is one undo.
 
-`get_merge_candidates(paths)` gathers, per path in one round-trip, everything the
-dialog needs to show: the companion (`tags.*` and `meta.core.{rating,
-color_label, notes, location}`), the file mtime, indexed EXIF GPS from
-`media_meta`, and size/dimensions for display.
+`set::` tags union onto the keeper like user tags. Without that, merging a set
+member silently drops that member's set; a keeper ending up in two sets is fine,
+since suppression is pairwise.
 
-`merge_duplicates(plan)` then applies a fully-resolved `MergePlan` — the dialog
-does the resolving, the backend does no conflict logic of its own:
+**The mtime stamp is the one place anything writes one**, and it is an explicit
+field of the plan rather than a side effect. Restoring a file with a rewritten
+mtime is silent data loss, so the operation that legitimately rewrites one says
+so out loud.
 
-1. `modify_companion(&keeper, …)` applies the resolved tags and meta, folding in
-   the auto and plugin tag unions. This is the same helper `commands/tags.rs`
-   uses, so a merge and a hand-edit write the file identically.
-2. If the plan sets an mtime, stamp the keeper file.
-3. `reindex_tags_for_file` plus an autocomplete-count refresh, mirroring
-   `add_user_tag_impl`, so the tag index reflects the merge immediately rather
-   than at the next gallery open.
-4. Trash the discards through `trash_files_impl` — the existing,
-   capability-gated path, so merge inherits its confinement and its undo.
+**The stamp moves the row too, in the same breath.** `index_one` afterwards
+re-reads the *companion*, not the file, so the indexed `mtime` would otherwise
+keep its old value — and since the grid's date sort falls back to `mtime` (see
+[`query/`](../query/README.md)), the keeper would sit in its old place until the
+next open and then move without being asked. Invisible while only `date_taken`
+drove the order; a silent reorder on restart once it does not.
 
-The keeper's image bytes are unchanged, so no thumbnail cache-bust is needed;
-the discards leave the index via the trash path's normal sweep.
+There is no "companion location versus EXIF location" choice. The companion's
+coordinates are mirrored over the indexed ones at index time, so a file has one
+effective location and the real question is *which copy's*.
 
-`merge_duplicates` sits behind the same `delete` capability as the Trash button,
-because step 4 is a delete.
+## Invariants a caller must uphold
 
-### Out of scope
-
-Rewriting embedded EXIF into image bytes, and merging across arbitrary
-selections that are not a detected duplicate group.
+- **Never write a sentinel hash.** `NULL` is the only value for "could not
+  hash", and the reason is a library-wide false grouping.
+- **Load, release, then compare.** The all-pairs loop runs on a blocking thread
+  with no connection held.
+- **A merge is `Owner`.** It rewrites a companion, stamps an mtime and trashes
+  several files at once. Finding duplicates is `Device`; resolving them is not.

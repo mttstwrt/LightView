@@ -1,14 +1,16 @@
 import { Show, createSignal } from "solid-js";
-import { resetServiceWorker } from "../lib/swControl";
 
-// Shown on the web client when the boot round-trip to the server failed but
-// the grid rendered anyway — from the IndexedDB snapshot and service-worker
-// thumbnail cache. Without it that state is invisible: the app paints a full,
-// scrollable gallery while every write, filter, and uncached thumbnail
-// silently fails, which reads as "the app is fine, the photos are just slow".
+// Shown when a request to the server failed for a reason that is neither the
+// readiness gate nor a credential — the network, a dropped TLS exception, a
+// server that went away. Without it that state is invisible: the browser's own
+// HTTP cache keeps painting a full, scrollable grid of already-fetched
+// thumbnails while every write and every uncached cell silently fails, which
+// reads as "the app is fine, the photos are just slow".
 //
-// `Reset connection` is the recovery path for the common cause on iOS — a
-// dropped certificate exception. See lib/swControl.ts.
+// There is no `Reset connection` button any more. It unregistered the service
+// worker so iOS would re-prompt for the certificate, and both the worker and
+// the second cache it managed are gone — the browser's own cache revalidates
+// against the `ETag`, and reloading is the whole recovery.
 
 export function ConnectionBanner(props: { onRetry: () => void }) {
   const [dismissed, setDismissed] = createSignal(false);
@@ -29,7 +31,7 @@ export function ConnectionBanner(props: { onRetry: () => void }) {
         <span class="flex-1 min-w-0">
           <b class="font-medium">Offline view.</b>{" "}
           <span class="text-amber-200/80">
-            Can't reach LightView — showing the last cached gallery.
+            Can't reach LightView — what you see may be out of date.
           </span>
         </span>
         <button
@@ -38,13 +40,6 @@ export function ConnectionBanner(props: { onRetry: () => void }) {
           class="flex-shrink-0 px-2 py-1 rounded bg-amber-900/70 hover:bg-amber-800/70 disabled:opacity-50 transition-colors cursor-pointer"
         >
           {retrying() ? "Retrying…" : "Retry"}
-        </button>
-        <button
-          onClick={() => void resetServiceWorker()}
-          title="Unregister the service worker and reload, so the browser can re-prompt for the server's certificate. Your pairing is kept."
-          class="flex-shrink-0 px-2 py-1 rounded bg-amber-900/70 hover:bg-amber-800/70 transition-colors cursor-pointer"
-        >
-          Reset connection
         </button>
         <button
           onClick={() => setDismissed(true)}

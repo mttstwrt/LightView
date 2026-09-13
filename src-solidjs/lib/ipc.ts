@@ -1,969 +1,440 @@
-// The single boundary between the SPA and the backend.
+// The only module that talks to the backend.
 //
-// One typed function per backend command, and one place that knows which
-// transport is in use: Tauri's `invoke()` inside the desktop webview, or
-// `POST /api/invoke` in a browser. Nothing above this file branches on that,
-// which is what lets the same bundle ship to both.
+// There is one transport. `isTauri()`, `safeListen` and the dual-default
+// capabilities store are gone with the second runtime: everything is
+// `POST /api/invoke` plus the media and thumbnail routes.
 //
-// Two auth conditions are absorbed here rather than surfaced to callers:
+// Two behaviours are absorbed here so they never leak to callers, and each one
+// is a bug the previous arrangement had:
 //
-//   * 401 with `WWW-Authenticate: LV-Password` — the gallery password is
-//     required again. The transport raises a challenge, waits for the modal,
-//     and retries the original request. Concurrent 401s share one pending
-//     promise, so a grid firing twenty requests produces one prompt instead of
+//  1. A `401` carrying `WWW-Authenticate: LV-Password` raises a challenge,
+//     waits for the modal, and retries — and **concurrent 401s share one
+//     pending promise**. Without that, a grid firing twenty requests produces
 //     twenty stacked modals.
-//   * 401 without that header — the device cookie is missing or revoked. Emits
-//     NOT_PAIRED_EVENT so the router can redirect to /pair.
-//
-// A command the web client must not reach is not hidden here; it is simply
-// absent from the server's allowlist, and 403s if called. `capabilitiesStore`
-// tells components what to render, but it is not the enforcement.
-//
-// The types below mirror the Rust serde structs. When one side changes, the
-// other must too — `tsc --noEmit` is what catches it.
+//  2. A `401` *without* that header means the credential is missing or
+//     revoked. On a served bind that is "not paired" and the client goes to
+//     pairing. **On a loopback bind it is a dead end**: there is no pairing
+//     flow, and a browser cannot read `instance.json` to find the new URL —
+//     that is exactly the filesystem access the trust model exists to
+//     withhold. So it reports that the session has ended and a new one will
+//     open a new tab.
 
-import { invoke as _rawInvoke } from "@tauri-apps/api/core";
-import { isActive as isPerfActive, recordIpcCall } from "./perfMonitor";
-import {
-  isTauri,
-  NOT_PAIRED_EVENT,
-  PASSWORD_CHALLENGE_EVENT,
-} from "./runtime";
 import type {
-  GalleryOpenResult,
-  GroupBy,
-  MemoryStatus,
+  Capabilities,
+  DuplicateGroup,
+  GallerySettings,
+  Items,
+  MediaMeta,
+  MergePlan,
   PluginInfo,
-  PluginRunResult,
-  SortField,
-  SortOrder,
-  SortedResult,
+  SortedItem,
   TagSuggestion,
+  ThumbTier,
+  TierPresence,
+  TrashEntry,
+  WritableNamespace,
 } from "./types";
 
 // ---------------------------------------------------------------------------
-// Transport — Tauri IPC on desktop, HTTP bridge in the browser
+// Paths on the wire
 // ---------------------------------------------------------------------------
 
-/** Pending password-challenge promise. While set, every 401-LV-Password
- *  response awaits the same prompt instead of stacking modals.
- *  Resolves with `true` if the user supplied the right password, `false`
- *  if they cancelled. */
-let _pendingPasswordChallenge: Promise<boolean> | null = null;
-
-function _requestPassword(): Promise<boolean> {
-  if (_pendingPasswordChallenge) return _pendingPasswordChallenge;
-  _pendingPasswordChallenge = new Promise<boolean>((resolve) => {
-    const onResolved = (e: Event) => {
-      window.removeEventListener("lightview:password-resolved", onResolved);
-      _pendingPasswordChallenge = null;
-      resolve(Boolean((e as CustomEvent<boolean>).detail));
-    };
-    window.addEventListener("lightview:password-resolved", onResolved);
-    window.dispatchEvent(new CustomEvent(PASSWORD_CHALLENGE_EVENT));
-  });
-  return _pendingPasswordChallenge;
-}
-
-/** Web-client transport: POST to the read-only `/api/invoke` bridge.
+/** Percent-encode each segment independently and leave `/` literal.
  *
- *  Auth handling:
- *   - The `lv_device` cookie rides along automatically (same-origin).
- *   - 401 with `WWW-Authenticate: LV-Password` → ask the user for the
- *     password, then transparently retry. The caller never sees the 401.
- *   - 401 without that header → device is not paired (or revoked); emit
- *     `NOT_PAIRED_EVENT` so the router can redirect to `/pair`. */
-async function _httpInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const body = JSON.stringify({ command: cmd, args: args ?? {} });
-  const doFetch = () =>
-    fetch("/api/invoke", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
-
-  let res = await doFetch();
-  if (res.status === 401) {
-    const challenge = res.headers.get("www-authenticate") ?? "";
-    if (challenge.toLowerCase().includes("lv-password")) {
-      const accepted = await _requestPassword();
-      if (accepted) {
-        res = await doFetch();
-      }
-    } else {
-      window.dispatchEvent(new Event(NOT_PAIRED_EVENT));
-    }
-  }
-
-  if (!res.ok) {
-    const detail = await res.text().catch(() => res.statusText);
-    throw new Error(`invoke ${cmd} failed (${res.status}): ${detail}`);
-  }
-  const text = await res.text();
-  return (text ? JSON.parse(text) : undefined) as T;
-}
-
-/** Dispatch a command over the active transport. */
-function _transport<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  return isTauri() ? _rawInvoke<T>(cmd, args) : _httpInvoke<T>(cmd, args);
-}
-
-// ---------------------------------------------------------------------------
-// Instrumented invoke — records IPC metrics when perf monitor is active
-// ---------------------------------------------------------------------------
-
-async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (!isPerfActive()) {
-    return _transport<T>(cmd, args);
-  }
-  const argStr = args ? JSON.stringify(args) : "";
-  const start = performance.now();
-  const result = await _transport<T>(cmd, args);
-  const elapsed = performance.now() - start;
-  const resStr = result !== undefined && result !== null ? JSON.stringify(result) : "";
-  recordIpcCall(cmd, argStr.length, resStr.length, elapsed);
-  return result;
-}
-
-// ---------------------------------------------------------------------------
-// Gallery
-// ---------------------------------------------------------------------------
-
-export const openGallery = (path: string) =>
-  invoke<GalleryOpenResult>("open_gallery", { path });
-
-export const closeGallery = () => invoke<void>("close_gallery");
-
-/** Everything the web client's first frame needs, in one round-trip:
- *  gallery info + default filter + sorted items (filter pre-applied
- *  server-side). Replaces three serial invokes on boot. */
-export interface BootState {
-  gallery: GalleryOpenResult | null;
-  default_filter: { enabled: boolean; query: string } | null;
-  sorted: SortedResult | null;
-}
-
-export const getBootState = (
-  sortField: SortField,
-  sortOrder: SortOrder,
-  groupBy: GroupBy,
-  subSortField?: SortField,
-  subSortOrder?: SortOrder,
-) =>
-  invoke<BootState>("get_boot_state", {
-    sortField,
-    sortOrder,
-    groupBy,
-    subSortField,
-    subSortOrder,
-  });
-
-// ---------------------------------------------------------------------------
-// Media
-// ---------------------------------------------------------------------------
-
-
-export interface ThumbnailResult {
-  path: string;
-  width: number;
-  height: number;
-  media_type: string;
-  format: string;
-}
-
-/** LOD tier for thumbnails; see docs/pipeline/README.md and
- *  `ThumbTier` in src-tauri/src/cache/thumbnails.rs. */
-export type ThumbTier = "s" | "m" | "l" | "p" | "j" | "jm" | "jh";
-
-/** Build a protocol URL for a cached thumbnail at a given tier. The
- *  `lightview://thumb/<tier>/<path>` protocol serves image data directly
- *  from SQLite — no JSON serialization overhead. When `tier` is omitted
- *  the backend falls back to the standard (m) tier for legacy URLs. */
-export function thumbUrl(path: string, tier: ThumbTier = "m"): string {
-  if (isTauri()) {
-    return `lightview://thumb/${tier}/${encodeURIComponent(path)}`;
-  }
-  // Web client: same-origin HTTP route served by the axum server. Cookie auth.
-  const rel = path.startsWith("/") ? path.slice(1) : path;
-  return `/thumb/${tier}/${encodeMediaPath(rel)}`;
-}
-
-/** Base URL of the local HTTP media server (e.g. `http://127.0.0.1:52431`).
- *  Populated by the Rust backend via an initialization script (see
- *  `setup` in `main.rs`). Falls back to an IPC fetch if the script has
- *  not yet executed. */
-let _mediaServerUrl: string | null =
-  (globalThis as any).__LV_MEDIA_URL__ ?? null;
-
-/** Eagerly fetch the media server URL and cache it. Safe to call
- *  multiple times — subsequent calls are no-ops once the URL is known.
- *  Call from app startup so `mediaUrl()` can run synchronously later. */
-export async function initMediaServer(): Promise<string> {
-  // Web client serves media from its own origin, so there is no separate URL
-  // to prime — `mediaUrl()` returns same-origin relative paths.
-  if (!isTauri()) return "";
-  if (_mediaServerUrl) return _mediaServerUrl;
-  const injected = (globalThis as any).__LV_MEDIA_URL__;
-  if (typeof injected === "string" && injected.length > 0) {
-    _mediaServerUrl = injected;
-    return injected;
-  }
-  const url = await invoke<string>("get_media_server_url");
-  _mediaServerUrl = url;
-  return url;
-}
-
-/** Percent-encode each path segment independently so `/` is preserved but
- *  special characters (spaces, unicode, `?`, `#`, etc.) are encoded.
- *  Axum's router decodes captures but rejects paths containing raw
- *  encoded slashes, so we must keep `/` literal. */
-function encodeMediaPath(path: string): string {
+ *  axum decodes captures but rejects paths containing raw encoded slashes, so a
+ *  single `encodeURIComponent` over the whole path 404s every file in a
+ *  subdirectory. This is the rule that travels with gallery-relative paths. */
+export function encodePath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-/** Build a URL for full-resolution media (image or video). Served by the
- *  local axum HTTP server, which streams the file with Range support — so
- *  large videos don't get buffered into memory and large images don't
- *  block the protocol thread. WebKitGTK also refuses `<video>` from any
- *  non-http(s) URI scheme, so this single path covers both elements.
+export function thumbUrl(path: string, tier: ThumbTier): string {
+  return `/thumb/${tier}/${encodePath(path)}`;
+}
+
+export function mediaUrl(path: string, fit?: number): string {
+  const base = `/media/${encodePath(path)}`;
+  return fit ? `${base}?fit=${fit}` : base;
+}
+
+// ---------------------------------------------------------------------------
+// Auth interruptions
+// ---------------------------------------------------------------------------
+
+export type AuthInterruption =
+  /** Present the password modal; resolve the returned promise with the answer,
+   *  or reject to give up. */
+  | { kind: "password" }
+  /** No usable credential, and there is a pairing flow to go to. */
+  | { kind: "not-paired" }
+  /** No usable credential, and there is not. The process restarted. */
+  | { kind: "session-ended" };
+
+type Listener = (interruption: AuthInterruption) => void;
+const listeners = new Set<Listener>();
+
+/** Subscribe to auth interruptions. `App` wires the modal and the banner. */
+export function onAuthInterruption(listener: Listener): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function announce(interruption: AuthInterruption) {
+  for (const listener of listeners) listener(interruption);
+}
+
+/** Resolved by the password modal. One at a time, shared by every caller that
+ *  hit a challenge while it was open. */
+let pendingPassword: Promise<boolean> | null = null;
+let resolvePassword: ((accepted: boolean) => void) | null = null;
+
+/** Called by the modal when the user submits or cancels. */
+export function answerPasswordChallenge(accepted: boolean) {
+  resolvePassword?.(accepted);
+  resolvePassword = null;
+  pendingPassword = null;
+}
+
+function challenge(): Promise<boolean> {
+  // The shared promise. Twenty concurrent 401s raise one modal.
+  if (!pendingPassword) {
+    pendingPassword = new Promise<boolean>((resolve) => {
+      resolvePassword = resolve;
+    });
+    announce({ kind: "password" });
+  }
+  return pendingPassword;
+}
+
+/** Whether this client is talking to a bind that has a pairing flow at all. */
+let hasPairing = true;
+export function setHasPairing(value: boolean) {
+  hasPairing = value;
+}
+
+// ---------------------------------------------------------------------------
+// The one call
+// ---------------------------------------------------------------------------
+
+export class IpcError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+async function post(command: string, args: unknown): Promise<Response> {
+  return fetch("/api/invoke", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ command, args: args ?? {} }),
+  });
+}
+
+export async function invoke<T>(command: string, args?: unknown): Promise<T> {
+  let response = await post(command, args);
+
+  if (response.status === 401) {
+    if (response.headers.get("www-authenticate") === "LV-Password") {
+      const accepted = await challenge();
+      if (!accepted) throw new IpcError("password required", 401);
+      response = await post(command, args);
+    } else {
+      announce(hasPairing ? { kind: "not-paired" } : { kind: "session-ended" });
+      throw new IpcError("not authenticated", 401);
+    }
+  }
+
+  if (!response.ok) {
+    const body = await response.text();
+    let message = body;
+    try {
+      message = (JSON.parse(body) as { error?: string }).error ?? body;
+    } catch {
+      // A non-JSON body is a middleware refusal (503, 403), which already
+      // reads as prose.
+    }
+    throw new IpcError(message || response.statusText, response.status);
+  }
+  return (await response.json()) as T;
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+export interface AuthStatus {
+  trust: "device" | "owner";
+  password_required: boolean;
+  pairing: boolean;
+}
+
+export async function authStatus(): Promise<AuthStatus> {
+  const response = await fetch("/auth/status");
+  const status = (await response.json()) as AuthStatus;
+  setHasPairing(status.pairing);
+  return status;
+}
+
+/** Exchange `?t=<token>` for the session cookie.
  *
- *  `fitEdge` (px) requests an aspect-preserving backend resize to that longest
- *  edge for native raster stills, so the webview decodes a cell-sized image off
- *  its main thread instead of the full original. Omit it for whole-file serving
- *  (video, GIF playback, non-raster formats). */
-export function mediaUrl(path: string, fitEdge?: number): string {
-  const rel = path.startsWith("/") ? path.slice(1) : path;
-  const q = fitEdge && fitEdge > 0 ? `?fit=${Math.round(fitEdge)}` : "";
-  // Web client: same-origin HTTP route served by the axum server. Cookie auth.
-  if (!isTauri()) {
-    return `/media/${encodeMediaPath(rel)}${q}`;
-  }
-  if (!_mediaServerUrl) {
-    _mediaServerUrl = (globalThis as any).__LV_MEDIA_URL__ ?? null;
-  }
-  if (!_mediaServerUrl) return "";
-  return `${_mediaServerUrl}/media/${encodeMediaPath(rel)}${q}`;
+ *  Single use and rotated on redemption, so the caller must clear it from the
+ *  address bar immediately — see `index.tsx`. */
+export async function redeemLaunchToken(token: string): Promise<boolean> {
+  const response = await fetch("/auth/launch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  return response.ok;
 }
 
-/** Alias for `mediaUrl`. Kept for the `<video>` callsite where the name
- *  documents intent. */
-export const videoSrc = mediaUrl;
-
-/** Build a URL for a GIF frame atlas (PNG sprite sheet + `X-Gif-*` headers),
- *  served only by the axum HTTP server so the frontend can `fetch()` the body
- *  and metadata together. Used for canvas GIF playback — see `GifCanvas`. */
-export function gifAtlasUrl(path: string, tier: ThumbTier = "m"): string {
-  const rel = path.startsWith("/") ? path.slice(1) : path;
-  if (!isTauri()) {
-    return `/gif-atlas/${tier}/${encodeMediaPath(rel)}`;
-  }
-  if (!_mediaServerUrl) {
-    _mediaServerUrl = (globalThis as any).__LV_MEDIA_URL__ ?? null;
-  }
-  if (!_mediaServerUrl) return "";
-  return `${_mediaServerUrl}/gif-atlas/${tier}/${encodeMediaPath(rel)}`;
+export async function redeemPairingCode(
+  code: string,
+  name: string,
+): Promise<boolean> {
+  const response = await fetch("/pair/redeem", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code, name }),
+  });
+  return response.ok;
 }
 
-/** Outcome of a tier warm-up. `generated` counts newly cached thumbnails; the
- *  caller should refetch the tier URL (with a new cache-buster) after this
- *  resolves. `evicted` lists paths the backend dropped to stay inside the
- *  tier's disk budget — callers that memo "already warmed" paths must forget
- *  these, or those cells never get re-warmed and fall through to the slow
- *  one-at-a-time serve path. */
-export interface EnsureTierResult {
-  generated: number;
-  evicted: string[];
+export async function submitPassword(password: string): Promise<boolean> {
+  const response = await fetch("/auth/password", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  return response.ok;
 }
-
-/** Lazily generate high-resolution tier thumbnails (L / P). Re-decodes each
- *  source image at the tier's target size. */
-export const ensureTierThumbnails = (paths: string[], tier: ThumbTier) =>
-  invoke<EnsureTierResult>("ensure_tier_thumbnails", { paths, tier });
-
-export const getThumbnailsBatch = (paths: string[]) =>
-  invoke<ThumbnailResult[]>("get_thumbnails_batch", { paths });
-
-export interface PrecacheResult {
-  generated: number;
-  failed: string[];
-}
-
-export const precacheThumbnails = (paths: string[]) =>
-  invoke<PrecacheResult>("precache_thumbnails", { paths });
-
-export const getMediaMeta = (path: string) =>
-  invoke<{
-    path: string;
-    media_type: string;
-    file_size: number;
-    date_taken: number | null;
-    width: number | null;
-    height: number | null;
-    duration_seconds: number | null;
-    rating: number | null;
-    last_rated: number | null;
-  } | null>("get_media_meta", { path });
 
 // ---------------------------------------------------------------------------
-// Tags
+// Commands
 // ---------------------------------------------------------------------------
 
-export const getTags = (path: string) =>
-  invoke<{ namespace: string; tag: string }[]>("get_tags", { path });
+export const api = {
+  capabilities: () => invoke<Capabilities>("get_capabilities"),
 
-export const addUserTag = (path: string, tag: string) =>
-  invoke<void>("add_user_tag", { path, tag });
+  items: (request: {
+    sort?: string;
+    order?: string;
+    sub_sort?: string | null;
+    sub_order?: string | null;
+    filter?: string;
+    group_by?: unknown;
+  }) => invoke<Items>("get_items", request),
 
-export const removeUserTag = (path: string, tag: string) =>
-  invoke<void>("remove_user_tag", { path, tag });
+  mediaMeta: (path: string) =>
+    invoke<MediaMeta | null>("get_media_meta", { path }),
 
-export const setRating = (path: string, rating: number) =>
-  invoke<void>("set_rating", { path, rating });
+  tiers: (path: string) =>
+    invoke<TierPresence[]>("get_all_thumbnail_tiers", { path }),
 
-/** The colour labels the UI offers. Free-form on disk and in the filter, but
- *  these five are what the swatches draw and what `color:<name>` expects —
- *  matching the Lightroom/Bridge vocabulary users already have muscle memory
- *  for. Stored and queried lowercase. */
-export const COLOR_LABELS = ["red", "yellow", "green", "blue", "purple"] as const;
-export type ColorLabel = (typeof COLOR_LABELS)[number];
+  tierTotals: () =>
+    invoke<{ tier: ThumbTier; bytes: number }[]>("get_tier_totals"),
 
-/** Hex per label, for the swatches and the cell corner marker. */
-export const COLOR_LABEL_HEX: Record<ColorLabel, string> = {
-  red: "#ef4444",
-  yellow: "#eab308",
-  green: "#22c55e",
-  blue: "#3b82f6",
-  purple: "#a855f7",
+  autocomplete: (query: string, namespace?: string, limit = 20) =>
+    invoke<TagSuggestion[]>("autocomplete", { query, namespace, limit }),
+
+  settings: () => invoke<GallerySettings>("get_settings"),
+
+  setDefaultFilter: (filter: string) =>
+    invoke<GallerySettings>("set_default_filter", { filter }),
+
+  /** Every tag in one writable namespace, most-used first. The tag manager's
+   *  list; answered from the same in-memory vocabulary autocomplete queries. */
+  listTags: (namespace: WritableNamespace) =>
+    invoke<{ namespace: string; tag: string; count: number }[]>("list_tags", {
+      namespace,
+    }),
+
+  /** A capped sample of the files a tag selection covers, so a gallery-wide
+   *  rewrite can be confirmed against something more than a count. */
+  pathsWithTags: (tags: string[], namespace: WritableNamespace, limit = 120) =>
+    invoke<string[]>("paths_with_tags", { tags, namespace, limit }),
+
+  // --- Tag writes. Every one names a namespace of `user` or `set`. ---
+  addTags: (paths: string[], tags: string[], namespace: WritableNamespace) =>
+    invoke<{ changed: number }>("add_tags", { paths, tags, namespace }),
+
+  removeTags: (paths: string[], tags: string[], namespace: WritableNamespace) =>
+    invoke<{ changed: number }>("remove_tags", { paths, tags, namespace }),
+
+  renameTag: (from: string, to: string, namespace: WritableNamespace) =>
+    invoke<{ changed: number }>("rename_tag", { from, to, namespace }),
+
+  mergeTags: (sources: string[], target: string, namespace: WritableNamespace) =>
+    invoke<{ changed: number }>("merge_tags", { sources, target, namespace }),
+
+  deleteTag: (tag: string, namespace: WritableNamespace) =>
+    invoke<{ changed: number }>("delete_tag", { tag, namespace }),
+
+  /** A selection, always — rating one photo is a selection of one, and the
+   *  server answers with a single `items-changed` however many there are. */
+  setRating: (paths: string[], rating: number | null) =>
+    invoke<void>("set_rating", { paths, rating }),
+
+  setColorLabel: (paths: string[], color_label: string | null) =>
+    invoke<void>("set_color_label", { paths, color_label }),
+
+  setNotes: (path: string, notes: string | null) =>
+    invoke<void>("set_notes", { path, notes }),
+
+  recordView: (path: string) => invoke<void>("record_view", { path }),
+
+  // --- Thumbnails ---
+  regenerate: (paths: string[]) =>
+    invoke<void>("regenerate_thumbnail", { paths }),
+
+  precache: (tier: ThumbTier, paths: string[]) =>
+    invoke<void>("precache_thumbnails", { tier, paths }),
+
+  // --- Trash ---
+  trash: (paths: string[]) => invoke<{ entry: string }>("trash_files", { paths }),
+
+  listTrash: () => invoke<TrashEntry[]>("list_trash"),
+
+  /** Both fields, always: the id names the entry and the path names the
+   *  destination, and neither is derived from the other. */
+  restoreTrash: (id: string, relative_path: string) =>
+    invoke<void>("restore_trash", { id, relative_path }),
+
+  /** `Owner` only — permanent deletion is not "move to trash". */
+  purgeTrash: (entry?: string) => invoke<{ purged: number }>("purge_trash", { entry }),
+
+  // --- Duplicates ---
+  findDuplicates: (threshold?: number) =>
+    invoke<DuplicateGroup[]>("find_duplicates", { threshold }),
+
+  /** Every copy in a group, in one round trip. The same row shape the info
+   *  panel reads — a merge candidate is a row plus its tags and notes. */
+  mergeCandidates: (paths: string[]) =>
+    invoke<MediaMeta[]>("get_merge_candidates", { paths }),
+
+  /** `Owner` only — it rewrites a companion, stamps an mtime and trashes
+   *  files. A remote client may find duplicates and not resolve them. */
+  mergeDuplicates: (plan: MergePlan) =>
+    invoke<{ keeper: string; trashed: number; trash_entry: string }>(
+      "merge_duplicates",
+      plan,
+    ),
+
+  // --- Owner-only filesystem operations ---
+  copyFiles: (paths: string[], destination: string) =>
+    invoke<{ count: number }>("copy_files", { paths, destination }),
+
+  moveFiles: (paths: string[], destination: string) =>
+    invoke<{ count: number }>("move_files", { paths, destination }),
+
+  clipboardFiles: (paths: string[], cut = false) =>
+    invoke<void>("clipboard_files", { paths, cut }),
+
+  /** An **index** into server-side configuration. No request can name a
+   *  program. */
+  openWith: (app_index: number, path: string) =>
+    invoke<void>("open_with", { app_index, path }),
+
+  externalApps: () => invoke<{ label: string }[]>("list_external_apps"),
+
+  /** One level of the directory picker. The parent and the sidebar's places
+   *  come back with the listing rather than being computed here — a browser
+   *  doing its own string surgery on a path is how a picker ends up asking
+   *  for a file. `places` is constant for the process and rides along rather
+   *  than costing a second call. */
+  listDirs: (path?: string) =>
+    invoke<{
+      path: string;
+      parent: string | null;
+      entries: { name: string; path: string }[];
+      places: { label: string; path: string }[];
+    }>("list_dirs", { path }),
+
+  // --- Plugins ---
+  listPlugins: () => invoke<PluginInfo[]>("list_plugins"),
+
+  /** Run a plugin over a selection. Progress arrives as `job-progress` events
+   *  and the terminal `job-finished`, never as a return value: a run over a
+   *  thousand files outlives any request. */
+  runPlugin: (plugin: string, paths: string[]) =>
+    invoke<{ started: boolean }>("run_plugin", { plugin, paths }),
 };
 
-export const setColorLabel = (path: string, label: string | null) =>
-  invoke<void>("set_color_label", { path, label });
-
-export const setColorLabelBatch = (paths: string[], label: string | null) =>
-  invoke<number>("set_color_label_batch", { paths, label });
-
-export const setNotes = (path: string, notes: string | null) =>
-  invoke<void>("set_notes", { path, notes });
-
-export const addUserTagBatch = (paths: string[], tag: string) =>
-  invoke<number>("add_user_tag_batch", { paths, tag });
-
-export const removeUserTagBatch = (paths: string[], tag: string) =>
-  invoke<number>("remove_user_tag_batch", { paths, tag });
-
-export const setRatingBatch = (paths: string[], rating: number) =>
-  invoke<number>("set_rating_batch", { paths, rating });
-
-// --- Gallery-wide tag management (the tag manager panel) -------------------
-
-/** A user tag and how many files in the gallery carry it. */
-export interface UserTagSummary {
-  tag: string;
-  count: number;
-}
-
-/** Files rewritten by a rename/merge/delete, and files that could not be
- *  (missing or unwritable companion) — those keep the old tag on disk. */
-export interface TagEditResult {
-  filesChanged: number;
-  filesFailed: number;
-}
-
-export const listUserTags = () => invoke<UserTagSummary[]>("list_user_tags");
-
-/** Files carrying any of `tags` — what a rename/merge/delete would touch. */
-export const pathsForUserTags = (tags: string[], limit?: number) =>
-  invoke<string[]>("paths_for_user_tags", { tags, limit });
-
-export const renameUserTag = (from: string, to: string) =>
-  invoke<TagEditResult>("rename_user_tag", { from, to });
-
-export const mergeUserTags = (sources: string[], target: string) =>
-  invoke<TagEditResult>("merge_user_tags", { sources, target });
-
-export const deleteUserTags = (tags: string[]) =>
-  invoke<TagEditResult>("delete_user_tags", { tags });
-
 // ---------------------------------------------------------------------------
-// Filter
+// Uploads
 // ---------------------------------------------------------------------------
 
-export const applyFilter = (query: string) =>
-  invoke<string[]>("apply_filter", { query });
-
-// ---------------------------------------------------------------------------
-// Geo / map view
-// ---------------------------------------------------------------------------
-
-export interface GeoBbox {
-  south: number;
-  west: number;
-  north: number;
-  east: number;
-}
-
-export interface GeoCluster {
-  lat: number;
-  lon: number;
-  count: number;
-  sample_path: string;
-}
-
-export interface GeoQueryResult {
-  clusters: GeoCluster[];
-  total: number;
-}
-
-export const getGeoPoints = (
-  bbox: GeoBbox,
-  zoom: number,
-  filter?: string,
-) => invoke<GeoQueryResult>("get_geo_points", { bbox, zoom, filter });
-
-export const getGeoPaths = (
-  bbox: GeoBbox,
-  filter?: string,
-) => invoke<string[]>("get_geo_paths", { bbox, filter });
-
-// ---------------------------------------------------------------------------
-// Autocomplete
-// ---------------------------------------------------------------------------
-
-export const autocompleteTags = (
-  query: string,
-  namespace?: string,
-  limit?: number
-) =>
-  invoke<TagSuggestion[]>("autocomplete_tags", { query, namespace, limit });
-
-
-// ---------------------------------------------------------------------------
-// Sort
-// ---------------------------------------------------------------------------
-
-export const getSortedItems = (
-  sortField: SortField,
-  sortOrder: SortOrder,
-  groupBy: GroupBy,
-  filterPaths?: string[],
-  subSortField?: SortField,
-  subSortOrder?: SortOrder,
-) =>
-  invoke<SortedResult>("get_sorted_items", {
-    sortField,
-    sortOrder,
-    groupBy,
-    filterPaths,
-    subSortField,
-    subSortOrder,
-  });
-
-// ---------------------------------------------------------------------------
-// Plugins
-// ---------------------------------------------------------------------------
-
-export const listPlugins = () => invoke<PluginInfo[]>("list_plugins");
-
-export const runPlugin = (
-  pluginName: string,
-  mediaPath: string,
-  action: string
-) => invoke<PluginRunResult>("run_plugin", { pluginName, mediaPath, action });
-
-export const runPluginBatch = (
-  pluginName: string,
-  mediaPaths: string[],
-  action: string,
-) => invoke<void>("run_plugin_batch", { pluginName, mediaPaths, action });
-
-export const cancelPluginBatch = () => invoke<void>("cancel_plugin_batch");
-
-export const installPlugin = (path: string) =>
-  invoke<PluginInfo>("install_plugin", { path });
-
-/** One plugin-namespace tag write, as pushed by a remote tagging worker (a
- * paired machine runs the tagger locally and reports results over HTTP).
- * Same write path as a local plugin run, so `NOT has::plugin.<prefix>`
- * filters see the file as tagged afterwards. Used by `lightview-worker`,
- * not this UI — kept here to document the contract. */
-export interface PluginTagWrite {
-  path: string;
-  tagPrefix: string;
-  version: string;
-  tags: string[];
-  meta?: unknown;
-}
-
-export const applyPluginTags = (entries: PluginTagWrite[]) =>
-  invoke<FileOpResult>("apply_plugin_tags", { entries });
-
-// ---------------------------------------------------------------------------
-// Remote tagging jobs (web-triggered, executed by a paired lightview-worker;
-// see docs/remote/worker-tagging.md and stores/taggingStore.ts)
-// ---------------------------------------------------------------------------
-
-export type TaggingJobState = "queued" | "running" | "done" | "failed" | "cancelled";
-
-export interface TaggingJob {
-  id: string;
-  pluginName: string;
-  tagPrefix: string;
-  displayName: string;
-  target: { paths: string[] } | { filter: string };
-  /** When set, only this worker may claim the job (explicit "run on the
-   * server" / "run on worker X" choice). */
-  pinnedWorker: string | null;
-  state: TaggingJobState;
-  /** Fixed when the job is claimed; 0 for still-queued filter jobs. */
-  total: number;
-  completed: number;
-  failed: number;
-  claimedBy: string | null;
-  workerName: string | null;
-  error: string | null;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface WorkerStatus {
-  workerId: string;
-  workerName: string;
-  plugins: PluginInfo[];
-  /** `lightview-worker` build this machine reports. Null for a worker old
-   *  enough to predate the field — which is itself the answer to how old. */
-  workerVersion: string | null;
-  lastSeen: number;
-  /** True for the in-process executor on the server host itself. */
-  local: boolean;
-  busyJobId: string | null;
-}
-
-export interface TaggingStatus {
-  workers: WorkerStatus[];
-  jobs: TaggingJob[];
-}
-
-export const getTaggingStatus = () => invoke<TaggingStatus>("get_tagging_status");
-
-/** Enqueue a tagging job for a connected worker: either an explicit path list
- * (selection) or a filter query resolved at claim time ("tag all untagged").
- * `workerId` pins the job to one worker — used to choose between the server's
- * own executor and a remote worker when both offer the plugin. */
-export const enqueueTaggingJob = (
-  pluginName: string,
-  target: { paths: string[] } | { filter: string },
-  workerId?: string,
-) => invoke<TaggingJob>("enqueue_tagging_job", { pluginName, ...target, workerId });
-
-export const cancelTaggingJob = (jobId: string) =>
-  invoke<void>("cancel_tagging_job", { jobId });
-
-// ---------------------------------------------------------------------------
-// File Operations (Copy / Move / Trash)
-// ---------------------------------------------------------------------------
-
-export interface FileOpResult {
-  succeeded: string[];
-  failed: { path: string; error: string }[];
-}
-
-export interface MovedFile {
-  from: string;
-  to: string;
-}
-
-export interface MoveResult {
-  /** Files that stayed in the gallery (old path -> new path); re-key the cells. */
-  moved: MovedFile[];
-  /** Files that left the gallery; remove the cells. */
-  removed: string[];
-  failed: { path: string; error: string }[];
-}
-
-export const copyFiles = (paths: string[], destination: string) =>
-  invoke<FileOpResult>("copy_files", { paths, destination });
-
-export const moveFiles = (paths: string[], destination: string) =>
-  invoke<MoveResult>("move_files", { paths, destination });
-
-export const trashFiles = (paths: string[]) =>
-  invoke<FileOpResult>("trash_files", { paths });
-
-export const copyFilesToClipboard = (paths: string[]) =>
-  invoke<void>("copy_files_to_clipboard", { paths });
-
-// ---------------------------------------------------------------------------
-// Server capabilities (what a remote client may do; see capabilitiesStore)
-// ---------------------------------------------------------------------------
-
-export interface ServerCapabilities {
-  metadataWrite: boolean;
-  delete: boolean;
-  localFs: boolean;
-  plugins: boolean;
-}
-
-export const getServerCapabilities = () =>
-  invoke<ServerCapabilities>("get_server_capabilities");
-
-/** Views this gallery offers, as `ViewMode` strings. Readable by both clients;
- *  the setter is desktop-only, since it configures the gallery rather than the
- *  device looking at it. */
-export const getEnabledViews = () => invoke<string[]>("get_enabled_views");
-export const setEnabledViews = (enabled: string[]) =>
-  invoke<void>("set_enabled_views", { enabled });
-
-/** Desktop-only host toggle for the web client's delete capability. */
-export const getRemoteDeleteConfig = () => invoke<boolean>("get_remote_delete_config");
-export const setRemoteDeleteConfig = (enabled: boolean) =>
-  invoke<void>("set_remote_delete_config", { enabled });
-
-/** DOM event dispatched on web after `regenerate_thumbnail` resolves, standing
- * in for the desktop-only `thumb:regenerated` Tauri event so grids cache-bust. */
-export const THUMB_REGENERATED_EVENT = "lv:thumb-regenerated";
-
-// ---------------------------------------------------------------------------
-// App-managed trash (delete moves into <gallery>/.lightview/trash/)
-// ---------------------------------------------------------------------------
-
-export interface TrashEntry {
-  id: string;
-  /** Gallery-relative path the entry restores to. */
-  original_path: string;
-  file_name: string;
-  /** Unix seconds. */
-  deleted_at: number;
-  size: number;
-}
-
-export const listTrash = () => invoke<TrashEntry[]>("list_trash");
-
-/** Restored paths come back in `succeeded`; the grid refreshes via the
- * fs-changed broadcast, so callers only need this for error reporting. */
-export const restoreTrash = (ids: string[]) =>
-  invoke<FileOpResult>("restore_trash", { ids });
-
-/** No args = empty the whole trash. */
-export const purgeTrash = (ids?: string[], olderThanDays?: number) =>
-  invoke<number>("purge_trash", { ids: ids ?? null, olderThanDays: olderThanDays ?? null });
-
-// ---------------------------------------------------------------------------
-// Duplicate Detection
-// ---------------------------------------------------------------------------
-
-export interface DuplicateItem {
-  path: string;
-  width: number | null;
-  height: number | null;
-  file_size: number;
-  date_taken: number | null;
-  is_best: boolean;
-}
-
-export interface DuplicateGroup {
-  items: DuplicateItem[];
-  hash: number;
-}
-
-export interface FindDuplicatesResult {
-  hashes_computed: number;
-  groups: DuplicateGroup[];
-}
-
-export const findDuplicates = (threshold?: number) =>
-  invoke<FindDuplicatesResult>("find_duplicates", { threshold });
-
-export interface MergeGps {
-  lat: number;
-  lon: number;
-  alt: number | null;
-}
-
-export interface MergeCandidate {
-  path: string;
-  width: number | null;
-  height: number | null;
-  file_size: number;
-  mtime: number | null;
-  user_tags: string[];
-  rating: number | null;
-  color_label: string | null;
-  notes: string | null;
-  companion_location: MergeGps | null;
-  exif_location: MergeGps | null;
-}
-
-export interface MergePlan {
-  keeper: string;
-  discard: string[];
-  user_tags: string[];
-  rating: number | null;
-  color_label: string | null;
-  notes: string | null;
-  location: MergeGps | null;
-  set_mtime: number | null;
-}
-
-export const getMergeCandidates = (paths: string[]) =>
-  invoke<MergeCandidate[]>("get_merge_candidates", { paths });
-
-export const mergeDuplicates = (plan: MergePlan) =>
-  invoke<void>("merge_duplicates", { plan });
-
-export const markNotDuplicates = (paths: string[]) =>
-  invoke<number>("mark_not_duplicates", { paths });
-
-// ---------------------------------------------------------------------------
-// Settings / Maintenance
-// ---------------------------------------------------------------------------
-
-export const getMemoryStatus = () =>
-  invoke<MemoryStatus>("get_memory_status");
-
-export interface RemoteAccessInfo {
-  port: number;
-  lan_ip: string | null;
-  /** Base URL of the running server (no path) — e.g. `https://192.168.0.5:8723`. */
-  base_url: string | null;
-  clients_seen: number;
-  firewall_hint: string | null;
-}
-
-export interface RemoteDeviceInfo {
-  id: string;
-  name: string;
-  created_at: number;
-  last_seen: number;
-  last_auth_at: number;
-  revoked_at: number | null;
-}
-
-export interface RemoteAuthState {
-  devices: RemoteDeviceInfo[];
-  password_set: boolean;
-  inactivity_secs: number;
-}
-
-export interface PairingCode {
-  code: string;
-  kind: "qr" | "pin";
-  expires_at: number;
-  /** URL embedded in the QR code (or pair-page link for PIN flow). Null when
-   *  the server is running but no LAN IP could be detected. */
-  pairing_url: string | null;
-}
-
-export const enableRemoteAccess = (port?: number) =>
-  invoke<RemoteAccessInfo>("enable_remote_access", { port });
-
-export const disableRemoteAccess = () =>
-  invoke<void>("disable_remote_access");
-
-export const getRemoteAccessInfo = () =>
-  invoke<RemoteAccessInfo | null>("get_remote_access_info");
-
-export const getRemoteAuthState = () =>
-  invoke<RemoteAuthState>("get_remote_auth_state");
-
-export const generatePairingCode = (kind: "qr" | "pin") =>
-  invoke<PairingCode>("generate_pairing_code", { kind });
-
-export const revokeRemoteDevice = (deviceId: string) =>
-  invoke<void>("revoke_remote_device", { deviceId });
-
-export const deleteRemoteDevice = (deviceId: string) =>
-  invoke<void>("delete_remote_device", { deviceId });
-
-export const setRemotePassword = (password: string) =>
-  invoke<void>("set_remote_password", { password });
-
-export const clearRemotePassword = () =>
-  invoke<void>("clear_remote_password");
-
-export const setRemoteInactivity = (secs: number) =>
-  invoke<void>("set_remote_inactivity", { secs });
-
-// ---------------------------------------------------------------------------
-// Device uploads (web client → host gallery)
-// ---------------------------------------------------------------------------
-
-/** How uploaded files are foldered under `Uploads/` on the host. Mirrors the
- *  Rust `UploadScheme`. */
-export type UploadScheme = "year" | "year_month" | "year_album" | "flat";
-
-export interface UploadConfig {
-  enabled: boolean;
-  scheme: UploadScheme;
-}
-
-/** Works in both modes: Tauri command on desktop, `/api/invoke` bridge on the
- *  web client (the only upload-related command on the read-only allowlist). */
-export const getUploadConfig = () => invoke<UploadConfig>("get_upload_config");
-
-/** Host-only (desktop) — sets the per-gallery upload config. */
-export const setUploadConfig = (enabled: boolean, scheme: UploadScheme) =>
-  invoke<void>("set_upload_config", { enabled, scheme });
-
-export interface UploadResult {
-  uploaded: { original: string; stored: string }[];
-  rejected: { original: string; reason: string }[];
-}
-
-/** Low-level POST to `/api/upload` with upload-progress reporting. Uses
- *  XMLHttpRequest because `fetch` can't report request-body upload progress. */
-function _postUpload(
-  form: FormData,
-  onProgress?: (fraction: number) => void,
-): Promise<{ status: number; auth: string; text: string }> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/upload");
-    if (onProgress && xhr.upload) {
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress(e.loaded / e.total);
-      };
-    }
-    xhr.onload = () =>
-      resolve({
-        status: xhr.status,
-        auth: xhr.getResponseHeader("www-authenticate") ?? "",
-        text: xhr.responseText,
-      });
-    xhr.onerror = () => reject(new Error("network error during upload"));
-    xhr.send(form);
-  });
-}
-
-/** Upload media files from the web client into the host gallery. Web-only.
+/** Upload files, reporting progress as a fraction.
  *
- *  `album` is honored only by the host's `year_album` scheme; it is appended
- *  *before* the files so the server can apply it to them (the backend reads
- *  fields in order). 401 handling mirrors `_httpInvoke`: an `LV-Password`
- *  challenge prompts and retries once; any other 401 means the device is no
- *  longer paired. */
-export async function uploadFiles(
+ *  The one `XMLHttpRequest` in the codebase, and it is here for a reason
+ *  `fetch` cannot answer: `fetch` exposes no upload progress at all. The
+ *  streaming-request alternative (`ReadableStream` body with `duplex: "half"`)
+ *  is Chromium-only and needs HTTP/2, so it is not an option for the phone this
+ *  exists for — and a phone pushing a four-gigabyte clip over Wi-Fi with no
+ *  indication of progress looks hung. */
+export function upload(
   files: File[],
-  album?: string,
   onProgress?: (fraction: number) => void,
-): Promise<UploadResult> {
-  const buildForm = () => {
-    const form = new FormData();
-    if (album && album.trim()) form.append("album", album.trim());
-    for (const f of files) form.append("file", f, f.name);
-    return form;
+): Promise<string[]> {
+  const form = new FormData();
+  for (const file of files) form.append("file", file, file.name);
+
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/upload");
+    request.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded / e.total);
+    };
+    request.onload = () => {
+      if (request.status < 200 || request.status >= 300) {
+        reject(new IpcError(request.responseText, request.status));
+        return;
+      }
+      try {
+        resolve((JSON.parse(request.responseText) as { uploaded: string[] }).uploaded);
+      } catch (e) {
+        reject(new IpcError(String(e), request.status));
+      }
+    };
+    request.onerror = () => reject(new IpcError("upload failed", 0));
+    request.send(form);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/** Subscribe to the server's one event stream.
+ *
+ *  `onopen` re-fetches boot state rather than replaying history, and that is a
+ *  requirement rather than a nicety: `EventSource` reconnects silently, and on
+ *  a phone that happens constantly — screen lock, Wi-Fi to LTE, backgrounding.
+ *  Without it the client sits on a confidently wrong grid indefinitely. */
+export function subscribe(
+  onEvent: (event: import("./types").ServerEvent) => void,
+  onReconnect: () => void,
+): () => void {
+  let opened = false;
+  const source = new EventSource("/api/events");
+
+  source.onopen = () => {
+    // The first open is the initial load, which the caller has already done.
+    if (opened) onReconnect();
+    opened = true;
+  };
+  source.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data));
+    } catch {
+      // A malformed frame is not worth tearing the stream down for.
+    }
   };
 
-  let res = await _postUpload(buildForm(), onProgress);
-  if (res.status === 401) {
-    if (res.auth.toLowerCase().includes("lv-password")) {
-      const accepted = await _requestPassword();
-      if (accepted) res = await _postUpload(buildForm(), onProgress);
-    } else {
-      window.dispatchEvent(new Event(NOT_PAIRED_EVENT));
-    }
-  }
-  if (res.status < 200 || res.status >= 300) {
-    throw new Error(`upload failed (${res.status}): ${res.text || ""}`);
-  }
-  return JSON.parse(res.text) as UploadResult;
+  return () => source.close();
 }
 
-export const reindexGallery = () => invoke<number>("reindex_gallery");
-
-export const rebuildThumbnails = () => invoke<number>("rebuild_thumbnails");
-
-export const regenerateThumbnail = (path: string) =>
-  invoke<void>("regenerate_thumbnail", { path });
-
-export const saveGallerySettings = (settingsJson: string) =>
-  invoke<void>("save_gallery_settings", { settingsJson });
-
-export const loadGallerySettings = () =>
-  invoke<string | null>("load_gallery_settings");
-
-/** Process-level rendering prefs (read at startup; changes need a restart).
- *  `null` for a field means "use the built-in default". */
-export interface RenderConfig {
-  gpu_acceleration: boolean | null;
-  gtk_backend: string | null;
-}
-
-export const getRenderConfig = () =>
-  invoke<RenderConfig>("get_render_config");
-
-export const setRenderConfig = (
-  gpuAcceleration: boolean | null,
-  gtkBackend: string | null,
-) => invoke<void>("set_render_config", { gpuAcceleration, gtkBackend });
-
-/** Gallery-wide default filter (shared by desktop and LAN web clients). */
-export const getGalleryDefaultFilter = () =>
-  invoke<{ enabled: boolean; query: string } | null>("get_gallery_default_filter");
-
-export interface RecentGallery {
-  path: string;
-  last_opened: number;
-}
-
-export const getRecentGalleries = () =>
-  invoke<RecentGallery[]>("get_recent_galleries");
-
-export const removeRecentGallery = (path: string) =>
-  invoke<void>("remove_recent_gallery", { path });
-
-export const openWith = (command: string, args: string[]) =>
-  invoke<void>("open_with", { command, args });
-
-export interface DebugInfo {
-  storage_type: string;
-  filesystem: string;
-  cpu_cores: number;
-  total_ram_mb: number;
-  supports_reflink: boolean;
-  thumbnail_threads: number;
-  prefetch_count: number;
-  lru_cache_size: number;
-  standard_thumb_size: number;
-  sqlite_thumbnail_count: number;
-  gpu_resize_active: boolean;
-  gdk_backend: string;
-  webkit_disable_dmabuf: boolean;
-}
-
-export const getDebugInfo = () =>
-  invoke<DebugInfo>("get_debug_info");
-
-// ---------------------------------------------------------------------------
-// Thumbnail Info
-// ---------------------------------------------------------------------------
-
-export interface ThumbnailTierInfo {
-  tier: string;
-  width: number;
-  height: number;
-  size_bytes: number;
-  format: string;
-  resize_filter: string | null;
-}
-
-export const getAllThumbnailTiers = (path: string) =>
-  invoke<ThumbnailTierInfo[]>("get_all_thumbnail_tiers", { path });
-
-// ---------------------------------------------------------------------------
-// Viewer (GPU-accelerated transforms)
-// ---------------------------------------------------------------------------
-
-export const recordView = (path: string) =>
-  invoke<void>("record_view", { path });
-
-// ---------------------------------------------------------------------------
-// Performance Snapshot (debug overlay)
-// ---------------------------------------------------------------------------
-
-export interface PerfSnapshot {
-  disk_read_bytes: number;
-  disk_write_bytes: number;
-}
-
-export const getPerfSnapshot = () =>
-  _transport<PerfSnapshot>("get_perf_snapshot");
+export type { SortedItem };

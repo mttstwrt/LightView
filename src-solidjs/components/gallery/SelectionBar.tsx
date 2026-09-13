@@ -1,5 +1,5 @@
 import { Show, For, createSignal } from "solid-js";
-import { addUserTagBatch, removeUserTagBatch, setRatingBatch } from "../../lib/ipc";
+import { api } from "../../lib/ipc";
 import { isMobile } from "../../lib/runtime";
 
 interface SelectionBarProps {
@@ -27,7 +27,7 @@ export function SelectionBar(props: SelectionBarProps) {
     if (!tag || busy() || empty()) return;
     setBusy(true);
     try {
-      await addUserTagBatch(paths(), tag);
+      await api.addTags(paths(), [tag], "user");
       setTagInput("");
     } catch (err) {
       console.error("Batch tag failed:", err);
@@ -40,7 +40,7 @@ export function SelectionBar(props: SelectionBarProps) {
     if (busy() || empty()) return;
     setBusy(true);
     try {
-      await setRatingBatch(paths(), value);
+      await api.setRating(paths(), value > 0 ? value : null);
       setShowRating(false);
     } catch (err) {
       console.error("Batch rating failed:", err);

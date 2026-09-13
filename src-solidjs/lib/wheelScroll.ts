@@ -1,20 +1,18 @@
 // Wheel-driven scrolling of the gallery's scroll host, with momentum smoothing.
 //
-// WebKitGTK doesn't propagate wheel events to window scroll natively, so the
-// grids intercept them and drive the scroll themselves. Two quirks (vs.
-// Chromium in the web client) shape this:
+// The grid intercepts wheel events and drives the scroll itself, for two
+// reasons that outlive the desktop webview this was first written for:
 //
-//   1. Traditional mouse wheels arrive as DOM_DELTA_LINE (deltaY ±1 per notch),
-//      not pixels — normalized by deltaMode via `wheelPxPerUnit`, which maps one
-//      WebKitGTK notch to one grid row. `lib/wheel.ts` has the full table.
+//   1. Ctrl+wheel is a zoom, and deciding that per-event means owning the
+//      event — returning `false` from `onZoom` is what lets a Ctrl+drag
+//      selection keep scrolling past the viewport.
 //   2. Fractional relative scroll steps get rounded away every frame, so
 //      relative stepping silently drops the tail of each gesture by an amount
 //      that varies with frame timing. We instead animate an absolute float
 //      target and keep our own float position, immune to engine rounding.
 //
-// Both grids need exactly this, differing only in their row height and what
-// Ctrl+wheel means (resize thumbnails vs. change the target row height), so
-// those are the two hooks the caller supplies.
+// Deltas are normalized by `deltaMode` through `wheelPxPerUnit`; `lib/wheel.ts`
+// has the engine table.
 
 import { wheelPxPerUnit } from "./wheel";
 import { maxScroll, scrollToY, scrollTop } from "./scrollHost";
@@ -25,8 +23,6 @@ const DECAY = 0.8;
 const SETTLE = 0.5;
 
 export interface WheelScrollOptions {
-  /** Pixels one wheel notch should travel — the grid's row height. */
-  rowHeight: () => number;
   /** Called once the animation settles, so the caller can drain its fetch queue. */
   onSettle: () => void;
   /**
@@ -83,7 +79,7 @@ export function createWheelScroll(opts: WheelScrollOptions): WheelScroll {
       targetY = scrollTop();
       animating = true;
     }
-    const deltaPx = e.deltaY * wheelPxPerUnit(e, opts.rowHeight());
+    const deltaPx = e.deltaY * wheelPxPerUnit(e);
     targetY = Math.max(0, Math.min(maxScroll(), targetY + deltaPx));
     if (!rafId) rafId = requestAnimationFrame(drain);
   };
