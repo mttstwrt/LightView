@@ -185,6 +185,11 @@ const PROBE_BATCH: usize = 256;
 /// Read `paths`' metadata headers and record both what they said and that they
 /// were read.
 ///
+/// **Which header depends on the file.** An image carries EXIF; a video carries
+/// what its container declares, which `ffprobe` reads. Both arrive as a
+/// [`meta::ProbedMedia`] and neither knows about the other — the branch is the
+/// only place the difference exists.
+///
 /// **Both facts are recorded, and they are different facts.** A file with no
 /// EXIF block leaves `date_taken` and the coordinates NULL, which is
 /// indistinguishable from never having looked — so the looking is written down
@@ -194,6 +199,11 @@ const PROBE_BATCH: usize = 256;
 /// Reads happen off the writer lock, a batch at a time, and the lock is taken
 /// only to commit — so a gallery being enriched can still warm thumbnails.
 async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), OpenError> {
+    // Asked once, outside the loop, because the answer cannot change while the
+    // process runs — and asked *here* rather than inside the probe, so that a
+    // host with no ffmpeg leaves its video rows untouched instead of recording
+    // a look that never happened.
+    let ffprobe = crate::pipeline::video::ffprobe_available();
     for chunk in paths.chunks(PROBE_BATCH) {
         let root = gallery.root.clone();
         let batch: Vec<RelPath> = chunk.to_vec();
@@ -202,18 +212,31 @@ async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), Ope
             for path in batch {
                 // A path that will not resolve is still a path that has been
                 // looked at: leaving it unmarked would retry it every open.
-                let facts = match root.resolve(&path) {
-                    Ok(absolute) => crate::pipeline::exif::read(absolute.as_path()),
-                    Err(_) => crate::pipeline::exif::Facts::default(),
+                let Ok(absolute) = root.resolve(&path) else {
+                    out.push((path, meta::ProbedMedia::default()));
+                    continue;
                 };
-                out.push((
-                    path,
-                    meta::ProbedMedia {
-                        date_taken: facts.date_taken,
-                        location: facts.location,
-                        ..Default::default()
+                let facts = match media_type_of(&path) {
+                    MediaType::Video => match video_facts(absolute.as_path(), ffprobe) {
+                        Some(facts) => facts,
+                        // Nothing looked, so nothing is recorded as having
+                        // looked: the row stays in the candidate set and an
+                        // ffmpeg installed later fills it in.
+                        None => continue,
                     },
-                ));
+                    // A GIF goes down the image path. It has no EXIF block
+                    // either, and the grid animates it on its own rules rather
+                    // than on a duration, so a probe would buy nothing.
+                    MediaType::Image | MediaType::Gif => {
+                        let facts = crate::pipeline::exif::read(absolute.as_path());
+                        meta::ProbedMedia {
+                            date_taken: facts.date_taken,
+                            location: facts.location,
+                            ..Default::default()
+                        }
+                    }
+                };
+                out.push((path, facts));
             }
             out
         })
@@ -229,6 +252,47 @@ async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), Ope
         tx.commit()?;
     }
     Ok(())
+}
+
+/// What a video's container knows, or `None` when nothing looked at it.
+///
+/// **Availability is asked for, never inferred from the error.**
+/// [`crate::pipeline::video::probe`] reports a missing `ffprobe` and an
+/// unparseable container with the same `ThumbError::Decode`, so a caller that
+/// branched on `Err` would re-probe every corrupt clip on every open for the
+/// life of the cache — the result-column gate this module exists to avoid.
+/// Taking it as an argument is also the only way to test the rule on a host
+/// that does have ffmpeg.
+///
+/// The two outcomes are different facts, and the distinction is the point:
+/// `None` means *we did not look*, and the caller must leave the row unmarked.
+/// `Some(default)` means we looked at a file `ffprobe` cannot read, which
+/// leaves exactly the row a photo with no EXIF block leaves, and is a completed
+/// look.
+///
+/// Coordinates and the capture time are deliberately not read here yet. A video
+/// carrying coordinates is what makes the geocoder write it a sidecar, and new
+/// durable data in the user's gallery belongs to the change that announces it.
+///
+/// One spawn measured ~60 ms over 60 clips. The pass stays serial: a few
+/// thousand clips is a couple of minutes of background work that is batched,
+/// committed as it goes and resumable, which is not enough to buy a thread pool.
+fn video_facts(absolute: &Path, ffprobe_available: bool) -> Option<meta::ProbedMedia> {
+    if !ffprobe_available {
+        return None;
+    }
+    let Ok(info) = crate::pipeline::video::probe(absolute) else {
+        return Some(meta::ProbedMedia::default());
+    };
+    Some(meta::ProbedMedia {
+        // Display dimensions: the rotation from the container's display matrix
+        // is already applied, so these are the same values the thumbnailer
+        // writes later and the two writers cannot disagree.
+        width: Some(info.width),
+        height: Some(info.height),
+        duration: info.duration,
+        ..Default::default()
+    })
 }
 
 /// Turn coordinates into place names, once per file per gazetteer version.
@@ -902,6 +966,62 @@ fn media_type_str(path: &RelPath) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The distinction the whole video branch turns on. A host with no ffmpeg
+    /// has not looked at its clips, so its rows must stay in the candidate set;
+    /// a host that looked at a file ffprobe cannot parse *has* looked, and its
+    /// row must leave the set or every corrupt clip is re-probed forever.
+    #[test]
+    fn not_looking_and_finding_nothing_are_different_answers() {
+        let d = tempfile::tempdir().unwrap();
+        let junk = d.path().join("not-a-video.mp4");
+        std::fs::write(&junk, b"this is not a container").unwrap();
+
+        assert!(
+            video_facts(&junk, false).is_none(),
+            "with no ffprobe the file has not been looked at"
+        );
+
+        if !crate::pipeline::video::ffprobe_available() {
+            eprintln!("skipping the other half: ffprobe not installed");
+            return;
+        }
+        let looked = video_facts(&junk, true).expect("a failed probe is still a completed look");
+        assert_eq!(looked.duration, None);
+        assert_eq!(looked.width, None);
+    }
+
+    /// What the setting in the grid ultimately reads.
+    #[test]
+    fn a_clip_probes_to_its_duration_and_display_dimensions() {
+        if !crate::pipeline::video::ffprobe_available() {
+            eprintln!("skipping: ffprobe not installed");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let clip = d.path().join("clip.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x240:duration=2:rate=10")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("skipping: ffmpeg could not build a fixture");
+            return;
+        }
+
+        let facts = video_facts(&clip, true).expect("looked");
+        assert_eq!((facts.width, facts.height), (Some(320), Some(240)));
+        assert!(
+            facts.duration.unwrap_or(0.0) > 1.0,
+            "duration was {:?}",
+            facts.duration
+        );
+        // Held back for the change that announces the sidecars it causes.
+        assert_eq!(facts.location, None);
+        assert_eq!(facts.date_taken, None);
+    }
 
     #[test]
     fn a_companion_path_maps_back_to_its_media() {

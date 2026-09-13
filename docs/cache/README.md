@@ -59,6 +59,14 @@ Three placements worth their own sentence:
   only the rows still owed, so it is empty on a warm gallery and the pass costs
   a lookup rather than a scan of the library.
 
+  The flag says a header was read, not which reader read it — an image's comes
+  from EXIF, a video's from what `ffprobe` reports about the container. The one
+  case where the index is *not* empty on a warm gallery is a host with no
+  `ffmpeg`: its video rows are deliberately left unmarked, since nothing looked
+  at them, so an `ffmpeg` installed later fills them in rather than needing the
+  cache rebuilt. On such a host the pass walks those rows every open and finds
+  nothing to do.
+
 - **`thumbhash` is on `media_meta`, not on a tier.** It is ~25 bytes, and the
   items query would otherwise walk a thumbnail row's overflow pages to reach it.
 - **`phash` is a column on `thumbs_j`**, so a perceptual hash is discarded and

@@ -72,6 +72,23 @@ ITEMS=$(inv get_items)
 echo "$ITEMS" | jq -e '.items | length == 3' >/dev/null && ok "get_items returned all three files" || bad "items: $(echo "$ITEMS" | head -c 200)"
 echo "$ITEMS" | jq -e '[.items[].path] | index("2026/january/wide.png")' >/dev/null && ok "nested paths are gallery-relative" || bad "paths"
 
+# The clip has never been thumbnailed at this point -- nothing has requested a
+# tier for it -- so a duration here can only have come from the index. It is
+# what the grid's short-video autoplay reads, and it was null for every video
+# ever indexed until the container was probed when the file was indexed.
+# Enrichment is spawned, not awaited, so the URL can be printed before the
+# clip has been probed. Waiting for it is the honest shape of the check.
+for _ in $(seq 1 25); do
+  DUR=$(inv get_items | jq -r '.items[] | select(.path == "clip.mp4") | .duration')
+  [ "$DUR" != "null" ] && [ -n "$DUR" ] && break
+  sleep 0.2
+done
+awk -v d="$DUR" 'BEGIN { exit !(d > 1) }' 2>/dev/null \
+  && ok "a video carries its duration before anything thumbnails it ($DUR s)" \
+  || bad "clip duration: $DUR"
+inv get_items | jq -e '.items[] | select(.path == "2026/january/wide.png") | .duration == null' >/dev/null \
+  && ok "an image has no duration" || bad "an image reported a duration"
+
 CAPS=$(inv get_capabilities)
 echo "$CAPS" | jq -e '.trust == "owner"' >/dev/null && ok "capabilities report owner" || bad "caps: $CAPS"
 

@@ -80,7 +80,9 @@ pub struct SortedItem {
     pub last_viewed: Option<i64>,
     pub date_added: Option<i64>,
     pub last_rated: Option<i64>,
-    /// Video duration in seconds, if known (probed lazily during thumbnailing).
+    /// Video duration in seconds. Read from the container when the file is
+    /// indexed, so it is known before anything has been thumbnailed; NULL for
+    /// an image, and for a clip indexed on a host with no `ffprobe`.
     pub duration: Option<f64>,
     /// Source media dimensions, if indexed. Drive aspect-ratio layout without
     /// an extra round-trip.

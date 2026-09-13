@@ -20,9 +20,13 @@
 //!   `height` are landscape. Reading the rotation and swapping the probed
 //!   dimensions is what stops portrait clips from being laid out — and
 //!   thumbnailed — sideways.
-//! * **One probe per file.** The probe result is memoised (keyed on mtime), so
-//!   the thumbnail path and the metadata path that runs right behind it share a
-//!   single `ffprobe` spawn instead of taking one each.
+//! * **A short-lived probe memo.** The result is memoised (keyed on mtime) so
+//!   that a thumbnail and the frame extraction behind it share one spawn. It is
+//!   a bridge across milliseconds, not a cache: indexing probes a clip when the
+//!   gallery opens and the thumbnailer probes it again whenever the user
+//!   scrolls to it, which on any real library is long past eviction. Two spawns
+//!   per clip over its lifetime is the accepted cost of reading a file's facts
+//!   when it is indexed rather than when somebody looks at it.
 //!
 //! Both binaries are probed once and remembered: with no ffmpeg installed every
 //! video would otherwise pay two failed spawns before falling back to the grey

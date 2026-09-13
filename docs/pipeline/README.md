@@ -3,7 +3,8 @@
 [← docs](../README.md)
 
 **Responsible for** turning a file on disk into bytes a browser can show: image
-and video decoding, HEIC transcoding, EXIF extraction, the four thumbnail tiers,
+and video decoding, HEIC transcoding, EXIF and container-metadata extraction,
+the four thumbnail tiers,
 the coalescer that keeps a scroll from generating the same thumbnail forty
 times, the byte budget, and the idle worker that fills in what nobody has asked
 for yet.

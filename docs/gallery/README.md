@@ -23,7 +23,7 @@ emits events, and stops there.
 4. scan and index               the whole tree; every route is 503 until this ends
 5. arm the watcher              ← before the gate opens
 6. open the readiness gate
-7. enrich in the background     EXIF, geocoding, companions
+7. enrich in the background     headers, geocoding, companions
 8. spawn the idle worker and the hourly sweep
 ```
 
@@ -35,6 +35,21 @@ Reversed, that window is the entire initial scan.
 file's metadata header itself, in the same breath as its companion — otherwise a
 batch arriving over rsync or Samba is dateless and placeless until a restart.
 Step 7 exists for whatever that missed.
+
+**Which header gets read depends on the file, and only one branch knows it.**
+An image's facts come from its EXIF block; a video's come from what its
+container declares, which `ffprobe` reads — duration and the display dimensions
+with any rotation already applied. Both arrive as the same row, so nothing
+downstream of the probe has a video case. A GIF takes the image branch: it has
+no EXIF either, and the grid animates it on its own rules rather than on a
+duration.
+
+`ffprobe`'s absence is asked about **before** the probe, never inferred from its
+failure, because the probe reports a missing binary and an unreadable container
+identically. A host with no `ffmpeg` leaves its video rows unmarked rather than
+recording a look that never happened, so installing it later fills them in on
+the next open — the one case where a row stays a candidate without having been
+excluded.
 
 **What decides whether a header still needs reading is `media_meta.exif_read`,
 and nothing else.** It is set whenever a header is read, found or not, because
