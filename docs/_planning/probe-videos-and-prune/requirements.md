@@ -41,12 +41,22 @@ With **autoplay short videos in the grid** on and a threshold of *n* seconds, a
 clip shorter than *n* plays in the grid and a longer one does not. The setting
 is either honoured or removed; it does not stay inert.
 
+Bounded by what the browser can play: `ThumbnailCell.isShortVideo` also requires
+`isPlayableVideo()`, so `.avi`, `.mkv`, `.wmv` and `.flv` never autoplay however
+short. That is existing, deliberate behaviour — those containers go to the
+external player — and this requirement does not change it.
+
 ### R3 — A session whose window has closed exits without waiting for enrichment
 
 Closing the last window ends the session within the grace period even while a
-first-open enrichment pass is still running, except across the one operation
-that writes durable data. An interrupted pass resumes on the next open rather
-than restarting.
+first-open enrichment pass is still running, except across an operation that
+writes durable data. An interrupted pass resumes on the next open rather than
+restarting.
+
+Every unattended `modify_companion` caller holds a guard across its write, and
+no caller holds one across work that writes only the derived cache. "Unattended"
+means not covered by the HTTP graceful shutdown: the enrichment pass, the
+companion sweep, and the detached plugin job spawned by `run_plugin`.
 
 ### R4 — Nothing public is uncalled
 
@@ -73,5 +83,29 @@ the process. Opening ten files in an external viewer leaves ten.
   one and the `qrcode` package is installed for it, but nothing renders it. That
   is a missing feature, not a dangling one; this plan removes the unused
   dependency and leaves the decision alone.
-- **Re-probing on a `format_version` the cache already holds.** The bump is the
-  migration; see the design.
+- **A general migration mechanism.** Whether *this* change earns a
+  `format_version` bump or a narrower one-shot reset is decided in the design,
+  and it is the plan's central question rather than an out-of-scope one.
+
+## Two facts that reframe the cost, found by the plan review
+
+**A format bump loses more than time.** `cache/db.rs` says at its head that
+`date_added` and `last_viewed` "are mirrored into the companion … so the bump
+loses time and nothing else", and twice lower down (`db.rs:308`, `db.rs:533`)
+says a wipe "costs `date_added` and `last_viewed` for everything". Both are
+right about different galleries: the mirror only reaches files that already have
+a sidecar, because `reindex_companions` skips any path whose companion cannot be
+stat'd. An untagged camera roll has no sidecars at all, so a bump resets when
+every file was added and when it was last seen. The head comment is the one that
+needs fixing.
+
+This already applies to the bump shipped earlier in this branch (1 → 2, for
+`exif_read`). Anyone opening an untagged library on that build has already paid
+it once.
+
+**The geocoder does not filter by media type.** `backfill_locations` selects
+`WHERE gps_lat IS NOT NULL` with no predicate on kind. The moment videos carry
+coordinates, the first enrichment pass creates a sidecar in the user's gallery
+for every geotagged clip that never had one. That is new durable data on the
+tree the design promises is safe to copy around, so it is a contract decision,
+not a side effect.
