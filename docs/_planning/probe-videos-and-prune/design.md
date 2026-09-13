@@ -5,9 +5,11 @@ independent review of the first draft, which found three false premises and one
 regression the plan would have shipped; each is marked **[corrected]** where it
 changed the design rather than only the prose.
 
-## Three decisions this plan cannot make on its own
+## Three decisions, settled
 
-Stated up front because the rest only makes sense once they are settled.
+Stated up front because the rest only makes sense once they are. All three were
+put to the owner after the review and answered; the reasoning is kept because
+the answer alone does not explain itself.
 
 **1. Which clock a video's date is on.** **[corrected]** The first draft said
 `VideoInfo.date_taken` would be "Unix seconds UTC, the same units and frame as
@@ -23,7 +25,8 @@ clip shot at 08:00 would file under the previous day's header and sort ahead of
 every photo from the same morning, and `date=2024` would acquire a twelve-hour
 wrong edge for videos only.
 
-The recommendation: prefer Apple's `com.apple.quicktime.creationdate`, which
+**Settled: wall clock, matching photos.** Prefer Apple's
+`com.apple.quicktime.creationdate`, which
 carries a local time *with* its offset, and keep the wall-clock half; when it is
 absent, convert `creation_time` from UTC into the host's local zone and keep
 that wall clock. The assumption is that the library's owner shot the clip in the
@@ -42,7 +45,7 @@ camera roll — the exact library this change targets — has none. So the bump
 resets when every file was added and when it was last seen, on top of
 re-thumbnailing everything.
 
-The cheaper option the draft did not name: a one-shot, tool-scoped reset —
+**Settled: the one-shot reset, and no bump.** A tool-scoped reset —
 `UPDATE media_meta SET exif_read = 0 WHERE media_type = 'video'`, guarded by a
 key in `gallery_meta`, which `meta_get`/`meta_set` already support. That is a
 gate over *which tool last looked*, not over what it found, so it is not the
@@ -50,20 +53,27 @@ pattern AGENTS.md forbids; it is structurally the same stamp
 `backfill_locations` already keeps for the gazetteer. It costs one key and one
 statement at open, and it preserves thumbnails, `date_added` and `last_viewed`.
 
-Against it: AGENTS.md says a `format_version` bump "is the only migration
-mechanism", and this is a migration by another name. That invariant is worth
-something — it is why there is no migration code to maintain — and a second
-mechanism, once it exists, will be reached for again.
+Accepted against it: AGENTS.md says a `format_version` bump "is the only
+migration mechanism", and this is a migration by another name. That invariant is
+worth something — it is why there is no migration code to maintain — and a
+second mechanism, once it exists, will be reached for again. The invariant is
+therefore rewritten rather than quietly broken: a bump stays the only mechanism
+for a *schema* change, and a stamped one-shot is what a *tool* change uses. Both
+predicates are checked — `media_meta.media_type` is `TEXT NOT NULL`, and
+`meta_get`/`meta_set` on `gallery_meta` already exist.
 
-**3. Whether geotagged videos should get sidecars.** **[corrected, absent from
-the first draft]** `backfill_locations` selects `WHERE gps_lat IS NOT NULL` with
+The consequence worth stating: this branch's existing 1 → 2 bump stands, and
+there is no second one. Thumbnails, `date_added` and `last_viewed` survive.
+
+**3. Whether geotagged videos should get sidecars. Settled: yes, the same as
+photos.** **[corrected, absent from the first draft]** `backfill_locations` selects `WHERE gps_lat IS NOT NULL` with
 no predicate on media type. The moment videos carry coordinates, the first
 enrichment pass writes a new companion into the user's gallery for every
 geotagged clip that never had one, and puts place-name tags in it. That is
-probably wanted — place tags for videos are a feature, and it is what already
+wanted — it is what makes a video findable by place, and it is what already
 happens for photos — but it is new durable data on the one tree the design
-promises is safe to copy around, so it belongs in the contract rather than
-arriving as a side effect.
+promises is safe to copy around, so it goes in the contract rather than arriving
+as a side effect, and the release note says it out loud.
 
 ## Placement
 
@@ -120,7 +130,7 @@ holding the session open. That was the point, and it survives the correction.
 | `media_meta.duration`, `width`, `height`, `gps_lat`, `gps_lon`, `date_taken` populated for videos | `sort::sorter`, `services::media`, the wire, `galleryStore.durationByPath`, `ThumbnailCell` |
 | **new sidecars in the user's gallery for geotagged videos** | the companion format; see decision 3 |
 | `enrich_and_index` takes `Arc<Presence>`; `plugin::run::run` takes one | `cli/mod.rs`, `server/commands.rs` |
-| either `FORMAT_VERSION` 2 → 3, or a `gallery_meta` probe-version key | every existing derived cache; see decision 2 |
+| a `gallery_meta` probe-version key, resetting `exif_read` for video rows once | every existing derived cache; no bump, nothing rebuilt — see decision 2 |
 
 Nothing changes shape on the wire. Fields that were always `null` start
 carrying values, and the frontend already types every one of them as nullable —
@@ -240,7 +250,7 @@ Tests: a fixture clip probes to a duration and rotation-corrected dimensions; a
 video row is neither written nor marked when ffprobe is absent.
 
 **2. Give videos a capture date.** `date_taken` on `VideoInfo`, parsed per
-decision 1. Whichever of decision 2 is chosen. Tests: a clip with a QuickTime
+decision 1, plus the stamped one-shot reset of decision 2. Tests: a clip with a QuickTime
 local-with-offset tag, one with only `creation_time`, one with neither; a
 regression that a video and a photo shot in the same hour group under the same
 day header.
