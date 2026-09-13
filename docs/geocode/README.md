@@ -5,8 +5,9 @@
 **Responsible for** turning the coordinates already cached in `media_meta` into
 the place names a person types into the filter bar — country, region, city.
 
-**Not responsible for** reading image bytes. The coordinate was extracted by the
-EXIF pass and stored; this module is a pure function over two floats.
+**Not responsible for** reading image bytes. The coordinate was extracted when
+the file was indexed — from EXIF for a photo, from the container's tags for a
+video — and stored; this module is a pure function over two floats.
 
 **Depends on** the `reverse_geocoder` crate and a bundled GeoNames dataset.
 **Depended on by** the gallery's open-time location backfill, and through it by
@@ -14,7 +15,16 @@ EXIF pass and stored; this module is a pure function over two floats.
 
 ## The names are written to companions; the coordinate is not
 
-The coordinate lives in the file's own EXIF and any photo tool can recover it,
+**Videos take part on the same terms, and that creates files.** The backfill
+selects on coordinates and not on kind, so a geotagged clip gets a sidecar
+written for it exactly as a photo does — which for a camera roll full of phone
+video means new `.lightview.json` files appearing in the gallery tree on the
+first open after the container reader started reading coordinates. That is the
+intent: a video nobody can find by place is a video missing from half the
+searches. It is called out here because it is the one part of this module that
+writes to the gallery rather than to a cache.
+
+The coordinate lives in the file's own metadata and any photo tool can recover it,
 so mirroring it into a sidecar would be redundant. The **name** is not in the
 file — recovering it needs this gazetteer, at a particular version — so it is
 the one part of this that would not survive the gallery being read by anything

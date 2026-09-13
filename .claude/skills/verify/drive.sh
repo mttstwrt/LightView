@@ -16,7 +16,12 @@ check(){ if [ "$2" = "$3" ]; then ok "$1 ($2)"; else bad "$1: expected $3, got $
 echo "== fixtures =="
 ffmpeg -y -v error -f lavfi -i testsrc=size=800x600:duration=1 -frames:v 1 "$G/2026/january/wide.png" 2>/dev/null
 ffmpeg -y -v error -f lavfi -i testsrc=size=480x640:duration=1 -frames:v 1 "$G/tall.png" 2>/dev/null
-ffmpeg -y -v error -f lavfi -i "testsrc=size=320x240:duration=2:rate=10" -c:v libx264 -pix_fmt yuv420p "$G/clip.mp4" 2>/dev/null
+# Dated deliberately, and far from a year boundary: the stored value is a wall
+# clock, so the day it reads back as depends on the host's zone, but the year
+# does not -- and the file's own mtime is today, so a 2019 here can only have
+# come from the container.
+ffmpeg -y -v error -f lavfi -i "testsrc=size=320x240:duration=2:rate=10" -c:v libx264 -pix_fmt yuv420p \
+  -metadata creation_time="2019-07-14T09:22:33.000000Z" "$G/clip.mp4" 2>/dev/null
 ls "$G"/2026/january/wide.png "$G"/tall.png "$G"/clip.mp4 >/dev/null && ok "gallery built" || bad "gallery"
 
 echo "== help and argument errors =="
@@ -88,6 +93,10 @@ awk -v d="$DUR" 'BEGIN { exit !(d > 1) }' 2>/dev/null \
   || bad "clip duration: $DUR"
 inv get_items | jq -e '.items[] | select(.path == "2026/january/wide.png") | .duration == null' >/dev/null \
   && ok "an image has no duration" || bad "an image reported a duration"
+
+CLIP_DATE=$(inv get_items | jq -r '.items[] | select(.path == "clip.mp4") | .date')
+CLIP_YEAR=$(date -u -d "@$CLIP_DATE" +%Y 2>/dev/null)
+check "a video sorts by the date in its container, not its mtime" "$CLIP_YEAR" "2019"
 
 CAPS=$(inv get_capabilities)
 echo "$CAPS" | jq -e '.trust == "owner"' >/dev/null && ok "capabilities report owner" || bad "caps: $CAPS"

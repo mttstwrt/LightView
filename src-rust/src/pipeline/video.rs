@@ -62,6 +62,11 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration: Option<f64>,
+    /// When the clip was shot, as a **wall clock relabelled UTC** — the same
+    /// frame `media_meta.date_taken` holds for a photo, and for the same
+    /// reason: a grid that groups by day has to agree with the clock the
+    /// camera showed. See [`capture_wall_clock`] for what that costs.
+    pub date_taken: Option<i64>,
     /// Where the clip was shot, when the container carries it. Decimal
     /// degrees, WGS-84 — the same convention as the EXIF path, so both feed
     /// `media_meta.gps_lat/gps_lon` without conversion.
@@ -181,12 +186,11 @@ fn probe_uncached(path: &Path) -> Result<VideoInfo, ThumbError> {
     let duration = positive_number(stream.get("duration"))
         .or_else(|| positive_number(json.get("format").and_then(|f| f.get("duration"))));
 
-    let location = json
-        .get("format")
-        .and_then(|f| f.get("tags"))
-        .and_then(location_from_tags);
+    let tags = json.get("format").and_then(|f| f.get("tags"));
+    let location = tags.and_then(location_from_tags);
+    let date_taken = tags.and_then(capture_wall_clock);
 
-    Ok(VideoInfo { width, height, duration, location })
+    Ok(VideoInfo { width, height, duration, location, date_taken })
 }
 
 /// Pull a shooting location out of a container's format tags.
@@ -204,6 +208,70 @@ fn probe_uncached(path: &Path) -> Result<VideoInfo, ThumbError> {
 ///
 /// This costs nothing extra to fetch: `probe_uncached` already asks for
 /// `-show_format`, so these tags were being parsed and discarded.
+/// What this reader knows how to pull out of a container.
+///
+/// Stamped into `gallery_meta` so a cache can tell whether its video rows were
+/// read by *this* reader or an older one. It is not a schema version and does
+/// not belong to `format_version`: nothing about the tables changes when this
+/// moves, only what a row would contain if it were read again. Bump it when
+/// this module learns to read a field it used to ignore.
+pub const PROBE_VERSION: &str = "1";
+
+/// When the clip was shot, as a wall clock relabelled UTC.
+///
+/// **The frame matters more than the precision here.** `media_meta.date_taken`
+/// holds, for every photo, whatever the camera's clock said, stored as though
+/// that reading were UTC — EXIF carries no zone, so there is nothing else it
+/// could hold. A video is the awkward case because MP4 *does* carry a zone:
+/// `creation_time` is a true instant. Storing it as one would put videos on a
+/// different clock from the photos beside them, and since the grid renders day
+/// headers in UTC calendar fields, a clip shot at 08:00 in UTC+9 would file
+/// under the previous day, ahead of every photo from the same morning.
+///
+/// So both tags are reduced to a wall clock:
+///
+/// * `com.apple.quicktime.creationdate` carries the shooting-local time *with*
+///   its offset, which is exactly the fact EXIF records. Keeping the local half
+///   and discarding the offset reproduces the photo convention precisely. Every
+///   iPhone writes it.
+/// * `creation_time` is UTC and nothing more, so it has to be moved into some
+///   zone to become a wall clock, and the host's is the only one available.
+///   That is right whenever the library's owner shot the clip in the zone they
+///   live in, and wrong by the difference when they did not — an Android clip
+///   shot abroad reads as the time it was back home. The alternative was two
+///   clocks in one column forever.
+///
+/// An instant at or before the Unix epoch is a muxer's default rather than a
+/// capture time; no video was shot in 1969.
+fn capture_wall_clock(tags: &serde_json::Value) -> Option<i64> {
+    let tags = tags.as_object()?;
+    if let Some(shot) = tags
+        .get("com.apple.quicktime.creationdate")
+        .and_then(|v| v.as_str())
+        .and_then(parse_offset_datetime)
+    {
+        return Some(shot.naive_local().and_utc().timestamp());
+    }
+    let utc = parse_offset_datetime(tags.get("creation_time")?.as_str()?)?;
+    if utc.timestamp() <= 0 {
+        return None;
+    }
+    Some(
+        utc.with_timezone(&chrono::Local)
+            .naive_local()
+            .and_utc()
+            .timestamp(),
+    )
+}
+
+/// RFC 3339, or the same thing with an offset written `+0900` — which is how
+/// Apple spells it, and which `parse_from_rfc3339` rejects.
+fn parse_offset_datetime(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z"))
+        .ok()
+}
+
 fn location_from_tags(tags: &serde_json::Value) -> Option<Location> {
     tags.as_object()?
         .iter()
@@ -722,6 +790,74 @@ mod tests {
         // Nothing to sample.
         assert!(sample_timestamps(0.0, 5).is_empty());
         assert!(sample_timestamps(10.0, 0).is_empty());
+    }
+
+    fn tags(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The Apple tag carries the shooting-local time with its offset, which is
+    /// the fact EXIF records. Keeping the local half and dropping the offset is
+    /// what puts a clip and a photo taken beside it under the same day header.
+    #[test]
+    fn the_apple_tag_keeps_the_clock_the_camera_showed() {
+        let t = tags(r#"{"com.apple.quicktime.creationdate": "2019-07-14T18:22:33+0900"}"#);
+        let ts = capture_wall_clock(&t).expect("a date");
+        // Read back in UTC calendar fields -- the frame the grid groups by --
+        // it must say 18:22:33 on the 14th, not 09:22 or the 13th.
+        let read_back = chrono::DateTime::from_timestamp(ts, 0).unwrap();
+        assert_eq!(read_back.format("%Y-%m-%d %H:%M:%S").to_string(), "2019-07-14 18:22:33");
+    }
+
+    /// Offsets spelled without a colon are what Apple actually writes, and
+    /// `parse_from_rfc3339` alone rejects them.
+    #[test]
+    fn an_offset_without_a_colon_still_parses() {
+        assert!(parse_offset_datetime("2019-07-14T18:22:33+0900").is_some());
+        assert!(parse_offset_datetime("2019-07-14T18:22:33+09:00").is_some());
+        assert!(parse_offset_datetime("2019-07-14T09:22:33.000000Z").is_some());
+        assert!(parse_offset_datetime("last tuesday").is_none());
+    }
+
+    /// `creation_time` is a true instant, so it is moved into the host's zone
+    /// before it becomes a wall clock. Asserting the shift rather than the
+    /// value keeps the test honest wherever it runs.
+    #[test]
+    fn a_utc_creation_time_is_shifted_into_the_hosts_zone() {
+        use chrono::Offset;
+        let t = tags(r#"{"creation_time": "2019-07-14T09:22:33.000000Z"}"#);
+        let ts = capture_wall_clock(&t).expect("a date");
+        let instant = chrono::DateTime::parse_from_rfc3339("2019-07-14T09:22:33Z").unwrap();
+        let offset = instant
+            .with_timezone(&chrono::Local)
+            .offset()
+            .fix()
+            .local_minus_utc() as i64;
+        assert_eq!(ts, instant.timestamp() + offset);
+    }
+
+    /// The two tags disagree on iPhone footage -- one is local, one is UTC --
+    /// and the local one is the answer.
+    #[test]
+    fn the_local_tag_wins_over_the_utc_one() {
+        let t = tags(
+            r#"{"creation_time": "2019-07-14T09:22:33.000000Z",
+                "com.apple.quicktime.creationdate": "2019-07-14T18:22:33+0900"}"#,
+        );
+        let ts = capture_wall_clock(&t).unwrap();
+        let read_back = chrono::DateTime::from_timestamp(ts, 0).unwrap();
+        assert_eq!(read_back.format("%H:%M:%S").to_string(), "18:22:33");
+    }
+
+    /// A muxer with nothing to say writes the epoch. Trusting it would date a
+    /// library to 1970, which sorts every clip before every photo.
+    #[test]
+    fn the_epoch_is_a_muxers_default_not_a_capture_time() {
+        assert_eq!(
+            capture_wall_clock(&tags(r#"{"creation_time": "1970-01-01T00:00:00.000000Z"}"#)),
+            None
+        );
+        assert_eq!(capture_wall_clock(&tags(r#"{"encoder": "Lavf60"}"#)), None);
     }
 
     #[test]

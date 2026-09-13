@@ -136,6 +136,7 @@ pub async fn scan_and_index(gallery: &Gallery) -> Result<usize, OpenError> {
 /// companion, a rayon read-modify-write over every geotagged file, and a
 /// checkpoint — during which the grid could not warm a single thumbnail.
 pub async fn enrich_and_index(gallery: &Gallery) -> Result<(), OpenError> {
+    reprobe_videos_if_the_reader_changed(gallery).await?;
     backfill_exif(gallery).await?;
     backfill_locations(gallery).await?;
     reindex_companions(gallery).await?;
@@ -254,6 +255,45 @@ async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), Ope
     Ok(())
 }
 
+/// Where the stamp of the video reader's version lives, per gallery.
+const VIDEO_PROBE_KEY: &str = "video_probe_version";
+
+/// Bring video rows back into the candidate set when the container reader has
+/// learned to read something it used to ignore.
+///
+/// **This is a gate over which tool looked, not over what it found**, which is
+/// what separates it from the pattern `exif_read` exists to avoid: it asks a
+/// question about this build, answered identically for every row, rather than
+/// inspecting result columns that a successful-but-empty read leaves looking
+/// exactly like an absent one.
+///
+/// **Why not a `format_version` bump.** That is the mechanism for a *schema*
+/// change and it stays so; nothing about the tables moves here. A bump also
+/// deletes the cache, and the thing a rebuild cannot recover is not "time" as
+/// [`crate::cache::db`] once claimed — `date_added` and `last_viewed` come back
+/// from sidecars only where sidecars exist, and an untagged camera roll has
+/// none. Re-reading a few thousand containers is minutes; re-deciding when
+/// every file in a library was added is not recoverable at all.
+///
+/// Runs before the backfill and writes nothing but the flag, so the probing
+/// itself stays where it already is.
+async fn reprobe_videos_if_the_reader_changed(gallery: &Gallery) -> Result<(), OpenError> {
+    let conn = gallery.db.writer().await;
+    let current = crate::pipeline::video::PROBE_VERSION;
+    if db::meta_get(&conn, VIDEO_PROBE_KEY)?.as_deref() == Some(current) {
+        return Ok(());
+    }
+    let owed = conn.execute(
+        "UPDATE media_meta SET exif_read = 0 WHERE media_type = 'video' AND exif_read = 1",
+        [],
+    )?;
+    db::meta_set(&conn, VIDEO_PROBE_KEY, current)?;
+    if owed > 0 {
+        log::info!("the container reader changed: {owed} video(s) owed another look");
+    }
+    Ok(())
+}
+
 /// What a video's container knows, or `None` when nothing looked at it.
 ///
 /// **Availability is asked for, never inferred from the error.**
@@ -270,9 +310,11 @@ async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), Ope
 /// leaves exactly the row a photo with no EXIF block leaves, and is a completed
 /// look.
 ///
-/// Coordinates and the capture time are deliberately not read here yet. A video
-/// carrying coordinates is what makes the geocoder write it a sidecar, and new
-/// durable data in the user's gallery belongs to the change that announces it.
+/// **Coordinates here have a durable consequence.** A video that carries them
+/// is a video the geocoder will write a sidecar for, the same as a photo — see
+/// [`backfill_locations`], which filters on coordinates and not on kind. That
+/// is the intent, and it is the one thing in this function that puts a new file
+/// in the user's gallery rather than a row in a cache.
 ///
 /// One spawn measured ~60 ms over 60 clips. The pass stays serial: a few
 /// thousand clips is a couple of minutes of background work that is batched,
@@ -291,7 +333,8 @@ fn video_facts(absolute: &Path, ffprobe_available: bool) -> Option<meta::ProbedM
         width: Some(info.width),
         height: Some(info.height),
         duration: info.duration,
-        ..Default::default()
+        date_taken: info.date_taken,
+        location: info.location,
     })
 }
 
@@ -1018,9 +1061,58 @@ mod tests {
             "duration was {:?}",
             facts.duration
         );
-        // Held back for the change that announces the sidecars it causes.
-        assert_eq!(facts.location, None);
+        // ffmpeg writes no creation_time unless asked, and a clip that does not
+        // carry one must not acquire a date here -- it falls back to mtime
+        // through COALESCE, which is the whole reason that fallback exists.
         assert_eq!(facts.date_taken, None);
+        assert_eq!(facts.location, None);
+    }
+
+    /// The stamp is what lets a cache built by an older reader catch up without
+    /// being thrown away, and the second half is the part that matters: having
+    /// caught up once, it must not keep re-reading every video on every open.
+    #[tokio::test]
+    async fn the_reader_stamp_reprobes_once_and_then_stops() {
+        let d = tempfile::tempdir().unwrap();
+        let gallery = test_gallery(d.path());
+        {
+            let conn = gallery.db.writer().await;
+            for (path, kind) in [("clip.mp4", "video"), ("photo.jpg", "image")] {
+                conn.execute(
+                    "INSERT INTO media_meta (path, media_type, file_size, mtime, exif_read)
+                     VALUES (?1, ?2, 0, 0, 1)",
+                    rusqlite::params![path, kind],
+                )
+                .unwrap();
+            }
+        }
+
+        reprobe_videos_if_the_reader_changed(&gallery).await.unwrap();
+        // An item rather than a closure: a closure returning an async block
+        // cannot hold the borrow across the await.
+        async fn owed(gallery: &Gallery) -> Option<String> {
+            let conn = gallery.db.read().await;
+            conn.query_row(
+                "SELECT path FROM media_meta WHERE exif_read = 0",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        }
+        assert_eq!(
+            owed(&gallery).await.as_deref(),
+            Some("clip.mp4"),
+            "the video is owed another look; the photo is not"
+        );
+
+        // Having been read by this reader, it is put back. A second open must
+        // leave it alone -- the stamp, not the row's contents, is the gate.
+        {
+            let conn = gallery.db.writer().await;
+            conn.execute("UPDATE media_meta SET exif_read = 1", []).unwrap();
+        }
+        reprobe_videos_if_the_reader_changed(&gallery).await.unwrap();
+        assert_eq!(owed(&gallery).await, None, "the one-shot fired twice");
     }
 
     #[test]

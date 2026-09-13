@@ -44,6 +44,27 @@ downstream of the probe has a video case. A GIF takes the image branch: it has
 no EXIF either, and the grid animates it on its own rules rather than on a
 duration.
 
+**A video's date is reduced to a wall clock**, because that is what the column
+already holds. Every photo's `date_taken` is whatever the camera's clock said,
+stored as though that reading were UTC — EXIF carries no zone, so there is
+nothing else it could be. MP4 is the awkward case: `creation_time` is a true
+instant, and storing it as one would put videos on a different clock from the
+photos beside them. Since the grid renders day headers in UTC calendar fields, a
+clip shot at 08:00 in UTC+9 would file under the previous day, ahead of every
+photo from that morning. So Apple's `com.apple.quicktime.creationdate` is
+preferred, which carries the shooting-local time with its offset and reproduces
+the photo convention exactly; failing that, `creation_time` is moved into the
+host's zone. The second case is right whenever the owner shot the clip in the
+zone they live in and wrong by the difference when they did not. The alternative
+was two clocks in one column forever.
+
+An instant at or before the Unix epoch is a muxer's default rather than a
+capture time, and is discarded — trusting it would date a library to 1970 and
+sort every clip ahead of every photo.
+
+A clip whose container says nothing gets no date at all and falls back to its
+mtime through `COALESCE(date_taken, mtime)`, which is what that fallback is for.
+
 `ffprobe`'s absence is asked about **before** the probe, never inferred from its
 failure, because the probe reports a missing binary and an unreadable container
 identically. A host with no `ffmpeg` leaves its video rows unmarked rather than

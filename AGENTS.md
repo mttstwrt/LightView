@@ -71,7 +71,11 @@ about to change.
 - **Paths on the wire are gallery-relative, percent-encoded per segment**, `/`
   left literal.
 - **The cache is outside the gallery and fully derived.** A `format_version`
-  bump deletes and rebuilds it; that is the only migration mechanism.
+  bump deletes and rebuilds it, and that is the only mechanism for a *schema*
+  change. A **reader** learning to extract something new is not one: it stamps
+  its version in `gallery_meta` and clears `exif_read` for the rows it owns, so
+  a library catches up without losing `date_added` and `last_viewed` — which a
+  rebuild only restores where sidecars already exist.
 - **Companion sidecars are the only durable data.** Never write one outside
   `modify_companion`, and never drop a field without keeping `extra`.
 - **A header read is recorded separately from what it found.** `exif_read`

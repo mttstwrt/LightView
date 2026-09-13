@@ -25,15 +25,39 @@ had already drifted from its own derived version constant, which is the failure
 mode of the thing rather than an argument against it in principle.
 
 The cost, stated because it is real: a schema mistake is not a patch later, it is
-a version bump that re-thumbnails every library. Two things make that survivable
-— it costs **time and nothing else**, because `date_added` and `last_viewed` are
-mirrored into the companion, so the two fields a rebuild could not otherwise
-recover come back from the sidecars.
+a version bump that re-thumbnails every library. `date_added` and `last_viewed`
+are mirrored into the companion, so on a gallery that has sidecars the two fields
+a rebuild could not otherwise recover come back from them.
+
+**That mirror does not reach a gallery with no sidecars**, and an untagged camera
+roll is exactly that: the companion sweep skips any file without one, so there is
+nowhere for those two fields to have been written. On such a library a bump does
+not cost time and nothing else — it resets when every file was added and when it
+was last seen, neither of which is recoverable from anything. This page used to
+claim otherwise and was wrong.
+
+## A tool change is not a schema change
+
+A bump is the mechanism for the *tables* moving. When instead a **reader** learns
+to extract something it used to ignore, nothing about the schema changes; some
+rows simply hold less than a fresh read would give them. Deleting the cache to
+fix that trades minutes of re-reading for data that cannot be rebuilt, which is
+the wrong way round.
+
+So a reader stamps its version into `gallery_meta` — `video_probe_version` is the
+first — and on open, a mismatch puts the rows that reader owns back into the
+candidate set by clearing their `exif_read`. **It is still a gate over which tool
+looked, not over what it found**: the question is asked once about the build and
+answered identically for every row, never by inspecting result columns where a
+successful-but-empty read is indistinguishable from an absent one.
+
+Two mechanisms, and the line between them is what changed: the schema, or the
+reader.
 
 ## The schema, and why the indexes are part of it
 
 ```
-gallery_meta   key/value — format_version lives here
+gallery_meta   key/value — format_version and the reader stamps
 media_meta     path PK · type · size · mtime · dates · rating · dimensions
                · duration · gps · colour label · thumbhash · exif_read
 tag_index      (path, namespace, tag) PK
