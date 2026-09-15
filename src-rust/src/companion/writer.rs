@@ -100,18 +100,6 @@ pub fn modify_companion<T>(
     Ok(value)
 }
 
-/// Write a companion to an explicit path, with no lock and no read.
-///
-/// The one caller is the trash, which deposits a companion *alongside* the
-/// media inside an entry directory it has just created and nobody else can
-/// reach. Everything touching a live companion goes through
-/// [`modify_companion`].
-pub fn write_companion_to(path: &Path, companion: &CompanionFile) -> Result<(), WriteError> {
-    let json = serde_json::to_string_pretty(companion)?;
-    write_durable(path, json.as_bytes())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

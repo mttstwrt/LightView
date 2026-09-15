@@ -221,8 +221,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     });
   });
 
-  // The thumbnail tier backing the current level (used for cells not served as
-  // an original, and for the GIF atlas request). Each detail level maps to a
+  // The thumbnail tier backing the current level, for cells not served as an
+  // original. Each detail level maps to a
   // resolution sized for the cells it shows: base→512 ("j"), mid→1280 ("jm"),
   // high→2560 ("jh"). The mid tier exists so a mid-zoom cell doesn't decode the
   // 2560px high image at ~1/4 the displayed size.

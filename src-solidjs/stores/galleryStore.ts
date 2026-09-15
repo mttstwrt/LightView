@@ -125,9 +125,6 @@ let current: Query = {
   group_by: { type: "none" },
 };
 
-export function currentQuery(): Query {
-  return current;
-}
 
 /** Run the one query and replace the list. */
 export async function refresh(next?: Partial<Query>) {

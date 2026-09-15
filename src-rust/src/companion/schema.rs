@@ -102,22 +102,6 @@ impl CompanionFile {
         result
     }
 
-    /// Tags in one namespace only.
-    pub fn tags_in_namespace(&self, namespace: &str) -> Vec<String> {
-        match namespace {
-            "user" => self.tags.user.clone(),
-            "set" => self.tags.set.clone(),
-            ns if ns.starts_with("plugin.") => {
-                let plugin_name = &ns["plugin.".len()..];
-                self.tags
-                    .plugins
-                    .get(plugin_name)
-                    .map(|e| e.tags.clone())
-                    .unwrap_or_default()
-            }
-            _ => Vec::new(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +254,11 @@ pub struct Location {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// **Nothing in LightView writes this**, and that is deliberate rather than an
+/// oversight. It is part of the sidecar format, so a plugin or another tool may
+/// fill it in and must find it intact on the next round trip. A probed duration
+/// does not belong here either: the companion is the one thing a cache rebuild
+/// cannot regenerate, and a duration is recoverable from the file itself.
 pub struct MediaInfo {
     #[serde(default)]
     pub width: u32,

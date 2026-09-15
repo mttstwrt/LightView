@@ -158,9 +158,10 @@ export function MediaViewer(props: MediaViewerProps) {
     props.onClose();
   };
 
-  // Desktop webview renders GIFs on a <canvas> from a backend frame atlas —
-  // WebKitGTK's <img> GIF animation is broken (too fast + leaks). A real
-  // browser (web client) animates GIFs fine, so it uses the normal <img> path.
+  // Every GIF takes the <img> path. There used to be a second one — a <canvas>
+  // fed by a backend frame atlas, for an engine whose <img> animation ran too
+  // fast and leaked — and that engine went with Tauri, along with the atlas,
+  // its cache and its tier. See the mount path below, which says the same.
   const isGif = () => ext() === "gif";
 
   // Adjacent paths for the filmstrip neighbour slots (undefined past the ends).

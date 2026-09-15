@@ -196,10 +196,6 @@ impl AutocompleteEngine {
         out
     }
 
-    /// Get the total number of unique tags in the cache.
-    pub async fn tag_count(&self) -> usize {
-        self.tags.read().await.len()
-    }
 }
 
 /// Distinct namespace names, in the order they first appear in the vocabulary.

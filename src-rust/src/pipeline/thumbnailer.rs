@@ -400,14 +400,6 @@ pub fn encode_rgb_to_jpeg(rgb: &[u8], w: u32, h: u32) -> Result<Vec<u8>, ThumbEr
     Ok(buf.into_inner())
 }
 
-/// Pixel dimensions from an image's header, without decoding it.
-///
-/// `None` for anything the `image` crate cannot parse from a header — HEIC,
-/// AVIF, RAW, video. Callers use this to skip work that would be a no-op, so
-/// "don't know" must degrade to doing the work, never to skipping it.
-pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
-    image::image_dimensions(path).ok()
-}
 
 /// Media type inferred from a path's extension (None for non-media files).
 fn media_type_for_path(path: &Path) -> Option<MediaType> {
@@ -581,15 +573,6 @@ pub fn decode_heic_natural(path: &Path) -> Result<HeicDecode, ThumbError> {
     decode_heic_internal(path, None)
 }
 
-/// Decode a HEIC/HEIF image from in-memory bytes. Lets callers that
-/// already have the file contents (e.g. via the provider abstraction)
-/// avoid a redundant disk read, and lets remote providers (SMB/SFTP/S3)
-/// participate at all.
-pub fn decode_heic_natural_from_bytes(bytes: &[u8]) -> Result<HeicDecode, ThumbError> {
-    let ctx = libheif_rs::HeifContext::read_from_bytes(bytes)
-        .map_err(|e| ThumbError::Decode(format!("HEIC open failed: {}", e)))?;
-    decode_heic_from_ctx(&ctx, None)
-}
 
 fn into_rgba_tuple(dec: HeicDecode) -> (Vec<u8>, u32, u32, u32, u32) {
     let HeicDecode { pixels, width, height, src_width, src_height } = dec;

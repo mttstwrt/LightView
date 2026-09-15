@@ -77,8 +77,6 @@ export interface DisplayPrefs {
   /** Open scrolled to the end of the grid rather than the start. Only changes
    *  where the view lands; the sort order itself is unaffected. */
   start_at_bottom: boolean;
-  preload_count: number;
-  lru_cache_size: number;
 }
 
 const DEFAULT_PREFS: DisplayPrefs = {
@@ -97,8 +95,6 @@ const DEFAULT_PREFS: DisplayPrefs = {
   mobile_filter_sheet: "top",
   video_autoplay_viewer: true,
   start_at_bottom: false,
-  preload_count: 3,
-  lru_cache_size: 5,
 };
 
 /** Merge stored preferences over the defaults.

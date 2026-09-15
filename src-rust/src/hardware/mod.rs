@@ -1,4 +1,4 @@
-//! One-shot hardware detection: storage class, CPU, RAM.
+//! One-shot hardware detection: storage class and CPU count.
 //!
 //! Read once at startup and never updated. Its output sizes the bounded
 //! thumbnail thread pool, so it runs before any of that exists — which is also
@@ -16,6 +16,13 @@
 //!
 //! There is no GPU probe. Its only consumer was the fused crop+resize on wgpu,
 //! which was reachable only from the square grid this design deletes.
+//!
+//! **There is no RAM probe either, for the same reason.** It fed two
+//! recommendations — how many full-resolution images to hold and how many to
+//! prefetch — that nothing ever asked for; the viewer sizes its own caches. The
+//! frontend carried matching settings fields that nothing read. Both ends are
+//! gone rather than one, so nothing is left looking like a feature that is
+//! merely unfinished.
 
 use serde::Serialize;
 
@@ -23,28 +30,9 @@ use serde::Serialize;
 pub struct HardwareProfile {
     pub storage_type: StorageType,
     pub cpu_cores: usize,
-    pub total_ram_mb: u64,
 }
 
-/// Snapshot of current memory status for pressure-aware cache management.
-#[derive(Debug, Clone, Serialize)]
-pub struct MemoryStatus {
-    pub total_ram_mb: u64,
-    pub available_ram_mb: u64,
-}
 
-impl MemoryStatus {
-    /// Sample current memory status from the OS.
-    pub fn sample() -> Self {
-        use sysinfo::System;
-        let mut sys = System::new();
-        sys.refresh_memory();
-        Self {
-            total_ram_mb: sys.total_memory() / (1024 * 1024),
-            available_ram_mb: sys.available_memory() / (1024 * 1024),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -66,7 +54,6 @@ impl HardwareProfile {
         Self {
             storage_type: detect_storage_type(),
             cpu_cores,
-            total_ram_mb: detect_ram_mb(),
         }
     }
 
@@ -81,36 +68,9 @@ impl HardwareProfile {
         }
     }
 
-    /// Recommended number of images to prefetch.
-    pub fn prefetch_count(&self) -> usize {
-        match self.storage_type {
-            StorageType::NVMe => 5,
-            StorageType::SSD => 3,
-            StorageType::HDD => 1,
-            StorageType::Network => 2,
-            StorageType::Unknown => 3,
-        }
-    }
 
-    /// Recommended LRU cache size (number of full-res images).
-    pub fn lru_cache_size(&self) -> usize {
-        if self.total_ram_mb > 32_000 {
-            10
-        } else if self.total_ram_mb > 16_000 {
-            5
-        } else {
-            3
-        }
-    }
 }
 
-/// Detect total system RAM in MB.
-fn detect_ram_mb() -> u64 {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.total_memory() / (1024 * 1024)
-}
 
 /// Detect whether the primary storage is NVMe, SSD, or HDD.
 /// On Linux, checks /sys/block/*/queue/rotational.

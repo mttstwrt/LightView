@@ -26,7 +26,6 @@ use std::path::{Path, PathBuf};
 
 use crate::companion::migration::migrate;
 use crate::companion::schema::{CompanionFile, COMPANION_EXTENSION, CURRENT_SCHEMA_VERSION};
-use crate::util::lock::FileLock;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
@@ -112,20 +111,6 @@ pub fn read_companion(media_path: &Path) -> Result<Option<CompanionFile>, ReadEr
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ReadError::Io(e)),
     }
-}
-
-/// Read a companion **under the directory lock**.
-///
-/// This is what a decision about durable state is made from. A tagger's skip
-/// predicate resolved against the derived index is a *plan*; resolved against
-/// the file under the lock it is an answer, and the difference is whether the
-/// design is correct for one tagging machine or for any number of them.
-///
-/// Takes and releases the lock itself, so it never nests with
-/// [`crate::companion::writer::modify_companion`], which takes the same one.
-pub fn read_companion_locked(media_path: &Path) -> Result<Option<CompanionFile>, ReadError> {
-    let _guard = FileLock::acquire(&lock_path(media_path))?;
-    read_companion(media_path)
 }
 
 /// Parse companion JSON, validating the schema version and running migrations.

@@ -429,20 +429,6 @@ name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
-dependencies = [
- "bytemuck_derive",
-]
-
-[[package]]
-name = "bytemuck_derive"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0e56a716f1e132ff6bf4bdac1c944a3fcdc1cae65f70a4a2a1ac3b401d2d1f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.5",
-]
 
 [[package]]
 name = "byteorder-lite"
@@ -1653,7 +1639,6 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
- "bytemuck",
  "bytes",
  "chrono",
  "env_logger",
@@ -1670,7 +1655,6 @@ dependencies = [
  "log",
  "memmap2",
  "notify",
- "percent-encoding",
  "rand 0.8.8",
  "rayon",
  "rcgen",
@@ -1690,7 +1674,6 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tower",
- "tower-http",
  "uuid",
  "walkdir",
  "webp",
@@ -3114,22 +3097,6 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "tower-http"
-version = "0.6.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
-dependencies = [
- "bitflags 2.13.2",
- "bytes",
- "http",
- "http-body",
- "pin-project-lite",
  "tower-layer",
  "tower-service",
  "tracing",
