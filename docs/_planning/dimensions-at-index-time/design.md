@@ -79,7 +79,10 @@ harder to trust than one that is obviously wrong in one place.
 change height.** This is the right answer for the residue — the formats neither
 reader handles — and it is deliberately *not* in this plan. It is a second
 mechanism, it only helps once the first has shrunk the problem to its edges, and
-adding both at once would make it impossible to tell which one worked.
+adding both at once would make it impossible to tell which one worked. The
+instrumented runs strengthen that ordering: with no double correction and no
+other moving input, the placeholder is the whole of the mechanism, so anchoring
+would be compensating for something this change removes outright.
 
 **Let the idle worker fix it by thumbnailing sooner.** It already does this, and
 it is why no stamp is needed for existing caches. It does not help the case that
@@ -133,6 +136,13 @@ thumbnails yet, and asserts it does not change. That check fails on the current
 build — it is the regression test for this bug, and writing it first is what
 stops the fix being declared working because the churn happened to land below
 the fold.
+
+**Its fixtures have to be photograph-sized.** Six repro variants at 800×600 came
+back clean while the bug was live: small thumbnails arrive fast enough and
+uniformly enough that the corrections finish before anything is watched. The
+symptom only appeared at 3024×4032. A regression test built from `testsrc`
+frames a few kilobytes each would pass on a broken build, which is worse than no
+test at all.
 
 Docs: `docs/gallery/` (what an index-time read now covers),
 `docs/pipeline/` (the dimensions entry point and what it cannot read), and

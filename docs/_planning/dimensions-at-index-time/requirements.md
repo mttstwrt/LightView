@@ -51,11 +51,45 @@ thumbnail is generated, to satisfy R1.
   and generates it, which writes dimensions through `set_probed`. Existing
   caches converge on their own; the stamp would only make them converge sooner,
   and "sooner" does not earn a permanent mechanism.
-- **The jump that returns *exactly* where it started.** The reported symptom on
-  a phone is a jump up and then back down to precisely the original position.
-  The defect above cannot produce that: `recordMeasuredAspect` returns early for
-  an already-measured path, so each correction happens once and sticks, moving
-  the grid one way. Either those corrections happen to cancel on that device, or
-  there is a second mechanism. This plan fixes what it can prove and treats the
-  remaining symptom as diagnostic: if it survives, the cause reverts rather than
-  settles, which is a different search.
+- **A second mechanism behind the jump.** Investigated and not found; recorded
+  here so nobody re-opens it on the same hunch. See "What the instrumented runs
+  settled" below.
+
+## What the instrumented runs settled
+
+The cause was established by building the SPA with a probe inside the
+`aspectArray` memo and driving the real binary at phone size, rather than by
+reading the code. Three things came out of it, and two of them contradict
+earlier conclusions in this session.
+
+**The defect is the reported bug.** Every height change coincided with an aspect
+correction, `rows` constant at 18 while `total` moved 3139 → 3166 → 3139 → 3104
+as four files went from the square guess to their measured shape. An earlier run
+had appeared to separate the two — the corrections finished before the viewer
+closed and the height still moved afterwards — and that reading was wrong. It is
+a race between thumbnail arrival and the close, so the two look independent
+whenever the timing happens to separate them.
+
+**No layout input other than the aspects ever changes.** The probe logged
+container width, target row height, gap and the group boundaries on every
+recompute, and none of them moved once. This rules out the group boundaries
+shifting as dates are written during enrichment, which had been the leading
+suspicion and would have implicated a shipped commit.
+
+**There is no double correction.** A per-path counter across a full run:
+**0 of 21** paths that changed aspect changed more than once, and the paths array
+was never reordered. The write-once guard in `recordMeasuredAspect` holds. An
+earlier count of "51 changes for 36 files" had suggested otherwise; that counter
+incremented once per *recompute containing any difference*, which is not the same
+quantity as a per-path change, and comparing the two was the error.
+
+So the fix needs no second mechanism. Removing the placeholder removes every
+correction, and with them every recompute.
+
+**What remains unexplained** is the precision of the reported symptom: the grid
+returning to exactly its starting position. One-way corrections wander the total
+height in both directions — a row that gains a wide image gets shorter, one that
+gains a tall image gets taller — so passing back through the starting value is
+possible rather than surprising, but "exactly" was a person's description of a
+moving grid and is not evidence of an exact return. This is worth re-checking
+after the fix rather than designing around now.
