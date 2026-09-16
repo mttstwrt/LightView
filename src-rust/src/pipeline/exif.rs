@@ -339,6 +339,45 @@ pub(crate) mod tests_support {
         out
     }
 
+    /// Insert an EXIF `Orientation` tag into a JPEG that already exists.
+    ///
+    /// **Takes real JPEG bytes rather than building a file**, because
+    /// [`MINIMAL_JPEG_BODY`] is only good enough for a reader that walks APP1
+    /// and stops: its DQT segment declares 67 bytes and carries ~28, so any
+    /// decoder that validates the stream — `image::image_dimensions` among them
+    /// — refuses it. A fixture for a *dimension* probe has to be a file a
+    /// decoder would accept.
+    ///
+    /// The APP1 segment goes directly after SOI, which is where a camera puts
+    /// it and the only place a reader looks for it.
+    pub fn with_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+        // One IFD0 entry: Orientation (0x0112), SHORT, count 1. A SHORT's value
+        // sits in the low two bytes of the four-byte value field.
+        let mut ifd0: Vec<u8> = Vec::new();
+        ifd0.extend_from_slice(&0x0112u16.to_le_bytes());
+        ifd0.extend_from_slice(&3u16.to_le_bytes());
+        ifd0.extend_from_slice(&1u32.to_le_bytes());
+        ifd0.extend_from_slice(&orientation.to_le_bytes());
+        ifd0.extend_from_slice(&[0, 0]);
+
+        let mut tiff: Vec<u8> = b"II".to_vec();
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&ifd0);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut payload: Vec<u8> = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+
+        let mut out: Vec<u8> = jpeg[..2].to_vec(); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
     /// SOF0/DHT/DQT/SOS/EOI for a 1x1 image, taken from a libjpeg encode.
     const MINIMAL_JPEG_BODY: [u8; 59] = [
         0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07,

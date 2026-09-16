@@ -783,6 +783,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **What the index stores for a JPEG that relies on EXIF Orientation**, and
+    /// therefore what the grid lays out.
+    ///
+    /// Nothing in LightView reads the Orientation tag — not [`crate::pipeline::exif`],
+    /// not `decode_jpeg_to_rgba` (which reports SOF dimensions), not
+    /// `decode_generic_to_rgba` (`image` does not rotate on load). So a photo
+    /// stored landscape with a "rotate for display" flag is indexed, and laid
+    /// out, landscape.
+    ///
+    /// **That is deliberate to the extent that it is at least consistent**: the
+    /// header read here and the dimensions the thumbnailer writes agree, so
+    /// `set_probed`'s first-wins cannot freeze one against the other. The cell
+    /// matches its thumbnail, because a re-encoded thumbnail carries no
+    /// Orientation tag for a browser to honour.
+    ///
+    /// Where it shows is the viewer, which serves the original file: browsers
+    /// apply the tag by default, so such a photo opens upright while its grid
+    /// cell is on its side. This test pins the current answer so that anyone
+    /// changing it has to change a stated expectation rather than discover the
+    /// asymmetry from a user report.
+    #[test]
+    fn a_jpeg_is_measured_by_its_stored_shape_not_its_display_shape() {
+        use crate::pipeline::exif::tests_support::with_orientation;
+
+        let dir = std::env::temp_dir().join("lightview-orientation-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let plain = dir.join("plain.jpg");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x360:duration=1",
+                   "-frames:v", "1"])
+            .arg(&plain)
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("skipping: ffmpeg could not build a fixture");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let path = dir.join("upright-on-a-phone.jpg");
+        // 6 is "rotate 90° clockwise to display": stored 640x360, shown 360x640.
+        let bytes = with_orientation(&std::fs::read(&plain).unwrap(), 6);
+        std::fs::write(&path, bytes).unwrap();
+
+        // The fixture is not vacuous: the tag really is there to be ignored.
+        let file = std::fs::File::open(&path).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+        let parsed = exif::Reader::new().read_from_container(&mut reader).unwrap();
+        let tag = parsed
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0));
+        assert_eq!(tag, Some(6), "the fixture must carry the tag it is testing");
+
+        assert_eq!(
+            dimensions(&path),
+            Some((640, 360)),
+            "stored dimensions; a reader that honoured the tag would say 360x640"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The half `image` cannot read. AVIF stands in for HEIC here because no
     /// HEIC encoder is available in this environment — it is the same container
     /// family through the same libheif entry point, so it exercises the code
