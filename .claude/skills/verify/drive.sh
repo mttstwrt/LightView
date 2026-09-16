@@ -94,6 +94,15 @@ awk -v d="$DUR" 'BEGIN { exit !(d > 1) }' 2>/dev/null \
 inv get_items | jq -e '.items[] | select(.path == "2026/january/wide.png") | .duration == null' >/dev/null \
   && ok "an image has no duration" || bad "an image reported a duration"
 
+# Same argument as the duration check above: nothing has asked for a tier for
+# these files yet, so dimensions here can only have come from the header read at
+# index time. Without them the grid lays a file out as a square and repacks
+# every row below it when the thumbnail arrives to correct the guess.
+DIMS=$(inv get_items | jq -c '[.items[] | select(.path == "tall.png") | {width, height}]')
+check "an image carries its shape before anything thumbnails it" "$DIMS" '[{"width":480,"height":640}]'
+UNSHAPED=$(inv get_items | jq '[.items[] | select(.media_type != "video") | select(.width == null)] | length')
+check "no image is left without a shape" "$UNSHAPED" "0"
+
 CLIP_DATE=$(inv get_items | jq -r '.items[] | select(.path == "clip.mp4") | .date')
 CLIP_YEAR=$(date -u -d "@$CLIP_DATE" +%Y 2>/dev/null)
 check "a video sorts by the date in its container, not its mtime" "$CLIP_YEAR" "2019"

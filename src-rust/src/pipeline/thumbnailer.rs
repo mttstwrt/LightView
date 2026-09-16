@@ -583,6 +583,42 @@ fn into_rgba_tuple(dec: HeicDecode) -> (Vec<u8>, u32, u32, u32, u32) {
     (rgba, width, height, src_width, src_height)
 }
 
+/// Pixel dimensions from a file's header, without decoding it.
+///
+/// **Why this exists at all:** the grid lays out by aspect ratio, and until a
+/// file has dimensions it is drawn as a 1:1 square and corrected when its
+/// thumbnail loads — which recomputes the whole justified layout and moves
+/// every row below it. Dimensions used to arrive only as a side effect of
+/// [`crate::pipeline::serve`] decoding a frame, so a file nobody had scrolled
+/// to had no shape. This is the cheap way to know it at index time instead.
+///
+/// `None` for anything neither reader parses — RAW, and video, which has its
+/// own probe. "Don't know" must degrade to the placeholder the grid already
+/// has, never to a wrong number, so a caller stores nothing on `None`.
+pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
+    if let Ok(wh) = image::image_dimensions(path) {
+        return Some(wh);
+    }
+    heic_dimensions(path)
+}
+
+/// HEIC, HEIF and AVIF, from the container's primary image handle.
+///
+/// **No decode.** `width()` and `height()` are read off the handle, before any
+/// `decode()` call — which is exactly what [`decode_heic_from_ctx`] reports as
+/// `src_width`/`src_height` for every thumbnail it produces, and therefore
+/// exactly what [`crate::pipeline::serve`] already stores in `media_meta` for
+/// any HEIC that has been thumbnailed. Reading them here changes *when* the
+/// grid learns a file's shape, never *what* that shape is: if these were
+/// stored rather than display dimensions, every portrait HEIC would already lay
+/// out landscape after its first thumbnail. That is the whole argument for why
+/// this needs no separate rotation handling.
+fn heic_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let ctx = libheif_rs::HeifContext::read_from_file(path.to_str()?).ok()?;
+    let primary = ctx.primary_image_handle().ok()?;
+    Some((primary.width(), primary.height()))
+}
+
 fn decode_heic_internal(
     path: &Path,
     target_edge: Option<u32>,
@@ -720,6 +756,61 @@ fn decode_generic_to_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32, u32, u32), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grid's shape, from a header, with nothing decoded.
+    #[test]
+    fn a_header_gives_up_its_dimensions() {
+        let dir = std::env::temp_dir().join("lightview-dims-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let png = dir.join("wide.png");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x360:duration=1",
+                   "-frames:v", "1"])
+            .arg(&png)
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("skipping: ffmpeg could not build a fixture");
+            return;
+        }
+        assert_eq!(dimensions(&png), Some((640, 360)));
+
+        // A reader that cannot parse it says so, and the caller keeps its
+        // placeholder rather than storing a guess.
+        let junk = dir.join("not-an-image.png");
+        std::fs::write(&junk, b"this is not a PNG").unwrap();
+        assert_eq!(dimensions(&junk), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The half `image` cannot read. AVIF stands in for HEIC here because no
+    /// HEIC encoder is available in this environment — it is the same container
+    /// family through the same libheif entry point, so it exercises the code
+    /// path; what it cannot prove is rotation, which is argued from
+    /// `decode_heic_from_ctx` reporting these very numbers as `src_width` and
+    /// `src_height` for every thumbnail already stored.
+    #[test]
+    fn libheif_reads_what_the_image_crate_cannot() {
+        let dir = std::env::temp_dir().join("lightview-heic-dims-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let avif = dir.join("still.avif");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:duration=1",
+                   "-frames:v", "1", "-c:v", "libaom-av1", "-still-picture", "1"])
+            .arg(&avif)
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("skipping: ffmpeg cannot encode AVIF here");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(
+            heic_dimensions(&avif),
+            Some((320, 180)),
+            "the libheif path must read a container the image crate rejects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_rgb_to_rgba_sets_opaque_alpha() {

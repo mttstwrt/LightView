@@ -233,9 +233,23 @@ async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), Ope
                     // than on a duration, so a probe would buy nothing.
                     MediaType::Image | MediaType::Gif => {
                         let facts = crate::pipeline::exif::read(absolute.as_path());
+                        // Shape, from the header. Without it the grid draws a
+                        // square and repacks every row below when the thumbnail
+                        // arrives to correct it — and dimensions used to reach
+                        // the index only when something decoded a frame, so a
+                        // file nobody had scrolled to never had one.
+                        let (width, height) =
+                            match crate::pipeline::thumbnailer::dimensions(absolute.as_path()) {
+                                // A zero is a reader saying it does not know, and
+                                // `set_probed` asserts against storing one.
+                                Some((w, h)) if w > 0 && h > 0 => (Some(w), Some(h)),
+                                _ => (None, None),
+                            };
                         meta::ProbedMedia {
                             date_taken: facts.date_taken,
                             location: facts.location,
+                            width,
+                            height,
                             ..Default::default()
                         }
                     }
