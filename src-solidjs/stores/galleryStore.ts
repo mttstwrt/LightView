@@ -20,8 +20,26 @@ const [loading, setLoading] = createSignal(false);
 const [items, setItems] = createSignal<SortedItem[]>([]);
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
 
-/** What the grid renders, in order. */
-const displayPaths = createMemo(() => items().map((item) => item.path));
+/** True when two path lists name the same files in the same order. */
+const sameOrder = (a: string[], b: string[]) =>
+  a.length === b.length && a.every((p, i) => p === b[i]);
+
+/** True when two aspect maps hold the same ratio for the same paths. */
+const sameAspects = (a: Map<string, number>, b: Map<string, number>) =>
+  a.size === b.size && [...a].every(([p, v]) => b.get(p) === v);
+
+/** What the grid renders, in order.
+ *
+ *  **Compared by content, not by identity.** `patchItem` rebuilds the whole
+ *  array to change one item's rating or view stamp, so this memo re-ran and
+ *  handed the grid a new `paths` array whose contents were identical. That
+ *  fires the grid's `on(() => props.paths)` effect — prune, reset the
+ *  background cursor, recompute the visible range — for a field the grid does
+ *  not lay out from. A view recorded on one device did it to every other
+ *  device's grid, because the event is broadcast. */
+const displayPaths = createMemo(() => items().map((item) => item.path), [], {
+  equals: sameOrder,
+});
 
 /** Per-path video duration, for the grid to gate short-video autoplay without
  *  changing its `paths: string[]` contract. Unknown durations are absent. */
@@ -35,16 +53,24 @@ const durationByPath = createMemo(() => {
 
 /** Per-path aspect ratio, so the justified layout can place a cell before any
  *  thumbnail bytes exist. Unknown dimensions are absent and the layout falls
- *  back to 1:1. */
-const aspectByPath = createMemo(() => {
-  const map = new Map<string, number>();
-  for (const item of items()) {
-    if (item.width && item.height && item.width > 0 && item.height > 0) {
-      map.set(item.path, item.width / item.height);
+ *  back to 1:1.
+ *
+ *  Compared by content for the same reason as `displayPaths`: a rating patch
+ *  must not re-run the justified layout, and a path's dimensions never change
+ *  once it has them. */
+const aspectByPath = createMemo(
+  () => {
+    const map = new Map<string, number>();
+    for (const item of items()) {
+      if (item.width && item.height && item.width > 0 && item.height > 0) {
+        map.set(item.path, item.width / item.height);
+      }
     }
-  }
-  return map;
-});
+    return map;
+  },
+  new Map<string, number>(),
+  { equals: sameAspects },
+);
 
 export interface CellMeta {
   size: number;
