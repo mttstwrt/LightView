@@ -25,16 +25,16 @@ had already drifted from its own derived version constant, which is the failure
 mode of the thing rather than an argument against it in principle.
 
 The cost, stated because it is real: a schema mistake is not a patch later, it is
-a version bump that re-thumbnails every library. `date_added` and `last_viewed`
-are mirrored into the companion, so on a gallery that has sidecars the two fields
-a rebuild could not otherwise recover come back from them.
+a version bump that re-thumbnails every library. `date_added`, `last_viewed` and
+`date_rated` are mirrored into the companion, so on a gallery that has sidecars
+the three fields a rebuild could not otherwise recover come back from them.
 
 **That mirror does not reach a gallery with no sidecars**, and an untagged camera
 roll is exactly that: the companion sweep skips any file without one, so there is
-nowhere for those two fields to have been written. On such a library a bump does
-not cost time and nothing else — it resets when every file was added and when it
-was last seen, neither of which is recoverable from anything. This page used to
-claim otherwise and was wrong.
+nowhere for those fields to have been written. On such a library a bump does not
+cost time and nothing else — it resets when every file was added, when it was
+last seen and when it was last rated, none of which is recoverable from
+anything. This page used to claim otherwise and was wrong.
 
 ## A tool change is not a schema change
 

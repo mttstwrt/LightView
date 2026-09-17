@@ -170,6 +170,7 @@ pub struct MirrorResult {
     /// write back under the companion lock.
     pub missing_date_added: Option<i64>,
     pub missing_last_viewed: Option<i64>,
+    pub missing_date_rated: Option<i64>,
 }
 
 /// Mirror a companion's core fields into the row, companion-wins.
@@ -193,10 +194,12 @@ pub fn mirror_companion(
     let last_rated = core.and_then(|c| c.date_rated.as_deref()).and_then(parse_rfc3339);
     let location = core.and_then(|c| c.location);
 
-    let (db_added, db_viewed): (Option<i64>, Option<i64>) = conn
-        .prepare_cached("SELECT date_added, last_viewed FROM media_meta WHERE path = ?1")?
-        .query_row([path.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap_or((None, None));
+    let (db_added, db_viewed, db_rated): (Option<i64>, Option<i64>, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT date_added, last_viewed, last_rated FROM media_meta WHERE path = ?1",
+        )?
+        .query_row([path.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap_or((None, None, None));
 
     conn.prepare_cached(
         "UPDATE media_meta SET
@@ -223,6 +226,12 @@ pub fn mirror_companion(
     Ok(MirrorResult {
         missing_date_added: if date_added.is_none() { db_added } else { None },
         missing_last_viewed: if last_viewed.is_none() { db_viewed } else { None },
+        // Owed back for the same reason the other two are, and it was the one
+        // that got away: ratings predate `date_rated` in the sidecar, so a
+        // library rated before then carried the date only in the index — which
+        // a `format_version` bump deletes. Sorting by "recently rated" silently
+        // became sorting by nothing.
+        missing_date_rated: if last_rated.is_none() { db_rated } else { None },
     })
 }
 
@@ -370,8 +379,11 @@ mod tests {
         let db = CacheDb::open_at(dir.path()).unwrap();
         let conn = db.writer_blocking();
         insert_scanned(&conn, &[scanned("a.jpg")]).unwrap();
-        conn.execute("UPDATE media_meta SET date_added = 1234, last_viewed = 5678", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE media_meta SET date_added = 1234, last_viewed = 5678, last_rated = 9012",
+            [],
+        )
+        .unwrap();
 
         let c = CompanionFile::new("a.jpg", MediaType::Image);
         let path = RelPath::new("a.jpg").unwrap();
@@ -379,6 +391,37 @@ mod tests {
 
         assert_eq!(result.missing_date_added, Some(1234));
         assert_eq!(result.missing_last_viewed, Some(5678));
+        // The one that used to be left behind. Ratings predate `date_rated` in
+        // the sidecar, so a library rated before then holds the date only here
+        // — and here is the half a `format_version` bump deletes.
+        assert_eq!(result.missing_date_rated, Some(9012));
+    }
+
+    /// The companion wins, and having won it is owed nothing back. A date the
+    /// sidecar already carries must not be reported as missing, or the sweep
+    /// would rewrite every companion in the library on every pass.
+    #[test]
+    fn a_companion_that_has_the_date_is_owed_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CacheDb::open_at(dir.path()).unwrap();
+        let conn = db.writer_blocking();
+        insert_scanned(&conn, &[scanned("a.jpg")]).unwrap();
+        conn.execute("UPDATE media_meta SET last_rated = 9012", []).unwrap();
+
+        let mut c = CompanionFile::new("a.jpg", MediaType::Image);
+        let mut core = c.meta.core.take().unwrap_or_default();
+        core.rating = Some(4);
+        core.date_rated = Some("2020-01-01T00:00:00Z".to_string());
+        c.meta.core = Some(core);
+
+        let path = RelPath::new("a.jpg").unwrap();
+        let result = mirror_companion(&conn, &path, &c).unwrap();
+        assert!(result.missing_date_rated.is_none());
+
+        let stored: i64 = conn
+            .query_row("SELECT last_rated FROM media_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 1577836800, "the companion's date replaced the row's");
     }
 
     #[test]

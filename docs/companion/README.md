@@ -60,12 +60,19 @@ tags from the one file that cannot be regenerated. Dropping `auto` from the
 *index* is a decision; dropping it from the *file* is data loss, and this is the
 line between them.
 
-### Two fields are mirrored from the database on purpose
+### Three dates are mirrored from the database on purpose
 
-`date_added` and `last_viewed` live in the index, and are also written here.
-Without that, a `format_version` bump would silently empty them — and "a rebuild
-loses time and nothing else" would be false. The mirror runs both ways: the
-indexer writes them back into sidecars that lack them.
+`date_added`, `last_viewed` and `date_rated` live in the index, and are also
+written here. Without that, a `format_version` bump would silently empty them —
+and "a rebuild loses time and nothing else" would be false. The mirror runs both
+ways: the indexer writes them back into sidecars that lack them.
+
+`date_rated` was the one that got away. Ratings themselves have always been
+written here, but the *date* of a rating was stamped only into the index, so a
+library rated before the field existed carried it nowhere durable and a rebuild
+dropped it — "sort by recently rated" quietly became "sort by nothing". The
+sweep now completes it from the index the same way it completes the other two,
+which recovers it on any library whose index still holds it.
 
 ## One read-modify-write, under one lock
 

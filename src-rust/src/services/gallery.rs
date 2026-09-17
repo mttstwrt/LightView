@@ -621,6 +621,7 @@ async fn complete_companions(
             };
             let added = mirror.missing_date_added.map(meta::to_rfc3339);
             let viewed = mirror.missing_last_viewed.map(meta::to_rfc3339);
+            let rated = mirror.missing_date_rated.map(meta::to_rfc3339);
             // The mirror is the sweep's durable half, and the reason this
             // function is not just an index write.
             let _busy = presence.busy();
@@ -631,6 +632,9 @@ async fn complete_companions(
                 }
                 if core.last_viewed.is_none() {
                     core.last_viewed = viewed.clone();
+                }
+                if core.date_rated.is_none() {
+                    core.date_rated = rated.clone();
                 }
                 companion.meta.core = Some(core);
                 Outcome::Write(())
