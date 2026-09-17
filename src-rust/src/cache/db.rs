@@ -9,10 +9,22 @@
 //!
 //! The consequence, stated because it is the cost: a schema mistake here is not
 //! a patch later, it is a version bump that re-thumbnails every library. Two
-//! things make that survivable rather than merely cheap to say — `date_added`
-//! and `last_viewed` are mirrored into the companion (see
-//! [`crate::companion::schema::CoreMeta`]), so the bump loses time and nothing
-//! else.
+//! things keep that survivable.
+//!
+//! **The dates are mirrored.** `date_added`, `last_viewed` and `date_rated` are
+//! written into the companion as well as here (see
+//! [`crate::companion::schema::CoreMeta`]), so a bump costs time and nothing
+//! else — on a gallery that has sidecars. It does not reach one that has none:
+//! the companion sweep skips a file without a sidecar, so there is nowhere for
+//! those dates to have been written, and on an untagged camera roll a bump
+//! really does reset when each file was added and last seen.
+//!
+//! **A reader learning something new is not a schema change.** When a reader
+//! starts extracting a fact it could not extract before, bumping the format to
+//! make old rows re-read would throw away everything above along with them.
+//! Such a reader stamps its own version in `gallery_meta` and clears
+//! `exif_read` for the rows it owns, so the library catches up in place. See
+//! `reprobe_videos_if_the_reader_changed`.
 //!
 //! **Every path-keyed table is swept together.** [`path_keyed_tables`] is the
 //! single source of truth, derived from [`ThumbTier::ALL`], and a test asserts

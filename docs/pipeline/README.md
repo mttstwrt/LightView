@@ -39,6 +39,22 @@ the grid trade sharpness for latency mid-scroll without the backend knowing.
 evicting them means regenerating them on the next scroll. The two large tiers
 are, because they are generated for what a person actually zoomed into.
 
+## Measuring a file without decoding it
+
+`thumbnailer::dimensions(path)` answers how big an image is from its header
+alone: the `image` crate first, then a libheif handle. Neither decodes a pixel,
+and the libheif half is not optional — a library that is entirely HEIC would
+otherwise get nothing, which is the case it was written for. libheif has applied
+`irot`/`imir` since 1.16 and this project requires ≥ 1.21, so a handle's width
+and height are *display* dimensions and agree with what the decode path reports
+for the same file.
+
+It is called at index time, by the image branch of the gallery's probe, so the
+grid knows a file's aspect ratio before anything has been drawn — see
+[the gallery's ordering](../gallery/README.md). What it cannot read is RAW and
+AVIF, and those are the only formats still reaching the grid's square
+placeholder.
+
 ## The hot path, and the three things that keep it standing
 
 A scrolling grid asks for a few hundred thumbnails a second, aborts most of

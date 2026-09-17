@@ -37,12 +37,25 @@ batch arriving over rsync or Samba is dateless and placeless until a restart.
 Step 7 exists for whatever that missed.
 
 **Which header gets read depends on the file, and only one branch knows it.**
-An image's facts come from its EXIF block; a video's come from what its
-container declares, which `ffprobe` reads — duration and the display dimensions
-with any rotation already applied. Both arrive as the same row, so nothing
-downstream of the probe has a video case. A GIF takes the image branch: it has
-no EXIF either, and the grid animates it on its own rules rather than on a
-duration.
+An image's facts come from its EXIF block and its dimensions from its container
+header; a video's come from what its container declares, which `ffprobe` reads —
+duration and the display dimensions with any rotation already applied. Both
+arrive as the same row, so nothing downstream of the probe has a video case. A
+GIF takes the image branch: it has no EXIF either, and the grid animates it on
+its own rules rather than on a duration.
+
+**An image's shape is part of that read**, and it was the last fact still being
+discovered by accident. Width and height used to be written only as a side
+effect of decoding a frame for a thumbnail, so a file nobody had scrolled past
+had no shape, and the justified grid laid it out as a 1:1 square and corrected
+itself when the thumbnail arrived. Every correction re-ran the layout, so rows
+moved under the reader — seven recomputes in 333 ms, measured at phone width on
+a gallery whose files never changed. Now the shape is read from the header at
+index time, which decodes nothing;
+[`pipeline::thumbnailer::dimensions`](../pipeline/README.md) is the one entry
+point and it covers everything either reader can parse. The thumbnail path
+still writes the same values and the two cannot disagree, because `set_probed`
+is first-wins and both report display dimensions.
 
 **A video's date is reduced to a wall clock**, because that is what the column
 already holds. Every photo's `date_taken` is whatever the camera's clock said,
