@@ -1039,7 +1039,19 @@ export function JustifiedGrid(props: JustifiedGridProps) {
           No media files found
         </div>
       </Show>
-      <Show when={props.loading}>
+      {/* Only when there is nothing else to show. This banner is `h-screen` and
+          sits *in flow* above the grid, so rendering it beside a populated grid
+          displaced every row by exactly one viewport and back again — measured
+          at 390px: content height 3482 → 4262 → 3482 while `scrollTop` never
+          moved. That is the "grid jumps and comes to rest exactly where it
+          started" bug, and "exactly" is the tell: the displacement is the
+          banner's own height.
+
+          The cost is that a refetch over an already-drawn grid is silent. That
+          is the right trade here — every refetch replaces the list with one
+          that is nearly always identical, so the honest feedback is no visible
+          change at all. */}
+      <Show when={props.loading && props.paths.length === 0}>
         <div class="flex items-center justify-center h-screen text-neutral-500 text-sm">
           Loading...
         </div>

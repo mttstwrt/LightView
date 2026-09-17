@@ -283,7 +283,8 @@ async fn tag(
     gallery_service::scan_and_index(&gallery)
         .await
         .map_err(|e| format!("could not scan the gallery: {e}"))?;
-    gallery.refresh_autocomplete().await;
+    // No event: `lightview tag` has no clients.
+    let _ = gallery.refresh_autocomplete().await;
 
     let paths = select_paths(&gallery, filter).await?;
     if paths.is_empty() {

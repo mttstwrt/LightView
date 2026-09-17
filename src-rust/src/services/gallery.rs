@@ -143,7 +143,9 @@ pub async fn enrich_and_index(
     backfill_exif(gallery).await?;
     backfill_locations(gallery, presence).await?;
     reindex_companions(gallery, presence).await?;
-    gallery.refresh_autocomplete().await;
+    // No event: this runs at open, before the vocabulary has ever been served,
+    // so there is no client holding a stale one.
+    let _ = gallery.refresh_autocomplete().await;
     Ok(())
 }
 
@@ -585,9 +587,14 @@ pub fn spawn_companion_sweep(
                 Ok(0) => {}
                 Ok(n) => {
                     log::info!("companion sweep re-indexed {n} file(s)");
-                    gallery.refresh_autocomplete().await;
+                    let _ = gallery.refresh_autocomplete().await;
                     // `tags`, not `items`: the vocabulary moved and so did what
                     // a tag filter matches, but no file appeared or vanished.
+                    //
+                    // Unconditional, unlike the watcher: the sweep only reports
+                    // a non-zero count when it re-indexed a companion whose tag
+                    // rows it replaced, and a tag moving from one file to
+                    // another leaves every count in the vocabulary identical.
                     gallery.events.send(Event::TagsIndexed);
                 }
                 Err(e) => log::warn!("companion sweep failed: {e}"),
@@ -1017,7 +1024,14 @@ async fn flush(
         gallery.events.send(Event::FsChanged { added, removed });
     }
     if touched_tags {
-        gallery.refresh_autocomplete().await;
+        // Only if the vocabulary actually moved. Every sidecar write lands here
+        // — a rating, a colour label, a note, a view — and none of those is news
+        // a client can act on, but a client holding a filter answers a tag event
+        // by re-running its query, which costs it a full payload and a frame of
+        // empty grid.
+        if gallery.refresh_autocomplete().await {
+            gallery.events.send(Event::TagsIndexed);
+        }
     }
 }
 

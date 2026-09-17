@@ -56,21 +56,34 @@ impl Gallery {
         *self.settings.write().expect("gallery settings poisoned") = next;
     }
 
-    /// Refresh the autocomplete vocabulary from the index, and tell clients.
+    /// Refresh the autocomplete vocabulary from the index. Reports whether it
+    /// moved; **does not tell anyone.**
     ///
     /// One aggregate over an indexed table at the moments the engine already
     /// refreshes — which is the whole replacement for the `tag_counts` table.
-    pub async fn refresh_autocomplete(&self) {
+    ///
+    /// Publishing [`Event::TagsIndexed`] used to happen here, and that was the
+    /// bug: the watcher calls this after *any* companion write, so viewing a
+    /// photo announced a tag edit to every connected browser, and a browser
+    /// holding an active filter answers that by re-running its query. Which
+    /// callers have news is not knowable from here — a tag moved between two
+    /// files leaves every count identical — so the decision belongs to each
+    /// caller. One that edited tags says so outright; one that merely noticed a
+    /// companion change asks this function.
+    ///
+    /// [`Event::TagsIndexed`]: crate::server::events::Event::TagsIndexed
+    #[must_use = "a caller that knows tags moved should publish TagsIndexed"]
+    pub async fn refresh_autocomplete(&self) -> bool {
         let counts = {
             let conn = self.db.read().await;
             crate::cache::index::tag_counts(&conn)
         };
         match counts {
-            Ok(counts) => {
-                self.autocomplete.refresh(counts).await;
-                self.events.send(crate::server::events::Event::TagsIndexed);
+            Ok(counts) => self.autocomplete.refresh(counts).await,
+            Err(e) => {
+                log::warn!("could not refresh the tag vocabulary: {e}");
+                false
             }
-            Err(e) => log::warn!("could not refresh the tag vocabulary: {e}"),
         }
     }
 }

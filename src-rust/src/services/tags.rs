@@ -291,7 +291,12 @@ async fn edit(
     }
 
     if !touched.is_empty() {
-        gallery.refresh_autocomplete().await;
+        let _ = gallery.refresh_autocomplete().await;
+        // Unconditional: this is the one path that *knows* tags moved. Moving a
+        // tag from one file to another leaves the vocabulary byte for byte the
+        // same while changing what a tag filter selects, so the vocabulary is
+        // the wrong thing to ask here.
+        gallery.events.send(Event::TagsIndexed);
         let changed = touched.len();
         gallery.events.send(Event::ItemsChanged { paths: touched });
         return Ok(changed);

@@ -192,7 +192,13 @@ pub async fn run(
     // the work it did, which is the whole resumability argument.
     report.tagged += apply(gallery, plugin, applied, presence).await;
     session.shutdown().await;
-    gallery.refresh_autocomplete().await;
+    // A re-run that skipped every item applied the tags already on disk, so the
+    // vocabulary is the honest question: it moved only if the run added one.
+    if gallery.refresh_autocomplete().await {
+        gallery
+            .events
+            .send(crate::server::events::Event::TagsIndexed);
+    }
 
     result.map(|()| report)
 }

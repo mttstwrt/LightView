@@ -183,7 +183,11 @@ pub async fn merge(gallery: &Gallery, plan: MergePlan) -> Result<MergeResult, Du
     crate::services::gallery::index_one(gallery, &plan.keeper)
         .await
         .map_err(|e| DuplicateError::Io(std::io::Error::other(e.to_string())))?;
-    gallery.refresh_autocomplete().await;
+    if gallery.refresh_autocomplete().await {
+        gallery
+            .events
+            .send(crate::server::events::Event::TagsIndexed);
+    }
     gallery.events.send(crate::server::events::Event::FsChanged {
         added: Vec::new(),
         removed: plan.others.clone(),

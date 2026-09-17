@@ -35,9 +35,19 @@ npm run build          # → dist/ — must exist before any cargo command
 cargo build --manifest-path src-rust/Cargo.toml
 ```
 
-The SPA is embedded into the **library**, not read from disk by the binary, so
-**every** Rust target — `check`, `test`, `clippy`, `build` — fails without
-`dist/`. It is the first thing to check when a fresh clone will not compile.
+`dist/` is read by a proc macro in the **library**, so **every** Rust target —
+`check`, `test`, `clippy`, `build` — fails without it. That is the first thing
+to check when a fresh clone will not compile.
+
+What that macro then does differs by profile, and the difference decides
+whether a frontend change needs a Rust rebuild. A release build embeds each
+file's bytes; a debug build records the paths and reads them at run time. So in
+development `npm run build` alone is enough — the running binary serves the new
+bundle — while an incremental **release** build after a frontend-only change
+could embed the previous one, because Vite's hashed filenames are invented
+after cargo has decided what to rebuild. Nothing here is exposed to that: the
+container image, `PKGBUILD` and the release workflow all build from a clean
+checkout, which is the cheaper guarantee than teaching cargo about `dist/`.
 
 **`Cargo.lock` is committed.** This crate ships a binary, and the package
 build, the container image and the release workflow all start from a clean

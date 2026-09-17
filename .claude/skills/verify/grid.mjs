@@ -302,6 +302,60 @@ try {
   );
   check("nothing overflows horizontally at 390px", overflow <= 0);
 
+  // A server event must not move a grid that is already drawn.
+  //
+  // The regression this pins: `record_view` — a *read*, sent when the viewer
+  // closes — reached every client as `tags-indexed`, and a client holding a
+  // filter answered it with a full refetch. The refetch set `loading`, and the
+  // `h-screen` "Loading..." banner rendered in flow above a grid that kept
+  // rendering, so every row moved down exactly one viewport and back. Measured
+  // on the broken build at this width: content height 3482 → 4262 → 3482 with
+  // `scrollTop` pinned.
+  //
+  // Sampled per animation frame from inside the page. The refetch is one frame
+  // against a local gallery this size, so anything polled over the wire misses
+  // it — on a phone against a real library it is the better part of a second.
+  const filterInput = page.locator('input[placeholder^="Filter"]');
+  if (await filterInput.count()) {
+    await filterInput.fill("width>=100");
+    await filterInput.press("Enter");
+    await page.waitForTimeout(1500);
+    await page.evaluate(() => {
+      const host = document.querySelector(".hide-scrollbar.fixed.inset-0");
+      if (host) host.scrollTop = Math.min(400, host.scrollHeight);
+    });
+    await page.waitForTimeout(600);
+
+    const settled = await page.evaluate(async () => {
+      const host = document.querySelector(".hide-scrollbar.fixed.inset-0");
+      const frames = [];
+      let raf;
+      const tick = () => {
+        frames.push([Math.round(host.scrollTop), Math.round(host.scrollHeight)]);
+        raf = requestAnimationFrame(tick);
+      };
+      tick();
+      const first = document.querySelector("img[src*='/thumb/']");
+      const path = first ? decodeURIComponent(new URL(first.src).pathname.split("/thumb/")[1].replace(/^[a-z]+\//, "")) : null;
+      await fetch("/api/invoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ command: "record_view", args: { path } }),
+      });
+      await new Promise((r) => setTimeout(r, 4000));
+      cancelAnimationFrame(raf);
+      const uniq = (i) => [...new Set(frames.map((f) => f[i]))];
+      return { frames: frames.length, tops: uniq(0), heights: uniq(1) };
+    });
+
+    check(
+      `a view does not move the grid under it (height ${settled.heights.join("/")}, over ${settled.frames} frames)`,
+      settled.heights.length === 1 && settled.tops.length === 1,
+    );
+  } else {
+    bad("the filter input was unreachable, so the refetch path went unchecked");
+  }
+
   // Nothing is filtered out of either list. A 404 the page causes is a 404 a
   // user sees in their console, and "that one is fine" is how the missing
   // favicon link survived for as long as it did.

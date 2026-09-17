@@ -129,8 +129,13 @@ pub fn load_state(conn: &Connection) -> Result<HashMap<String, IndexState>, Cach
 /// One aggregate over an indexed table, at the moments the engine already
 /// refreshes — which is the whole replacement for a second table.
 pub fn tag_counts(conn: &Connection) -> Result<Vec<TagCount>, CacheError> {
-    let mut stmt =
-        conn.prepare("SELECT namespace, tag, COUNT(*) FROM tag_index GROUP BY 1, 2")?;
+    // `ORDER BY` because a caller compares two of these element by element to
+    // decide whether the vocabulary moved. SQLite's `GROUP BY` happens to emit
+    // groups in key order today, but that is an artefact of the sorter it
+    // chooses, not a promise — and a comparison that silently starts reporting
+    // a change on every call is the kind of failure nothing would catch.
+    let mut stmt = conn
+        .prepare("SELECT namespace, tag, COUNT(*) FROM tag_index GROUP BY 1, 2 ORDER BY 1, 2")?;
     let rows = stmt.query_map([], |r| {
         Ok(TagCount {
             namespace: r.get(0)?,

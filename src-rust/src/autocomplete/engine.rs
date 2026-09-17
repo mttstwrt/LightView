@@ -84,9 +84,32 @@ impl AutocompleteEngine {
         }
     }
 
-    /// Reload the tag cache from the database.
-    pub async fn refresh(&self, tag_counts: Vec<TagCount>) {
-        let prepared = tag_counts
+    /// Reload the tag cache from the database, reporting whether the vocabulary
+    /// actually moved.
+    ///
+    /// **The answer is what the caller tells clients about**, and it has to be
+    /// asked here because most calls change nothing. Every companion write
+    /// reaches this function through the watcher, and a view, a rating, a
+    /// colour label and a note all leave the tag rows exactly as they were.
+    /// Answering "nothing moved" is what keeps a read from arriving at every
+    /// connected browser as a tag edit.
+    ///
+    /// Comparing before replacing also skips the rebuild, and the rebuild is
+    /// the expensive half: one lowercased `String` per tag, five thousand of
+    /// them, to arrive at the vocabulary already in hand.
+    ///
+    /// The comparison is positional, which [`crate::cache::index::tag_counts`]
+    /// orders for.
+    pub async fn refresh(&self, tag_counts: Vec<TagCount>) -> bool {
+        let mut tags = self.tags.write().await;
+        let moved = tags.len() != tag_counts.len()
+            || tags.iter().zip(&tag_counts).any(|(old, new)| {
+                old.count != new.count || old.tag != new.tag || old.namespace != new.namespace
+            });
+        if !moved {
+            return false;
+        }
+        *tags = tag_counts
             .into_iter()
             .map(|tc| Entry {
                 tag_lower: tc.tag.to_lowercase(),
@@ -95,8 +118,7 @@ impl AutocompleteEngine {
                 count: tc.count,
             })
             .collect();
-        let mut tags = self.tags.write().await;
-        *tags = prepared;
+        true
     }
 
     /// Query tags with fuzzy substring matching.
@@ -264,6 +286,65 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vocab(pairs: &[(&str, &str, u32)]) -> Vec<TagCount> {
+        pairs
+            .iter()
+            .map(|(namespace, tag, count)| TagCount {
+                namespace: namespace.to_string(),
+                tag: tag.to_string(),
+                count: *count,
+            })
+            .collect()
+    }
+
+    /// The question every caller asks before telling clients anything. A
+    /// reload that found the same vocabulary has no news, and the count is part
+    /// of it: one more photo carrying `holiday` is a change a filter bar should
+    /// see, even though the tag itself is not new.
+    #[tokio::test]
+    async fn a_reload_reports_only_a_vocabulary_that_moved() {
+        let engine = AutocompleteEngine::new();
+        assert!(
+            engine.refresh(vocab(&[("user", "holiday", 2)])).await,
+            "the first load is always a change"
+        );
+        assert!(
+            !engine.refresh(vocab(&[("user", "holiday", 2)])).await,
+            "the same vocabulary twice is not news"
+        );
+        assert!(
+            engine.refresh(vocab(&[("user", "holiday", 3)])).await,
+            "one more file carrying the tag is news"
+        );
+        assert!(
+            engine
+                .refresh(vocab(&[("user", "holiday", 3), ("auto", "dog", 1)]))
+                .await,
+            "a new tag is news"
+        );
+        assert!(
+            !engine
+                .refresh(vocab(&[("user", "holiday", 3), ("auto", "dog", 1)]))
+                .await
+        );
+        assert!(
+            engine.refresh(vocab(&[])).await,
+            "losing every tag is news"
+        );
+    }
+
+    /// A vocabulary that did not move is still the vocabulary that gets
+    /// matched — the early return must not leave the engine holding nothing.
+    #[tokio::test]
+    async fn an_unchanged_reload_keeps_what_it_already_had() {
+        let engine = AutocompleteEngine::new();
+        engine.refresh(vocab(&[("user", "holiday", 2)])).await;
+        engine.refresh(vocab(&[("user", "holiday", 2)])).await;
+        let hits = engine.query("holi", None, 10).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tag, "holiday");
+    }
 
     #[test]
     fn test_fuzzy_exact() {

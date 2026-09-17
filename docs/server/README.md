@@ -170,10 +170,21 @@ been missed.** A client re-fetches exactly those.
 |---|---|
 | `fs-changed` | `{added, removed}` — **what changed**, so a client splices rather than re-fetching. One phone upload used to cost every connected client a full-library payload |
 | `items-changed` | `{paths}` — plural, and one per *operation*. Tagging 500 photos is one event, not 500 |
-| `tags-indexed` | the vocabulary moved; the item list moved with it only under an active filter |
+| `tags-indexed` | the vocabulary moved, or a tag moved between files; the item list moves with it only under an active filter |
 | `job-progress` | throttled to one a second — the only high-rate producer on the channel |
 | `job-finished` | never throttled, or a run appears to stall at 99% |
 | `resync` | `{domains}` — you may have missed something in exactly these |
+
+**Who publishes `tags-indexed` is a decision each caller makes, and
+[`refresh_autocomplete`](../../src-rust/src/state.rs) does not make it.**
+Reloading the vocabulary used to publish the event as a side effect, and the
+watcher calls that reload after *any* companion write — so viewing a photo, a
+read, reached every connected browser as a tag edit, and a browser holding a
+filter answered it by re-running its query. A caller that edited tags now says
+so outright, because a tag moving from one file to another leaves every count in
+the vocabulary identical while changing what a filter selects. A caller that
+merely noticed a sidecar change asks the reload whether the vocabulary moved and
+stays quiet when it did not.
 
 A keep-alive comment goes out every fifteen seconds. A phone's radio and every
 intermediary between it and the server will drop an idle connection, and a

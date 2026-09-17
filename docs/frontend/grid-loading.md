@@ -162,12 +162,31 @@ seconds at a stretch, and on a phone that is long enough for the browser to kill
 the tab as unresponsive. A memo would instead recompute eagerly on every item
 change, for the many sessions that never touch the scrollbar at all.
 
+## Nothing above the grid may take layout space
+
+The "Loading…" banner and the "No media files found" banner both render in flow,
+above the rows, and both are `h-screen`. That is fine when there is nothing else
+on screen and wrong the moment there is: a refetch over an already-drawn grid
+inserted a full viewport of banner above every row, then removed it when the
+answer arrived. The grid appeared to jump and come back to rest exactly where it
+started — *exactly*, because the displacement was the banner's own height.
+
+So the banner renders only when there are no rows. The consequence is that a
+refetch over a drawn grid is silent, which is the right way round: a refetch
+almost always returns the list already on screen, and the honest rendering of an
+unchanged list is an unchanged screen. Anything added above the rows later has
+to clear the same bar. `grid.mjs` samples the scroll host per animation frame
+across a server event and fails if the content height moves.
+
 ## Invariants a caller must uphold
 
 - **Assign nothing while warping.** A scrub is thousands of cells nobody sees.
 - **Speculation waits on what the user is waiting on.** Cells already pointed at
   a full-resolution source that have not painted are a whole decode each, on the
   same bounded pool.
+- **A refetch must not move what is already drawn.** A grid holding rows keeps
+  them until the replacement arrives; nothing renders above them in the
+  meantime.
 - **A tier URL is not a cache handle.** An evicted tier regenerates on request,
   so a stale look-ahead record costs one generation and nothing else — which is
   why the grid no longer tracks what the server dropped.
