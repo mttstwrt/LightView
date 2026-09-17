@@ -63,9 +63,17 @@ drifts from `Cargo.toml` is a build error and not a surprise later.
 cargo test    --manifest-path src-rust/Cargo.toml --all-targets
 cargo clippy  --manifest-path src-rust/Cargo.toml --all-targets --all-features
 npx tsc --noEmit          # from src-solidjs/
+npm test                  # vitest, node environment
 ```
 
-All three are expected to be clean. `cargo fmt` has never been run over this
+All four are expected to be clean.
+
+`npm test` covers the frontend's **arithmetic** and nothing else — layout
+geometry and the scroll maths that reads it. It runs in the `node` environment
+rather than the `jsdom` that `vite-plugin-solid` would otherwise select, because
+none of what is worth testing this way touches a DOM, and taking the browser
+environment would mean a second heavyweight dependency to run tests that never
+render. Anything that needs a browser belongs in `grid.mjs`, in a real one. `cargo fmt` has never been run over this
 tree, so `--check` fails on almost every file; formatting it is its own change,
 not something to fold into another one.
 

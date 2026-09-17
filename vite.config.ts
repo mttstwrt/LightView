@@ -42,6 +42,16 @@ export default defineConfig({
     strictPort: true,
   },
   envPrefix: ["VITE_"],
+  // `node`, not the `jsdom` that `vite-plugin-solid` would otherwise select.
+  // What is worth unit testing here is arithmetic — layout geometry, scroll
+  // compensation — and none of it touches a DOM. Taking the browser
+  // environment would mean a second heavyweight dependency to run tests that
+  // never render anything. Behaviour that *does* need a browser is covered by
+  // `.claude/skills/verify/grid.mjs`, in a real one.
+  test: {
+    environment: "node",
+    include: ["**/*.test.ts"],
+  },
   build: {
     target: "esnext",
     outDir: "../dist",
