@@ -4,78 +4,117 @@ Principle 1's five questions, in order.
 
 ## Placement
 
-**The arithmetic goes in `lib/justifiedLayout.ts`; the effects and the gesture
-state stay in `JustifiedGrid.tsx`.**
+**Three pure functions in `lib/justifiedLayout.ts`, one new capability on
+`lib/scrollHost.ts`, the reactive state in `JustifiedGrid.tsx`.**
 
-Three pure functions, each taking a `JustifiedLayout` — the type that module
-already owns and exports:
+The helpers take a `JustifiedLayout` — the type that module already owns — and,
+crucially, a **path or index**, because identity across the change is the whole
+of the information (see the requirements' note):
 
 ```
-heightAbove(layout, scrollTop)                  -> number
-anchorAt(layout, scrollTop, viewportHeight)     -> { index, fraction }
-scrollForAnchor(layout, anchor, viewportHeight) -> number
+topVisible(layout, cells, scrollTop)        -> { index, offsetIntoViewport }
+centreVisible(layout, scrollTop, height)    -> { index, fraction }
+scrollToHold(layout, anchor, height)        -> number
 ```
 
-They belong beside the structure they read rather than in a module of their own.
-A `lib/scrollAnchor.ts` with one consumer would be a new concept for no second
-use (principle 2), and it would put functions that are *about* a
-`JustifiedLayout` somewhere other than where `JustifiedLayout` lives. The
-dependency direction is unchanged: the grid reads `lib/`, `lib/` knows nothing
-about the grid.
+They belong beside the structure they read. A module of their own would be a new
+concept for one consumer, and they are now unit-testable in `node` — which is
+the verification that would have caught the refuted design and that the browser
+harness structurally could not.
 
-What cannot move out of the component: the `createEffect` that fires on a layout
-change, the `leaving` map, and the zoom-gesture state. Each is reactive or DOM
-state, and hoisting them would mean inventing a store for something one component
-owns.
+**`lib/scrollHost.ts` gains `adjustBy(delta)`.** This is the piece the first
+draft lacked entirely (R8). It writes `scrollTop` *and* records the adjustment;
+`scrollDynamics`, `TopBar` and `ScrollBar` subtract recorded adjustments from the
+delta they observe, so a compensating write is invisible to all three. Three real
+consumers, so it is not an abstraction built for one.
 
-**R8 is a different module and a different commit.** A `sort_positions`-style
-command lives in `server/commands.rs` alongside `get_items`, delegating to the
-same `sort::sorter` query with a `WHERE path IN (…)` and a rank. No new layer.
+**What stays in the component:** the effect that fires on a layout change, the
+`leaving` map, and the zoom-gesture state. Each is reactive or DOM state that one
+component owns.
+
+**`lib/wheelScroll.ts` gains gesture edges.** R5 needs to capture an anchor on
+the first notch and release it when the gesture ends. `onSettle` cannot serve:
+`wheelScroll.ts:68` returns on a handled zoom *before* `animating`, so during a
+zoom it fires zero times — and it is a momentum tail, not a start. A debounce
+inside the zoom branch, surfaced as `onZoomStart` / `onZoomEnd`.
 
 ## Contract
 
 | what changes | who is on the other side |
 |---|---|
-| a cell may be in the DOM while absent from `props.paths` | `grid.mjs`, anything counting cells |
-| `scrollTop` is written by the grid, not only by the reader | `lib/scrollHost.ts`, the custom scroll rail |
-| `JustifiedLayout` gains three pure readers | one caller each, in-bundle |
-| **R8 only:** a new command returning sort positions for named paths | `galleryStore`, the command table |
+| a cell may be in the DOM while absent from `props.paths` | `grid.mjs`, `cellSources.prune`, `geom`, `pathIndex`, `viewerTransition` |
+| `scrollHost` gains `adjustBy`; three consumers learn to discount it | `scrollDynamics`, `TopBar`, `ScrollBar` |
+| `wheelScroll` gains `onZoomStart` / `onZoomEnd` | `JustifiedGrid`, its only caller |
+| `JustifiedLayout` gains three pure readers | one caller each |
+| `overflow-anchor: none` on the scroll host | the browser |
 
-**The first row is the one to watch.** A leaving cell is real DOM with a real
-`<img>` for the length of its fade, so any check that counts
-`img[src*='/thumb/']` sees a transient over-count. `grid.mjs` counts cells in
-four places today. Those counts are all taken at rest, so they are safe, but the
-new checks must sample deliberately rather than incidentally.
+**The first row is far more entangled than the first draft admitted**, and every
+one of these is a real collision rather than a hypothetical:
 
-**The second row has a subtlety.** The rail's thumb and date markers are
-positioned from `scrollTop`, so compensation moves the thumb without the reader
-touching it. That is accepted and is the point: a marker shifting is
-imperceptible next to a photograph shifting.
+- `cells.prune` nulls the URL (`cellSources.ts:149`) the instant a path leaves
+  `props.paths`, so without intervention a leaving cell fades out as an **empty
+  box** — the exact opposite of R1.
+- `geom` is rebuilt from `visibleCells()` and the cell body is gated on
+  `<Show when={g()}>`, so a leaving path's wrapper unmounts before any
+  transition can run. `leaving` has to feed `geom` too.
+- `pathIndex.indexOf(path) ?? -1` for a leaving path is **−1**, and that reaches
+  `openViewer(-1)` on click and collapses an in-progress drag-selection range on
+  hover. A leaving cell must be inert from the moment it starts leaving.
+- `viewerTransition` takes the *first* `[data-vt-path=…]` match, so a path that
+  leaves and returns inside the transition window gives the fly-back two
+  candidates and it may land on the corpse.
+- **`<For>` iterates `visiblePaths()` — the virtualized window, not
+  `props.paths`.** Cells leave that array on every scroll step, so a `leaving`
+  map driven off `<For>` exits would retain a live `<img>` for every row flung
+  past, which is precisely the decoded-bitmap retention `scrollDynamics`
+  documents as killing phone tabs. "Left the item list" and "left the render
+  window" are different events and only the first may animate.
 
-No wire change and no schema change for R1–R7.
+`overflow-anchor: none` is not optional. The first draft asserted the browser
+could not anchor here, on the grounds that the cells are out of flow inside a
+`contain: strict` box. That reasoning is shaky — Blink excludes boxes whose
+containing block is outside the scroller, and here the containing block is the
+positioned track *inside* the host. Nothing in the tree sets `overflow-anchor`,
+so the host is at the default `auto`. If Chrome does anchor, it adjusts
+`scrollTop` before the effect reads it and the effect applies its correction on
+top — overshoot on Chrome and Firefox but not Safari, which is the worst
+possible shape of bug. Turning it off makes the question moot rather than
+answering it.
+
+No wire change and no schema change.
 
 ## Cost in concepts
 
-Four, counted honestly:
+Seven, counted honestly — up from the four the first draft claimed, and the
+increase is the review's doing rather than the design growing ambition:
 
-1. A transition duration, and the rule that it is suppressed on first mount.
-2. A `leaving` map: path → its last geometry, swept after the transition.
-3. A crossfade threshold. **Not** `PATCH_LIMIT`, despite both being 12 — that
-   one is about where N round trips stop beating one payload, and reusing a
-   constant because the numbers coincide is how two unrelated things become
-   impossible to tune apart.
-4. An anchor held for the duration of a zoom gesture rather than recomputed per
-   notch.
+1. A transition duration, suppressed on first mount.
+2. A `leaving` map, distinct from the virtualization window, feeding both the
+   render list and `geom`, and inert to pointer events.
+3. A crossfade threshold. **Not** `PATCH_LIMIT`, despite both being 12 — that one
+   is about where N round trips stop beating one payload. Sharing a constant
+   because two numbers coincide is how two unrelated things become impossible to
+   tune apart. Its unit is **changed set membership**, not changed geometry;
+   under R2's reflow the geometry reading would crossfade on every single
+   removal.
+4. An anchor by path, captured before a change and restored after.
+5. A second anchor rule for scale changes, and the discrimination between the
+   two — which the effect cannot infer from `layout()` alone and must derive by
+   comparing the previous `props.paths` / `targetRowHeight` / `containerWidth`.
+6. `adjustBy`, and the notion of a scroll delta that the reader did not cause.
+7. Gesture edges on `wheelScroll`.
 
-Checked in the opposite direction, as principle 1 asks. Two candidates for
-deletion rather than addition: the 1:1 aspect placeholder is already unreachable
-for every format either reader can parse, and could go entirely if RAW and AVIF
-were given a header read — but that is a different plan, and compensation covers
-their corrections in the meantime. The `loading` prop could be deleted now that
-the banner only renders on an empty grid; it is retained because the empty-grid
-case is the one it is for.
+Seven is a lot. It is the honest price of "nothing moves except where the reader
+caused it to" in a virtualized reflowing grid, and it should be read as an
+argument for doing the first commit and then *stopping to look* rather than
+running the second on momentum.
 
-Nothing here needs the word *except*.
+Checked in the opposite direction, as principle 1 asks. One deletion is
+available and taken: `overflow-anchor: none` removes a browser behaviour from
+the picture rather than negotiating with it. One candidate was rejected — the
+first draft proposed deleting the `loading` prop, which is wrong: it is what
+distinguishes "No media files found" from "Loading…" on an empty grid, and
+conflating those is a regression.
 
 ## Alternatives
 
@@ -98,9 +137,17 @@ it to hold. Rejected on fact rather than on preference.
 control inside a virtualized list, and it would fight the recycling window.
 Rejected.
 
-**An anchor item for set changes too, for symmetry.** Rejected in the
-requirements' measurement note: it is more machinery than `heightAbove` and it is
-wrong for a change inside the viewport.
+**A pure layout-arithmetic correction, with no anchor.** This *was* the design,
+and it is refuted rather than merely rejected: a function of a layout and a
+scroll offset cannot carry identity across a change, so its correction evaluates
+to ~0. `justifiedLayout.test.ts` pins the refutation so nobody rediscovers the
+idea and finds it appealing.
+
+**A centre anchor for set changes too, for symmetry with zoom.** Rejected: for an
+edit inside the viewport it holds an item *below* the edit, sliding everything
+above the edit downward while the gap closes from below — two motions, one of
+them inexplicable. The top-visible item is above any in-viewport edit, which is
+why R3 needs no mechanism of its own.
 
 **Animating `transform` instead of `top`/`left`.** This is the fallback if the
 assumption below fails, not the first choice: it means every cell carries a
@@ -121,47 +168,76 @@ readers of the layout to hold. Deferred until measured, deliberately.
   from the shape of `PATCH_LIMIT`'s reasoning, not from watching 12 cells move.
   Cheap to change; named here so it is not mistaken for a measurement.
 - **(unmeasured)** Holding the zoom anchor across a gesture is enough to prevent
-  drift. The alternative failure is that the anchor item scrolls out of the
-  viewport mid-gesture at extreme zoom, which needs a re-pick and therefore
-  reintroduces exactly the drift it avoids.
+  drift. Two failure modes, and the second is the common one: the anchor item
+  scrolling out of view mid-gesture at extreme zoom, and — far more often —
+  `scrollToY` clamping to `maxScroll` in the last viewport of any gallery, where
+  zooming out shrinks the content by ~12% a notch and every notch clamps. A
+  clamped restore destroys the anchor's fraction, so "twenty notches without
+  drift" is unmeetable there unless the clamp is handled explicitly. The same
+  clamp affects a removal near the bottom, where the browser has already
+  clamped before the effect reads `scrollTop`.
 - **(measured, this session)** The layout takes no viewport height; the chrome
-  overlays rather than pushes; `interactive-widget=resizes-content` is set; a
-  warmed item is ~235–290 bytes.
+  overlays rather than pushes; `interactive-widget=resizes-content` is set; one
+  removal displaces later items by 18/283/11/29 px while total height moves 10.
+- **(extrapolated, not measured — was previously filed as measured)** ~290 bytes
+  for a warmed item with real nested paths. The measurement was 235 bytes on
+  short paths with thumbhash on 8 of 30 files.
 
 ## The two checks principle 1 asks for
 
-**Second-implementation test.** No abstraction, interface or plugin point is
-introduced. The three helpers are concrete functions with one caller each; if a
-second grid ever existed they would still be the same three functions.
+**Second-implementation test.** The helpers are concrete functions with one
+caller each, not abstractions. `adjustBy` is the one addition that looks like an
+interface, and it has **three** real consumers on day one — `scrollDynamics`,
+`TopBar`, `ScrollBar` — so it is extracted on demonstrated use rather than
+anticipated use. The gesture edges on `wheelScroll` have a single caller and are
+deliberately two callbacks rather than a gesture abstraction.
 
-**Seam test.** Passes. The helpers sit with the type they read, the effects sit
-with the reactive state they depend on, and nothing had to move for either to
-fit.
+**Seam test.** Passes, with one qualification worth stating. The helpers sit with
+the type they read and the effects with the reactive state they depend on, so
+nothing had to move. But `adjustBy` exists because three modules independently
+infer user intent from a scroll event, and that inference is the actual seam —
+each of them is guessing at something no one tells them. Discounting a recorded
+adjustment is the cheap fix; giving the host a notion of *who caused this scroll*
+would be the honest one, and is worth revisiting if a fourth consumer appears.
 
 ## The work
 
-Three commits, ordered so the *correct* half lands before the *pretty* half and
-can be judged on its own.
+Two commits. What was commit 3 is out of this plan entirely (see the
+requirements' out-of-scope note).
 
-**1. The grid holds its place.** R2, R3, R5, R6, R7 — `heightAbove`, `anchorAt`,
-`scrollForAnchor`, the compensation effect, and the anchor held across a zoom
-gesture via the `onSettle` hook `createWheelScroll` already exposes. No animation
-yet, so every assertion is a number. `grid.mjs`: a removal above the viewport
-leaves the first visible cell's rect unchanged; a removal inside the viewport
-leaves the rows above it unchanged; a twenty-notch ctrl+wheel zoom leaves the
-centre item within a few pixels of centre; a simulated keyboard-shaped height
-change moves nothing. Each verified to fail before the change.
+**1. The grid holds its place.** R2, R3, R5, R6, R7, R8, R9 — the anchor
+helpers, `adjustBy` and its three consumers, the zoom-gesture edges,
+`overflow-anchor: none`, and the effect that discriminates a set change from a
+scale change. No animation, so every assertion is a number.
+
+*Verified by `npm test`* for the arithmetic: an anchor restored across a
+reflowing change holds its offset; a centre anchor demonstrably does not, for an
+in-viewport edit; the clamp at the end of the content is handled rather than
+silently destroying the anchor's fraction.
+
+*Verified by `grid.mjs`* for the wiring, on a **larger fixture** — the current 12
+PNGs are barely a viewport at desktop width, so today the harness has no content
+above the fold to remove and no room for twenty notches of zoom without
+clamping. Checks: a removal above the viewport leaves the top-visible cell's rect
+unchanged; the mobile chrome does not move when the grid compensates; a
+twenty-notch ctrl+wheel leaves the centre item within a few pixels of centre.
+Each verified to fail before the change.
 
 **2. The grid moves rather than jumps.** R1 and R4 — the transition, the
-`leaving` map, the crossfade above the threshold. Preceded by the frame-rate
-measurement named in the assumptions; if it fails, stop and re-present rather
-than reaching for the fallback unasked. `grid.mjs`: after a removal, a surviving
-cell's rect is sampled per frame and must take more than one frame to reach its
-destination — the assertion that distinguishes a slide from a teleport.
+`leaving` map with all five collisions above resolved, the crossfade above the
+threshold. **Preceded by the frame-rate measurement** named in the assumptions;
+if it fails, stop and re-present rather than reaching for the `transform`
+fallback unasked. `grid.mjs`: a surviving cell's rect sampled per frame must take
+more than one frame to reach its destination — the assertion that distinguishes a
+slide from a teleport.
 
-**3. A change costs what it changed.** R8 — the sort-position command and the
-client splice, replacing the wholesale refetch.
+Also in commit 1, because it is a doc contradicting code (principle 5):
+`JustifiedGrid.tsx:160-166` says a just-added file is inserted with NULL
+dimensions "after the frontend has already fetched the sorted items". That is no
+longer true — the watcher now runs `probe_and_store` before it sends
+`FsChanged`, so dimensions are written before any client hears about the file.
+`measuredAspects` still exists for un-reprobed caches and for the formats
+`dimensions()` cannot read, which is why R9 exists.
 
 Docs on completion: `docs/frontend/grid-loading.md` gains the steadiness rules
-beside the banner rule it already carries; `docs/server/README.md` gains the new
-command in its table for commit 3; this directory is deleted.
+beside the banner rule it already carries; this directory is deleted.

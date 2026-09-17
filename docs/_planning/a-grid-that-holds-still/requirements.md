@@ -37,10 +37,19 @@ Every layout change is animated. A cell that survives the change slides from
 where it was to where it is; a cell that arrives fades in; a cell that leaves
 fades out, and only then does its space close.
 
-### R2 — A change above the viewport moves nothing on screen
+### R2 — A change above the viewport holds the top edge
 
-Items added or removed entirely above the scroll position leave every visible
-cell exactly where it was. The scroll rail may move; photographs may not.
+The item at the top of the viewport stays at the same offset from the top of the
+viewport. **Not every visible cell** — that is unachievable and the requirement
+used to claim it. A justified grid reflows like text: row height is
+`avail / sumAspect` over the items that landed in the row, so removing one item
+repacks every row after it. Measured at the real defaults, removing a single
+item near the top displaces later items by 18, 283, 11 and 29 px — four
+different amounts — while total height moves 2081 → 2071. Cells below the top
+edge will move, and the honest promise is that the reader's place is kept, not
+that the picture is frozen.
+
+Pinned by `justifiedLayout.test.ts`.
 
 ### R3 — A change inside the viewport is local to itself
 
@@ -74,14 +83,22 @@ below). The grid must not react: holding the top edge, so the reader sees less
 of the same content, is the correct behaviour and it is also what the browser
 does unaided.
 
-### R8 — A set change costs what it changed
+### R8 — Compensation is invisible to everything that watches scrolling
 
-A client learns about new items without re-fetching the library. Measured at
-**235 bytes per item** with thumbhash populated on only 8 of 30 files; warmed,
-with real nested paths, roughly 290. A twenty-thousand item gallery is ~6 MB to
-every connected client per upload batch — and moving photographs between devices
-by tagging them is a primary workflow, so the most-used path is the one paying
-most.
+A `scrollTop` the grid writes must not read as a scroll the reader performed.
+Three consumers currently cannot tell the difference, and all three misbehave at
+trivial magnitudes: `scrollDynamics` calls anything over ~21px in a frame a
+fling and drops newly revealed cells to the cheap rung; `TopBar` hides or
+reveals the mobile chrome over 6px; `ScrollBar` fades the rail in for 1200 ms on
+every scroll event. A grid that moves itself in order to hold still, and thereby
+moves the chrome, is this plan's own thesis inverted.
+
+### R9 — A layout change from a measured aspect is a layout change like any other
+
+`recordMeasuredAspect` fires once per decoded image whose dimensions the index
+did not have, and on a cold cache that is dozens of layout changes in a few
+seconds — more frequent than every other cause combined. It gets the same
+treatment as the rest, or loading a gallery becomes a shimmer.
 
 ## Out of scope
 
@@ -95,10 +112,14 @@ most.
 - **Snapshot filters.** A filter is a live view, not a frozen one. A snapshot has
   no honest expiry, so it forces a "stale — reload" affordance, and that
   affordance is the thing that reads as dated.
-- **A JavaScript unit-test runner.** The arithmetic in this plan would be
-  pleasant to unit test, but adding `vitest` to test ~40 lines is a permanent
-  dependency for one use. `grid.mjs` covers it in the real browser, which is
-  where the failure would actually appear.
+- **R8, and the whole of what was commit 3.** Pulled into a plan of its own. Its
+  justification did not survive review: `tags-indexed` carries no paths, so a
+  command answering "where do these sort" has nothing to work with for the
+  tagging workflow that motivated it, and would only help uploads. It also
+  requires maintaining `groups` across a splice — `setGroups` is called only
+  from `refresh()`, so every `start_index` after an insert is wrong. That is
+  already a latent bug on the removal path and commit 3 would have made it the
+  common case. None of it belongs in a change about motion.
 
 ## What the measurements settled
 
@@ -126,10 +147,29 @@ means a surviving cell keeps its DOM node, and cells carry explicit
 `top/left/width/height`. Sliding is therefore a CSS transition on four
 properties, with no FLIP measurement, no reparenting and no snapshotting.
 
-**An anchor item is unnecessary for set changes.** For a change entirely above
-the viewport, pinning *any* visible item gives `newScrollTop = S - Δ` — the
-choice of item cancels out. For a change inside the viewport, a centre anchor is
-actively wrong: it scrolls to hold an item below the edit, which slides
-everything above the edit downward while the gap closes from below. Compensating
-by the height change of rows *strictly above the viewport* is simpler than
-anchoring and is correct in all three positions.
+**Set changes need an anchor by path, and it is the top-visible item.** This
+replaces the opposite claim, which was wrong twice over and is worth recording
+because both errors are easy to make again.
+
+The first: "pinning any visible item gives the same answer, so the choice
+cancels out." That holds only if everything below the edit moves by one uniform
+delta, which a justified layout does not do — see R2. Two visible cells
+generally move by different amounts and change size, so the choice does not
+cancel and the derivation was void.
+
+The second, worse: "then no anchor is needed — compensate by the change in
+height of rows above the viewport." Any pure function of a layout and a scroll
+offset can only answer that question with the top of whichever row straddles the
+offset, which is within one row height of the offset in *every* layout. The
+difference between the old and new answers is therefore ~0, always, while the
+real correction is a full row height. Ten rows of 100 px at S=500: delete a row
+above, the content that was at y=500 is now at y=400, but row 5 still *starts*
+at 500 — it holds different photographs. Computed 0, correct 100.
+
+What carries the information is identity. Record the top-visible item's path and
+its row top's offset from the viewport top; after the change, find that path's
+new row top and restore the offset. A centre anchor is still wrong for set
+changes, for the reason originally given: it holds an item below an in-viewport
+edit, sliding everything above the edit downward while the gap closes from
+below. The top-visible item is above any in-viewport edit, so R3 falls out of
+the same mechanism rather than needing a second one.
