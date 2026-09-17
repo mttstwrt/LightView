@@ -366,6 +366,7 @@ pub async fn dispatch(
                 a.app_index,
                 &a.path,
             )
+            .await
             .map_err(failed)?;
             Ok(json!({ "ok": true }))
         }

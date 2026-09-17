@@ -117,7 +117,7 @@ pub fn clipboard(
 /// `app_index` is an index into `apps`, which comes from server-side
 /// configuration. There is no code path by which a request supplies a program
 /// name or an argument.
-pub fn open_with(
+pub async fn open_with(
     gallery: &Gallery,
     apps: &[ExternalApp],
     app_index: usize,
@@ -136,7 +136,20 @@ pub fn open_with(
             .collect()
     };
 
-    std::process::Command::new(&app.command)
+    // `tokio::process`, and `async` to say so in the signature: nothing here
+    // awaits, but the spawn needs the runtime's reactor and a caller that
+    // reached this from `spawn_blocking` would panic rather than misbehave
+    // quietly.
+    //
+    // The reason is the child nobody waits for. A `std::process::Child` dropped
+    // without a `wait` leaves a zombie until this process exits, and "open in
+    // an editor" is a button — a long-running server accumulates one entry per
+    // click, for the life of the session. Tokio keeps an orphan queue and reaps
+    // on `SIGCHLD`, which is the whole of the fix and costs no thread.
+    //
+    // Waiting is not the alternative: the point is to hand the file to another
+    // application and return, and that application outlives the request.
+    tokio::process::Command::new(&app.command)
         .args(&args)
         .spawn()?;
     Ok(())
@@ -467,3 +480,4 @@ mod tests {
     }
 
 }
+

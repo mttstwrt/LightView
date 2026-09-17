@@ -97,7 +97,7 @@ async fn open(dirs: &Dirs, dir: &Path) -> Result<std::process::ExitCode, String>
     let db = match CacheDb::open_at(&cache_dir) {
         Ok(db) => Arc::new(db),
         // Not a failure to report as one.
-        Err(CacheError::AlreadyOpen) => return open_the_running_one(&cache_dir),
+        Err(CacheError::AlreadyOpen) => return open_the_running_one(&cache_dir).await,
         Err(e) => return Err(format!("could not open the gallery cache: {e}")),
     };
 
@@ -121,7 +121,7 @@ async fn open(dirs: &Dirs, dir: &Path) -> Result<std::process::ExitCode, String>
     // would otherwise be unknowable — which is also why there is no
     // `--no-browser` flag to define.
     println!("{url}");
-    if let Err(e) = open_browser(&url) {
+    if let Err(e) = open_browser(&url).await {
         eprintln!("lightview: could not launch a browser ({e}); open the URL above");
     }
 
@@ -145,7 +145,7 @@ async fn open(dirs: &Dirs, dir: &Path) -> Result<std::process::ExitCode, String>
 }
 
 /// The lock was held: find the live window and open it.
-fn open_the_running_one(cache_dir: &Path) -> Result<std::process::ExitCode, String> {
+async fn open_the_running_one(cache_dir: &Path) -> Result<std::process::ExitCode, String> {
     let Some(instance) = Instance::read(cache_dir) else {
         return Err(
             "this gallery is open in another process, but its instance.json could not be read"
@@ -153,7 +153,7 @@ fn open_the_running_one(cache_dir: &Path) -> Result<std::process::ExitCode, Stri
         );
     };
     println!("{}", instance.url);
-    if let Err(e) = open_browser(&instance.url) {
+    if let Err(e) = open_browser(&instance.url).await {
         eprintln!("lightview: could not launch a browser ({e}); open the URL above");
     }
     Ok(std::process::ExitCode::SUCCESS)
@@ -601,8 +601,13 @@ fn load_config(dirs: &Dirs) -> Result<ServerConfig, String> {
 }
 
 /// Hand the URL to the desktop. Failure is reported, never fatal.
-fn open_browser(url: &str) -> Result<(), String> {
-    std::process::Command::new("xdg-open")
+///
+/// `tokio::process` so the handoff leaves nothing behind: `xdg-open` exits the
+/// moment it has handed off, and a `std::process::Child` dropped without a
+/// `wait` would sit in the process table as a zombie for as long as this
+/// gallery stays open. `async` because the spawn needs the reactor.
+async fn open_browser(url: &str) -> Result<(), String> {
+    tokio::process::Command::new("xdg-open")
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
