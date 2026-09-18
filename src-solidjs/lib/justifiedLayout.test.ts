@@ -8,7 +8,13 @@
 // could not have caught either error; three assertions here would have.
 
 import { describe, it, expect } from "vitest";
-import { computeJustifiedLayout } from "./justifiedLayout";
+import {
+  computeJustifiedLayout,
+  rowIndexAtOffset,
+  scaleAnchor,
+  scrollHolding,
+  topAnchor,
+} from "./justifiedLayout";
 
 /** The real defaults, so the numbers mean something. */
 const layout = (aspects: number[], groupStarts?: number[]) =>
@@ -91,5 +97,106 @@ describe("height above an offset carries no information about a change", () => {
     // be the correction. Identity across the change is the missing input.
     const naive = topOfStraddlingRow(before) - topOfStraddlingRow(after);
     expect(Math.abs(naive)).toBeLessThan(tallestRow);
+  });
+});
+
+describe("holding the reader's place", () => {
+  /** Where an item's row starts, in a given layout. */
+  const yOf = (l: ReturnType<typeof layout>, index: number) => {
+    for (const row of l.rows) if (row.cells.some((c) => c.index === index)) return row.y;
+    throw new Error(`item ${index} is in no row`);
+  };
+
+  it("keeps the top item at the top across a removal above it", () => {
+    const S = 1200;
+    const before = layout(aspects(60));
+    const anchor = topAnchor(before, S)!;
+    // The item the reader is looking at, by identity rather than by position:
+    // removing item 1 shifts every later index down by one.
+    const held = anchor.index;
+    const after = layout(aspects(60).filter((_, i) => i !== 1));
+
+    const S2 = scrollHolding(after, { ...anchor, index: held - 1 }, 800);
+    // Its row now sits exactly where it sat relative to the viewport.
+    expect(Math.round(yOf(after, held - 1) - S2)).toBe(Math.round(anchor.offset));
+    // And the correction is real, not the ~0 the refuted design produced.
+    expect(Math.abs(S2 - S)).toBeGreaterThan(20);
+  });
+
+  it("does not move for a removal below the viewport", () => {
+    const S = 600;
+    const before = layout(aspects(60));
+    const anchor = topAnchor(before, S)!;
+    // Item 55 is far below the fold; packing is forward-only, so nothing the
+    // reader can see may move.
+    const after = layout(aspects(60).filter((_, i) => i !== 55));
+    expect(Math.round(scrollHolding(after, anchor, 800))).toBe(S);
+  });
+
+  it("keeps the top item still for an edit inside the viewport", () => {
+    // R3: the gap closes from below and rows above the edit do not move. With a
+    // top anchor this needs no mechanism of its own — the anchor is above the
+    // edit, so it is unmoved and the correction is zero.
+    const S = 1200;
+    const before = layout(aspects(60));
+    const anchor = topAnchor(before, S)!;
+    const inView = before.rows[rowIndexAtOffset(before.rowTops, S + 400)].cells[0].index;
+    expect(inView).toBeGreaterThan(anchor.index);
+    const after = layout(aspects(60).filter((_, i) => i !== inView));
+    expect(Math.round(scrollHolding(after, anchor, 800))).toBe(S);
+  });
+
+  it("a centre anchor is wrong for an edit inside the viewport", () => {
+    // Why the two anchors are not interchangeable: holding an item *below* the
+    // edit drags the whole screen. Pinned so nobody unifies them for symmetry.
+    const S = 1200;
+    const before = layout(aspects(60));
+    const centre = scaleAnchor(before, S, 800)!;
+    const inView = before.rows[rowIndexAtOffset(before.rowTops, S + 100)].cells[0].index;
+    expect(centre.index).toBeGreaterThan(inView);
+    const after = layout(aspects(60).filter((_, i) => i !== inView));
+    const moved = scrollHolding(after, { ...centre, index: centre.index - 1 }, 800);
+    expect(Math.abs(moved - S)).toBeGreaterThan(20);
+  });
+
+  it("holds the centre item's fraction across a zoom", () => {
+    const S = 1200;
+    const V = 800;
+    const before = layout(aspects(60));
+    const anchor = scaleAnchor(before, S, V)!;
+    // A zoom changes no item's identity, so the index is carried as-is.
+    const zoomed = computeJustifiedLayout({
+      aspects: aspects(60),
+      containerWidth: 1600,
+      targetRowHeight: Math.round(240 * 1.12),
+      gap: 4,
+    });
+    const S2 = scrollHolding(zoomed, anchor, V);
+    const row = zoomed.rows[zoomed.rows.findIndex((r) => r.cells.some((c) => c.index === anchor.index))];
+    expect((row.y + row.height / 2 - S2) / V).toBeCloseTo(anchor.fraction, 6);
+  });
+
+  it("does not drift over twenty notches when the anchor is held", () => {
+    // R5's real requirement. Re-deriving the anchor each notch accumulates
+    // rounding; holding the one captured at the gesture's start does not, and
+    // that is also what makes a clamped notch survivable — the next notch
+    // restores from the original reading rather than from the clamped result.
+    const V = 800;
+    let S = 4000;
+    const first = layout(aspects(200));
+    const anchor = scaleAnchor(first, S, V)!;
+    let target = 240;
+    for (let n = 0; n < 20; n++) {
+      target = Math.round(target * 1.12);
+      const next = computeJustifiedLayout({
+        aspects: aspects(200), containerWidth: 1600, targetRowHeight: target, gap: 4,
+      });
+      S = scrollHolding(next, anchor, V);
+    }
+    const last = computeJustifiedLayout({
+      aspects: aspects(200), containerWidth: 1600, targetRowHeight: target, gap: 4,
+    });
+    const row = last.rows[last.rows.findIndex((r) => r.cells.some((c) => c.index === anchor.index))];
+    expect((row.y + row.height / 2 - S) / V).toBeCloseTo(anchor.fraction, 6);
   });
 });

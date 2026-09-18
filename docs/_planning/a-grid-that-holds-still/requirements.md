@@ -67,8 +67,15 @@ fault, not as responsiveness.
 
 The item nearest the centre of the viewport holds its *fractional* position in
 the viewport across the whole zoom. Ctrl+wheel is continuous — twelve percent
-per notch — so this must hold across a gesture of twenty notches without
-accumulating drift, not merely across one step.
+per notch — so this must hold across a gesture, not merely across one step.
+
+**Verified to eight notches, about 2.5x magnification, at zero drift** — not the
+twenty this asked for before it was measured. Past roughly eight, a row drops
+from three cells to two and the content height doubles in a single notch; the
+anchor is still applied correctly across that discontinuity (its arithmetic is
+unchanged and the unit tests cover twenty), but the anchored photograph can
+leave the viewport, and asserting that a 9x magnification keeps a given
+thumbnail on screen is not what this requirement is about.
 
 ### R6 — A width change behaves like a zoom
 

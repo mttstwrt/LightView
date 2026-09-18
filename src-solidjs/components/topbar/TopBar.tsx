@@ -8,7 +8,7 @@ import { displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelec
 import { viewerOpen } from "../../stores/viewerStore";
 import { prefs } from "../../stores/settingsStore";
 import { isMobile } from "../../lib/runtime";
-import { onScrollHost, scrollTop } from "../../lib/scrollHost";
+import { adjustmentTotal, onScrollHost, scrollTop } from "../../lib/scrollHost";
 
 interface TopBarProps {
   /** What the command list runs. Declared once in `App`, which owns the
@@ -146,10 +146,17 @@ export function TopBar(props: TopBarProps) {
     // Mobile scroll-direction watcher. Always attached — the handler bails out
     // on desktop so behavior stays purely hover-driven there.
     let lastY = scrollTop();
+    let lastAdjustment = adjustmentTotal();
     const onScroll = () => {
       if (!isMobile()) return;
       const y = scrollTop();
-      const dy = y - lastY;
+      // Only what the reader did. The grid compensates its own scroll position
+      // to hold the gallery still across a relayout, and six pixels of that is
+      // enough to hide this bar — so without the discount, a photo arriving
+      // somewhere off-screen would close the toolbar under the reader's thumb.
+      const total = adjustmentTotal();
+      const dy = y - lastY - (total - lastAdjustment);
+      lastAdjustment = total;
       if (y < MOBILE_REVEAL_AT_TOP) {
         setScrollHidden(false);
       } else if (dy > MOBILE_DIR_THRESHOLD) {

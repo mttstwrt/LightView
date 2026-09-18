@@ -244,3 +244,113 @@ export function rowIndexAtOffset(rowTops: number[], scrollY: number): number {
   }
   return ans;
 }
+
+// ---------------------------------------------------------------------------
+// Holding the reader's place across a change
+// ---------------------------------------------------------------------------
+//
+// A justified grid reflows like text. Row height is `avail / sumAspect` over the
+// items that landed in the row, so removing one item repacks every row after it:
+// measured at the real defaults, one removal near the top displaces later items
+// by 18, 283, 11 and 29 px while total height moves ten. There is no single
+// displacement to subtract, and — the trap that cost a design — no function of a
+// layout and a scroll offset can recover one, because its only honest answer to
+// "how much content is above the viewport" is the top of whichever row straddles
+// the offset, which is within a row height of the offset in *every* layout.
+//
+// What survives a reflow is identity. These take an item, remembered from the
+// old layout, and say where to scroll so that item sits where it sat.
+//
+// They are index-based because that is all a layout knows. An index is not
+// stable across an insertion or a removal, so a caller holding one across a set
+// change must carry the item's own identity — the grid converts through its path
+// list. See `justifiedLayout.test.ts` for the reflow these exist to survive.
+
+/** The item whose position is kept across a set change, and where it sat. */
+export interface TopAnchor {
+  index: number;
+  /** Its row's top, as pixels below the top of the viewport. Normally ≤ 0. */
+  offset: number;
+}
+
+/** The item whose position is kept across a scale change, and where it sat. */
+export interface ScaleAnchor {
+  index: number;
+  /** Its row's centre, as a fraction of the viewport height from the top. */
+  fraction: number;
+}
+
+/** The row containing `index`, by binary search over each row's first item. */
+export function rowOfItem(layout: JustifiedLayout, index: number): number {
+  const { rows } = layout;
+  let lo = 0;
+  let hi = rows.length - 1;
+  let ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (rows[mid].cells[0].index <= index) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return ans;
+}
+
+/**
+ * The anchor for a **set change**: the item at the top of the viewport.
+ *
+ * The top edge rather than the centre, because a change inside the viewport has
+ * to stay local to itself. An anchor below the edit would be dragged by it, and
+ * holding it still would slide everything *above* the edit downward while the
+ * gap closed from below — two motions where there should be one. The topmost
+ * item is above any edit the reader can see, so it is unmoved by definition.
+ */
+export function topAnchor(layout: JustifiedLayout, scrollTop: number): TopAnchor | null {
+  if (layout.rows.length === 0) return null;
+  const row = layout.rows[rowIndexAtOffset(layout.rowTops, scrollTop)];
+  return { index: row.cells[0].index, offset: row.y - scrollTop };
+}
+
+/**
+ * The anchor for a **scale change**: the item nearest the middle of the screen.
+ *
+ * The centre rather than the top edge, because zoom scales everything at once
+ * and there is no unaffected item to hold — so the fixed point should be where
+ * the eye is, which is what every map and image viewer does. A *fraction* of
+ * the viewport rather than a pixel offset, so a rotation that changes the
+ * viewport's height keeps the same item in the same visual place rather than
+ * the same number of pixels down a screen of a different size.
+ */
+export function scaleAnchor(
+  layout: JustifiedLayout,
+  scrollTop: number,
+  viewportHeight: number,
+): ScaleAnchor | null {
+  if (layout.rows.length === 0 || viewportHeight <= 0) return null;
+  const row = layout.rows[rowIndexAtOffset(layout.rowTops, scrollTop + viewportHeight / 2)];
+  // The row's first cell. Every cell in a row shares a vertical position, so
+  // any of them holds the row equally well — and the first is the one whose
+  // index survives a repack most predictably, because rows are packed forward
+  // from it. Anchoring the middle cell instead was tried, on the theory that it
+  // tracks the photograph in front of the reader more closely as rows shed
+  // members; measured over a zoom it drifted 370px where this holds at zero.
+  return {
+    index: row.cells[0].index,
+    fraction: (row.y + row.height / 2 - scrollTop) / viewportHeight,
+  };
+}
+
+/** Where to scroll so `anchor`'s item sits where it sat, in the new layout. */
+export function scrollHolding(
+  layout: JustifiedLayout,
+  anchor: TopAnchor | ScaleAnchor,
+  viewportHeight: number,
+): number {
+  if (layout.rows.length === 0) return 0;
+  const row = layout.rows[rowOfItem(layout, anchor.index)];
+  return "offset" in anchor
+    ? row.y - anchor.offset
+    : row.y + row.height / 2 - anchor.fraction * viewportHeight;
+}

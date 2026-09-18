@@ -43,17 +43,31 @@ const state = join(work, "state");
 
 // A gallery with enough cells to fill more than one row, and a portrait among
 // them so the justified layout has a reason to compute anything.
+// Sixty, not twelve. Twelve is barely one viewport at desktop width, which
+// leaves the steadiness checks below nothing above the fold to remove and no
+// room to zoom twenty notches without hitting the end of the content — they
+// would pass on a broken build by having nothing to measure.
+const COUNT = 60;
 const { execFileSync } = await import("node:child_process");
 execFileSync("mkdir", ["-p", join(gallery, "2026")]);
-for (let i = 0; i < 12; i++) {
+for (let i = 0; i < COUNT; i++) {
   const size = i % 3 === 0 ? "480x640" : "800x600";
   execFileSync("ffmpeg", [
     "-y", "-v", "error", "-f", "lavfi",
     "-i", `testsrc=size=${size}:duration=1`,
-    "-frames:v", "1", join(gallery, "2026", `p${i}.png`),
+    "-frames:v", "1", join(gallery, "2026", `p${String(i).padStart(2, "0")}.png`),
+  ]);
+  // A distinct date each, an hour apart. Written in one loop, these files
+  // otherwise share an mtime to the second, and the gallery sorts on
+  // `COALESCE(date_taken, mtime)` — sixty ties make the display order arbitrary
+  // and unstable between queries, which quietly invalidates every check that
+  // depends on where a photograph is relative to another one.
+  execFileSync("touch", [
+    "-d", `2026-01-01 ${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00`,
+    join(gallery, "2026", `p${String(i).padStart(2, "0")}.png`),
   ]);
 }
-ok("gallery built (12 files)");
+ok(`gallery built (${COUNT} files)`);
 
 // Install the bundled example tagger into this run's state directory, so the
 // plugin path is exercised from the UI as well as from `lightview tag`.
@@ -355,6 +369,134 @@ try {
   } else {
     bad("the filter input was unreachable, so the refetch path went unchecked");
   }
+
+  // ---- The grid holds its place ------------------------------------------
+  //
+  // What is asserted is *identity at a screen position*: the same photograph,
+  // at the same height on the display, after the layout changed underneath it.
+  //
+  // Not "a cell is near the middle" — there is always a cell near the middle,
+  // so that measures nothing. On the build before this change the same probe
+  // reported a stable-looking centre while the photograph occupying it changed
+  // from p09 to p38.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.waitForTimeout(600);
+
+  const host = ".hide-scrollbar.fixed.inset-0";
+  // A photograph is identified by its gallery path, not by its thumbnail URL:
+  // zooming in promotes a cell to a larger tier, which rewrites the `src`. A
+  // check keyed on the URL reports the photo as having vanished exactly when
+  // the zoom it is testing starts working.
+  const PATH_OF = `(img) => decodeURIComponent(
+    img.getAttribute("src").split("/thumb/")[1].replace(/^[a-z]+\\//, "").split("?")[0])`;
+
+  /** The photograph nearest the middle of the screen, and where it sits. */
+  const middle = () =>
+    page.evaluate((fn) => {
+      const pathOf = eval(fn);
+      const mid = window.innerHeight / 2;
+      let best = null;
+      for (const img of document.querySelectorAll("img[src*='/thumb/']")) {
+        const r = img.getBoundingClientRect();
+        const d = Math.abs(r.top + r.height / 2 - mid);
+        if (!best || d < best.d) {
+          best = { d, path: pathOf(img), centre: Math.round(r.top + r.height / 2) };
+        }
+      }
+      return best;
+    }, PATH_OF);
+
+  /** Where one known photograph sits now, or null if it is not rendered. */
+  const find = (want) =>
+    page.evaluate(([fn, target]) => {
+      const pathOf = eval(fn);
+      for (const img of document.querySelectorAll("img[src*='/thumb/']")) {
+        if (pathOf(img) !== target) continue;
+        const r = img.getBoundingClientRect();
+        return Math.round(r.top + r.height / 2);
+      }
+      return null;
+    }, [PATH_OF, want]);
+
+  await page.evaluate((sel) => { document.querySelector(sel).scrollTop = 1400; }, host);
+  await page.waitForTimeout(700);
+  const watched = await middle();
+
+  // Delete a file from *above* the viewport. The watcher drops it from the
+  // index, the client splices it out, and the grid reflows — which repacks
+  // every row after the edit, so nothing below it lands where it was unless the
+  // reader's own item is held by identity.
+  // Five files, not one. Removing a single item from a fixture whose aspects
+  // repeat every four items barely moves anything: the rows above repack to
+  // almost the same cumulative height, and the check passes on a build with no
+  // compensation at all. Five is more than one row's worth, so the content
+  // above the viewport genuinely loses a row and everything below it has to be
+  // held deliberately.
+  // The *newest* five, because the gallery sorts newest first — deleting p00
+  // removes the last row in the view, below the fold, where nothing needs
+  // holding and the check passes on any build at all.
+  const cellsBefore = await page.locator("img[src*='/thumb/']").count();
+  for (let i = COUNT - 5; i < COUNT; i++) {
+    execFileSync("rm", ["-f", join(gallery, "2026", `p${String(i).padStart(2, "0")}.png`)]);
+  }
+  await page.waitForFunction(
+    (n) => document.querySelectorAll("img[src*='/thumb/']").length !== n,
+    cellsBefore,
+    { timeout: 20_000 },
+  ).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const afterRemoval = await find(watched.path);
+  check(
+    `a removal above the viewport leaves the watched photo put (${watched.centre} -> ${afterRemoval}px)`,
+    afterRemoval !== null && Math.abs(afterRemoval - watched.centre) <= 3,
+  );
+
+  // Eight notches of ctrl+wheel zoom — about two and a half times magnification,
+  // which grows the content from roughly 2700px to 7500px. Dispatched rather
+  // than driven through `mouse.wheel`, which does not carry the Ctrl modifier
+  // into the wheel event and so scrolls two thousand pixels instead of zooming
+  // at all.
+  //
+  // Eight rather than the twenty the plan asked for. Past that the justified
+  // layout hits a discontinuity — a row drops from three cells to two and the
+  // content height doubles in a single notch — and the anchored photograph can
+  // leave the viewport entirely even though the anchor is applied correctly.
+  // Asserting through that would be asserting that a 9x magnification keeps a
+  // thumbnail on screen, which is not what the requirement is about.
+  const zoomWatched = await middle();
+  for (let i = 0; i < 8; i++) {
+    await page.evaluate(() =>
+      window.dispatchEvent(
+        new WheelEvent("wheel", {
+          deltaY: -120, deltaMode: 0, ctrlKey: true, bubbles: true, cancelable: true,
+        }),
+      ),
+    );
+    await page.waitForTimeout(90);
+  }
+  // Wait for it rather than sampling on a timer: a zoom promotes cells to a
+  // larger tier, and a tier the server has not generated yet arrives when it
+  // arrives. A fixed delay reports the photograph as missing when it is only
+  // late.
+  await page
+    .waitForFunction(
+      ([fn, target]) => {
+        const pathOf = eval(fn);
+        for (const img of document.querySelectorAll("img[src*='/thumb/']")) {
+          if (pathOf(img) === target) return true;
+        }
+        return false;
+      },
+      [PATH_OF, zoomWatched.path],
+      { timeout: 20_000 },
+    )
+    .catch(() => {});
+  const afterZoom = await find(zoomWatched.path);
+  check(
+    `zooming 2.5x leaves the watched photo where it was (${zoomWatched.centre} -> ${afterZoom}px)`,
+    afterZoom !== null && Math.abs(afterZoom - zoomWatched.centre) <= 12,
+  );
 
   // Nothing is filtered out of either list. A 404 the page causes is a 404 a
   // user sees in their console, and "that one is fine" is how the missing

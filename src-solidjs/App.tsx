@@ -361,7 +361,15 @@ export function App() {
               onCleanup(() => setScrollHost(null));
             }}
             class="hide-scrollbar fixed inset-0 overflow-y-auto overflow-x-hidden"
-            style={{ "overscroll-behavior-y": "contain" }}
+            /* `overflow-anchor: none` because the grid does its own anchoring
+               and two of them would fight. The browser's would adjust
+               `scrollTop` before the grid's effect reads it, and the effect
+               would then apply its correction on top — overshoot on Chrome and
+               Firefox, correct on Safari, which is the worst shape a bug can
+               take. Whether Blink would in fact anchor these out-of-flow cells
+               is arguable either way; turning it off means never having to be
+               right about it. */
+            style={{ "overscroll-behavior-y": "contain", "overflow-anchor": "none" }}
           >
             <JustifiedGrid
               paths={displayPaths()}

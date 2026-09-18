@@ -28,10 +28,26 @@ import type { ThumbTier } from "../../lib/types";
 import { onThumbRegenerated } from "../../lib/thumbRegeneration";
 import type { CellMeta } from "../../stores/galleryStore";
 import { createThumbProgress } from "../../lib/thumbProgress";
-import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
+import {
+  computeJustifiedLayout,
+  portraitRowBoost,
+  rowIndexAtOffset,
+  scaleAnchor,
+  scrollHolding,
+  topAnchor,
+  type JustifiedLayout,
+  type ScaleAnchor,
+  type TopAnchor,
+} from "../../lib/justifiedLayout";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
 import { createScrollDynamics, constrainedNetwork } from "../../lib/scrollDynamics";
-import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
+import {
+  adjustBy,
+  onScrollHost,
+  scrollToY,
+  scrollTop,
+  viewportHeight,
+} from "../../lib/scrollHost";
 import { VIEWER_PATH_EVENT } from "../../lib/viewerTransition";
 import { pickByPriority } from "../../lib/loadPriority";
 import { createUrlVersions } from "../../lib/urlVersions";
@@ -156,14 +172,20 @@ type DetailLevel = "base" | "mid" | "high";
 export function JustifiedGrid(props: JustifiedGridProps) {
   const gap = () => prefs().grid_gap;
 
-  // Aspect ratios recovered from loaded thumbnails, for paths whose indexed
-  // dimensions aren't known yet (a just-added file is inserted with NULL
-  // width/height and its dimensions are only written when its thumbnail is
-  // generated — after the frontend has already fetched the sorted items). The
-  // j/jm/jh tiers are all aspect-preserving, so a loaded cell's natural pixel
-  // size gives the exact source aspect. Without this such cells lay out 1:1 and
-  // the aspect-correct thumbnail is object-cover cropped to a square — looking
-  // like a grid thumbnail until a restart re-reads the now-populated dimensions.
+  // Aspect ratios recovered from loaded thumbnails, for the paths whose
+  // dimensions the index still does not have.
+  //
+  // That used to be every newly added file, because dimensions were written
+  // only as a side effect of generating a thumbnail — after the frontend had
+  // already fetched the sorted items. It is not any more: the watcher reads an
+  // image's header before it announces the file. What is left is a cache from
+  // before that change and the formats neither reader can parse, RAW and AVIF.
+  //
+  // The j/jm/jh tiers are all aspect-preserving, so a loaded cell's natural
+  // pixel size gives the exact source aspect. Without this such cells lay out
+  // 1:1 and the aspect-correct thumbnail is object-cover cropped to a square.
+  // Each correction is a relayout, so it is held steady like any other — see
+  // the anchoring effect below.
   const [measuredAspects, setMeasuredAspects] = createSignal<Map<string, number>>(new Map());
   // A path's aspect: indexed dimensions win; fall back to a measured value, then
   // 1:1. Reads measuredAspects() so consumers recompute when a cell is measured.
@@ -323,6 +345,92 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
   const totalHeight = () => layout().totalHeight;
 
+  // -----------------------------------------------------------------------
+  // Holding the reader's place across a relayout
+  // -----------------------------------------------------------------------
+  //
+  // The layout changes for reasons the reader cannot see: a photo arriving or
+  // leaving anywhere in the library, a thumbnail decoding and revealing an
+  // aspect the index did not have. Left alone, the content under the viewport
+  // slides and the reader loses their place — and because a justified grid
+  // reflows like text, there is no single displacement to undo. What is held is
+  // one *item*, chosen differently for the two kinds of change:
+  //
+  //   a set change — pin the item at the top edge, because it is above any edit
+  //   the reader can see, so an edit on screen closes its own gap from below
+  //   and nothing above it moves;
+  //
+  //   a scale change — pin the item in the middle, because zoom moves
+  //   everything and the fixed point should be where the eye is.
+  //
+  // A viewport *height* change is neither. `computeJustifiedLayout` takes no
+  // height, so the keyboard opening cannot reach this effect at all, and
+  // holding the top edge while the reader simply sees less is what the browser
+  // already does unaided.
+
+  /** Where the reader last put themselves, and how much they could see. */
+  let reader = { top: 0, height: 0 };
+  const noteReaderPosition = () => {
+    reader = { top: scrollTop(), height: viewportHeight() };
+  };
+
+  // Captured once per zoom gesture rather than per notch. Twenty notches of
+  // re-deriving accumulates rounding into visible drift, and a notch that
+  // clamps at the end of the content would poison every reading after it.
+  let zoomHold: ScaleAnchor | null = null;
+
+  let lastScale = { row: 0, width: 0 };
+  let lastPaths: readonly string[] = [];
+
+  createEffect(
+    on(layout, (next, previous) => {
+      const row = targetRowHeight();
+      const width = contentWidth();
+      const paths = props.paths;
+      const wasScale = lastScale;
+      const wasPaths = lastPaths;
+      lastScale = { row, width };
+      lastPaths = paths;
+
+      if (!previous || previous.rows.length === 0 || next.rows.length === 0) return;
+      if (reader.height === 0) noteReaderPosition();
+
+      const scaled = row !== wasScale.row || width !== wasScale.width;
+      const anchor = scaled
+        ? (zoomHold ?? scaleAnchor(previous, reader.top, reader.height))
+        : holdTopAcrossSetChange(previous, wasPaths, paths);
+      if (!anchor) return;
+
+      const applied = adjustBy(scrollHolding(next, anchor, viewportHeight()) - scrollTop());
+      reader = { top: reader.top + applied, height: viewportHeight() };
+    }),
+  );
+
+  /**
+   * The top-edge anchor, translated through item identity.
+   *
+   * An index means a different photograph after an insertion or a removal, so
+   * the index the old layout reports is looked up as a path and found again in
+   * the new list. When the anchored item is the one that left, the next
+   * surviving item after it inherits the anchor — the reader's place is "here,
+   * in the sequence", and the nearest thing still present is the honest reading
+   * of that.
+   */
+  function holdTopAcrossSetChange(
+    previous: JustifiedLayout,
+    wasPaths: readonly string[],
+    paths: readonly string[],
+  ): TopAnchor | null {
+    const anchor = topAnchor(previous, reader.top);
+    if (!anchor) return null;
+    const live = new Set(paths);
+    for (let i = anchor.index; i < wasPaths.length; i++) {
+      if (!live.has(wasPaths[i])) continue;
+      return { index: paths.indexOf(wasPaths[i]), offset: anchor.offset };
+    }
+    return null;
+  }
+
   // Cells within the rendered row range, with absolute positions. A memo so the
   // several consumers below (geometry store, visible-path list, src assignment)
   // share one computation per change.
@@ -462,7 +570,15 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // frame re-derives the visible row range.
   const dynamics = createScrollDynamics({
     rowHeight: () => targetRowHeight() + gap(),
-    onFrame: () => recalcRange?.(),
+    onFrame: () => {
+      // The reader has moved, so this is the place to hold next time. Reading
+      // it here rather than inside the layout effect is what makes the value a
+      // *reader's* choice: by the time a relayout runs, the browser may already
+      // have clamped `scrollTop` because the content shrank, and clamping is
+      // not a decision anyone made.
+      noteReaderPosition();
+      recalcRange?.();
+    },
   });
   onCleanup(() => dynamics.dispose());
 
@@ -922,6 +1038,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // During a Ctrl+drag selection, fall through to scroll (mirrors GalleryGrid).
     const detachWheel = createWheelScroll({
       onSettle: () => loop.schedule(),
+      onZoomStart: () => {
+        zoomHold = scaleAnchor(layout(), reader.top, reader.height);
+      },
+      onZoomEnd: () => {
+        zoomHold = null;
+      },
       onZoom: (e) => {
         if (isDragging()) return false;
         const cur = prefs().thumbnail_size;

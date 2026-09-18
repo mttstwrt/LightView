@@ -1,6 +1,6 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show, For } from "solid-js";
 import { markScrollBarActive, markScrollBarReleased } from "../../lib/scrollDynamics";
-import { scrollHost } from "../../lib/scrollHost";
+import { adjustmentTotal, scrollHost } from "../../lib/scrollHost";
 import { hasTouch } from "../../lib/runtime";
 
 export interface ScrollIndicator {
@@ -142,9 +142,18 @@ export function ScrollBar(props: ScrollBarProps) {
     }
   };
 
+  // The rail reveals itself when the gallery scrolls, but not when the gallery
+  // scrolls *itself*: holding the grid still across a relayout would otherwise
+  // flash the scrollbar for its 1200ms every time a photo arrived anywhere in
+  // the library. The thumb still moves — `recalc` is unconditional — it just
+  // does so without announcing itself.
+  let lastAdjustment = adjustmentTotal();
   const onScroll = () => {
     recalc();
-    showTemporarily();
+    const total = adjustmentTotal();
+    const programmatic = total !== lastAdjustment;
+    lastAdjustment = total;
+    if (!programmatic) showTemporarily();
   };
 
   // --- Dragging the thumb (cursor and finger alike) -------------------------

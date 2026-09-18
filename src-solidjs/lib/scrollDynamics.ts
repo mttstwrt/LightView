@@ -2,7 +2,13 @@
 
 import { createSignal, untrack, type Accessor } from "solid-js";
 import { ewmaImageLoadMs } from "./loadLatency";
-import { maxScroll, onScrollHost, scrollTop, viewportHeight } from "./scrollHost";
+import {
+  adjustmentTotal,
+  maxScroll,
+  onScrollHost,
+  scrollTop,
+  viewportHeight,
+} from "./scrollHost";
 
 // ---------------------------------------------------------------------------
 // Shared scroll dynamics for the virtualized grid views.
@@ -218,6 +224,7 @@ export function createScrollDynamics(opts: {
 
   let lastY = scrollTop();
   let lastTs = performance.now();
+  let lastAdjustment = adjustmentTotal();
   let vel = 0;
   let dir: 1 | -1 = 1;
   let rafId = 0;
@@ -287,9 +294,18 @@ export function createScrollDynamics(opts: {
     rafId = requestAnimationFrame((now) => {
       const y = scrollTop();
       const dt = (now - lastTs) / 1000;
-      const dy = Math.abs(y - lastY);
+      // Discount whatever the grid moved us by. A compensation lands in one
+      // frame, so its velocity is enormous and its direction is arbitrary —
+      // left in, it reads as a fling and costs the cells it just took care not
+      // to disturb their resolution, and it flips the look-ahead's direction
+      // for good measure.
+      const total = adjustmentTotal();
+      const programmatic = total - lastAdjustment;
+      lastAdjustment = total;
+      const raw = y - lastY - programmatic;
+      const dy = Math.abs(raw);
       vel = dt > 0 ? dy / dt : 0;
-      dir = y >= lastY ? 1 : -1;
+      dir = raw >= 0 ? 1 : -1;
       lastY = y;
       lastTs = now;
 
