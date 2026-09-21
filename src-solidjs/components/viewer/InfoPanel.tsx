@@ -1,13 +1,7 @@
 import { Show, For, createSignal, createEffect, on, onCleanup, onMount } from "solid-js";
-import {
-  getMediaMeta,
-  getTags,
-  addUserTag,
-  removeUserTag,
-  getAllThumbnailTiers,
-} from "../../lib/ipc";
+import { api } from "../../lib/ipc";
 import { rateItem } from "../../stores/galleryStore";
-import type { ThumbnailTierInfo } from "../../lib/ipc";
+import type { MediaMeta, TierPresence } from "../../lib/types";
 import { ScrollBar } from "../shared/ScrollBar";
 import { hasTouch } from "../../lib/runtime";
 import { setInfoPanelOpen } from "../../stores/viewerStore";
@@ -35,15 +29,6 @@ function formatDate(unixTimestamp: number): string {
   });
 }
 
-interface MetaInfo {
-  media_type: string;
-  file_size: number;
-  date_taken: number | null;
-  width: number | null;
-  height: number | null;
-  duration_seconds: number | null;
-}
-
 export function InfoPanel(props: {
   path: string;
   filename: string;
@@ -52,12 +37,12 @@ export function InfoPanel(props: {
    *  their chips stay inert. */
   onTagFilter?: (namespace: string, tag: string) => void;
 }) {
-  const [meta, setMeta] = createSignal<MetaInfo | null>(null);
+  const [meta, setMeta] = createSignal<MediaMeta | null>(null);
   const [tags, setTags] = createSignal<{ namespace: string; tag: string }[]>([]);
   const [newTag, setNewTag] = createSignal("");
   const [rating, setRating] = createSignal(0);
   const [lastRated, setLastRated] = createSignal<number | null>(null);
-  const [thumbTiers, setThumbTiers] = createSignal<ThumbnailTierInfo[]>([]);
+  const [thumbTiers, setThumbTiers] = createSignal<TierPresence[]>([]);
   const [thumbExpanded, setThumbExpanded] = createSignal(false);
   const [expandedNamespaces, setExpandedNamespaces] = createSignal<Set<string>>(
     new Set(["user"]),
@@ -72,10 +57,15 @@ export function InfoPanel(props: {
     });
   };
 
-  const loadTags = async (path: string) => {
+  /** Re-read the row after a tag edit. One call: `get_media_meta` carries the
+   *  tags, so there is no second round trip for them. */
+  const reload = async (path: string) => {
     try {
-      const result = await getTags(path);
-      setTags(result);
+      const result = await api.mediaMeta(path);
+      if (!result) return;
+      setMeta(result);
+      setTags(result.tags.map(([namespace, tag]) => ({ namespace, tag })));
+      setRating(result.rating ?? 0);
     } catch {}
   };
 
@@ -89,26 +79,10 @@ export function InfoPanel(props: {
         setRating(0);
         setLastRated(null);
         setThumbTiers([]);
+        await reload(path);
         try {
-          const result = await getMediaMeta(path);
-          if (result) {
-            setMeta({
-              media_type: result.media_type,
-              file_size: result.file_size,
-              date_taken: result.date_taken,
-              width: result.width,
-              height: result.height,
-              duration_seconds: result.duration_seconds,
-            });
-            setRating(result.rating ?? 0);
-            setLastRated(result.last_rated);
-          }
+          setThumbTiers(await api.tiers(path));
         } catch {}
-        try {
-          const tiers = await getAllThumbnailTiers(path);
-          setThumbTiers(tiers);
-        } catch {}
-        loadTags(path);
       },
     ),
   );
@@ -118,9 +92,9 @@ export function InfoPanel(props: {
     const tag = newTag().trim();
     if (!tag || !props.path) return;
     try {
-      await addUserTag(props.path, tag);
+      await api.addTags([props.path], [tag], "user");
       setNewTag("");
-      loadTags(props.path);
+      void reload(props.path);
     } catch (err) {
       console.error("Failed to add tag:", err);
     }
@@ -129,8 +103,8 @@ export function InfoPanel(props: {
   const handleRemoveTag = async (tag: string) => {
     if (!props.path) return;
     try {
-      await removeUserTag(props.path, tag);
-      loadTags(props.path);
+      await api.removeTags([props.path], [tag], "user");
+      void reload(props.path);
     } catch (err) {
       console.error("Failed to remove tag:", err);
     }
@@ -249,12 +223,27 @@ export function InfoPanel(props: {
   };
 
   // One compact line instead of a label:value row per fact.
+  /** The capture time when the file has one, its modification time when it
+   *  does not — and **labelled**, because they are different facts. Most of a
+   *  library has no EXIF: screenshots, exports, anything out of a messaging
+   *  app, every video. Showing a copy date unlabelled as a capture date would
+   *  be a confident lie, and the grid sorts by the same fallback, so the panel
+   *  saying which one it is doubles as the explanation for where the file sat
+   *  in the scroll. */
+  const dateLine = () => {
+    const m = meta();
+    if (!m) return null;
+    return m.date_taken !== null
+      ? `Taken ${formatDate(m.date_taken)}`
+      : `Modified ${formatDate(m.mtime)}`;
+  };
+
   const metaLine = () => {
     const m = meta();
     if (!m) return "";
     const parts = [m.media_type.toUpperCase(), formatBytes(m.file_size)];
     if (m.width && m.height) parts.push(`${m.width} × ${m.height}`);
-    if (m.duration_seconds) parts.push(`${m.duration_seconds.toFixed(1)}s`);
+    if (m.duration) parts.push(`${m.duration.toFixed(1)}s`);
     return parts.join(" · ");
   };
 
@@ -266,8 +255,8 @@ export function InfoPanel(props: {
             <div class="text-[11px] text-neutral-600 break-all mt-0.5">{props.path}</div>
             <Show when={meta()}>
               <div class="text-neutral-300 mt-1.5">{metaLine()}</div>
-              <Show when={meta()!.date_taken}>
-                <div class="text-neutral-500 mt-0.5">{formatDate(meta()!.date_taken!)}</div>
+              <Show when={dateLine()}>
+                {(line) => <div class="text-neutral-500 mt-0.5">{line()}</div>}
               </Show>
             </Show>
           </div>
@@ -294,16 +283,23 @@ export function InfoPanel(props: {
               </button>
               <Show when={thumbExpanded()}>
                 <div class="mt-2 space-y-3">
+                  {/* Four tiers, one family: every one is a WebP fitted
+                      inside a square of `edge` px with the same filter, so the
+                      only thing that differs between rows is the edge and
+                      whether the tier has been generated yet. The old panel
+                      printed a format and a resize filter per row because the
+                      seven tiers it listed genuinely disagreed about both. */}
                   <For each={thumbTiers()}>
                     {(tier) => (
                       <div class="pl-1 space-y-1.5">
-                        <span class="text-neutral-400 text-[11px] font-medium uppercase tracking-wider">{tier.tier}</span>
-                        <InfoRow label="Dimensions" value={`${tier.width} × ${tier.height}`} />
-                        <InfoRow label="Format" value={tier.format.toUpperCase()} />
-                        <InfoRow label="Size" value={formatBytes(tier.size_bytes)} />
-                        <Show when={tier.resize_filter}>
-                          <InfoRow label="Resize" value={tier.resize_filter!.charAt(0).toUpperCase() + tier.resize_filter!.slice(1)} />
-                        </Show>
+                        <span class="text-neutral-400 text-[11px] font-medium uppercase tracking-wider">
+                          {tier.tier}
+                        </span>
+                        <InfoRow label="Fits" value={`${tier.edge} px`} />
+                        <InfoRow
+                          label="Size"
+                          value={tier.bytes == null ? "not generated" : formatBytes(tier.bytes)}
+                        />
                       </div>
                     )}
                   </For>

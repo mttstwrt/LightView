@@ -2,15 +2,13 @@ import { Show, For, createSignal, createEffect, onCleanup, onMount } from "solid
 import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
 import { SettingsMenu } from "./SettingsMenu";
-import { TitleBar } from "./TitleBar";
 import { CommandMenu, CommandFab, commandsOpen, setCommandsOpen, type CommandHandlers } from "./CommandMenu";
-import { ViewSwitcher } from "./ViewSwitcher";
 import { CloseIcon, SearchIcon, SelectIcon } from "./icons";
-import { viewMode, setViewMode, enabledViews, VIEW_CHOICES, displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode, selectedPaths } from "../../stores/galleryStore";
+import { displayPaths, settingsOpen, setSettingsOpen, selectionMode, toggleSelectionMode, selectedPaths } from "../../stores/galleryStore";
 import { viewerOpen } from "../../stores/viewerStore";
-import { settings } from "../../stores/settingsStore";
-import { isMobile, isTauri } from "../../lib/runtime";
-import { onScrollHost, scrollTop } from "../../lib/scrollHost";
+import { prefs } from "../../stores/settingsStore";
+import { isMobile } from "../../lib/runtime";
+import { adjustmentTotal, onScrollHost, scrollTop } from "../../lib/scrollHost";
 
 interface TopBarProps {
   /** What the command list runs. Declared once in `App`, which owns the
@@ -36,7 +34,7 @@ export function TopBar(props: TopBarProps) {
 
   // Mobile filter/sort sheet: pinned to the top under the safe-area inset, or a
   // thumb-reachable sheet sliding up from the bottom (user preference).
-  const sheetAtBottom = () => settings().display.mobile_filter_sheet === "bottom";
+  const sheetAtBottom = () => prefs().mobile_filter_sheet === "bottom";
   // Drives the slide-in transition: the sheet mounts offscreen (entered=false),
   // then flips after a paint so the transform transitions instead of snapping.
   const [sheetEntered, setSheetEntered] = createSignal(false);
@@ -107,10 +105,6 @@ export function TopBar(props: TopBarProps) {
     }
   });
 
-  // Frameless (decorations: false) desktop gets a custom titlebar row above the
-  // filter row; both reveal together off the same hover state.
-  const frameless = () => isTauri() && !isMobile();
-
   // Debounce the hide so the pointer can travel across the gap between the
   // titlebar and filter rows without the chrome collapsing mid-move.
   let hideTimer: number | undefined;
@@ -152,10 +146,17 @@ export function TopBar(props: TopBarProps) {
     // Mobile scroll-direction watcher. Always attached — the handler bails out
     // on desktop so behavior stays purely hover-driven there.
     let lastY = scrollTop();
+    let lastAdjustment = adjustmentTotal();
     const onScroll = () => {
       if (!isMobile()) return;
       const y = scrollTop();
-      const dy = y - lastY;
+      // Only what the reader did. The grid compensates its own scroll position
+      // to hold the gallery still across a relayout, and six pixels of that is
+      // enough to hide this bar — so without the discount, a photo arriving
+      // somewhere off-screen would close the toolbar under the reader's thumb.
+      const total = adjustmentTotal();
+      const dy = y - lastY - (total - lastAdjustment);
+      lastAdjustment = total;
       if (y < MOBILE_REVEAL_AT_TOP) {
         setScrollHidden(false);
       } else if (dy > MOBILE_DIR_THRESHOLD) {
@@ -197,15 +198,6 @@ export function TopBar(props: TopBarProps) {
           onMouseEnter={handleMouseEnter}
         />
 
-        {/* Custom window titlebar — only when the native frame is hidden. */}
-        <Show when={frameless()}>
-          <TitleBar
-            visible={visible()}
-            onMouseEnter={handleMouseEnter}
-            onMouseLeave={handleMouseLeave}
-          />
-        </Show>
-
         {/* The bar itself. We slide via `top` (not `transform`) so the bar
             doesn't establish a containing block for fixed descendants —
             otherwise SettingsMenu's drawer would be confined to it. */}
@@ -214,7 +206,7 @@ export function TopBar(props: TopBarProps) {
           style={{
             background: "rgba(10, 10, 10, 0.85)",
             "backdrop-filter": "blur(12px)",
-            top: visible() ? (frameless() ? "2rem" : "0") : "-3rem",
+            top: visible() ? "0" : "-3rem",
             opacity: visible() ? "1" : "0",
           }}
           onMouseEnter={handleMouseEnter}
@@ -228,23 +220,6 @@ export function TopBar(props: TopBarProps) {
             title="Images in the current filter"
           >
             {displayPaths().length.toLocaleString()}
-          </div>
-          {/* View-mode selector. Only the views this gallery has enabled —
-              a disabled view generates no thumbnails, so offering it would
-              open onto a grid decoding the library on the spot. */}
-          <div class="shrink-0 flex items-center gap-0.5 p-0.5 rounded bg-neutral-800/60">
-            <For each={VIEW_CHOICES.filter((v) => enabledViews().includes(v.mode))}>
-              {(v) => (
-                <button
-                  onClick={() => setViewMode(v.mode)}
-                  class="px-2 py-0.5 text-xs rounded cursor-pointer transition-colors text-neutral-300 hover:bg-neutral-700"
-                  classList={{ "bg-neutral-700 text-white": viewMode() === v.mode }}
-                  title={v.title}
-                >
-                  {v.label}
-                </button>
-              )}
-            </For>
           </div>
           {/* Actions and settings drop from the same anchor: only one of them
               is ever open, and sharing the wrapper keeps the settings panel
@@ -318,8 +293,6 @@ export function TopBar(props: TopBarProps) {
           >
             <SelectIcon size={20} />
           </button>
-
-          <ViewSwitcher visible={visible()} />
         </div>
 
         {/* Filter + sort sheet */}

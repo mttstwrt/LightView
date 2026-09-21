@@ -1,55 +1,53 @@
 // Configuration only — the things you *set*.
 //
-// Everything you *do* moved out to the command list (`CommandMenu.tsx`) when
-// this drawer stopped distinguishing between the two; opening this panel is
-// itself the last entry in that list, on both surfaces. What is left is one
+// Everything you *do* moved out to the command list (`CommandMenu.tsx`);
+// opening this panel is itself the last entry in that list. What is left is one
 // ordered list of `Section`s, and the order is source order: the `order` prop
 // this used to carry let thirteen call sites each pick a magic number, four of
-// which collided, because nobody ever saw all thirteen at once. See
-// docs/frontend/chrome.md.
+// which collided, because nobody ever saw all thirteen at once.
+//
+// **Three sections, down from nine.** The ones that went are not a trim for
+// tidiness — each described a mechanism that no longer exists:
+//
+//   - *Remote Access* (a third of this file: the enable/disable toggle, port
+//     field, QR pairing, device roster, password form, inactivity selector,
+//     upload and delete switches) — a served bind is `lightview --serve`, and
+//     nothing is `Owner` under it, so the administration moved to
+//     `lightview pair`, `lightview devices` and `lightview password`, which are
+//     the only place it could live.
+//   - *Views* — there is one grid and it is justified.
+//   - *Storage* — the companion location is one place now, and the cache moved
+//     out of the gallery entirely.
+//   - *GPU acceleration* — the compositing path it toggled went with the
+//     desktop webview.
+//   - *Reset connection* — it unregistered the service worker so iOS would
+//     re-prompt for the certificate; there is no service worker, and reloading
+//     is the whole recovery.
+//
+// **Display preferences are per client, for every client.** They live in
+// `clientPrefs` (localStorage), not in a file inside the gallery: a file in the
+// gallery is per *gallery*, so two desktops mounting one share would fight over
+// thumbnail size — the exact thing a per-client preference exists to prevent.
 
-import { createSignal, createEffect, Show, For, onCleanup, onMount } from "solid-js";
+import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { Portal, Dynamic } from "solid-js/web";
+
 import { CloseIcon } from "./icons";
-import { settings, setSettings } from "../../stores/settingsStore";
-import { displayPaths, settingsOpen, setSettingsOpen, enabledViews, applyEnabledViews, loadEnabledViews, VIEW_CHOICES, type ViewMode } from "../../stores/galleryStore";
-import { viewerOpen } from "../../stores/viewerStore";
-import type { AppSettings, CompanionLocation } from "../../lib/types";
+import { api } from "../../lib/ipc";
+import { isMobile } from "../../lib/runtime";
 import { versionLabel, GIT_SHA } from "../../lib/version";
-import { resetServiceWorker } from "../../lib/swControl";
+import { setThumbWork } from "../../stores/activityStore";
+import { displayPaths, settingsOpen, setSettingsOpen } from "../../stores/galleryStore";
+import { refreshFilteredItems } from "../../stores/filterStore";
 import {
-  rebuildThumbnails,
-  getSortedItems,
-  precacheThumbnails,
-  ensureTierThumbnails,
-  enableRemoteAccess,
-  disableRemoteAccess,
-  getRemoteAccessInfo,
-  type RemoteAccessInfo,
-  getRemoteAuthState,
-  generatePairingCode,
-  revokeRemoteDevice,
-  deleteRemoteDevice,
-  setRemotePassword,
-  clearRemotePassword,
-  setRemoteInactivity,
-  getUploadConfig,
-  setUploadConfig,
-  getRemoteDeleteConfig,
-  setRemoteDeleteConfig,
-  setEnabledViews,
-  getRenderConfig,
-  setRenderConfig,
-  type RenderConfig,
-  type RemoteAuthState,
-  type PairingCode,
-  type UploadConfig,
-  type UploadScheme,
-} from "../../lib/ipc";
-import QRCode from "qrcode";
-import { thumbGenStarted, thumbGenProgress, thumbGenFinished, thumbGenFailed } from "../../stores/thumbnailProgressStore";
-import { isWeb, isMobile } from "../../lib/runtime";
-import { thumbSizeForCols, currentColCount } from "../../lib/gridLayout";
+  gallerySettings,
+  prefs,
+  saveDefaultFilter,
+  setPrefs,
+  type DisplayPrefs,
+} from "../../stores/settingsStore";
+import { viewerOpen } from "../../stores/viewerStore";
+import type { ThumbTier } from "../../lib/types";
 
 const THUMB_PRESETS = [
   { label: "S", value: 120 },
@@ -58,10 +56,8 @@ const THUMB_PRESETS = [
   { label: "XL", value: 400 },
 ] as const;
 
-// On mobile, the thumbnail size picker switches from fixed-pixel buckets to
-// a column-count picker: tapping "3" sets thumbnail_size such that the grid
-// renders exactly 3 columns at the current viewport width. The choice of
-// presets here matches the user's request: 1 column (biggest) → 5 columns.
+// On mobile the thumbnail-size picker is a column count rather than a pixel
+// bucket: 200px gives a desktop six columns and a 390px phone exactly one.
 const MOBILE_COL_PRESETS = [1, 2, 3, 4, 5] as const;
 
 const GAP_PRESETS = [
@@ -71,20 +67,29 @@ const GAP_PRESETS = [
   { label: "Wide", value: 8 },
 ] as const;
 
+/** How many paths to hand the server per precache call. Bounded so one
+ *  maintenance pass cannot occupy the whole thumbnail pool for minutes while
+ *  somebody is scrolling. */
+const PRECACHE_BATCH = 48;
+
+/** The tiers a maintenance pass fills. `js` derives from the same decode as
+ *  `j` and the two high tiers are generated for what is actually viewed zoomed
+ *  in — warming those across a whole library is disk spent on cells nobody has
+ *  opened. */
+const PRECACHE_TIERS: ThumbTier[] = ["j"];
+
 /** The settings panel. It has no trigger of its own — the command list opens
  *  it, on both surfaces. `onRequestShow` lets the keyboard shortcut reveal the
  *  auto-hiding chrome before the panel appears over it. */
 export function SettingsMenu(props: { onRequestShow?: () => void }) {
-  // Open state lives in the store (`settingsOpen`) so the command list can
-  // open this panel, and so App can hide the grid behind the full-screen
-  // mobile settings page. Cleared on unmount.
+  // Open state lives in the store so the command list can open this panel, and
+  // so `App` can hide the grid behind the full-screen mobile page.
   const open = settingsOpen;
   const setOpen = setSettingsOpen;
   onCleanup(() => setSettingsOpen(false));
 
   const toggle = () => setOpen((v) => !v);
 
-  // Close on Escape, toggle on 'I' in grid view
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Escape" && open()) {
       e.stopPropagation();
@@ -105,391 +110,130 @@ export function SettingsMenu(props: { onRequestShow?: () => void }) {
   window.addEventListener("keydown", handleKey, true);
   onCleanup(() => window.removeEventListener("keydown", handleKey, true));
 
-  const updateDisplay = <K extends keyof AppSettings["display"]>(
-    key: K,
-    value: AppSettings["display"][K],
-  ) => {
-    setSettings((prev) => ({
-      ...prev,
-      display: { ...prev.display, [key]: value },
-    }));
+  const set = <K extends keyof DisplayPrefs>(key: K, value: DisplayPrefs[K]) =>
+    setPrefs({ [key]: value } as Partial<DisplayPrefs>);
+
+  /** Set the cell size to whatever renders `cols` columns at this width. */
+  const setColumns = (cols: number) => {
+    const gap = prefs().grid_gap;
+    set("thumbnail_size", Math.round((window.innerWidth + gap) / cols - gap));
   };
 
-  const updatePerformance = <K extends keyof AppSettings["performance"]>(
-    key: K,
-    value: AppSettings["performance"][K],
-  ) => {
-    setSettings((prev) => ({
-      ...prev,
-      performance: { ...prev.performance, [key]: value },
-    }));
+  /** Roughly how many columns the current size gives, for the mobile picker's
+   *  active state. Rounded, because the justified layout varies the count row
+   *  by row and an exact match would light up nothing. */
+  const currentColumns = () => {
+    const gap = prefs().grid_gap;
+    return Math.max(1, Math.round((window.innerWidth + gap) / (prefs().thumbnail_size + gap)));
   };
 
-  const updateStorage = <K extends keyof AppSettings["storage"]>(
-    key: K,
-    value: AppSettings["storage"][K],
-  ) => {
-    setSettings((prev) => ({
-      ...prev,
-      storage: { ...prev.storage, [key]: value },
-    }));
-  };
-
-  const updateDefaultFilter = <K extends keyof AppSettings["default_filter"]>(
-    key: K,
-    value: AppSettings["default_filter"][K],
-  ) => {
-    setSettings((prev) => ({
-      ...prev,
-      default_filter: { ...prev.default_filter, [key]: value },
-    }));
-  };
-
-  // ── Remote (LAN) web access ──
-  const REMOTE_PORT_KEY = "lv_remote_port";
-  const DEFAULT_REMOTE_PORT = 8723;
-  const [remote, setRemote] = createSignal<RemoteAccessInfo | null>(null);
-  const [remoteBusy, setRemoteBusy] = createSignal(false);
-  const [remoteError, setRemoteError] = createSignal("");
-
-  // Per-gallery device list, password state, inactivity threshold.
-  const [authState, setAuthState] = createSignal<RemoteAuthState | null>(null);
-
-  // Active short-lived pairing code (one per kind at a time). The QR image is
-  // rendered from `pairingQr.url`.
-  const [pairing, setPairing] = createSignal<PairingCode | null>(null);
-  const [pairingQr, setPairingQr] = createSignal<string>(""); // data URL
-  const [pairingError, setPairingError] = createSignal("");
-
-  // Password form state (separate from authState so we can show "saved").
-  const [passwordInput, setPasswordInput] = createSignal("");
-  const [passwordStatus, setPasswordStatus] = createSignal("");
-
-  // Inactivity selector, in seconds. Keeping the choices coarse so users
-  // don't fiddle endlessly.
-  const INACTIVITY_PRESETS = [
-    { label: "1h", value: 3600 },
-    { label: "6h", value: 6 * 3600 },
-    { label: "24h", value: 24 * 3600 },
-    { label: "Never", value: 365 * 24 * 3600 },
-  ] as const;
-
-  // Fixed port persisted in localStorage so a firewall rule made for it keeps
-  // working across launches. 0 means "let the OS pick" (ephemeral).
-  const storedPort = Number(localStorage.getItem(REMOTE_PORT_KEY));
-  const [remotePort, setRemotePort] = createSignal<number>(
-    Number.isFinite(storedPort) && storedPort > 0 ? storedPort : DEFAULT_REMOTE_PORT,
-  );
-
-  const updateRemotePort = (raw: string) => {
-    const n = parseInt(raw, 10);
-    const port = Number.isFinite(n) ? Math.min(Math.max(n, 0), 65535) : 0;
-    setRemotePort(port);
-    localStorage.setItem(REMOTE_PORT_KEY, String(port));
-  };
-
-  const refreshAuthState = () => {
-    if (isWeb()) return;
-    getRemoteAuthState()
-      .then(setAuthState)
-      .catch(() => {});
-  };
-
-  onMount(() => {
-    if (isWeb()) return;
-    getRemoteAccessInfo().then(setRemote).catch(() => {});
-    refreshAuthState();
-    refreshUploadCfg();
-    refreshRemoteDelete();
-  });
-
-  // While the panel is open and remote access is on, poll status so the
-  // reachability indicator and device list stay fresh as phones connect.
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
-  createEffect(() => {
-    clearInterval(pollTimer);
-    if (open() && remote() && !isWeb()) {
-      pollTimer = setInterval(() => {
-        getRemoteAccessInfo()
-          .then((info) => info && setRemote(info))
-          .catch(() => {});
-        refreshAuthState();
-      }, 3000);
-    }
-  });
-  onCleanup(() => clearInterval(pollTimer));
-
-  const toggleRemote = async () => {
-    if (remoteBusy()) return;
-    setRemoteBusy(true);
-    setRemoteError("");
+  // ── Default filter ────────────────────────────────────────────────────────
+  // The one setting here that is *not* per client: it lives in the gallery's
+  // own settings file so it survives a cache rebuild and applies to whichever
+  // client opens the gallery next. Committed on blur rather than per keystroke
+  // — each save is a durable write to a file inside the gallery.
+  const [filterDraft, setFilterDraft] = createSignal<string | null>(null);
+  const filterValue = () => filterDraft() ?? gallerySettings().default_filter;
+  const commitFilter = async () => {
+    const next = filterDraft();
+    if (next === null || next === gallerySettings().default_filter) return;
+    setFilterDraft(null);
     try {
-      if (remote()) {
-        await disableRemoteAccess();
-        setRemote(null);
-        setPairing(null);
-        setPairingQr("");
-      } else {
-        // 0 → ephemeral (OS-assigned); any other value → fixed port.
-        setRemote(await enableRemoteAccess(remotePort() || undefined));
-        refreshAuthState();
+      await saveDefaultFilter(next);
+    } catch (e) {
+      console.error("Could not save the default filter:", e);
+    }
+  };
+
+  // ── Thumbnails ────────────────────────────────────────────────────────────
+  const [tierBytes, setTierBytes] = createSignal<{ tier: ThumbTier; bytes: number }[]>([]);
+  const refreshTotals = () =>
+    api.tierTotals().then(setTierBytes).catch(() => setTierBytes([]));
+  onMount(() => void refreshTotals());
+
+  const [working, setWorking] = createSignal(false);
+  let cancelWork = false;
+
+  /** Generate the base tier for the whole gallery, in bounded batches.
+   *
+   *  Deliberately unfiltered: the active view filter must not hide paths from a
+   *  whole-gallery maintenance pass. Already-cached paths are skipped by the
+   *  server, so a re-run is cheap and cancelling loses nothing. */
+  const generateMissing = async () => {
+    if (working()) {
+      cancelWork = true;
+      return;
+    }
+    setWorking(true);
+    cancelWork = false;
+    try {
+      const all = await api.items({
+        sort: "name",
+        order: "asc",
+        filter: "",
+        group_by: { type: "none" },
+      });
+      const paths = all.items.map((it) => it.path);
+      const total = paths.length * PRECACHE_TIERS.length;
+      let done = 0;
+      setThumbWork({ done, total });
+      for (const tier of PRECACHE_TIERS) {
+        for (let i = 0; i < paths.length && !cancelWork; i += PRECACHE_BATCH) {
+          const batch = paths.slice(i, i + PRECACHE_BATCH);
+          await api.precache(tier, batch);
+          done += batch.length;
+          setThumbWork({ done, total });
+        }
       }
     } catch (e) {
-      console.error("Remote access toggle failed:", e);
-      const msg = String(e);
-      setRemoteError(
-        msg.includes("in use") || msg.includes("address")
-          ? `Port ${remotePort()} is unavailable — try another.`
-          : msg.includes("No gallery")
-            ? "Open a gallery first."
-            : "Failed to start remote access.",
-      );
-    } finally {
-      setRemoteBusy(false);
+      console.error("Thumbnail generation failed:", e);
     }
+    setThumbWork(null);
+    setWorking(false);
+    void refreshTotals();
   };
 
-  const newPairingCode = async (kind: "qr" | "pin") => {
-    setPairingError("");
-    setPairingQr("");
+  /** Discard every cached tier for every file and let them regenerate on
+   *  demand. Restorable by definition — the source images are untouched — so
+   *  it is `Device` like every other thumbnail operation. */
+  const rebuildAll = async () => {
     try {
-      const code = await generatePairingCode(kind);
-      setPairing(code);
-      if (kind === "qr" && code.pairing_url) {
-        // Render the QR locally so the desktop never has to round-trip the
-        // image bytes through IPC.
-        const dataUrl = await QRCode.toDataURL(code.pairing_url, {
-          margin: 1,
-          width: 220,
-          color: { dark: "#e5e5e5", light: "#0a0a0a" },
-        });
-        setPairingQr(dataUrl);
-      }
-    } catch (e) {
-      setPairingError(String(e));
-    }
-  };
-
-  const handleRevokeDevice = async (id: string) => {
-    try {
-      await revokeRemoteDevice(id);
-      refreshAuthState();
-    } catch (e) {
-      console.error("Revoke failed:", e);
-    }
-  };
-
-  const handleDeleteDevice = async (id: string) => {
-    try {
-      await deleteRemoteDevice(id);
-      refreshAuthState();
-    } catch (e) {
-      console.error("Delete failed:", e);
-    }
-  };
-
-  const handleSetPassword = async () => {
-    if (!passwordInput()) return;
-    try {
-      await setRemotePassword(passwordInput());
-      setPasswordInput("");
-      setPasswordStatus("Saved");
-      setTimeout(() => setPasswordStatus(""), 2000);
-      refreshAuthState();
-    } catch (e) {
-      setPasswordStatus(String(e));
-    }
-  };
-
-  const handleClearPassword = async () => {
-    try {
-      await clearRemotePassword();
-      setPasswordStatus("Cleared");
-      setTimeout(() => setPasswordStatus(""), 2000);
-      refreshAuthState();
-    } catch (e) {
-      setPasswordStatus(String(e));
-    }
-  };
-
-  const handleSetInactivity = async (secs: number) => {
-    try {
-      await setRemoteInactivity(secs);
-      refreshAuthState();
-    } catch (e) {
-      console.error("Set inactivity failed:", e);
-    }
-  };
-
-  // ── Device uploads (per-gallery) ──
-  const [uploadCfg, setUploadCfg] = createSignal<UploadConfig | null>(null);
-  const UPLOAD_SCHEMES: { label: string; value: UploadScheme }[] = [
-    { label: "Year", value: "year" },
-    { label: "Year & month", value: "year_month" },
-    { label: "Year & album", value: "year_album" },
-    { label: "Flat", value: "flat" },
-  ];
-
-  const refreshUploadCfg = () => {
-    if (isWeb()) return;
-    getUploadConfig().then(setUploadCfg).catch(() => {});
-  };
-
-  const saveUploadCfg = async (next: UploadConfig) => {
-    setUploadCfg(next); // optimistic
-    try {
-      await setUploadConfig(next.enabled, next.scheme);
-    } catch (e) {
-      console.error("Set upload config failed:", e);
-      refreshUploadCfg(); // revert to server truth
-    }
-  };
-
-  // ── Remote delete (per-gallery) ──
-  const [remoteDelete, setRemoteDelete] = createSignal<boolean | null>(null);
-
-  const refreshRemoteDelete = () => {
-    if (isWeb()) return;
-    getRemoteDeleteConfig().then(setRemoteDelete).catch(() => {});
-  };
-
-  const saveRemoteDelete = async (enabled: boolean) => {
-    setRemoteDelete(enabled); // optimistic
-    try {
-      await setRemoteDeleteConfig(enabled);
-    } catch (e) {
-      console.error("Set remote delete config failed:", e);
-      refreshRemoteDelete(); // revert to server truth
-    }
-  };
-
-  // ── Enabled views (per-gallery, host-only) ──
-  //
-  // Turning the last one off would leave a switcher with nothing in it and no
-  // way back, so the final enabled view can't be removed.
-  const toggleView = async (mode: ViewMode) => {
-    const current = enabledViews();
-    const next = current.includes(mode)
-      ? current.filter((v) => v !== mode)
-      : VIEW_CHOICES.map((v) => v.mode).filter((v) => v === mode || current.includes(v));
-    if (next.length === 0) return;
-    applyEnabledViews(next); // optimistic
-    try {
-      await setEnabledViews(next);
-    } catch (e) {
-      console.error("Set enabled views failed:", e);
-      loadEnabledViews(); // revert to server truth
-    }
-  };
-
-  const formatRelative = (ts: number) => {
-    if (!ts) return "never";
-    const diff = Math.max(0, Date.now() / 1000 - ts);
-    if (diff < 60) return "just now";
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-    return `${Math.floor(diff / 86400)}d ago`;
-  };
-
-  // Process-level render config (GPU compositing). Global, not per-gallery, so
-  // it's fetched directly rather than from the settings store. Changes take
-  // effect only on restart.
-  const [renderCfg, setRenderCfg] = createSignal<RenderConfig | null>(null);
-  const [renderRestart, setRenderRestart] = createSignal(false);
-  if (!isWeb()) {
-    onMount(async () => {
-      try { setRenderCfg(await getRenderConfig()); } catch { /* ignore */ }
-    });
-  }
-  // Default-off (software path) until the user opts in.
-  const gpuOn = () => renderCfg()?.gpu_acceleration ?? false;
-  const toggleGpu = async (v: boolean) => {
-    const cfg = renderCfg();
-    try {
-      await setRenderConfig(v, cfg?.gtk_backend ?? null);
-      setRenderCfg({ gpu_acceleration: v, gtk_backend: cfg?.gtk_backend ?? null });
-      setRenderRestart(true);
-    } catch (e) {
-      console.error("Failed to save render config:", e);
-    }
-  };
-
-  const [rebuilding, setRebuilding] = createSignal(false);
-  const handleRebuild = async () => {
-    setRebuilding(true);
-    try {
-      await rebuildThumbnails();
+      const all = await api.items({
+        sort: "name",
+        order: "asc",
+        filter: "",
+        group_by: { type: "none" },
+      });
+      await api.regenerate(all.items.map((it) => it.path));
       window.dispatchEvent(new CustomEvent("lightview:thumbnails-invalidated"));
+      void refreshTotals();
     } catch (e) {
       console.error("Rebuild failed:", e);
     }
-    setRebuilding(false);
   };
 
-  // ── Generate missing thumbnails (all tiers the grids use at normal zoom) ──
-  // Sequential bounded batches over the whole gallery: pass 1 the standard
-  // grid tier (micro derives with it), pass 2 the justified base tier.
-  // Already-cached paths are filtered backend-side, so re-runs are cheap.
-  // Running this up front trades one supervised generation session for the
-  // burst-generation heat that otherwise happens while scrolling cold
-  // regions. Progress drives the same overlay as scroll-driven generation.
-  const [precachingAll, setPrecachingAll] = createSignal(false);
-  let precacheAllCancel = false;
-  const PRECACHE_ALL_BATCH = 48;
-  const handlePrecacheAll = async () => {
-    if (precachingAll()) {
-      precacheAllCancel = true;
-      return;
-    }
-    setPrecachingAll(true);
-    precacheAllCancel = false;
-    try {
-      // Unfiltered listing — the active view filter must not hide paths from
-      // a whole-gallery maintenance pass.
-      const all = await getSortedItems("name", "asc", { type: "none" });
-      const paths = all.items.map((it) => it.path);
-      const totalSteps = paths.length * 2;
-      let done = 0;
-      thumbGenStarted(totalSteps);
-      for (const pass of ["standard", "justified"] as const) {
-        for (let i = 0; i < paths.length && !precacheAllCancel; i += PRECACHE_ALL_BATCH) {
-          const batch = paths.slice(i, i + PRECACHE_ALL_BATCH);
-          if (pass === "standard") await precacheThumbnails(batch);
-          else await ensureTierThumbnails(batch, "j");
-          done += batch.length;
-          thumbGenProgress(done, totalSteps);
-        }
-      }
-      thumbGenFinished(done);
-    } catch (e) {
-      console.error("Generate-missing-thumbnails failed:", e);
-      thumbGenFailed(String(e));
-    }
-    setPrecachingAll(false);
-  };
+  const totalBytes = () => tierBytes().reduce((sum, t) => sum + t.bytes, 0);
 
   return (
-    // Dropdown panel (desktop) / full-screen page (mobile)
     <Show when={open()}>
-        {/* Backdrop — click to close (desktop only; the mobile page is opaque
-            and covers the whole viewport, so there's nothing to click behind). */}
-        <Show when={!isMobile()}>
-          <div class="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-        </Show>
+      {/* Backdrop — click to close (desktop only; the mobile page is opaque
+          and covers the whole viewport, so there is nothing to click behind). */}
+      <Show when={!isMobile()}>
+        <div class="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+      </Show>
 
-        {/* On mobile the panel is a full-screen, fully-opaque page rather than a
-            translucent drawer over the gallery: phones don't reliably honor
-            `backdrop-filter`, so the gallery used to bleed through and the panel
-            read as empty/cut-off.
+      {/* On mobile the panel is a full-screen opaque page rather than a
+          translucent drawer: phones do not reliably honour `backdrop-filter`,
+          so the gallery bled through and the panel read as empty.
 
-            The mobile page is portalled to <body> so its `position: fixed`
-            resolves against the viewport. Rendered in place it would be trapped
-            by the top bar's `backdrop-filter`, which establishes a containing
-            block for fixed descendants and clips the page to the bar's height.
-            Desktop stays in place — its `absolute` panel is positioned by the
-            wrapper it shares with the command button in `TopBar`, so it drops
-            from the control that opened it. */}
-        <Dynamic component={isMobile() ? Portal : InPlace}>
+          The mobile page is portalled to <body> so its `position: fixed`
+          resolves against the viewport. Rendered in place it would be trapped
+          by the top bar's `backdrop-filter`, which establishes a containing
+          block for fixed descendants and clips the page to the bar's height.
+          Desktop stays in place — its `absolute` panel is positioned by the
+          wrapper it shares with the command button in `TopBar`, so it drops
+          from the control that opened it. */}
+      <Dynamic component={isMobile() ? Portal : InPlace}>
         <div
           class={
             isMobile()
@@ -498,9 +242,7 @@ export function SettingsMenu(props: { onRequestShow?: () => void }) {
           }
           style={
             isMobile()
-              ? {
-                  background: "#121212",
-                }
+              ? { background: "#121212" }
               : {
                   background: "rgba(18, 18, 18, 0.96)",
                   "backdrop-filter": "blur(16px)",
@@ -511,8 +253,8 @@ export function SettingsMenu(props: { onRequestShow?: () => void }) {
           <div class="px-4 py-3 border-b border-neutral-800/60 flex items-center justify-between shrink-0">
             <div class="flex items-baseline gap-2">
               <span class="text-sm font-medium text-neutral-200">Settings</span>
-              {/* Image count for the current filter. On desktop this sits in the
-                  top bar; on mobile the bar is too cramped, so it lives here. */}
+              {/* Image count for the current filter. On desktop this sits in
+                  the top bar; on mobile the bar is too cramped. */}
               <Show when={isMobile()}>
                 <span class="text-xs text-neutral-500 tabular-nums">
                   {displayPaths().length.toLocaleString()} images
@@ -533,735 +275,290 @@ export function SettingsMenu(props: { onRequestShow?: () => void }) {
 
           <div
             class="px-4 py-3 flex flex-col gap-4 overflow-y-auto overscroll-contain flex-1 min-h-0"
-            classList={{
-              "hide-scrollbar": isMobile(),
-              "dupes-scroll": !isMobile(),
-            }}
+            classList={{ "hide-scrollbar": isMobile(), "dupes-scroll": !isMobile() }}
           >
             {/* ── Display ── */}
             <Section label="Display">
-              {/* Thumbnail size — mobile uses a column-count picker so the
-                  presets stay meaningful on a 400px-wide viewport; desktop
-                  keeps the fixed-pixel S/M/L/XL buckets. */}
               <Show
                 when={isMobile()}
                 fallback={
                   <Field label="Thumbnail size">
-                    <div class="flex items-center gap-2">
-                      <div class="flex gap-1">
-                        {THUMB_PRESETS.map((p) => (
-                          <button
-                            class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                              settings().display.thumbnail_size === p.value
-                                ? "bg-teal-700/60 text-teal-200"
-                                : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                            }`}
-                            onClick={() => updateDisplay("thumbnail_size", p.value)}
+                    <div class="flex gap-1">
+                      <For each={THUMB_PRESETS}>
+                        {(p) => (
+                          <Chip
+                            active={prefs().thumbnail_size === p.value}
+                            onClick={() => set("thumbnail_size", p.value)}
                           >
                             {p.label}
-                          </button>
-                        ))}
-                      </div>
+                          </Chip>
+                        )}
+                      </For>
                     </div>
                   </Field>
                 }
               >
                 <Field label="Columns">
-                  <div class="flex items-center gap-1.5">
-                    {MOBILE_COL_PRESETS.map((n) => {
-                      const active = () =>
-                        currentColCount(
-                          settings().display.thumbnail_size,
-                          settings().display.grid_gap,
-                        ) === n;
-                      return (
-                        <button
-                          class={`min-w-8 h-8 px-2 text-sm rounded cursor-pointer transition-colors ${
-                            active()
-                              ? "bg-teal-700/60 text-teal-200"
-                              : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                          }`}
-                          onClick={() =>
-                            updateDisplay(
-                              "thumbnail_size",
-                              thumbSizeForCols(n, settings().display.grid_gap),
-                            )
-                          }
+                  <div class="flex gap-1">
+                    <For each={MOBILE_COL_PRESETS}>
+                      {(cols) => (
+                        <Chip
+                          active={currentColumns() === cols}
+                          onClick={() => setColumns(cols)}
                         >
-                          {n}
-                        </button>
-                      );
-                    })}
+                          {cols}
+                        </Chip>
+                      )}
+                    </For>
                   </div>
                 </Field>
               </Show>
 
-              {/* Grid gap */}
               <Field label="Grid spacing">
-                <div class="flex items-center gap-2">
-                  <div class="flex gap-1">
-                    {GAP_PRESETS.map((p) => (
-                      <button
-                        class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                          settings().display.grid_gap === p.value
-                            ? "bg-teal-700/60 text-teal-200"
-                            : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                        }`}
-                        onClick={() => updateDisplay("grid_gap", p.value)}
+                <div class="flex gap-1">
+                  <For each={GAP_PRESETS}>
+                    {(p) => (
+                      <Chip
+                        active={prefs().grid_gap === p.value}
+                        onClick={() => set("grid_gap", p.value)}
                       >
                         {p.label}
-                      </button>
-                    ))}
-                  </div>
+                      </Chip>
+                    )}
+                  </For>
                 </div>
               </Field>
 
-              {/* Zoom range — min/max thumbnail (row) size the zoom allows. */}
               <Field label="Zoom range (px)">
                 <div class="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min="40"
-                    max="2000"
-                    value={settings().display.thumb_size_min ?? 120}
-                    onInput={(e) => {
-                      const n = parseInt(e.currentTarget.value, 10);
-                      if (Number.isFinite(n) && n > 0) {
-                        const max = settings().display.thumb_size_max ?? 700;
-                        updateDisplay("thumb_size_min", Math.min(n, max - 1));
-                      }
-                    }}
-                    class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
-                    title="Smallest thumbnail / row size the zoom control reaches"
+                  <NumberInput
+                    value={prefs().thumb_size_min}
+                    title="Smallest row size the zoom control reaches"
+                    onChange={(n) => set("thumb_size_min", Math.min(n, prefs().thumb_size_max - 1))}
                   />
                   <span class="text-xs text-neutral-500">to</span>
-                  <input
-                    type="number"
-                    min="40"
-                    max="2000"
-                    value={settings().display.thumb_size_max ?? 700}
-                    onInput={(e) => {
-                      const n = parseInt(e.currentTarget.value, 10);
-                      if (Number.isFinite(n) && n > 0) {
-                        const min = settings().display.thumb_size_min ?? 120;
-                        updateDisplay("thumb_size_max", Math.max(n, min + 1));
-                      }
-                    }}
-                    class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
-                    title="Largest thumbnail / row size the zoom control reaches"
+                  <NumberInput
+                    value={prefs().thumb_size_max}
+                    title="Largest row size the zoom control reaches"
+                    onChange={(n) => set("thumb_size_max", Math.max(n, prefs().thumb_size_min + 1))}
                   />
                 </div>
               </Field>
 
-              {/* Background color */}
               <Field label="Background">
                 <div class="flex items-center gap-2">
                   <input
                     type="color"
-                    value={settings().display.background_color}
-                    onInput={(e) =>
-                      updateDisplay("background_color", e.currentTarget.value)
-                    }
+                    value={prefs().background_color}
+                    onInput={(e) => set("background_color", e.currentTarget.value)}
                     class="w-6 h-6 rounded cursor-pointer border border-neutral-700 bg-transparent"
                   />
                   <span class="text-xs text-neutral-500 font-mono">
-                    {settings().display.background_color}
+                    {prefs().background_color}
                   </span>
                 </div>
               </Field>
 
-              {/* Toggles */}
               <Toggle
                 label="Start at bottom"
-                checked={settings().display.start_at_bottom}
-                onChange={(v) => updateDisplay("start_at_bottom", v)}
+                checked={prefs().start_at_bottom}
+                onChange={(v) => set("start_at_bottom", v)}
               />
-              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
-                Opens a gallery at the end of the grid and scrolls up. To change
-                which end is oldest, flip the sort direction instead.
-              </p>
+              <Note>
+                Opens at the end of the grid and scrolls up. To change which end
+                is oldest, flip the sort direction instead.
+              </Note>
+
               <Toggle
                 label="GIF autoplay in grid"
-                checked={settings().display.gif_autoplay_grid}
-                onChange={(v) => updateDisplay("gif_autoplay_grid", v)}
+                checked={prefs().gif_autoplay_grid}
+                onChange={(v) => set("gif_autoplay_grid", v)}
               />
               <Toggle
                 label="Autoplay short videos in grid"
-                checked={settings().display.video_autoplay_grid}
-                onChange={(v) => updateDisplay("video_autoplay_grid", v)}
+                checked={prefs().video_autoplay_grid}
+                onChange={(v) => set("video_autoplay_grid", v)}
               />
-              <Show when={settings().display.video_autoplay_grid}>
+              <Show when={prefs().video_autoplay_grid}>
                 <Field label="Max video length (seconds)">
-                  <input
-                    type="number"
-                    min="1"
-                    max="3600"
-                    value={settings().display.video_autoplay_max_seconds}
-                    onInput={(e) => {
-                      const n = parseInt(e.currentTarget.value, 10);
-                      if (Number.isFinite(n) && n > 0) {
-                        updateDisplay("video_autoplay_max_seconds", n);
-                      }
-                    }}
-                    class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
+                  <NumberInput
+                    value={prefs().video_autoplay_max_seconds}
                     title="Videos at or under this length autoplay in the grid"
+                    onChange={(n) => set("video_autoplay_max_seconds", n)}
                   />
                 </Field>
               </Show>
               <Toggle
                 label="Video hover preview"
-                checked={settings().display.video_hover_preview}
-                onChange={(v) => updateDisplay("video_hover_preview", v)}
+                checked={prefs().video_hover_preview}
+                onChange={(v) => set("video_hover_preview", v)}
               />
               <Toggle
                 label="Video auto-replay"
-                checked={settings().display.video_autoplay_loop}
-                onChange={(v) => updateDisplay("video_autoplay_loop", v)}
+                checked={prefs().video_autoplay_loop}
+                onChange={(v) => set("video_autoplay_loop", v)}
               />
               <Toggle
                 label="Autoplay videos in viewer"
-                checked={settings().display.video_autoplay_viewer}
-                onChange={(v) => updateDisplay("video_autoplay_viewer", v)}
+                checked={prefs().video_autoplay_viewer}
+                onChange={(v) => set("video_autoplay_viewer", v)}
               />
-              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
-                Starts muted — tap the pill or the speaker button for sound.
-              </p>
+              <Note>Starts muted — tap the pill or the speaker button for sound.</Note>
+
               <Toggle
                 label="Thumbnail fade-in"
-                checked={settings().display.scroll_blur}
-                onChange={(v) => updateDisplay("scroll_blur", v)}
+                checked={prefs().scroll_blur}
+                onChange={(v) => set("scroll_blur", v)}
               />
               <Toggle
-                label="Dark map tiles"
-                checked={settings().display.map_dark_mode ?? true}
-                onChange={(v) => updateDisplay("map_dark_mode", v)}
+                label="High-detail zoom"
+                checked={prefs().justified_high_detail}
+                onChange={(v) => set("justified_high_detail", v)}
               />
-              <Toggle
-                label="High-detail justified zoom"
-                checked={settings().display.justified_high_detail ?? true}
-                onChange={(v) => updateDisplay("justified_high_detail", v)}
-              />
-              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
-                Generates sharper thumbnails when zoomed into the justified view.
-                Uses more disk for the images you view zoomed in.
-              </p>
+              <Note>
+                Serves a larger tier when you zoom in, for visible cells only.
+                Uses more disk for the photos you actually look at closely.
+              </Note>
 
-              {/* Mobile-only: where the search/sort sheet appears. */}
               <Show when={isMobile()}>
-                <div class="flex flex-col gap-1.5">
-                  <span class="text-xs text-neutral-300">Filter sheet position</span>
+                <Field label="Filter sheet position">
                   <div class="flex items-center gap-1 p-0.5 rounded bg-neutral-800/60">
-                    <For each={[
-                      { value: "top" as const, label: "Top" },
-                      { value: "bottom" as const, label: "Bottom" },
-                    ]}>
-                      {(opt) => {
-                        const active = () =>
-                          settings().display.mobile_filter_sheet === opt.value;
-                        return (
-                          <button
-                            class="flex-1 px-2 py-1 text-xs rounded cursor-pointer transition-colors"
-                            classList={{
-                              "bg-neutral-700 text-white": active(),
-                              "text-neutral-300": !active(),
-                            }}
-                            onClick={() => updateDisplay("mobile_filter_sheet", opt.value)}
-                          >
-                            {opt.label}
-                          </button>
-                        );
-                      }}
+                    <For each={["top", "bottom"] as const}>
+                      {(where) => (
+                        <button
+                          class="flex-1 px-2 py-1 text-xs rounded cursor-pointer transition-colors capitalize"
+                          classList={{
+                            "bg-neutral-700 text-white": prefs().mobile_filter_sheet === where,
+                            "text-neutral-300": prefs().mobile_filter_sheet !== where,
+                          }}
+                          onClick={() => set("mobile_filter_sheet", where)}
+                        >
+                          {where}
+                        </button>
+                      )}
                     </For>
                   </div>
-                  <p class="text-[10px] text-neutral-500 pl-0.5">
-                    Bottom is easier to reach one-handed on large phones.
-                  </p>
-                </div>
+                </Field>
+                <Note>Bottom is easier to reach one-handed on large phones.</Note>
               </Show>
-
             </Section>
 
-            {/* ── Views (desktop only — this configures the gallery, not the
-                device, so a paired phone reads the list but cannot change
-                it) ── */}
-            <Show when={!isWeb()}>
-              <Section label="Views">
-                <Field label="Available in this gallery">
-                  <div class="flex flex-col gap-1.5">
-                    <For each={VIEW_CHOICES}>
-                      {(v) => (
-                        <div class="flex items-center justify-between">
-                          <span class="text-[11px] text-neutral-400">{v.label}</span>
-                          <button
-                            onClick={() => toggleView(v.mode)}
-                            class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
-                              enabledViews().includes(v.mode) ? "bg-teal-600" : "bg-neutral-700"
-                            }`}
-                            title={v.title}
-                          >
-                            <span
-                              class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
-                                enabledViews().includes(v.mode) ? "left-[18px]" : "left-0.5"
-                              }`}
-                            />
-                          </button>
+            {/* ── Thumbnails ── */}
+            <Section label="Thumbnails">
+              <button
+                onClick={() => void generateMissing()}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+              >
+                {working() ? "Cancel generation" : "Generate missing thumbnails"}
+              </button>
+              <Note>
+                Fills the base tier for the whole gallery up front, so cold
+                regions do not burst-generate while you scroll them. Safe to
+                cancel and re-run — cached files are skipped.
+              </Note>
+
+              <Show when={tierBytes().length > 0}>
+                <Field label={`Cached (${formatBytes(totalBytes())})`}>
+                  <div class="flex flex-col gap-0.5">
+                    <For each={tierBytes()}>
+                      {(t) => (
+                        <div class="flex items-baseline justify-between text-[11px]">
+                          <span class="text-neutral-500 uppercase tracking-wider">{t.tier}</span>
+                          <span class="text-neutral-400 tabular-nums">{formatBytes(t.bytes)}</span>
                         </div>
                       )}
                     </For>
                   </div>
                 </Field>
-                <span class="text-[10px] text-neutral-600 leading-snug">
-                  A disabled view stops pre-generating its thumbnails — on a large
-                  gallery that is gigabytes for cells nobody renders. Thumbnails
-                  already cached are kept, so re-enabling a view costs nothing.
-                </span>
-              </Section>
-            </Show>
+              </Show>
 
-            {/* ── Thumbnails ── */}
-            <Section label="Thumbnails">
               <button
-                onClick={handlePrecacheAll}
-                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
+                onClick={() => void rebuildAll()}
+                disabled={working()}
+                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {precachingAll() ? "Cancel Generation" : "Generate Missing Thumbnails"}
+                Rebuild all thumbnails
               </button>
-              <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
-                Pre-generates every thumbnail size the gallery views use, so
-                they don't burst-generate (CPU spikes) while scrolling new
-                areas. Safe to cancel and re-run — already-generated
-                thumbnails are skipped.
-              </p>
-              {/* Rebuild + rendering are desktop-only (destructive / local) */}
-              <Show when={!isWeb()}>
+              <Note>
+                Discards every cached size and regenerates on demand. Your
+                photos are untouched.
+              </Note>
+            </Section>
+
+            {/* ── Default filter ── */}
+            <Section label="Default filter">
+              <input
+                type="text"
+                value={filterValue()}
+                onInput={(e) => setFilterDraft(e.currentTarget.value)}
+                onBlur={() => void commitFilter()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                placeholder="e.g. rating>=3 AND NOT set::scans"
+                class="w-full px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
+              />
+              <Note>
+                Applied whenever this gallery is opened, by any client. It lives
+                in the gallery's own settings file, so it survives a cache
+                rebuild. Leave it empty for no default.
+              </Note>
+              <Show when={filterValue().trim()}>
                 <button
-                  onClick={handleRebuild}
-                  disabled={rebuilding()}
-                  class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                  onClick={() => void refreshFilteredItems()}
+                  class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
                 >
-                  {rebuilding() ? "Rebuilding..." : "Rebuild All Thumbnails"}
+                  Apply now
                 </button>
-                <Toggle
-                  label="GPU acceleration (experimental)"
-                  checked={gpuOn()}
-                  onChange={toggleGpu}
-                />
-                <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5">
-                  Uses the GPU compositing path for much smoother scrolling and
-                  faster image display. Disabled by default because it can crash
-                  on some drivers. Takes effect after restarting the app.
-                </p>
-                <Show when={renderRestart()}>
-                  <p class="text-[10px] text-amber-400/80 pl-0.5">
-                    Restart LightView to apply the new rendering mode.
-                  </p>
-                </Show>
               </Show>
             </Section>
 
-            {/* ── Remote access (desktop only) ── */}
-            <Show when={!isWeb()}>
-              <Section label="Remote Access">
-                <Toggle
-                  label="Enable LAN web access"
-                  checked={remote() !== null}
-                  onChange={() => void toggleRemote()}
-                />
-                {/* Port is editable only while disabled — changing it requires
-                    a restart of the server. A fixed port lets a firewall rule
-                    stick across launches. */}
-                <Show when={!remote()}>
-                  <Field label="Port">
-                    <input
-                      type="number"
-                      min="0"
-                      max="65535"
-                      value={remotePort()}
-                      onInput={(e) => updateRemotePort(e.currentTarget.value)}
-                      class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
-                      title="0 = random port each launch"
-                    />
-                  </Field>
-                </Show>
-                <Show when={remoteError()}>
-                  <span class="text-xs text-red-400">{remoteError()}</span>
-                </Show>
-                <Show when={remote()}>
-                  {(info) => (
-                    <div class="flex flex-col gap-3">
-                      <Show
-                        when={info().base_url}
-                        fallback={
-                          <span class="text-xs text-amber-400">
-                            No LAN IP detected — port {info().port}
-                          </span>
-                        }
-                      >
-                        <span class="text-[10px] text-neutral-500 font-mono">
-                          {info().base_url}
-                        </span>
-                      </Show>
-
-                      {/* ── Pair a new device ── */}
-                      <div class="flex flex-col gap-1.5">
-                        <span class="text-[11px] text-neutral-400">Pair a device</span>
-                        <div class="flex gap-1.5">
-                          <button
-                            onClick={() => newPairingCode("qr")}
-                            class="px-2 py-1 text-[11px] rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 cursor-pointer transition-colors"
-                          >
-                            QR code
-                          </button>
-                          <button
-                            onClick={() => newPairingCode("pin")}
-                            class="px-2 py-1 text-[11px] rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 cursor-pointer transition-colors"
-                          >
-                            PIN
-                          </button>
-                          <Show when={pairing()}>
-                            <button
-                              onClick={() => { setPairing(null); setPairingQr(""); }}
-                              class="px-2 py-1 text-[11px] rounded text-neutral-500 hover:text-neutral-300 cursor-pointer"
-                            >
-                              Clear
-                            </button>
-                          </Show>
-                        </div>
-                        <Show when={pairingError()}>
-                          <span class="text-[10px] text-red-400">{pairingError()}</span>
-                        </Show>
-                        <Show when={pairing()}>
-                          {(code) => (
-                            <div class="mt-1 px-3 py-2.5 rounded bg-neutral-900 border border-neutral-800 flex flex-col items-center gap-2">
-                              <Show when={code().kind === "qr"}>
-                                <Show when={pairingQr()} fallback={
-                                  <span class="text-[10px] text-neutral-500">Rendering&hellip;</span>
-                                }>
-                                  <img src={pairingQr()} alt="Pairing QR" class="w-44 h-44" />
-                                </Show>
-                                <span class="text-[10px] text-neutral-500 text-center">
-                                  Scan with the phone's camera. Single-use; expires in 10&nbsp;min.
-                                </span>
-                              </Show>
-                              <Show when={code().kind === "pin"}>
-                                <div class="text-3xl font-mono tracking-[0.4em] text-teal-300 pl-[0.4em]">
-                                  {code().code}
-                                </div>
-                                <Show when={code().pairing_url}>
-                                  <span class="text-[10px] text-neutral-500 font-mono break-all text-center">
-                                    {code().pairing_url}
-                                  </span>
-                                </Show>
-                                <span class="text-[10px] text-neutral-500 text-center">
-                                  Open the URL above and enter the PIN. Single-use; expires in 10&nbsp;min.
-                                </span>
-                              </Show>
-                            </div>
-                          )}
-                        </Show>
-                      </div>
-
-                      {/* ── Optional gallery password ── */}
-                      <Show when={authState()}>
-                        {(s) => (
-                          <div class="flex flex-col gap-1.5">
-                            <div class="flex items-center justify-between">
-                              <span class="text-[11px] text-neutral-400">Gallery password</span>
-                              <Show when={s().password_set}>
-                                <span class="text-[10px] text-teal-400">Set</span>
-                              </Show>
-                            </div>
-                            <div class="flex gap-1.5">
-                              <input
-                                type="password"
-                                value={passwordInput()}
-                                onInput={(e) => setPasswordInput(e.currentTarget.value)}
-                                placeholder={s().password_set ? "Replace password" : "Set password"}
-                                class="flex-1 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-[11px] text-neutral-200 outline-none focus:border-neutral-500"
-                              />
-                              <button
-                                onClick={handleSetPassword}
-                                disabled={!passwordInput()}
-                                class="px-2 py-1 text-[11px] rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 disabled:opacity-40 cursor-pointer transition-colors"
-                              >
-                                Save
-                              </button>
-                              <Show when={s().password_set}>
-                                <button
-                                  onClick={handleClearPassword}
-                                  class="px-2 py-1 text-[11px] rounded text-neutral-500 hover:text-red-400 cursor-pointer"
-                                  title="Remove password"
-                                >
-                                  Clear
-                                </button>
-                              </Show>
-                            </div>
-                            <Show when={passwordStatus()}>
-                              <span class="text-[10px] text-neutral-500">{passwordStatus()}</span>
-                            </Show>
-                            <span class="text-[10px] text-neutral-600 leading-snug">
-                              When set, paired devices re-enter it after the inactivity window.
-                            </span>
-
-                            <div class="flex items-center gap-1.5 mt-1">
-                              <span class="text-[10px] text-neutral-500 mr-1">Lock after</span>
-                              {INACTIVITY_PRESETS.map((p) => (
-                                <button
-                                  onClick={() => handleSetInactivity(p.value)}
-                                  class={`px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors ${
-                                    s().inactivity_secs === p.value
-                                      ? "bg-teal-700/60 text-teal-200"
-                                      : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
-                                  }`}
-                                >
-                                  {p.label}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </Show>
-
-                      {/* ── Device uploads ── */}
-                      <Show when={uploadCfg()}>
-                        {(cfg) => (
-                          <div class="flex flex-col gap-1.5">
-                            <div class="flex items-center justify-between">
-                              <span class="text-[11px] text-neutral-400">Allow uploads from devices</span>
-                              <button
-                                onClick={() => saveUploadCfg({ ...cfg(), enabled: !cfg().enabled })}
-                                class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
-                                  cfg().enabled ? "bg-teal-600" : "bg-neutral-700"
-                                }`}
-                                title="Let paired devices upload photos into this gallery"
-                              >
-                                <span
-                                  class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
-                                    cfg().enabled ? "left-[18px]" : "left-0.5"
-                                  }`}
-                                />
-                              </button>
-                            </div>
-                            {/* ── Remote delete ── */}
-                            <Show when={remoteDelete() !== null}>
-                              <div class="flex items-center justify-between mt-1">
-                                <span class="text-[11px] text-neutral-400">Allow deletes from devices</span>
-                                <button
-                                  onClick={() => saveRemoteDelete(!remoteDelete())}
-                                  class={`relative w-9 h-5 rounded-full transition-colors cursor-pointer ${
-                                    remoteDelete() ? "bg-teal-600" : "bg-neutral-700"
-                                  }`}
-                                  title="Let paired devices move photos to the gallery trash (restorable; auto-purged after the retention period)"
-                                >
-                                  <span
-                                    class={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${
-                                      remoteDelete() ? "left-[18px]" : "left-0.5"
-                                    }`}
-                                  />
-                                </button>
-                              </div>
-                            </Show>
-                            <Show when={cfg().enabled}>
-                              <div class="flex items-center gap-2 mt-0.5">
-                                <span class="text-[10px] text-neutral-500">Organize into</span>
-                                <select
-                                  value={cfg().scheme}
-                                  onChange={(e) =>
-                                    saveUploadCfg({ ...cfg(), scheme: e.currentTarget.value as UploadScheme })
-                                  }
-                                  class="flex-1 px-2 py-1 text-[11px] rounded bg-neutral-800 text-neutral-300 border border-neutral-700 cursor-pointer focus:outline-none focus:border-teal-600"
-                                >
-                                  <For each={UPLOAD_SCHEMES}>
-                                    {(s) => <option value={s.value}>{s.label}</option>}
-                                  </For>
-                                </select>
-                              </div>
-                              <span class="text-[10px] text-neutral-600 leading-snug">
-                                Uploads land in <span class="font-mono">Uploads/</span> under the gallery, foldered by capture date.
-                              </span>
-                            </Show>
-                          </div>
-                        )}
-                      </Show>
-
-                      {/* ── Paired devices ── */}
-                      <Show when={authState() && authState()!.devices.length > 0}>
-                        <div class="flex flex-col gap-1">
-                          <span class="text-[11px] text-neutral-400">Paired devices</span>
-                          <div class="flex flex-col gap-1">
-                            <For each={authState()!.devices}>
-                              {(d) => (
-                                <div class="flex items-center gap-2 px-2 py-1 rounded bg-neutral-900/60">
-                                  <div class="flex-1 min-w-0">
-                                    <div class={`text-xs truncate ${d.revoked_at ? "text-neutral-500 line-through" : "text-neutral-300"}`}>
-                                      {d.name}
-                                    </div>
-                                    <div class="text-[10px] text-neutral-600">
-                                      seen {formatRelative(d.last_seen)}
-                                    </div>
-                                  </div>
-                                  <Show
-                                    when={!d.revoked_at}
-                                    fallback={
-                                      <button
-                                        onClick={() => handleDeleteDevice(d.id)}
-                                        class="text-[10px] text-neutral-500 hover:text-red-400 cursor-pointer"
-                                      >
-                                        Delete
-                                      </button>
-                                    }
-                                  >
-                                    <button
-                                      onClick={() => handleRevokeDevice(d.id)}
-                                      class="text-[10px] text-neutral-500 hover:text-red-400 cursor-pointer"
-                                    >
-                                      Revoke
-                                    </button>
-                                  </Show>
-                                </div>
-                              )}
-                            </For>
-                          </div>
-                        </div>
-                      </Show>
-
-                      {/* Reachability indicator + firewall hint, same as before. */}
-                      <div class="flex items-start gap-1.5">
-                        <Show
-                          when={info().clients_seen > 0}
-                          fallback={
-                            <>
-                              <span class="text-amber-400 leading-tight">&#9679;</span>
-                              <span class="text-[10px] text-neutral-500 leading-tight">
-                                Waiting for a device to connect. If a device can't
-                                load the page, allow the port in your firewall.
-                              </span>
-                            </>
-                          }
-                        >
-                          <span class="text-teal-400 leading-tight">&#9679;</span>
-                          <span class="text-[10px] text-neutral-400 leading-tight">
-                            Reachable &mdash; a device has connected.
-                          </span>
-                        </Show>
-                      </div>
-                      <Show when={info().firewall_hint && info().clients_seen === 0}>
-                        <pre class="px-2 py-1.5 rounded bg-neutral-900/80 border border-neutral-800 text-[10px] text-neutral-400 whitespace-pre-wrap break-all font-mono">
-                          {info().firewall_hint}
-                        </pre>
-                      </Show>
-                    </div>
-                  )}
-                </Show>
-              </Section>
-            </Show>
-
-            {/* ── Connection (web only) ──
-                The certificate link also lives on /pair, but that page is only
-                reachable while *un*paired — after a successful pair the client
-                redirects to / and never shows it again. Since installing the
-                cert is exactly what a working, paired device wants to do next
-                (to stop the click-through exception lapsing), it needs a home
-                here too. */}
-            <Show when={isWeb()}>
+            {/* ── Connection ── */}
             <Section label="Connection">
+              {/* Plain <a>, no `download`: iOS routes the response to the
+                  profile installer off the navigation itself. */}
               <a
                 href="/cert"
                 class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300 text-center"
               >
                 Install server certificate
               </a>
-              <span class="text-[10px] text-neutral-600 leading-relaxed">
+              <Note>
                 Replaces the browser's temporary security exception with real
                 trust, so it stops expiring. On iPhone/iPad open this in Safari
-                (not the home-screen app), install from Settings &rarr; Profile
-                Downloaded, then enable it under General &rarr; About &rarr;
-                Certificate Trust Settings.
-              </span>
-              <button
-                onClick={() => void resetServiceWorker()}
-                class="px-3 py-1.5 text-xs rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-              >
-                Reset connection
-              </button>
-              <span class="text-[10px] text-neutral-600 leading-relaxed">
-                Unregisters the offline worker and reloads, so the next load
-                goes to the network and the browser can show its certificate
-                prompt. Cookies are kept — this device stays paired.
-              </span>
+                (not the home-screen app), install from Settings → Profile
+                Downloaded, then enable it under General → About → Certificate
+                Trust Settings.
+              </Note>
             </Section>
-            </Show>
 
-            {/* ── Default filter (desktop-managed; LAN clients inherit it) ── */}
-            <Show when={!isWeb()}>
-            <Section label="Default Filter">
-              <Toggle
-                label="Apply on gallery open"
-                checked={settings().default_filter?.enabled ?? false}
-                onChange={(v) => updateDefaultFilter("enabled", v)}
-              />
-              <Show when={settings().default_filter?.enabled}>
-                <input
-                  type="text"
-                  value={settings().default_filter?.query ?? ""}
-                  onInput={(e) => updateDefaultFilter("query", e.currentTarget.value)}
-                  placeholder="e.g. rating>=3 AND NOT auto::indoor"
-                  class="w-full px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
-                />
-                <span class="text-[10px] text-neutral-600 leading-snug">
-                  Applied automatically the next time this gallery is opened — including
-                  from LAN web clients.
-                </span>
-              </Show>
-            </Section>
-            </Show>
-
-            {/* ── Storage (desktop only) ── */}
-            <Show when={!isWeb()}>
-            <Section label="Storage">
-              <Field label="Companion file location">
-                <div class="flex gap-1">
-                  {([
-                    { value: "lightview_folder" as const, label: ".lightview folder" },
-                    { value: "alongside" as const, label: "Alongside images" },
-                  ]).map((opt) => (
-                    <button
-                      class={`px-2 py-0.5 text-xs rounded cursor-pointer transition-colors ${
-                        settings().storage.companion_location === opt.value
-                          ? "bg-teal-700/60 text-teal-200"
-                          : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300"
-                      }`}
-                      onClick={() => updateStorage("companion_location", opt.value)}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </Field>
-            </Section>
-            </Show>
-
-            {/* ── Build identity — always last. Lets a running client be matched
-                to a build (e.g. confirming a container actually updated). ── */}
+            {/* Build identity — always last. Lets a running client be matched
+                to a build ("did the container actually update?"). */}
             <AboutFooter />
           </div>
         </div>
-        </Dynamic>
+      </Dynamic>
     </Show>
   );
 }
 
-// ── Helpers ──
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
 
 /** Renders children where they sit (no portal). Paired with `Dynamic` so the
- *  desktop settings dropdown stays in place while the mobile page portals out. */
+ *  desktop dropdown stays in place while the mobile page portals out. */
 function InPlace(props: { children: any }) {
   return props.children;
 }
 
-/** Build identity line pinned to the bottom of the settings panel. Tap/click to
- *  copy the full label (version · commit · build time) so it can be pasted into
- *  a bug report or checked against what a deploy is meant to be running. */
+/** Build identity, pinned to the bottom. Tap to copy the full label so it can
+ *  be pasted into a bug report or checked against what a deploy should run. */
 function AboutFooter() {
   const [copied, setCopied] = createSignal(false);
   const label = versionLabel();
@@ -1307,6 +604,45 @@ function Field(props: { label: string; children: any }) {
   );
 }
 
+function Note(props: { children: any }) {
+  return (
+    <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5 leading-relaxed">{props.children}</p>
+  );
+}
+
+function Chip(props: { active: boolean; onClick: () => void; children: any }) {
+  return (
+    <button
+      onClick={props.onClick}
+      class="px-2 py-0.5 text-xs rounded cursor-pointer transition-colors"
+      classList={{
+        "bg-teal-700/60 text-teal-200": props.active,
+        "bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-300":
+          !props.active,
+      }}
+    >
+      {props.children}
+    </button>
+  );
+}
+
+function NumberInput(props: { value: number; title: string; onChange: (n: number) => void }) {
+  return (
+    <input
+      type="number"
+      min="1"
+      max="4000"
+      value={props.value}
+      title={props.title}
+      onInput={(e) => {
+        const n = parseInt(e.currentTarget.value, 10);
+        if (Number.isFinite(n) && n > 0) props.onChange(n);
+      }}
+      class="w-20 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 outline-none focus:border-neutral-500"
+    />
+  );
+}
+
 function Toggle(props: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
     <label class="flex items-center justify-between cursor-pointer group">
@@ -1323,9 +659,7 @@ function Toggle(props: { label: string; checked: boolean; onChange: (v: boolean)
       >
         <span
           class="absolute top-0.5 left-0.5 w-3.5 h-3.5 rounded-full bg-white transition-transform"
-          style={{
-            transform: props.checked ? "translateX(14px)" : "translateX(0)",
-          }}
+          style={{ transform: props.checked ? "translateX(14px)" : "translateX(0)" }}
         />
       </button>
     </label>

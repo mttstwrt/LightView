@@ -4,7 +4,6 @@ import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import solid from "vite-plugin-solid";
 import tailwindcss from "@tailwindcss/vite";
-import devtools from 'solid-devtools/vite';
 
 // Build stamp baked into the SPA so a running client can report exactly which
 // build it is — the "did docker compose actually pull/rebuild?" question. The
@@ -35,28 +34,32 @@ export default defineConfig({
     __GIT_SHA__: JSON.stringify(gitSha()),
     __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
   },
-  plugins: [
-    devtools({ autostructure: true }),
-    solid(),
-    tailwindcss(),
-  ],
+  plugins: [solid(), tailwindcss()],
   root: "src-solidjs",
   clearScreen: false,
   server: {
     port: 5173,
     strictPort: true,
   },
-  envPrefix: ["VITE_", "TAURI_"],
+  envPrefix: ["VITE_"],
+  // `node`, not the `jsdom` that `vite-plugin-solid` would otherwise select.
+  // What is worth unit testing here is arithmetic — layout geometry, scroll
+  // compensation — and none of it touches a DOM. Taking the browser
+  // environment would mean a second heavyweight dependency to run tests that
+  // never render anything. Behaviour that *does* need a browser is covered by
+  // `.claude/skills/verify/grid.mjs`, in a real one.
+  test: {
+    environment: "node",
+    include: ["**/*.test.ts"],
+  },
   build: {
     target: "esnext",
     outDir: "../dist",
     emptyOutDir: true,
-    minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
-    sourcemap: !!process.env.TAURI_DEBUG,
+    minify: "esbuild",
     rollupOptions: {
       input: {
         main: resolve(__dirname, "src-solidjs/index.html"),
-                            devtools: resolve(__dirname, "src-solidjs/devtools.html"),
       },
     },
   },

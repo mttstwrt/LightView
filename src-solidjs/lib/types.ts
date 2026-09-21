@@ -1,5 +1,8 @@
+// The wire, mirrored. Every shape here has a counterpart in the Rust crate, and
+// the two ship together — there is no version skew to design around.
+
 // ---------------------------------------------------------------------------
-// Companion file types (mirrors Rust companion::schema)
+// Companion file (mirrors companion::schema)
 // ---------------------------------------------------------------------------
 
 export interface CompanionFile {
@@ -17,7 +20,11 @@ export type MediaType = "image" | "video" | "gif";
 
 export interface TagCollection {
   user: string[];
-  auto: string[];
+  /** Set membership. A sibling of `user`, not a plugin bucket: a plugin bucket
+   *  is versioned and replaced wholesale on a re-run, which is right for
+   *  geocoded place names and exactly wrong for a set, which is user-owned and
+   *  must survive re-tagging. */
+  set: string[];
   plugins: Record<string, PluginTagEntry>;
 }
 
@@ -34,9 +41,13 @@ export interface MetaCollection {
 
 export interface CoreMeta {
   rating?: number;
+  date_rated?: string;
   color_label?: string;
   notes?: string;
   media?: MediaInfo;
+  /** Mirrored from the index so a cache rebuild loses time and nothing else. */
+  date_added?: string;
+  last_viewed?: string;
 }
 
 export interface MediaInfo {
@@ -49,16 +60,26 @@ export interface MediaInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Gallery types
+// Trust (mirrors server::auth::Trust)
 // ---------------------------------------------------------------------------
 
-export interface GalleryOpenResult {
-  path: string;
-  total_media: number;
+/** What this listener grants. `owner` only ever comes from a loopback bind. */
+export type Trust = "device" | "owner";
+
+/** What the client is told about itself, so the UI does not offer what the
+ *  server will refuse. The server enforces regardless; this exists only so the
+ *  UI does not lie. */
+export interface Capabilities {
+  trust: Trust;
+  upload: boolean;
+  /** A runtime question rather than a compile-time one: the X11 clipboard
+   *  backend fails on a Wayland session without XWayland, and on a process with
+   *  no display at all. */
+  clipboard: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Filter types (mirrors Rust filter::ast)
+// Filter (mirrors filter::ast)
 // ---------------------------------------------------------------------------
 
 export type FilterExpr =
@@ -71,13 +92,29 @@ export type FilterExpr =
   | { type: "has_namespace"; namespace: TagNamespace }
   | { type: "color_label"; value: string };
 
-export type TagNamespace = "user" | "auto" | `plugin.${string}` | "any";
+/** `auto` is gone and `set` has arrived. The enum is serialized in both
+ *  directions, so this is a wire change rather than only a parser change. */
+export type TagNamespace = "user" | "set" | `plugin.${string}` | "any";
+
+/** The two namespaces a person may write to. A plugin bucket is replaced
+ *  wholesale by its own run, so it is never writable this way — and the Rust
+ *  type has no variant for one, so a request naming it fails to deserialize
+ *  rather than reaching a check. */
+export type WritableNamespace = "user" | "set";
 
 // ---------------------------------------------------------------------------
-// Sort and group types (mirrors Rust sort module)
+// Sort and group (mirrors sort::)
 // ---------------------------------------------------------------------------
 
-export type SortField = "date" | "size" | "name" | "rating" | "media_type" | "lastviewed" | "dateadded" | "lastrated";
+export type SortField =
+  | "date"
+  | "size"
+  | "name"
+  | "rating"
+  | "mediatype"
+  | "lastviewed"
+  | "dateadded"
+  | "lastrated";
 export type SortOrder = "asc" | "desc";
 
 export type GroupBy =
@@ -93,18 +130,25 @@ export interface GroupHeader {
   count: number;
 }
 
-export interface SortedResult {
+/** The whole grid payload: one query, filter compiled in, groups computed. */
+export interface Items {
   items: SortedItem[];
   groups: GroupHeader[];
 }
 
 export interface SortedItem {
+  /** Gallery-relative, because the database is keyed that way. */
   path: string;
-  date_taken: number | null;
+  /** What the grid is ordered and grouped by: capture time when the file has
+   *  one, file modification time when it does not — so it is never null. This
+   *  is deliberately *not* `date_taken`; that is the camera's timestamp and is
+   *  what `date=` filters mean. A screenshot has a date here and no capture
+   *  time anywhere. */
+  date: number | null;
   file_size: number;
   media_type: string;
   rating: number | null;
-  /** Colour label, lowercase, or null. One of `COLOR_LABELS`. */
+  /** Colour label, lowercase, or null. */
   color_label: string | null;
   last_viewed: number | null;
   date_added: number | null;
@@ -112,18 +156,94 @@ export interface SortedItem {
   duration?: number | null;
   width?: number | null;
   height?: number | null;
-  /** Base64 ThumbHash placeholder (~25 bytes decoded); null until the item's
-   *  thumbnail has been generated at least once. Decoded client-side into a
-   *  blurry data-URL placeholder — see lib/thumbhashPlaceholder.ts. */
+  /** Base64 ThumbHash (~25 bytes decoded), or null until a thumbnail has been
+   *  generated once. Inlined here so the grid paints every cell blurry before
+   *  any thumbnail request goes out. */
   thumbhash?: string | null;
 }
 
 // ---------------------------------------------------------------------------
-// Timeline types
+// Item detail
 // ---------------------------------------------------------------------------
 
+export interface MediaMeta {
+  path: string;
+  media_type: string;
+  file_size: number;
+  /** The camera's capture time, or null when the file carries none. */
+  date_taken: number | null;
+  /** The file's modification time — always present, and what the panel shows
+   *  (labelled as such) when there is no capture time to show instead. */
+  mtime: number;
+  date_added: number | null;
+  last_viewed: number | null;
+  rating: number | null;
+  color_label: string | null;
+  width: number | null;
+  height: number | null;
+  duration: number | null;
+  gps: [number, number] | null;
+  /** `[namespace, tag]` pairs, as the index holds them. */
+  tags: [string, string][];
+  notes: string | null;
+}
+
+export type ThumbTier = "js" | "j" | "jm" | "jh";
+
+export interface TierPresence {
+  tier: ThumbTier;
+  edge: number;
+  bytes: number | null;
+}
+
 // ---------------------------------------------------------------------------
-// Autocomplete types
+// Trash
+// ---------------------------------------------------------------------------
+
+export interface TrashEntry {
+  /** `<epoch_ms>_<seq>` — digits and underscores, never a path. Keeping it
+   *  opaque is a security requirement: an id that could carry slashes forces
+   *  the removal of the check that stops a restore escaping the trash. */
+  id: string;
+  /** Where it came from, in its own field. */
+  relative_path: string;
+  file_name: string;
+  deleted_at: number;
+  size: number;
+}
+
+// ---------------------------------------------------------------------------
+// Duplicates
+// ---------------------------------------------------------------------------
+
+export interface DuplicateItem {
+  path: string;
+  width: number | null;
+  height: number | null;
+  file_size: number;
+  date_taken: number | null;
+  is_best: boolean;
+}
+
+export interface DuplicateGroup {
+  items: DuplicateItem[];
+  hash: number;
+}
+
+/** A fully-resolved merge. The dialog resolves the conflicts; the backend
+ *  applies the answer. */
+export interface MergePlan {
+  keeper: string;
+  others: string[];
+  rating?: number | null;
+  color_label?: string | null;
+  notes?: string | null;
+  location?: { lat: number; lon: number; alt?: number } | null;
+  mtime?: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Autocomplete
 // ---------------------------------------------------------------------------
 
 export interface TagSuggestion {
@@ -134,94 +254,55 @@ export interface TagSuggestion {
 }
 
 // ---------------------------------------------------------------------------
-// Hardware types
+// Settings
 // ---------------------------------------------------------------------------
 
-export interface MemoryStatus {
-  total_ram_mb: number;
-  available_ram_mb: number;
+/** `.lightview/settings.toml` — durable, and it holds exactly two keys.
+ *
+ *  Display preferences are **not** here, for any client. A file inside the
+ *  gallery is per-gallery, not per-client, so two desktops mounting one share
+ *  would fight over thumbnail size. They live in `clientPrefs`. */
+export interface GallerySettings {
+  /** Applied when the gallery is opened, by any client. */
+  default_filter: string;
+  /** Hand-edited only: it is the one setting that deletes data, so no command
+   *  writes it at any trust level. */
+  trash_retention_days: number;
 }
 
-// ---------------------------------------------------------------------------
-// Settings types
-// ---------------------------------------------------------------------------
-
-export type CompanionLocation = "lightview_folder" | "alongside";
-
-export interface AppSettings {
-  display: {
-    thumbnail_size: number;
-    /** Minimum thumbnail/row size (px) the zoom control allows. */
-    thumb_size_min: number;
-    /** Maximum thumbnail/row size (px) the zoom control allows. */
-    thumb_size_max: number;
-    grid_gap: number;
-    background_color: string;
-    video_hover_preview: boolean;
-    video_autoplay_loop: boolean;
-    gif_autoplay_grid: boolean;
-    /** Autoplay short videos in the grid (muted, looping), like GIFs. */
-    video_autoplay_grid: boolean;
-    /** Max duration (seconds) a video may have to qualify for grid autoplay. */
-    video_autoplay_max_seconds: number;
-    scroll_blur: boolean;
-    map_dark_mode: boolean;
-    /** Serve a 1600px aspect-preserving tier in the justified view when zoomed
-     *  in, instead of upscaling the 512px tier. Generated for visible cells
-     *  only, so disk cost scales with what you actually view zoomed in. */
-    justified_high_detail: boolean;
-    /** Where the mobile filter/sort sheet (opened by the search button)
-     *  appears: pinned to the top under the safe-area inset, or as a
-     *  thumb-reachable sheet sliding up from the bottom. Mobile web only. */
-    mobile_filter_sheet: "top" | "bottom";
-    /** Start playing a video automatically when you settle on it in the
-     *  viewer (always muted, with a tap-to-unmute pill). Off = tap play. */
-    video_autoplay_viewer: boolean;
-    /** Open a gallery scrolled to the *end* of the grid rather than the start,
-     *  so browsing runs bottom-to-top. Only changes where the view lands; the
-     *  sort order itself is unaffected (flip that in the sort menu). */
-    start_at_bottom: boolean;
-  };
-  performance: {
-    preload_count: number;
-    lru_cache_size: number;
-    thumbnail_threads: number;
-  };
-  storage: {
-    companion_location: CompanionLocation;
-  };
-  // Filter query applied automatically when a gallery is first opened (app or web).
-  default_filter: {
-    enabled: boolean;
-    query: string;
-  };
-  external_apps: ExternalApp[];
-}
-
+/** An external application, as the client sees it. The `command` is never sent
+ *  to the client and never accepted from it — `open_with` carries an index. */
 export interface ExternalApp {
   label: string;
-  command: string;
-  args: string[];
 }
 
 // ---------------------------------------------------------------------------
-// Plugin types
+// Plugins
 // ---------------------------------------------------------------------------
 
 export interface PluginInfo {
   name: string;
   display_name: string;
   version: string;
-  /** Host protocol version the plugin's manifest declares. `0` means it
-   *  predates the versioned protocol, which a remote worker refuses to run. */
   api_version: number;
   description: string;
   tag_prefix: string;
 }
 
-export interface PluginRunResult {
-  path: string;
-  tags_added: string[];
-  success: boolean;
-  error: string | null;
-}
+// ---------------------------------------------------------------------------
+// Events (mirrors server::events)
+// ---------------------------------------------------------------------------
+
+export type Domain = "items" | "tags" | "jobs";
+
+export type ServerEvent =
+  | { kind: "fs-changed"; added: string[]; removed: string[] }
+  /** Plural, and one per operation rather than one per file: every write in
+   *  the system takes a selection, and a 500-photo tag used to be 500 events
+   *  answered with 500 metadata calls. */
+  | { kind: "items-changed"; paths: string[] }
+  | { kind: "tags-indexed" }
+  | { kind: "job-progress"; plugin: string; done: number; total: number }
+  | { kind: "job-finished"; plugin: string; error: string | null }
+  /** You may have missed something in these domains. Re-fetch exactly them. */
+  | { kind: "resync"; domains: Domain[] };

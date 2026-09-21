@@ -1,35 +1,32 @@
 import { Show, For, createSignal } from "solid-js";
-import { uploadFiles, type UploadResult } from "../../lib/ipc";
-import { uploadConfig } from "../../stores/uploadStore";
+import { upload } from "../../lib/ipc";
 
-/** Upload photos/videos from this device into the host gallery, which files
- *  them into subfolders by capture date.
+/** Upload photos and videos from this device into the gallery.
  *
  *  Sheet only — no trigger of its own. Uploading is one entry in the command
- *  list (docs/frontend/chrome.md); the floating button this used to carry is
- *  now the command list's, which is why the three hide conditions that button
- *  needed are gone.
+ *  list; the floating button this used to carry is now the command list's,
+ *  which is why the three hide conditions that button needed are gone.
  *
- *  `onUploaded` is called after a successful upload so the gallery can refresh
- *  to show the new items (the web client gets no fs-watch push from the host). */
-export function UploadSheet(props: { open: boolean; onClose: () => void; onUploaded?: () => void }) {
+ *  No album field and no refresh callback. Where uploads land is server
+ *  configuration (`upload_dir`) rather than a per-upload choice, and what lands
+ *  reaches every client — this one included — through the watcher's
+ *  `fs-changed`, which is the same path a file copied in over the share takes.
+ *  The old client-side refetch existed because the web client got no watcher
+ *  push; it gets one now. */
+export function UploadSheet(props: { open: boolean; onClose: () => void }) {
   const [files, setFiles] = createSignal<File[]>([]);
-  const [album, setAlbum] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [progress, setProgress] = createSignal(0);
-  const [result, setResult] = createSignal<UploadResult | null>(null);
+  const [uploaded, setUploaded] = createSignal<string[] | null>(null);
   const [error, setError] = createSignal("");
 
   let fileInput: HTMLInputElement | undefined;
 
-  const showAlbum = () => uploadConfig()?.scheme === "year_album";
-
   const close = () => {
     if (busy()) return;
     setFiles([]);
-    setAlbum("");
     setProgress(0);
-    setResult(null);
+    setUploaded(null);
     setError("");
     props.onClose();
   };
@@ -37,7 +34,7 @@ export function UploadSheet(props: { open: boolean; onClose: () => void; onUploa
   const onPick = (e: Event) => {
     const input = e.currentTarget as HTMLInputElement;
     setFiles(input.files ? Array.from(input.files) : []);
-    setResult(null);
+    setUploaded(null);
     setError("");
   };
 
@@ -45,13 +42,11 @@ export function UploadSheet(props: { open: boolean; onClose: () => void; onUploa
     if (busy() || files().length === 0) return;
     setBusy(true);
     setError("");
-    setResult(null);
+    setUploaded(null);
     setProgress(0);
     try {
-      const res = await uploadFiles(files(), album(), setProgress);
-      setResult(res);
+      setUploaded(await upload(files(), setProgress));
       setFiles([]);
-      if (res.uploaded.length > 0) props.onUploaded?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -124,17 +119,6 @@ export function UploadSheet(props: { open: boolean; onClose: () => void; onUploa
             </div>
           </Show>
 
-          <Show when={showAlbum()}>
-            <input
-              type="text"
-              value={album()}
-              onInput={(e) => setAlbum(e.currentTarget.value)}
-              placeholder="Album name (optional)"
-              disabled={busy()}
-              class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm placeholder:text-white/30 focus:outline-none focus:border-teal-500/50 disabled:opacity-40"
-            />
-          </Show>
-
           <Show when={busy()}>
             <div class="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
               <div
@@ -148,22 +132,11 @@ export function UploadSheet(props: { open: boolean; onClose: () => void; onUploa
             <p class="text-red-400 text-xs">{error()}</p>
           </Show>
 
-          <Show when={result()}>
-            {(r) => (
-              <div class="text-xs flex flex-col gap-1">
-                <Show when={r().uploaded.length > 0}>
-                  <p class="text-green-400">
-                    Uploaded {r().uploaded.length} file{r().uploaded.length === 1 ? "" : "s"}.
-                  </p>
-                </Show>
-                <For each={r().rejected}>
-                  {(rej) => (
-                    <p class="text-yellow-400 truncate">
-                      {rej.original}: {rej.reason}
-                    </p>
-                  )}
-                </For>
-              </div>
+          <Show when={uploaded()?.length}>
+            {(count) => (
+              <p class="text-green-400 text-xs">
+                Uploaded {count()} file{count() === 1 ? "" : "s"}.
+              </p>
             )}
           </Show>
 

@@ -1,23 +1,20 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show } from "solid-js";
-import { settings } from "../../stores/settingsStore";
+import { prefs } from "../../stores/settingsStore";
 import { selectionMode, colorLabelByPath } from "../../stores/galleryStore";
-import { mediaUrl, gifAtlasUrl, COLOR_LABEL_HEX, type ColorLabel, type ThumbTier } from "../../lib/ipc";
+import { mediaUrl } from "../../lib/ipc";
+import { COLOR_LABEL_HEX, type ColorLabel } from "../../lib/colorLabels";
 import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { saveVideoPosition, restoreVideoPosition } from "../../lib/mediaPlayback";
 import { LONG_PRESS_MS, TAP_SLOP_PX, suppressNextClick } from "../../lib/touch";
 import { hapticTick } from "../../lib/haptics";
-import { isTauri } from "../../lib/runtime";
-import { recordImageLoad, recordImageLoadStart, recordImageLoadSettled } from "../../lib/perfMonitor";
+import { recordImageLoad } from "../../lib/loadLatency";
 import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
 import { hasUrlLoaded, markUrlLoaded } from "../../lib/loadedUrls";
-import { GifCanvas } from "../GifCanvas";
 
 interface ThumbnailCellProps {
   path: string;
   /** Protocol URL for the thumbnail image. */
   thumbSrc: string | null;
-  /** LOD tier for this cell — used to request a matching GIF frame atlas. */
-  tier: ThumbTier;
   /** Video duration in seconds, if known — gates short-video grid autoplay. */
   durationSec?: number | null;
   selected: boolean;
@@ -152,7 +149,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
     const want =
       isGif() &&
       !!props.thumbSrc &&
-      settings().display.gif_autoplay_grid &&
+      prefs().gif_autoplay_grid &&
       inView();
     if (!want) {
       releaseGifSlot(playToken);
@@ -173,7 +170,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
   const isShortVideo = () => {
     if (!isPlayableVideo()) return false;
     const d = props.durationSec;
-    return d != null && d <= settings().display.video_autoplay_max_seconds;
+    return d != null && d <= prefs().video_autoplay_max_seconds;
   };
 
   // Mirror the GIF autoplay slot logic for short videos, gated on its own
@@ -185,7 +182,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
     const want =
       isShortVideo() &&
       !!props.thumbSrc &&
-      settings().display.video_autoplay_grid &&
+      prefs().video_autoplay_grid &&
       inView();
     if (!want) {
       releaseVideoSlot(videoToken);
@@ -196,25 +193,17 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
   });
   onCleanup(() => releaseVideoSlot(videoToken));
 
-  // On the desktop webview (WebKitGTK) we render GIFs on a <canvas> from a
-  // backend frame atlas — its `<img>` GIF animation is broken (too fast + leaks).
-  // A real browser (web client) animates `<img>` GIFs fine, so swap there.
-  const useCanvasGif = () => isTauri();
-  const showGifCanvas = () => useCanvasGif() && gifActive();
-
-  // The base <img> shows the static thumbnail (and acts as the poster under the
-  // canvas). On the web client it swaps to the full animated GIF when active.
-  const effectiveSrc = () => {
-    if (!useCanvasGif() && gifActive()) {
-      return mediaUrl(props.path);
-    }
-    return props.thumbSrc;
-  };
+  // The base <img> shows the static thumbnail, and swaps to the full animated
+  // GIF when the cell is active. There used to be a second rendering — a
+  // <canvas> fed by a backend frame atlas — because WebKitGTK's own `<img>` GIF
+  // animation ran too fast and leaked. That engine is gone, and the atlas
+  // route, its cache and its thumbnail tier went with it.
+  const effectiveSrc = () => (gifActive() ? mediaUrl(props.path) : props.thumbSrc);
 
   // Show a muted looping video preview while hovering (when enabled), or
   // continuously for short videos when grid autoplay is on / they hold a slot.
   const showVideoPreview = () =>
-    (isPlayableVideo() && hovered() && settings().display.video_hover_preview) ||
+    (isPlayableVideo() && hovered() && prefs().video_hover_preview) ||
     (isShortVideo() && canVideoAutoplay());
 
   // Whether this cell's current image has finished loading (for fade-in).
@@ -248,25 +237,16 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       }
       const seen = url ? hasUrlLoaded(url) : false;
       setLoaded(seen);
-      // Timestamp every fresh load (seen URLs still skipped): the sample feeds
-      // the always-on load-latency EWMA that sizes the grids' look-ahead
-      // buffer, not just the debug overlay.
-      // A pending load that never completed (src swapped mid-flight, cell
-      // recycled) has to be settled here or the in-flight count only grows.
-      if (loadStart > 0) recordImageLoadSettled();
+      // Timestamp every fresh load (seen URLs skipped): the sample feeds the
+      // load-latency EWMA that sizes the grid's look-ahead buffer.
       loadStart = url && !seen ? performance.now() : 0;
-      if (loadStart > 0) recordImageLoadStart();
     },
   ));
-
-  onCleanup(() => {
-    if (loadStart > 0) recordImageLoadSettled();
-  });
 
   // Whether we have a valid URL to attempt loading.
   const hasUrl = () => !!props.thumbSrc && !errored();
 
-  const fadeEnabled = () => settings().display.scroll_blur;
+  const fadeEnabled = () => prefs().scroll_blur;
 
   // --- Touch long-press → context menu ------------------------------------
   // iOS Safari never fires `contextmenu` for touch, so the menu needs a
@@ -349,8 +329,6 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         // speed — defeating the buffer's pre-loading — so desktop-webview
         // only. Cell size is set externally (grid track / explicit), so the
         // intrinsic-size fallback is only a pre-first-paint placeholder.
-        "content-visibility": isTauri() ? "auto" : undefined,
-        "contain-intrinsic-size": isTauri() ? "auto 250px" : undefined,
         outline: props.selected ? "2px solid #3b82f6" : "none",
         "outline-offset": "-2px",
         // Long-press pop: lifts the pressed cell slightly above its
@@ -458,14 +436,12 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           // desktop, but on mobile a whole row of tier upgrades decodes at
           // once and cells blank for a beat. Reveal only after decode()
           // (which also makes buffered cells paint-ready when they scroll
-          // in). Not on WebKitGTK: it decodes on the main thread at paint
-          // time (no blank to hide), and deferring buffer-cell decodes is
-          // exactly what keeps it smooth.
+          // in).
           const reveal = () => {
             setLoaded(true);
             setPrevSrc(null); // new image attached — release the underlay
           };
-          if (isTauri() || !img.decode) {
+          if (!img.decode) {
             reveal();
             return;
           }
@@ -481,28 +457,12 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
         onError={() => {
           // Don't treat media URL errors as thumbnail errors
           if (isGif() && hovered()) return;
-          // A failed load produces no latency sample, so settle it explicitly.
-          if (loadStart > 0) {
-            recordImageLoadSettled();
-            loadStart = 0;
-          }
+          loadStart = 0;
           setPrevSrc(null); // don't leave a stale image under the skeleton
           setErrored(true);
           props.onError?.(props.path);
         }}
       />
-
-      {/* Canvas GIF playback (desktop), layered over the static thumbnail.
-          Keyed on the URL so recycling to a different GIF restarts cleanly. */}
-      <Show when={showGifCanvas()}>
-        <GifCanvas
-          // Cap the animated-frame atlas at the "j" tier — a high-res justified
-          // atlas ("jm" 1280px / "jh" 2560px) would decode every frame at that
-          // size and blow up memory.
-          url={gifAtlasUrl(props.path, props.tier === "jm" || props.tier === "jh" ? "j" : props.tier)}
-          class="absolute inset-0 w-full h-full object-cover"
-        />
-      </Show>
 
       {/* Muted video hover preview, layered over the static thumbnail. */}
       <Show when={showVideoPreview()}>

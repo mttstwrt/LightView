@@ -1,23 +1,28 @@
 # --- Rust/Cargo ---
-/src-tauri/target/
+/src-rust/target/
 **/*.rs.bk
-Cargo.lock
+# `Cargo.lock` is **committed**, not ignored. This crate ships a [[bin]], and
+# the package build, the container image and the release workflow all build
+# from a clean checkout — so without it every one of them re-resolves
+# dependencies from scratch and a semver-compatible upstream release can break
+# a build with no change here and nothing in git to bisect. `PKGBUILD` already
+# passes `--locked`, which fails outright on a fresh clone if the lock file is
+# not there.
 
 # --- Node/Frontend ---
 node_modules/
-dist/
-dist-tauri/
 .env
 .env.*
 .DS_Store
 
-# --- Tauri Bundler ---
-src-tauri/binaries/
-src-tauri/gen/
-*.AppImage
-*.deb
-*.msi
-*.exe
+# The SPA is embedded at compile time, so `dist/` must exist before any cargo
+# command. Excluding the directory outright would make that a permanent
+# "run npm first" exception — and git cannot re-include a file whose parent
+# directory is excluded, so the exclusion is on the contents and .gitkeep is
+# committed. A build without `npm run build` then serves a 404 at `/`: a loud
+# runtime failure instead of a confusing build failure.
+dist/*
+!dist/.gitkeep
 
 # --- Log files ---
 npm-debug.log*

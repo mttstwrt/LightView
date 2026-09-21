@@ -19,19 +19,35 @@
 
 import { For, Show, createSignal, createEffect, createMemo, on, onMount, onCleanup, batch, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { isMobile, isTauri, renderScale } from "../../lib/runtime";
+import { isMobile, renderScale } from "../../lib/runtime";
 import { createWheelScroll } from "../../lib/wheelScroll";
-import { settings, setSettings } from "../../stores/settingsStore";
+import { prefs, setPrefs } from "../../stores/settingsStore";
 import { durationByPath } from "../../stores/galleryStore";
-import { ensureTierThumbnails, thumbUrl, mediaUrl, type ThumbTier } from "../../lib/ipc";
+import { api, thumbUrl, mediaUrl } from "../../lib/ipc";
+import type { ThumbTier } from "../../lib/types";
 import { onThumbRegenerated } from "../../lib/thumbRegeneration";
-import type { MediaMeta } from "../../stores/galleryStore";
+import type { CellMeta } from "../../stores/galleryStore";
 import { createThumbProgress } from "../../lib/thumbProgress";
-import { recordCacheMiss } from "../../lib/perfMonitor";
-import { computeJustifiedLayout, rowIndexAtOffset, portraitRowBoost } from "../../lib/justifiedLayout";
+import {
+  computeJustifiedLayout,
+  portraitRowBoost,
+  rowIndexAtOffset,
+  scaleAnchor,
+  scrollHolding,
+  topAnchor,
+  type JustifiedLayout,
+  type ScaleAnchor,
+  type TopAnchor,
+} from "../../lib/justifiedLayout";
 import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
-import { createScrollDynamics, constrainedNetwork, CHEAP_RUNG_DURING_GATE } from "../../lib/scrollDynamics";
-import { onScrollHost, scrollToY, scrollTop, viewportHeight } from "../../lib/scrollHost";
+import { createScrollDynamics, constrainedNetwork } from "../../lib/scrollDynamics";
+import {
+  adjustBy,
+  onScrollHost,
+  scrollToY,
+  scrollTop,
+  viewportHeight,
+} from "../../lib/scrollHost";
 import { VIEWER_PATH_EVENT } from "../../lib/viewerTransition";
 import { pickByPriority } from "../../lib/loadPriority";
 import { createUrlVersions } from "../../lib/urlVersions";
@@ -47,7 +63,7 @@ interface JustifiedGridProps {
   aspects: Map<string, number>;
   /** File size + media type per path; drives serve-original-vs-thumbnail at
    *  high zoom. Missing entries fall back to always thumbnailing. */
-  itemMeta?: Map<string, MediaMeta>;
+  itemMeta?: Map<string, CellMeta>;
   /** Indices that begin a new group — force a row break before each. */
   groupStarts?: number[];
   onItemClick: (index: number) => void;
@@ -154,16 +170,22 @@ const ROW_HEIGHT_MAX = 600;
 type DetailLevel = "base" | "mid" | "high";
 
 export function JustifiedGrid(props: JustifiedGridProps) {
-  const gap = () => settings().display.grid_gap;
+  const gap = () => prefs().grid_gap;
 
-  // Aspect ratios recovered from loaded thumbnails, for paths whose indexed
-  // dimensions aren't known yet (a just-added file is inserted with NULL
-  // width/height and its dimensions are only written when its thumbnail is
-  // generated — after the frontend has already fetched the sorted items). The
-  // j/jm/jh tiers are all aspect-preserving, so a loaded cell's natural pixel
-  // size gives the exact source aspect. Without this such cells lay out 1:1 and
-  // the aspect-correct thumbnail is object-cover cropped to a square — looking
-  // like a grid thumbnail until a restart re-reads the now-populated dimensions.
+  // Aspect ratios recovered from loaded thumbnails, for the paths whose
+  // dimensions the index still does not have.
+  //
+  // That used to be every newly added file, because dimensions were written
+  // only as a side effect of generating a thumbnail — after the frontend had
+  // already fetched the sorted items. It is not any more: the watcher reads an
+  // image's header before it announces the file. What is left is a cache from
+  // before that change and the formats neither reader can parse, RAW and AVIF.
+  //
+  // The j/jm/jh tiers are all aspect-preserving, so a loaded cell's natural
+  // pixel size gives the exact source aspect. Without this such cells lay out
+  // 1:1 and the aspect-correct thumbnail is object-cover cropped to a square.
+  // Each correction is a relayout, so it is held steady like any other — see
+  // the anchoring effect below.
   const [measuredAspects, setMeasuredAspects] = createSignal<Map<string, number>>(new Map());
   // A path's aspect: indexed dimensions win; fall back to a measured value, then
   // 1:1. Reads measuredAspects() so consumers recompute when a cell is measured.
@@ -196,7 +218,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // then use that cell width as the row height. Grid and justified then share
   // one effective size and the picker drives both.
   const targetRowHeight = () => {
-    const ts = settings().display.thumbnail_size;
+    const ts = prefs().thumbnail_size;
     if (!isMobile()) return ts;
     const g = gap();
     const cw = Math.max(0, containerWidth() - 2 * g);
@@ -209,7 +231,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // high-detail is disabled or zoomed out; "mid"/"high" step up as you zoom in.
   const [detailLevel, setDetailLevel] = createSignal<DetailLevel>("base");
   createEffect(() => {
-    if (settings().display.justified_high_detail === false) {
+    if (prefs().justified_high_detail === false) {
       setDetailLevel("base");
       return;
     }
@@ -221,8 +243,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     });
   });
 
-  // The thumbnail tier backing the current level (used for cells not served as
-  // an original, and for the GIF atlas request). Each detail level maps to a
+  // The thumbnail tier backing the current level, for cells not served as an
+  // original. Each detail level maps to a
   // resolution sized for the cells it shows: base→512 ("j"), mid→1280 ("jm"),
   // high→2560 ("jh"). The mid tier exists so a mid-zoom cell doesn't decode the
   // 2560px high image at ~1/4 the displayed size.
@@ -323,6 +345,92 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
   const totalHeight = () => layout().totalHeight;
 
+  // -----------------------------------------------------------------------
+  // Holding the reader's place across a relayout
+  // -----------------------------------------------------------------------
+  //
+  // The layout changes for reasons the reader cannot see: a photo arriving or
+  // leaving anywhere in the library, a thumbnail decoding and revealing an
+  // aspect the index did not have. Left alone, the content under the viewport
+  // slides and the reader loses their place — and because a justified grid
+  // reflows like text, there is no single displacement to undo. What is held is
+  // one *item*, chosen differently for the two kinds of change:
+  //
+  //   a set change — pin the item at the top edge, because it is above any edit
+  //   the reader can see, so an edit on screen closes its own gap from below
+  //   and nothing above it moves;
+  //
+  //   a scale change — pin the item in the middle, because zoom moves
+  //   everything and the fixed point should be where the eye is.
+  //
+  // A viewport *height* change is neither. `computeJustifiedLayout` takes no
+  // height, so the keyboard opening cannot reach this effect at all, and
+  // holding the top edge while the reader simply sees less is what the browser
+  // already does unaided.
+
+  /** Where the reader last put themselves, and how much they could see. */
+  let reader = { top: 0, height: 0 };
+  const noteReaderPosition = () => {
+    reader = { top: scrollTop(), height: viewportHeight() };
+  };
+
+  // Captured once per zoom gesture rather than per notch. Twenty notches of
+  // re-deriving accumulates rounding into visible drift, and a notch that
+  // clamps at the end of the content would poison every reading after it.
+  let zoomHold: ScaleAnchor | null = null;
+
+  let lastScale = { row: 0, width: 0 };
+  let lastPaths: readonly string[] = [];
+
+  createEffect(
+    on(layout, (next, previous) => {
+      const row = targetRowHeight();
+      const width = contentWidth();
+      const paths = props.paths;
+      const wasScale = lastScale;
+      const wasPaths = lastPaths;
+      lastScale = { row, width };
+      lastPaths = paths;
+
+      if (!previous || previous.rows.length === 0 || next.rows.length === 0) return;
+      if (reader.height === 0) noteReaderPosition();
+
+      const scaled = row !== wasScale.row || width !== wasScale.width;
+      const anchor = scaled
+        ? (zoomHold ?? scaleAnchor(previous, reader.top, reader.height))
+        : holdTopAcrossSetChange(previous, wasPaths, paths);
+      if (!anchor) return;
+
+      const applied = adjustBy(scrollHolding(next, anchor, viewportHeight()) - scrollTop());
+      reader = { top: reader.top + applied, height: viewportHeight() };
+    }),
+  );
+
+  /**
+   * The top-edge anchor, translated through item identity.
+   *
+   * An index means a different photograph after an insertion or a removal, so
+   * the index the old layout reports is looked up as a path and found again in
+   * the new list. When the anchored item is the one that left, the next
+   * surviving item after it inherits the anchor — the reader's place is "here,
+   * in the sequence", and the nearest thing still present is the honest reading
+   * of that.
+   */
+  function holdTopAcrossSetChange(
+    previous: JustifiedLayout,
+    wasPaths: readonly string[],
+    paths: readonly string[],
+  ): TopAnchor | null {
+    const anchor = topAnchor(previous, reader.top);
+    if (!anchor) return null;
+    const live = new Set(paths);
+    for (let i = anchor.index; i < wasPaths.length; i++) {
+      if (!live.has(wasPaths[i])) continue;
+      return { index: paths.indexOf(wasPaths[i]), offset: anchor.offset };
+    }
+    return null;
+  }
+
   // Cells within the rendered row range, with absolute positions. A memo so the
   // several consumers below (geometry store, visible-path list, src assignment)
   // share one computation per change.
@@ -382,17 +490,16 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // `mediaUrl(path, fit)` is already cache-stable per (path, fit bucket).
   const versions = createUrlVersions();
   const pathIndex = createPathIndex();
-  // Paths already requested for high-tier (jh) look-ahead precache, so we don't
-  // re-issue IPC for them while zoomed in. The backend evicts from these tiers
-  // to stay inside a disk budget, so this memo can go stale — every warm call
-  // reports what it dropped and `forgetEvicted` takes those back out. Without
-  // that, an evicted cell is never re-warmed: the look-ahead still believes it's
-  // cached, so the cell falls through to the slow per-cell generate-on-serve.
+  // Paths already requested for high-tier (jh) look-ahead precache, so the same
+  // request is not re-issued while zoomed in.
+  //
+  // This set can go stale — the cache evicts from these tiers to stay inside a
+  // disk budget — and that is now harmless rather than something to track. A
+  // tier URL is not a cache handle: a request for an evicted tier regenerates
+  // it, so a stale entry here costs one generate-on-serve and nothing else. The
+  // old pipeline had the warm call report what it had dropped, because a cell
+  // pointed at an evicted thumbnail would otherwise never be re-warmed.
   const jhPrecached = new Set<string>();
-  const forgetEvicted = (evicted: string[] | undefined) => {
-    if (!evicted?.length) return;
-    for (const p of evicted) jhPrecached.delete(p);
-  };
   // NB: served-original (`?fit=`) cells are deliberately left un-warmed. They
   // aren't tier-backed — each is an on-demand source decode inside the request
   // (`serve_fit_image`) — so the obvious move is to load the same URL off-DOM
@@ -459,23 +566,19 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // queued for generation and nothing is in flight.
   const progress = createThumbProgress(() => queue.idle());
 
-  // Scroll velocity/direction tracking + the WebKitGTK decode gate (never
-  // engages on the web client). Owns the window scroll listener; each frame
-  // re-derives the visible row range. Cells-per-row and per-cell decode cost
-  // are estimates (avg ~square aspect; tier target size²) — the gate only
-  // needs the right order of magnitude.
+  // Scroll velocity/direction tracking. Owns the scroll host's listener; each
+  // frame re-derives the visible row range.
   const dynamics = createScrollDynamics({
     rowHeight: () => targetRowHeight() + gap(),
-    cellsPerRow: () => {
-      const rh = targetRowHeight();
-      return rh > 0 ? Math.max(1, contentWidth() / rh) : 1;
+    onFrame: () => {
+      // The reader has moved, so this is the place to hold next time. Reading
+      // it here rather than inside the layout effect is what makes the value a
+      // *reader's* choice: by the time a relayout runs, the browser may already
+      // have clamped `scrollTop` because the content shrank, and clamping is
+      // not a decision anyone made.
+      noteReaderPosition();
+      recalcRange?.();
     },
-    cellCostPx: () => {
-      const t = thumbTier();
-      const px = t === "jh" ? 2560 : t === "jm" ? 1280 : 512;
-      return px * px;
-    },
-    onFrame: () => recalcRange?.(),
   });
   onCleanup(() => dynamics.dispose());
 
@@ -548,7 +651,6 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // now — a cell can be upgraded between the miss and the drain — and
     // reports false, so only a genuinely fresh miss counts.
     if (!queue.queue(path, missingTierFor(path))) return;
-    recordCacheMiss();
     progress.queued();
     // Wake the loop rather than waiting on its poll. A landing reveals a
     // screenful of cold cells at once, and every one of them lands here.
@@ -566,15 +668,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Assign protocol URLs as soon as cells become visible. Cached thumbs load
   // instantly; uncached ones 404 → onError → queued for generation.
   createEffect(on(
-    [visibleCells, dynamics.decodeGate, dynamics.settled, fullStartRow, fullEndRow, pinnedPath,
+    [visibleCells, dynamics.settled, fullStartRow, fullEndRow, pinnedPath,
      viewStartRow, viewEndRow, awaitingCount, dynamics.warping],
-    ([visible, gated, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting, warping]) => {
-    // While the WebKitGTK decode gate is up, leave new cells on their
-    // placeholder so the main thread isn't buried under image decodes
-    // mid-scroll. When it releases this re-runs and assigns whatever's now on
-    // screen.
-    if (gated && !CHEAP_RUNG_DURING_GATE) return;
-    // Same, on every platform, while the view is being scrubbed past far
+    ([visible, settled, fullStart, fullEnd, pinned, viewStart, viewEnd, waiting, warping]) => {
+    // Nothing is assigned while the view is being scrubbed past far
     // faster than anything could load — the window turns over completely each
     // frame, so this would issue a request per cell for thousands of cells
     // nobody sees. Assignment resumes on the frame the scrub slows down.
@@ -584,11 +681,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // a fling is in progress, and upgrades to the level's real source
     // (jm/jh/fit-original) once it sits in the inner window with scrolling
     // settled — usually off-screen. At base detail "j" *is* the target, so
-    // there's nothing to degrade. On the desktop webview the hard gate covers
-    // flings (cheap rung behind the experiment flag). On a constrained
-    // network (Save-Data / 2g) cells are held at the cheap rung outright —
-    // "j" everywhere beats spending the data budget on jm/jh/fit upgrades.
-    const cheapScroll = isTauri() ? gated : !settled || constrainedNetwork();
+    // there's nothing to degrade. On a constrained network (Save-Data / 2g)
+    // cells are held at the cheap rung outright — "j" everywhere beats
+    // spending the data budget on jm/jh/fit upgrades.
+    const cheapScroll = !settled || constrainedNetwork();
     const degradable = detailLevel() !== "base";
 
     // Staged upgrade, in two passes over the same cells.
@@ -603,15 +699,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // still zero from the settled previous screen, so a single loop would
     // issue the whole window at once before any of it registered.
     //
-    // Measured neutral on the web client, where the browser decodes off the
-    // main thread and the backend's pool already serves in arrival order (the
-    // viewport is requested first either way). The reason to keep it is the
-    // desktop webview: WebKitGTK decodes on the main thread — the premise of
-    // the decode gate and of every isTauri() branch in this file — so cutting
-    // concurrent full-res decodes from ~17 to ~5 is main-thread work not done
-    // while the user is waiting on the visible rows. That platform is exactly
-    // what this harness cannot measure, so treat the win as reasoned, not
-    // demonstrated.
+    // Measured neutral in the browser for *decode* cost — the browser decodes
+    // off the main thread and the server's pool already serves in arrival order
+    // (the viewport is requested first either way). It is kept for the other
+    // half: each full-res source is a decode on the server's bounded pool, and
+    // over a LAN it is also bytes on the wire. Issuing ~5 at a time instead of
+    // ~17 is the difference between the visible rows queueing behind the
+    // look-ahead and not.
     const onScreenOf = (row: number) => row >= viewStart && row < viewEnd;
     const apply = (cell: ReturnType<typeof visibleCells>[number], mayTakeFull: boolean) => {
       // The viewer's current item is always treated as full-res and never
@@ -676,9 +770,9 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // the projected landing scroll position (± one viewport) so cells are
   // cached by the time the scroll arrives ("j" is both the cheap fling rung
   // and the base target, so it's the right thing to warm at every detail
-  // level). Backend warm via ensureTierThumbnails; on the web client
-  // additionally prime the browser's HTTP cache with the same URLs
-  // (responses are cacheable for 1h). One batch per pass, recomputed from the
+  // level). Server warm via `precache_thumbnails`, then prime the browser's
+  // own HTTP cache with the same URLs (responses carry a week's max-age and an
+  // ETag). One batch per pass, recomputed from the
   // live projection each time, so a redirected fling self-corrects and wasted
   // warms stay bounded.
   const warmLandingZone = () => {
@@ -708,14 +802,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
     loop.warm(async () => {
       try {
-        await ensureTierThumbnails(want, "j");
+        await api.precache("j", want);
         // Browser cache warm — low-priority so it can't compete with the
         // visible cells' loads. `priority` is a progressive enhancement
         // (ignored where unsupported; absent from TS 5.4's RequestInit).
-        if (!isTauri()) {
-          for (const p of want) {
-            fetch(versionedThumbUrl(p, "j"), { priority: "low" } as RequestInit).catch(() => {});
-          }
+        for (const p of want) {
+          fetch(versionedThumbUrl(p, "j"), { priority: "low" } as RequestInit).catch(() => {});
         }
       } catch (e) {
         console.error("Landing-zone warm failed:", e);
@@ -774,7 +866,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     const gen = generation();
     loop.fetch(async () => {
       try {
-        forgetEvicted((await ensureTierThumbnails(toGenerate, tier)).evicted);
+        await api.precache(tier, toGenerate);
         if (loop.aborted() || generation() !== gen) return;
         batch(() => {
           for (const p of toGenerate) {
@@ -833,7 +925,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     }
     if (want.length === 0) return false;
     loop.warm(async () => {
-      try { forgetEvicted((await ensureTierThumbnails(want, tier)).evicted); }
+      try { await api.precache(tier, want); }
       catch (e) { console.error("Justified look-ahead failed:", e); }
     });
     return true;
@@ -864,7 +956,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     }
     if (bgNeeded.length === 0) return;
     loop.warm(async () => {
-      try { await ensureTierThumbnails(bgNeeded, "j"); }
+      try { await api.precache("j", bgNeeded); }
       catch (e) { console.error("Justified background precache failed:", e); }
     });
   };
@@ -945,18 +1037,21 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     // Ctrl+wheel zooms (changes the target row height) instead of scrolling.
     // During a Ctrl+drag selection, fall through to scroll (mirrors GalleryGrid).
     const detachWheel = createWheelScroll({
-      rowHeight: () => targetRowHeight() + gap(),
       onSettle: () => loop.schedule(),
+      onZoomStart: () => {
+        zoomHold = scaleAnchor(layout(), reader.top, reader.height);
+      },
+      onZoomEnd: () => {
+        zoomHold = null;
+      },
       onZoom: (e) => {
         if (isDragging()) return false;
-        const cur = settings().display.thumbnail_size;
+        const cur = prefs().thumbnail_size;
         const step = Math.max(8, Math.round(cur * 0.12));
-        const lo = settings().display.thumb_size_min ?? ROW_HEIGHT_MIN;
-        const hi = settings().display.thumb_size_max ?? ROW_HEIGHT_MAX;
+        const lo = prefs().thumb_size_min ?? ROW_HEIGHT_MIN;
+        const hi = prefs().thumb_size_max ?? ROW_HEIGHT_MAX;
         const next = Math.max(lo, Math.min(hi, cur + (e.deltaY < 0 ? step : -step)));
-        if (next !== cur) {
-          setSettings((prev) => ({ ...prev, display: { ...prev.display, thumbnail_size: next } }));
-        }
+        if (next !== cur) setPrefs({ thumbnail_size: next });
         return true;
       },
     }).attach();
@@ -1066,7 +1161,19 @@ export function JustifiedGrid(props: JustifiedGridProps) {
           No media files found
         </div>
       </Show>
-      <Show when={props.loading}>
+      {/* Only when there is nothing else to show. This banner is `h-screen` and
+          sits *in flow* above the grid, so rendering it beside a populated grid
+          displaced every row by exactly one viewport and back again — measured
+          at 390px: content height 3482 → 4262 → 3482 while `scrollTop` never
+          moved. That is the "grid jumps and comes to rest exactly where it
+          started" bug, and "exactly" is the tell: the displacement is the
+          banner's own height.
+
+          The cost is that a refetch over an already-drawn grid is silent. That
+          is the right trade here — every refetch replaces the list with one
+          that is nearly always identical, so the honest feedback is no visible
+          change at all. */}
+      <Show when={props.loading && props.paths.length === 0}>
         <div class="flex items-center justify-center h-screen text-neutral-500 text-sm">
           Loading...
         </div>
@@ -1100,7 +1207,6 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                     <ThumbnailCell
                       path={path}
                       thumbSrc={cells.srcOf(path)}
-                      tier={thumbTier()}
                       freeSize={true}
                       durationSec={durationByPath().get(path) ?? null}
                       selected={effectiveSelected().has(path)}

@@ -1,29 +1,29 @@
 // The right-click / long-press menu over grid cells and the viewer.
 //
-// The most capability-sensitive component in the app: it is where file
-// operations, plugin runs, and deletes are offered. Every one of those is
-// gated on `capabilities()` so the web client never shows an action the server
-// will refuse — but that gating is presentation. The enforcement is the
-// `/api/invoke` allowlist, which is why a component bug here cannot become a
+// The most trust-sensitive component in the app: it is where file operations,
+// plugin runs and deletes are offered. Everything `Owner`-only is hidden rather
+// than offered and refused, so a phone never collects a 403 the user caused —
+// but that hiding is presentation. The enforcement is one `require(...)` line
+// per arm of the command table, which is why a bug here cannot become a
 // security hole.
 //
-// Plugin actions come in two flavours that look alike and are not: a local run
-// (desktop, spawns a subprocess here) and an enqueued tagging job (web, claimed
-// by a paired worker). `taggingStore` decides which are available.
+// **There is one plugin flavour now.** A run is in-process, started here and
+// reported through the same event stream as everything else; the worker roster
+// and the enqueued-job path went with the distributed queue. Under `--serve` no
+// plugins are installed and the models could not run there anyway, so the entry
+// is simply absent.
 
-import { Show, For, createSignal, createEffect, onCleanup } from "solid-js";
-import { open } from "@tauri-apps/plugin-dialog";
-import { safeListen as listen, isWeb, hasTouch } from "../../lib/runtime";
+import { Show, For, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { hasTouch } from "../../lib/runtime";
 import { rateItem, setItemColorLabel, colorLabelByPath } from "../../stores/galleryStore";
-import { addUserTag, removeUserTag, regenerateThumbnail, addUserTagBatch, setRatingBatch, setColorLabelBatch, COLOR_LABELS, COLOR_LABEL_HEX, listPlugins, runPlugin, runPluginBatch, cancelPluginBatch, enqueueTaggingJob, openWith, copyFiles, moveFiles, trashFiles, copyFilesToClipboard, mediaUrl, THUMB_REGENERATED_EVENT } from "../../lib/ipc";
-import type { MovedFile } from "../../lib/ipc";
+import { api, mediaUrl } from "../../lib/ipc";
+import { COLOR_LABELS, COLOR_LABEL_HEX } from "../../lib/colorLabels";
+import { announceThumbRegenerated } from "../../lib/thumbRegeneration";
 import { isVideoPath } from "../../lib/mediaExts";
-import { pluginStarted, pluginFinished, pluginFailed, pluginProgress, pluginCancelled } from "../../stores/pluginStore";
-import { workerPlugins, taggingActions, refreshTaggingStatus, trackQueuedJob } from "../../stores/taggingStore";
-import { capabilities } from "../../stores/capabilitiesStore";
-import { settings } from "../../stores/settingsStore";
+import { plugins, loadPlugins } from "../../stores/activityStore";
+import { capabilities, isOwner } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
-import type { PluginInfo } from "../../lib/types";
+import { DirectoryPicker } from "./DirectoryPicker";
 
 export interface ContextMenuState {
   x: number;
@@ -38,18 +38,28 @@ interface ContextMenuProps {
   paths: string[];
   selectedPaths?: Set<string>;
   onFilesRemoved?: (removed: string[]) => void;
-  onFilesMoved?: (moved: MovedFile[]) => void;
   hideViewOption?: boolean;
 }
 
 type SubMenu = "tag" | "rating" | "color" | "openWith" | "plugins" | null;
 
+/** Which transfer the picker is open for, or null when it is closed. */
+type Transfer = { kind: "copy" | "move"; paths: string[] } | null;
+
 export function ContextMenu(props: ContextMenuProps) {
   const [subMenu, setSubMenu] = createSignal<SubMenu>(null);
   const [tagInput, setTagInput] = createSignal("");
-  const [plugins, setPlugins] = createSignal<PluginInfo[]>([]);
-  const [pluginBusy, setPluginBusy] = createSignal(false);
+  const [externalApps, setExternalApps] = createSignal<{ label: string }[]>([]);
+  const [transfer, setTransfer] = createSignal<Transfer>(null);
   let menuRef: HTMLDivElement | undefined;
+
+  // Both lists are `Owner`-only and change about as often as the process
+  // restarts, so they are fetched once rather than on every open.
+  onMount(() => {
+    if (!isOwner()) return;
+    void loadPlugins();
+    api.externalApps().then(setExternalApps).catch(() => setExternalApps([]));
+  });
 
   // Close on click outside or Escape
   const handleKeyDown = (e: KeyboardEvent) => {
@@ -77,13 +87,6 @@ export function ContextMenu(props: ContextMenuProps) {
     if (props.state) {
       setSubMenu(null);
       setTagInput("");
-      if (capabilities().plugins) {
-        listPlugins().then(setPlugins).catch(() => setPlugins([]));
-      } else if (isWeb()) {
-        // No host plugins on web — but a connected lightview-worker may offer
-        // some. Refresh so the submenu (and its gate) reflect live workers.
-        refreshTaggingStatus();
-      }
       window.addEventListener("keydown", handleKeyDown);
       // Delay to avoid closing from the same right-click event
       setTimeout(() => window.addEventListener("click", handleClickOutside, true), 0);
@@ -94,10 +97,6 @@ export function ContextMenu(props: ContextMenuProps) {
       window.removeEventListener("click", handleClickOutside, true);
     }
   });
-
-  /** Plugins runnable from this menu: the host's own (desktop) or those
-   * offered by connected tagging workers (web). */
-  const menuPlugins = () => (capabilities().plugins ? plugins() : workerPlugins());
 
   onCleanup(() => {
     window.removeEventListener("keydown", handleKeyDown);
@@ -115,16 +114,17 @@ export function ContextMenu(props: ContextMenuProps) {
     return Array.from(props.selectedPaths);
   };
 
+  /** What this invocation acts on: the selection when the clicked cell is part
+   *  of one, otherwise just the clicked cell. */
+  const targetPaths = () =>
+    isBatchContext() ? batchPaths() : props.state ? [props.state.path] : [];
+
   const handleAddTag = async (e: Event) => {
     e.preventDefault();
     const tag = tagInput().trim();
     if (!tag || !props.state) return;
     try {
-      if (isBatchContext()) {
-        await addUserTagBatch(batchPaths(), tag);
-      } else {
-        await addUserTag(props.state.path, tag);
-      }
+      await api.addTags(targetPaths(), [tag], "user");
       setTagInput("");
     } catch (err) {
       console.error("Failed to add tag:", err);
@@ -135,9 +135,10 @@ export function ContextMenu(props: ContextMenuProps) {
     if (!props.state) return;
     try {
       if (isBatchContext()) {
-        await setRatingBatch(batchPaths(), value);
+        await api.setRating(batchPaths(), value > 0 ? value : null);
       } else {
-        // rateItem keeps sortedItems + the info panel in sync, not just the DB.
+        // `rateItem` keeps the item list and the info panel in step, not just
+        // the database.
         await rateItem(props.state.path, value);
       }
       props.onClose();
@@ -153,10 +154,10 @@ export function ContextMenu(props: ContextMenuProps) {
     if (!props.state) return;
     try {
       if (isBatchContext()) {
-        await setColorLabelBatch(batchPaths(), label);
+        await api.setColorLabel(batchPaths(), label);
       } else {
-        // setItemColorLabel keeps sortedItems in sync, not just the DB — so a
-        // `color:` filter re-evaluates without a refetch.
+        // `setItemColorLabel` keeps the item list in step, so a `color:` filter
+        // re-evaluates without a refetch.
         await setItemColorLabel(props.state.path, label);
       }
       props.onClose();
@@ -177,77 +178,17 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
   };
 
-  const handleRunPlugin = async (pluginName: string, workerId?: string) => {
-    if (!props.state || pluginBusy()) return;
-    const plugin = menuPlugins().find((p) => p.name === pluginName);
-    const displayName = plugin?.display_name ?? pluginName;
-    const isBatch = isBatchContext();
-    const paths = isBatch ? batchPaths() : [props.state.path];
-
-    // Web: the host can't run plugins — enqueue a job for a connected worker.
-    // Progress arrives via the tagging SSE events → taggingStore → toast.
-    if (!capabilities().plugins) {
-      props.onClose();
-      try {
-        const job = await enqueueTaggingJob(pluginName, { paths }, workerId);
-        trackQueuedJob(job);
-      } catch (err) {
-        console.error("Failed to enqueue tagging job:", err);
-        pluginStarted(pluginName, displayName, paths.length);
-        pluginFailed(String(err));
-      }
-      return;
-    }
-
-    setPluginBusy(true);
+  const handleRunPlugin = async (pluginName: string) => {
+    if (!props.state) return;
+    const paths = targetPaths();
     props.onClose();
     try {
-      if (isBatch) {
-        pluginStarted(pluginName, displayName, paths.length);
-
-        const unlistenProgress = await listen<{ completed: number; total: number; failed: number }>(
-          "plugin:progress",
-          (event) => pluginProgress(event.payload.completed, event.payload.total),
-        );
-        const unlistenDone = await listen<{ succeeded: number; failed: number; cancelled: boolean }>(
-          "plugin:done",
-          (event) => {
-            unlistenProgress();
-            unlistenDone();
-            const { succeeded, failed, cancelled } = event.payload;
-            if (cancelled) {
-              pluginCancelled();
-            } else if (failed > 0) {
-              pluginFailed(`${succeeded} tagged, ${failed} failed`);
-            } else {
-              pluginFinished(`Tagged ${succeeded} files`);
-            }
-            setPluginBusy(false);
-          },
-        );
-
-        runPluginBatch(pluginName, paths, "tag").catch((err) => {
-          console.error("Plugin batch failed to start:", err);
-          unlistenProgress();
-          unlistenDone();
-          pluginFailed("Failed to start batch");
-          setPluginBusy(false);
-        });
-        return; // pluginBusy cleared by event listener
-      } else {
-        pluginStarted(pluginName, displayName, 1);
-        const result = await runPlugin(pluginName, paths[0], "tag");
-        if (result.success) {
-          pluginFinished("Done");
-        } else {
-          pluginFailed(result.error ?? "Failed");
-        }
-      }
+      // Fire and forget. A run over a thousand files outlives any request, so
+      // the command starts it and progress arrives as `job-progress` events
+      // with a terminal `job-finished` — the toast in `App` reads both.
+      await api.runPlugin(pluginName, paths);
     } catch (err) {
-      console.error("Plugin execution failed:", err);
-      pluginFailed("Execution failed");
-    } finally {
-      setPluginBusy(false);
+      console.error("Could not start the plugin run:", err);
     }
   };
 
@@ -255,27 +196,33 @@ export function ContextMenu(props: ContextMenuProps) {
     if (!props.state) return;
     const path = props.state.path;
     try {
-      await regenerateThumbnail(path);
-      // Desktop grids cache-bust via the `thumb:regenerated` Tauri event; the
-      // web client has no event channel, so stand in with a DOM event.
-      if (isWeb()) {
-        window.dispatchEvent(new CustomEvent(THUMB_REGENERATED_EVENT, { detail: { path } }));
-      }
+      await api.regenerate([path]);
+      // The tier files changed, not the row — so this is a DOM event to the
+      // cells in this client rather than a server broadcast. Every other
+      // client's URL still works; it just costs one regeneration on next use.
+      announceThumbRegenerated(path);
     } catch (err) {
       console.error("Failed to regenerate thumbnail:", err);
     }
     props.onClose();
   };
 
-  const handleOpenWith = async (command: string, args: string[]) => {
+  /** Hand the file to an application configured on the server.
+   *
+   *  The argument is an **index** into that configuration, never a program
+   *  name: there is no shape of request a client can send that names something
+   *  to execute, which is what keeps this file access rather than code
+   *  execution. The labels come back from `list_external_apps`; the commands
+   *  never leave the server. */
+  const handleOpenWith = async (index: number) => {
     if (!props.state) return;
-    const resolvedArgs = args.map((a) => a.replace("{file}", props.state!.path));
+    const path = props.state.path;
+    props.onClose();
     try {
-      await openWith(command, resolvedArgs);
+      await api.openWith(index, path);
     } catch (err) {
       console.error("Failed to open with external app:", err);
     }
-    props.onClose();
   };
 
   const handleCopyImage = () => {
@@ -306,65 +253,52 @@ export function ContextMenu(props: ContextMenuProps) {
 
   const handleCopyToClipboard = async () => {
     if (!props.state) return;
-    const paths = isBatchContext() ? batchPaths() : [props.state.path];
+    const paths = targetPaths();
     props.onClose();
     try {
-      await copyFilesToClipboard(paths);
+      await api.clipboardFiles(paths);
     } catch (err) {
       console.error("Failed to copy files to clipboard:", err);
     }
   };
 
-  const handleCopyTo = async () => {
+  /** Open the picker for a copy or a move. The transfer runs when the picker
+   *  reports a destination — the menu closes immediately, because the picker
+   *  is a dialog of its own and a menu hovering behind it is noise. */
+  const startTransfer = (kind: "copy" | "move") => {
     if (!props.state) return;
-    const dest = await open({ directory: true, multiple: false });
-    if (!dest) return;
-    const paths = isBatchContext() ? batchPaths() : [props.state.path];
+    const paths = targetPaths();
     props.onClose();
-    try {
-      const result = await copyFiles(paths, dest as string);
-      if (result.failed.length > 0) {
-        console.error("Copy failures:", result.failed);
-      }
-    } catch (err) {
-      console.error("Copy failed:", err);
-    }
+    setTransfer({ kind, paths });
   };
 
-  const handleMoveTo = async () => {
-    if (!props.state) return;
-    const dest = await open({ directory: true, multiple: false });
-    if (!dest) return;
-    const paths = isBatchContext() ? batchPaths() : [props.state.path];
-    props.onClose();
+  const finishTransfer = async (destination: string) => {
+    const pending = transfer();
+    setTransfer(null);
+    if (!pending) return;
     try {
-      const result = await moveFiles(paths, dest as string);
-      if (result.moved.length > 0) {
-        props.onFilesMoved?.(result.moved);
-      }
-      if (result.removed.length > 0) {
-        props.onFilesRemoved?.(result.removed);
-      }
-      if (result.failed.length > 0) {
-        console.error("Move failures:", result.failed);
+      if (pending.kind === "copy") {
+        await api.copyFiles(pending.paths, destination);
+      } else {
+        await api.moveFiles(pending.paths, destination);
+        // A move out of the gallery removes the items; a move *within* it is
+        // the watcher's business, and it reports both halves. Either way the
+        // grid drops them here so the cells go at the moment of the action.
+        props.onFilesRemoved?.(pending.paths);
       }
     } catch (err) {
-      console.error("Move failed:", err);
+      console.error(`${pending.kind} failed:`, err);
     }
   };
 
   const handleTrash = async () => {
     if (!props.state) return;
-    const paths = isBatchContext() ? batchPaths() : [props.state.path];
+    const paths = targetPaths();
     props.onClose();
     try {
-      const result = await trashFiles(paths);
-      if (result.succeeded.length > 0) {
-        props.onFilesRemoved?.(result.succeeded);
-      }
-      if (result.failed.length > 0) {
-        console.error("Trash failures:", result.failed);
-      }
+      // One delete is one trash entry, which makes undoing it a natural unit.
+      await api.trash(paths);
+      props.onFilesRemoved?.(paths);
     } catch (err) {
       console.error("Trash failed:", err);
     }
@@ -384,6 +318,24 @@ export function ContextMenu(props: ContextMenuProps) {
   };
 
   return (
+    <>
+      {/* Outside the menu's own `<Show>`: the menu closes the moment a
+          transfer starts, and a picker mounted inside it would go with it. */}
+      <Show when={transfer()}>
+        {(pending) => (
+          <DirectoryPicker
+            title={pending().kind === "copy" ? "Copy to" : "Move to"}
+            confirmLabel={
+              pending().kind === "copy"
+                ? `Copy ${pending().paths.length} here`
+                : `Move ${pending().paths.length} here`
+            }
+            onPick={(destination) => void finishTransfer(destination)}
+            onCancel={() => setTransfer(null)}
+          />
+        )}
+      </Show>
+
     <Show when={props.state}>
       <div
         ref={menuRef}
@@ -415,7 +367,10 @@ export function ContextMenu(props: ContextMenuProps) {
             <Show when={!isBatchContext() && !props.hideViewOption}>
               <MenuItem label="View" onClick={handleOpenViewer} />
             </Show>
-            <Show when={capabilities().metadataWrite}>
+            {/* Tags, ratings and colour labels are `Device`: the phone is the
+                only UI there is under `--serve`, and a write here is the same
+                companion write the local viewer makes. */}
+            <>
               <MenuItem
                 label={isBatchContext() ? `Tag ${props.selectedPaths!.size} Items...` : "Add Tag..."}
                 onClick={() => setSubMenu("tag")}
@@ -428,51 +383,56 @@ export function ContextMenu(props: ContextMenuProps) {
                 label={isBatchContext() ? `Label ${props.selectedPaths!.size} Items` : "Colour Label"}
                 onClick={() => setSubMenu("color")}
               />
-            </Show>
+            </>
             <Divider />
-            <Show when={capabilities().metadataWrite && !isBatchContext()}>
+            <Show when={!isBatchContext()}>
               <MenuItem label="Regenerate Thumbnail" onClick={handleRegenerateThumbnail} />
             </Show>
             <MenuItem label="Copy Path" onClick={handleCopyPath} />
-            {/* Web client: copy the image bitmap via the browser clipboard.
-                Desktop copies actual files below instead. */}
-            <Show when={isWeb() && !isBatchContext() && !isVideoPath(props.state!.path)}>
+            {/* The image bitmap, through the browser's own clipboard. Works
+                anywhere; copying the *files* below needs a host to copy them
+                on, which is the `Owner` half. */}
+            <Show when={!isBatchContext() && !isVideoPath(props.state!.path)}>
               <MenuItem label="Copy Image" onClick={handleCopyImage} />
             </Show>
-            <Show when={capabilities().localFs}>
+            {/* Everything below is `Owner`: it acts on the filesystem of the
+                machine the server runs on. A runtime question rather than a
+                compile-time one for the clipboard, whose X11 backend fails on
+                a Wayland session without XWayland and on a process with no
+                display at all — so the server reports whether it works. */}
+            <Show when={isOwner() && capabilities().clipboard}>
               <MenuItem
                 label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to Clipboard` : "Copy to Clipboard"}
                 onClick={handleCopyToClipboard}
               />
             </Show>
-            <Show when={capabilities().localFs || capabilities().delete}>
-              <Divider />
-            </Show>
-            <Show when={capabilities().localFs}>
+            <Divider />
+            <Show when={isOwner()}>
               <MenuItem
                 label={isBatchContext() ? `Copy ${props.selectedPaths!.size} to...` : "Copy to..."}
-                onClick={handleCopyTo}
+                onClick={() => startTransfer("copy")}
               />
               <MenuItem
                 label={isBatchContext() ? `Move ${props.selectedPaths!.size} to...` : "Move to..."}
-                onClick={handleMoveTo}
+                onClick={() => startTransfer("move")}
               />
             </Show>
-            <Show when={capabilities().delete}>
-              <MenuItem
-                label={isBatchContext() ? `Delete ${props.selectedPaths!.size} Items` : "Delete"}
-                onClick={handleTrash}
-                danger
-              />
-            </Show>
-            <Show when={capabilities().plugins || menuPlugins().length > 0}>
+            {/* Move-to-trash is `Device` — restorable, and the inverse of a
+                delete this client was allowed to make. Permanent deletion is
+                the trash panel's, and `Owner`. */}
+            <MenuItem
+              label={isBatchContext() ? `Delete ${props.selectedPaths!.size} Items` : "Delete"}
+              onClick={handleTrash}
+              danger
+            />
+            <Show when={plugins().length > 0}>
               <Divider />
               <MenuItem
                 label={isBatchContext() ? `Run Plugin on ${props.selectedPaths!.size}...` : "Run Plugin..."}
                 onClick={() => setSubMenu("plugins")}
               />
             </Show>
-            <Show when={capabilities().localFs && settings().external_apps.length > 0}>
+            <Show when={isOwner() && externalApps().length > 0}>
               <MenuItem label="Open With..." onClick={() => setSubMenu("openWith")} />
             </Show>
           </Show>
@@ -546,51 +506,26 @@ export function ContextMenu(props: ContextMenuProps) {
 
           {/* Plugins sub-menu */}
           <Show when={subMenu() === "plugins"}>
-            <div class="px-3 py-2 text-neutral-500">
-              {capabilities().plugins ? "Run Plugin" : "Tag via Worker"}
-            </div>
-            <Show when={menuPlugins().length > 0} fallback={
-              <div class="px-3 py-1.5 text-neutral-600 text-xs">No plugins installed</div>
-            }>
-              <Show
-                when={!capabilities().plugins}
-                fallback={
-                  <For each={menuPlugins()}>
-                    {(plugin) => (
-                      <MenuItem
-                        label={pluginBusy() ? `${plugin.display_name} (running...)` : plugin.display_name}
-                        onClick={() => handleRunPlugin(plugin.name)}
-                      />
-                    )}
-                  </For>
-                }
-              >
-                {/* Web: one entry per (plugin, worker) — a plugin offered by
-                    several workers (e.g. server + remote) gets pinned entries
-                    so the user picks where it runs. */}
-                <For each={taggingActions()}>
-                  {(action) => (
-                    <MenuItem
-                      label={action.where ? `${action.plugin.display_name} ${action.where}` : action.plugin.display_name}
-                      onClick={() => handleRunPlugin(action.plugin.name, action.workerId)}
-                    />
-                  )}
-                </For>
-              </Show>
-            </Show>
+            <div class="px-3 py-2 text-neutral-500">Run Plugin</div>
+            <For each={plugins()}>
+              {(plugin) => (
+                <MenuItem
+                  label={plugin.display_name}
+                  onClick={() => handleRunPlugin(plugin.name)}
+                />
+              )}
+            </For>
             <Divider />
             <MenuItem label="Back" onClick={() => setSubMenu(null)} />
           </Show>
 
-          {/* Open With sub-menu */}
+          {/* Open With sub-menu. Labels only — the commands never leave the
+              server, and what goes back is the index of the row clicked. */}
           <Show when={subMenu() === "openWith"}>
             <div class="px-3 py-2 text-neutral-500">Open With</div>
-            <For each={settings().external_apps}>
-              {(app) => (
-                <MenuItem
-                  label={app.label}
-                  onClick={() => handleOpenWith(app.command, app.args)}
-                />
+            <For each={externalApps()}>
+              {(app, index) => (
+                <MenuItem label={app.label} onClick={() => handleOpenWith(index())} />
               )}
             </For>
             <Divider />
@@ -599,6 +534,7 @@ export function ContextMenu(props: ContextMenuProps) {
         </div>
       </div>
     </Show>
+    </>
   );
 }
 

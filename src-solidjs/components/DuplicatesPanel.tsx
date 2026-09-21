@@ -6,13 +6,22 @@
 // (detection compares all pairs regardless), so the control is about precision
 // only.
 //
-// Both destructive actions sit behind `capabilities().delete`; merge is gated
-// too, because its final step is a trash.
+// Trashing a copy is `Device` — it is the same move-to-trash any client may
+// make. **Merging is `Owner`**: it rewrites a companion, stamps an mtime and
+// trashes several files at once, so the button is absent rather than offered
+// and refused on a phone.
+//
+// **"Not duplicates" is now "name a set".** There is no table of pairwise
+// negations any more: two files sharing any `set::` tag are never offered as a
+// pair, so telling the panel these belong together is the same gesture as
+// giving the group a name — and the name is something the user can see, filter
+// on and reuse, which a list of negations never was.
 
 import { createSignal, Show, For, onCleanup } from "solid-js";
-import { findDuplicates, markNotDuplicates, thumbUrl, mediaUrl, trashFiles, type DuplicateGroup, type DuplicateItem } from "../lib/ipc";
-import { setDisplayPaths, displayPaths } from "../stores/galleryStore";
-import { capabilities } from "../stores/capabilitiesStore";
+import { api, thumbUrl, mediaUrl } from "../lib/ipc";
+import { setItems } from "../stores/galleryStore";
+import { isOwner } from "../stores/settingsStore";
+import type { DuplicateGroup, DuplicateItem, TagSuggestion } from "../lib/types";
 import { InfoPanel } from "./viewer/InfoPanel";
 import { MergeDialog } from "./MergeDialog";
 
@@ -45,7 +54,6 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
   const [scanning, setScanning] = createSignal(false);
   const [scanned, setScanned] = createSignal(false);
   const [threshold, setThreshold] = createSignal(8);
-  const [hashesComputed, setHashesComputed] = createSignal(0);
 
   // Merge dialog: which group index is being merged (null = closed)
   const [mergeGroup, setMergeGroup] = createSignal<number | null>(null);
@@ -107,9 +115,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
     setScanning(true);
     setScanned(false);
     try {
-      const result = await findDuplicates(threshold());
-      setGroups(result.groups);
-      setHashesComputed(result.hashes_computed);
+      setGroups(await api.findDuplicates(threshold()));
       setScanned(true);
     } catch (e) {
       console.error("Duplicate scan failed:", e);
@@ -117,22 +123,24 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
     setScanning(false);
   };
 
-  const handleNotDuplicates = async (groupIdx: number) => {
+  /** Name the group as a set. Every member gets the `set::` tag, which is both
+   *  the record that they belong together and the reason the scan will not
+   *  offer them again. */
+  const handleNameSet = async (groupIdx: number, name: string) => {
     const group = groups()[groupIdx];
-    if (!group) return;
-    const paths = group.items.map((it) => it.path);
+    if (!group || !name.trim()) return;
     try {
-      await markNotDuplicates(paths);
+      await api.addTags(group.items.map((it) => it.path), [name.trim()], "set");
       setGroups((prev) => prev.filter((_, i) => i !== groupIdx));
       if (previewGroup() === groupIdx) closePreview();
     } catch (e) {
-      console.error("Mark not duplicates failed:", e);
+      console.error("Naming the set failed:", e);
     }
   };
 
   const handleTrash = async (path: string, groupIdx: number) => {
     try {
-      await trashFiles([path]);
+      await api.trash([path]);
       // Remove from this group
       setGroups((prev) => {
         const updated = [...prev];
@@ -160,9 +168,8 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
         }
         return updated;
       });
-      // Remove from gallery display
-      const removedSet = new Set([path]);
-      setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+      // Splice it out of the grid too, rather than waiting for the watcher.
+      setItems((list) => list.filter((item) => item.path !== path));
     } catch (e) {
       console.error("Trash failed:", e);
     }
@@ -185,7 +192,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
       }
       return updated;
     });
-    setDisplayPaths(displayPaths().filter((p) => !removedSet.has(p)));
+    setItems((list) => list.filter((item) => !removedSet.has(item.path)));
     setMergeGroup(null);
   };
 
@@ -207,7 +214,6 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
           <Show when={scanned()}>
             <span class="text-xs text-neutral-500">
               {groups().length} {groups().length === 1 ? "group" : "groups"} found
-              {hashesComputed() > 0 && ` (${hashesComputed()} new hashes computed)`}
             </span>
           </Show>
         </div>
@@ -286,7 +292,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
                       Group {groupIdx() + 1} — {group.items.length} images
                     </span>
                     <div class="flex items-center gap-1.5">
-                      <Show when={capabilities().delete}>
+                      <Show when={isOwner()}>
                         <button
                           onClick={() => setMergeGroup(groupIdx())}
                           class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-teal-800/50 text-teal-300 hover:bg-teal-700/60 hover:text-teal-200"
@@ -295,13 +301,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
                           Merge
                         </button>
                       </Show>
-                      <button
-                        onClick={() => handleNotDuplicates(groupIdx())}
-                        class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
-                        title="Mark these images as not duplicates — they won't be grouped together in future scans"
-                      >
-                        Not duplicates
-                      </button>
+                      <NameSetField onName={(name) => handleNameSet(groupIdx(), name)} />
                     </div>
                   </div>
                   <div class="flex gap-2 flex-wrap">
@@ -462,7 +462,7 @@ function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void; onClic
         onClick={(e) => { e.stopPropagation(); props.onClick(); }}
       >
         <img
-          src={thumbUrl(props.item.path)}
+          src={thumbUrl(props.item.path, "j")}
           alt={fileName()}
           class="max-w-full max-h-full object-contain pointer-events-none"
           loading="lazy"
@@ -489,22 +489,118 @@ function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void; onClic
         </Show>
 
         {/* Trash button — muted for the "best" copy since it's the recommended
-            keep. Hidden when this client lacks the delete capability (web with
-            remote delete switched off) — resolving is then mark-only. */}
-        <Show when={capabilities().delete}>
-          <button
-            onClick={(e) => { e.stopPropagation(); props.onTrash(); }}
-            class={`mt-1 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors ${
-              props.item.is_best
-                ? "bg-neutral-800/40 text-neutral-500 hover:bg-red-900/30 hover:text-red-400"
-                : "bg-red-900/30 text-red-400 hover:bg-red-800/40 hover:text-red-300"
-            }`}
-            title={props.item.is_best ? "Trash (marked as best — usually the one to keep)" : "Trash"}
-          >
-            Trash
-          </button>
-        </Show>
+            keep. Always offered: move-to-trash is `Device`, and the entry it
+            creates is restorable from the trash panel. */}
+        <button
+          onClick={(e) => { e.stopPropagation(); props.onTrash(); }}
+          class={`mt-1 px-2 py-1 text-[10px] rounded cursor-pointer transition-colors ${
+            props.item.is_best
+              ? "bg-neutral-800/40 text-neutral-500 hover:bg-red-900/30 hover:text-red-400"
+              : "bg-red-900/30 text-red-400 hover:bg-red-800/40 hover:text-red-300"
+          }`}
+          title={props.item.is_best ? "Trash (marked as best — usually the one to keep)" : "Trash"}
+        >
+          Trash
+        </button>
       </div>
     </div>
+  );
+}
+
+/** Name a duplicate group as a set.
+ *
+ *  The replacement for "not duplicates", and the reason it is a text field
+ *  rather than a button: the old gesture recorded a negation nobody could see
+ *  afterwards, and this one records a name that shows up in autocomplete, in
+ *  `set:` filters and in the tag manager. Autocompletes over existing sets so a
+ *  second burst from the same shoot joins the first rather than founding a
+ *  near-duplicate name.
+ */
+function NameSetField(props: { onName: (name: string) => void }) {
+  const [open, setOpen] = createSignal(false);
+  const [value, setValue] = createSignal("");
+  const [suggestions, setSuggestions] = createSignal<TagSuggestion[]>([]);
+
+  let lookup: ReturnType<typeof setTimeout> | undefined;
+  const onInput = (next: string) => {
+    setValue(next);
+    clearTimeout(lookup);
+    if (!next.trim()) {
+      setSuggestions([]);
+      return;
+    }
+    lookup = setTimeout(async () => {
+      try {
+        setSuggestions(await api.autocomplete(next.trim(), "set", 6));
+      } catch {
+        setSuggestions([]);
+      }
+    }, 150);
+  };
+  onCleanup(() => clearTimeout(lookup));
+
+  const commit = (name: string) => {
+    if (!name.trim()) return;
+    setOpen(false);
+    setValue("");
+    setSuggestions([]);
+    props.onName(name);
+  };
+
+  return (
+    <Show
+      when={open()}
+      fallback={
+        <button
+          onClick={() => setOpen(true)}
+          class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
+          title="These belong together — name them as a set. Files sharing a set are never offered as duplicates again."
+        >
+          Name a set
+        </button>
+      }
+    >
+      <div class="relative">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            commit(value());
+          }}
+        >
+          <input
+            ref={(el) => queueMicrotask(() => el.focus())}
+            value={value()}
+            onInput={(e) => onInput(e.currentTarget.value)}
+            onBlur={() => setTimeout(() => setOpen(false), 150)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.stopPropagation();
+                setOpen(false);
+              }
+            }}
+            placeholder="Set name"
+            class="w-36 px-2 py-0.5 text-[10px] rounded bg-neutral-900 border border-neutral-700 text-neutral-200 outline-none focus:border-teal-700"
+          />
+        </form>
+        <Show when={suggestions().length > 0}>
+          <div class="absolute right-0 top-full mt-1 z-10 min-w-36 rounded border border-neutral-800 bg-neutral-950 py-1">
+            <For each={suggestions()}>
+              {(s) => (
+                <button
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    commit(s.tag);
+                  }}
+                  class="flex w-full items-baseline justify-between gap-2 px-2 py-0.5 text-left text-[10px] text-neutral-300 hover:bg-neutral-800"
+                >
+                  <span class="truncate">{s.tag}</span>
+                  <span class="shrink-0 text-neutral-600">{s.count}</span>
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+      </div>
+    </Show>
   );
 }

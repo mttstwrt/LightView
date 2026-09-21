@@ -5,8 +5,8 @@
 // currently showing.
 
 import { createSignal } from "solid-js";
-import { recordView } from "../lib/ipc";
-import { displayPaths, setSortedItems } from "./galleryStore";
+import { api } from "../lib/ipc";
+import { displayPaths, setItems } from "./galleryStore";
 
 const [viewerOpen, setViewerOpen] = createSignal(false);
 const [viewerIndex, setViewerIndex] = createSignal(0);
@@ -49,10 +49,10 @@ function trackView(index: number) {
   const path = paths[index];
   dwellTimer = window.setTimeout(() => {
     dwellTimer = null;
-    recordView(path).catch(() => {});
+    api.recordView(path).catch(() => {});
     const now = Math.floor(Date.now() / 1000);
-    setSortedItems((items) =>
-      items.map((it) => (it.path === path ? { ...it, last_viewed: now } : it)),
+    setItems((list) =>
+      list.map((it) => (it.path === path ? { ...it, last_viewed: now } : it)),
     );
   }, VIEW_DWELL_MS);
 }

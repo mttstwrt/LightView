@@ -10,7 +10,7 @@ import {
   refreshFilteredItems,
   clearAllFilters,
 } from "../../stores/filterStore";
-import { autocompleteTags } from "../../lib/ipc";
+import { api } from "../../lib/ipc";
 
 interface FilterBarProps {
   onInputRef?: (el: HTMLInputElement) => void;
@@ -76,7 +76,7 @@ export function FilterBar(props: FilterBarProps) {
       }
 
       try {
-        const suggestions = await autocompleteTags(lookupToken);
+        const suggestions = await api.autocomplete(lookupToken);
         setAcSuggestions(suggestions);
         setAcOpen(suggestions.length > 0);
       } catch {

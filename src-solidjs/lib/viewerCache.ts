@@ -2,10 +2,10 @@
 // Viewer Image Cache — preloads adjacent full-resolution images via Image()
 // ---------------------------------------------------------------------------
 //
-// Uses HTMLImageElement objects for preloading, which go through the exact same
-// webview pipeline as <img src> — guaranteed to work with Tauri's custom
-// protocol handler. Preloaded Image elements are swapped directly into the DOM
-// for instant display, avoiding any re-fetch or re-decode.
+// Uses HTMLImageElement objects for preloading, so a preload goes through the
+// exact same fetch, cache and decode path as the <img src> that will display
+// it. Preloaded elements are swapped directly into the DOM, avoiding any
+// re-fetch or re-decode.
 //
 // Memory pressure integration (cache is bounded by BOTH an image count and an
 // estimated decoded-byte budget, so a few huge full-res images can't blow past
@@ -14,13 +14,12 @@
 //   - Warning:   cache up to 5 images / 192MB,  preload 1 ahead/behind
 //   - Emergency: cache only current image / 64MB floor, no preloading
 //
-// The level comes from memoryPressure.ts, which reads the host's free RAM on
-// the desktop and the device class on the web — see that module for why the
-// two runtimes cannot share one signal.
+// The level comes from memoryPressure.ts and is a device class, sampled once —
+// see that module for why there is nothing to poll.
 
 import { mediaUrl } from "./ipc";
 import { isVideoPath } from "./mediaExts";
-import { MemoryPressureMonitor, type PressureLevel } from "./memoryPressure";
+import { pressureLevel, type PressureLevel } from "./memoryPressure";
 
 interface CacheEntry {
   img: HTMLImageElement;
@@ -59,20 +58,13 @@ export class ViewerImageCache {
   private pending = new Set<string>();
   private accessCounter = 0;
   private totalBytes = 0;
-  private pressureLevel: PressureLevel = "normal";
-  private monitor: MemoryPressureMonitor;
   private readyCallback: ((path: string) => void) | null = null;
 
-  constructor() {
-    this.monitor = new MemoryPressureMonitor((level: PressureLevel) => {
-      this.pressureLevel = level;
-      this.trimToCapacity();
-    });
-    this.monitor.start();
-  }
+  /** Sampled once at construction: the device class cannot change under us. */
+  private readonly level: PressureLevel = pressureLevel();
 
   private get config() {
-    return PRESSURE_CONFIGS[this.pressureLevel];
+    return PRESSURE_CONFIGS[this.level];
   }
 
   /** Register a callback invoked when a preloaded image finishes decoding. */
@@ -215,7 +207,6 @@ export class ViewerImageCache {
   }
 
   destroy() {
-    this.monitor.stop();
     this.readyCallback = null;
     this.pending.clear();
     for (const [, entry] of this.cache) {

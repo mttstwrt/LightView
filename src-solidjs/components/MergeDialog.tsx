@@ -1,12 +1,13 @@
 import { createSignal, createMemo, Show, For, onMount, onCleanup } from "solid-js";
-import {
-  getMergeCandidates,
-  mergeDuplicates,
-  thumbUrl,
-  type MergeCandidate,
-  type MergeGps,
-  type MergePlan,
-} from "../lib/ipc";
+import { api, thumbUrl } from "../lib/ipc";
+import type { MediaMeta, MergePlan } from "../lib/types";
+
+/** A copy in the group, as the dialog reads it. The same row the info panel
+ *  shows: a merge candidate is a row plus its tags and notes. */
+type MergeCandidate = MediaMeta;
+
+/** `[lat, lon]`, as the index holds it. */
+type MergeGps = [number, number];
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -36,11 +37,11 @@ function fileName(path: string): string {
 
 function gpsEq(a: MergeGps | null, b: MergeGps | null): boolean {
   if (a == null || b == null) return a === b;
-  return a.lat === b.lat && a.lon === b.lon && a.alt === b.alt;
+  return a[0] === b[0] && a[1] === b[1];
 }
 
 function formatGps(g: MergeGps): string {
-  return `${g.lat.toFixed(4)}, ${g.lon.toFixed(4)}`;
+  return `${g[0].toFixed(4)}, ${g[1].toFixed(4)}`;
 }
 
 /**
@@ -66,7 +67,11 @@ export function MergeDialog(props: {
   const [colorLabel, setColorLabel] = createSignal<string | null>(null);
   const [notes, setNotes] = createSignal<string | null>(null);
   const [location, setLocation] = createSignal<MergeGps | null>(null);
-  const [mtime, setMtime] = createSignal<number | null>(null);
+  // The time to stamp on the survivor. Chosen from the copies' *capture* times
+  // rather than their file mtimes: a copied file's mtime is the copy date,
+  // which is exactly the noise a merge is trying to discard, while
+  // `date_taken` is what the group is actually agreeing on.
+  const [captureTime, setCaptureTime] = createSignal<number | null>(null);
 
   // Tag union with per-tag keep flags.
   const [droppedTags, setDroppedTags] = createSignal<Set<string>>(new Set());
@@ -77,25 +82,29 @@ export function MergeDialog(props: {
     const seen = new Set<string>();
     const out: string[] = [];
     for (const c of candidates()) {
-      for (const t of c.user_tags) {
-        if (!seen.has(t)) {
-          seen.add(t);
-          out.push(t);
-        }
+      // The union is over *user* tags only. A plugin bucket is replaced
+      // wholesale by its own next run, and a set is membership the merge does
+      // not get to edit — neither is a thing to pick through here.
+      for (const [namespace, tag] of c.tags) {
+        if (namespace !== "user" || seen.has(tag)) continue;
+        seen.add(tag);
+        out.push(tag);
       }
     }
     return out;
   });
 
-  // Locations available across copies (companion + exif), de-duplicated.
+  // The distinct locations across the copies.
+  //
+  // One per copy, not two: a companion's coordinates are mirrored over the
+  // indexed ones when the file is indexed, so a file has a single effective
+  // location and "companion or EXIF?" was never the choice a person was making
+  // — "which copy's location?" was.
   const locationOptions = createMemo(() => {
-    const out: { gps: MergeGps; from: string; source: "companion" | "exif" }[] = [];
+    const out: { gps: MergeGps; from: string }[] = [];
     for (const c of candidates()) {
-      if (c.companion_location && !out.some((o) => gpsEq(o.gps, c.companion_location))) {
-        out.push({ gps: c.companion_location, from: c.path, source: "companion" });
-      }
-      if (c.exif_location && !out.some((o) => gpsEq(o.gps, c.exif_location))) {
-        out.push({ gps: c.exif_location, from: c.path, source: "exif" });
+      if (c.gps && !out.some((o) => gpsEq(o.gps, c.gps))) {
+        out.push({ gps: c.gps, from: c.path });
       }
     }
     return out;
@@ -112,15 +121,16 @@ export function MergeDialog(props: {
     setRating(firstNonNull((c) => c.rating));
     setColorLabel(firstNonNull((c) => c.color_label));
     setNotes(firstNonNull((c) => c.notes));
-    setLocation(firstNonNull((c) => c.companion_location ?? c.exif_location));
-    // Default mtime: the earliest across copies (usually the original).
-    const times = cands.map((c) => c.mtime).filter((t): t is number => t != null);
-    setMtime(times.length ? Math.min(...times) : (k?.mtime ?? null));
+    setLocation(firstNonNull((c) => c.gps));
+    // Default: the earliest capture time across the copies, which is the
+    // original if one of them is.
+    const times = cands.map((c) => c.date_taken).filter((t): t is number => t != null);
+    setCaptureTime(times.length ? Math.min(...times) : (k?.date_taken ?? null));
   };
 
   onMount(async () => {
     try {
-      const cands = await getMergeCandidates(props.paths);
+      const cands = await api.mergeCandidates(props.paths);
       setCandidates(cands);
       applyDefaults(cands, keeper());
     } catch (e) {
@@ -143,27 +153,31 @@ export function MergeDialog(props: {
     });
   };
 
-  const keeperMtime = () => candFor(keeper())?.mtime ?? null;
-
   const doMerge = async () => {
     setMerging(true);
     setError(null);
     const discard = props.paths.filter((p) => p !== keeper());
-    const finalTags = tagUnion().filter((t) => !droppedTags().has(t));
-    // Only stamp mtime when it actually differs from the keeper's current time.
-    const setMt = mtime() != null && mtime() !== keeperMtime() ? mtime() : null;
+    const gps = location();
     const plan: MergePlan = {
       keeper: keeper(),
-      discard,
-      user_tags: finalTags,
+      others: discard,
       rating: rating(),
       color_label: colorLabel(),
       notes: notes(),
-      location: location(),
-      set_mtime: setMt,
+      location: gps ? { lat: gps[0], lon: gps[1] } : null,
+      // Only stamp when it differs from what the keeper already carries.
+      mtime:
+        captureTime() != null && captureTime() !== candFor(keeper())?.date_taken
+          ? captureTime()
+          : null,
     };
     try {
-      await mergeDuplicates(plan);
+      // The tags the user kept are added to the keeper before the merge folds
+      // in what the others contribute; dropping a chip means simply not adding
+      // it, which is why there is no "discard these tags" field on the plan.
+      const keep = tagUnion().filter((t) => !droppedTags().has(t));
+      if (keep.length > 0) await api.addTags([keeper()], keep, "user");
+      await api.mergeDuplicates(plan);
       props.onMerged(keeper(), discard);
     } catch (e) {
       setError(String(e));
@@ -237,7 +251,7 @@ export function MergeDialog(props: {
                       </Show>
                       <div class="w-full h-[100px] bg-neutral-900 flex items-center justify-center overflow-hidden">
                         <img
-                          src={thumbUrl(c.path)}
+                          src={thumbUrl(c.path, "j")}
                           class="max-w-full max-h-full object-contain pointer-events-none"
                           loading="lazy"
                         />
@@ -350,13 +364,13 @@ export function MergeDialog(props: {
 
             {/* Location */}
             <Show when={locationOptions().length > 0}>
-              <FieldRow label="Location" hint="companion + EXIF">
+              <FieldRow label="Location" hint="pick one">
                 <PickChips
                   options={[
                     { key: "none", label: "None", selected: location() == null, onPick: () => setLocation(null) },
                     ...locationOptions().map((o, i) => ({
                       key: `loc${i}`,
-                      label: `${formatGps(o.gps)}${o.source === "exif" ? " (EXIF)" : ""}`,
+                      label: formatGps(o.gps),
                       selected: gpsEq(location(), o.gps),
                       onPick: () => setLocation(o.gps),
                     })),
@@ -365,15 +379,15 @@ export function MergeDialog(props: {
               </FieldRow>
             </Show>
 
-            {/* File time */}
-            <Show when={candidates().some((c) => c.mtime != null)}>
-              <FieldRow label="File time" hint="stamped on keeper">
+            {/* Capture time — stamped onto the survivor as its mtime */}
+            <Show when={candidates().some((c) => c.date_taken != null)}>
+              <FieldRow label="Capture time" hint="stamped on keeper">
                 <PickChips
-                  options={uniqueValues(candidates().map((c) => c.mtime)).map((v) => ({
+                  options={uniqueValues(candidates().map((c) => c.date_taken)).map((v) => ({
                     key: `t${v}`,
                     label: formatDate(v),
-                    selected: mtime() === v,
-                    onPick: () => setMtime(v),
+                    selected: captureTime() === v,
+                    onPick: () => setCaptureTime(v),
                   }))}
                 />
               </FieldRow>

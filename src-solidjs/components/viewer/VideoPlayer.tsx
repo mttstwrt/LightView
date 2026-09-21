@@ -1,5 +1,5 @@
 import { Show, createSignal, createEffect, onMount, onCleanup } from "solid-js";
-import { settings } from "../../stores/settingsStore";
+import { prefs } from "../../stores/settingsStore";
 
 // Custom video chrome for the media viewer, replacing the native `controls`
 // attribute. Native controls swallow every touch that lands on the video, so
@@ -195,7 +195,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
           // speeds up after the first pass) and re-issues a Range request
           // that can stall the pipeline (freeze / jump to a random spot). A
           // manual flushing seek to 0 followed by play() restarts cleanly.
-          if (!settings().display.video_autoplay_loop) return;
+          if (!prefs().video_autoplay_loop) return;
           const v = e.currentTarget;
           try { v.currentTime = 0; } catch { /* not seekable yet */ }
           void v.play().catch(() => {});

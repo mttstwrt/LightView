@@ -79,6 +79,47 @@ export function scrollToY(y: number): void {
 }
 
 /**
+ * Scroll by `delta` on the application's behalf, and return what actually
+ * landed after clamping.
+ *
+ * **A scroll the reader did not perform**, which is the distinction three
+ * modules need and none of them can make from a `scroll` event. `scrollDynamics`
+ * reads velocity off the event and calls anything over about a viewport and a
+ * half per second a fling — roughly twenty pixels inside one frame on a phone —
+ * which drops newly revealed cells to the cheap tier. `TopBar` hides the mobile
+ * chrome on six pixels of downward movement. `ScrollBar` reveals the rail for
+ * more than a second on any scroll at all. So a grid that moved itself in order
+ * to hold still would dim its own thumbnails, hide the toolbar and flash the
+ * scrollbar — every one of them a motion the reader did not ask for, in service
+ * of preventing a motion the reader did not ask for.
+ *
+ * The counter is cumulative and each consumer remembers what it last saw, so
+ * discounting is a subtraction rather than a subscription with an ordering
+ * problem. `applied` rather than `delta` because the ends of the content clamp:
+ * recording the request rather than the result would leave every consumer
+ * permanently offset by the difference.
+ */
+export function adjustBy(delta: number): number {
+  if (delta === 0) return 0;
+  const before = scrollTop();
+  scrollToY(before + delta);
+  const applied = scrollTop() - before;
+  adjustment += applied;
+  return applied;
+}
+
+let adjustment = 0;
+
+/**
+ * Cumulative pixels moved by [`adjustBy`]. A consumer measuring scroll deltas
+ * subtracts the growth in this since its own last reading; see its doc comment
+ * for why the three that do it must.
+ */
+export function adjustmentTotal(): number {
+  return adjustment;
+}
+
+/**
  * Subscribe to the host's scroll events, following the host if it changes.
  * Returns an unsubscribe. `scroll` does not bubble, so this has to be bound to
  * whichever object is actually scrolling — the reason a plain

@@ -1,21 +1,31 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import {
-  deleteUserTags,
-  listUserTags,
-  mergeUserTags,
-  pathsForUserTags,
-  renameUserTag,
-  thumbUrl,
-  type TagEditResult,
-  type UserTagSummary,
-} from "../lib/ipc";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { api, thumbUrl } from "../lib/ipc";
+import type { WritableNamespace } from "../lib/types";
 import { ConfirmButton } from "./shared/ConfirmButton";
 import { isMobile } from "../lib/runtime";
 
 type SortMode = "count" | "name";
 
-/** Gallery-wide user-tag management: rename, merge, and delete tags across
- *  every file that carries them.
+interface TagSummary {
+  tag: string;
+  count: number;
+}
+
+/** The two namespaces a person may edit. A plugin bucket is replaced wholesale
+ *  by its own next run, so renaming inside one would be undone silently — and
+ *  the wire type has no variant for it, so a request naming one fails to
+ *  deserialize rather than reaching a check. */
+const NAMESPACES: { id: WritableNamespace; label: string; blurb: string }[] = [
+  { id: "user", label: "Tags", blurb: "what you typed" },
+  { id: "set", label: "Sets", blurb: "photos that belong together" },
+];
+
+/** Gallery-wide tag management: rename, merge, and delete tags across every
+ *  file that carries them.
+ *
+ *  **Sets are managed here too**, and not as a second panel: a set is a tag in
+ *  its own namespace, renaming one is the same rewrite of the same sidecars,
+ *  and for a set the rename *is* the operation in full — the set is its name.
  *
  *  Laid out as a wrapping cloud of chips rather than a list of rows: tag names
  *  are short, so one-per-line burned most of the width and put the actions in
@@ -35,7 +45,8 @@ type SortMode = "count" | "name";
  *  `onChanged` re-runs the active filter so the grid behind reflects the new
  *  tags (a tag-based filter may now match a different set of files). */
 export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => void }) {
-  const [tags, setTags] = createSignal<UserTagSummary[]>([]);
+  const [namespace, setNamespace] = createSignal<WritableNamespace>("user");
+  const [tags, setTags] = createSignal<TagSummary[]>([]);
   const [loading, setLoading] = createSignal(true);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -56,7 +67,7 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
   const load = async () => {
     setError(null);
     try {
-      const list = await listUserTags();
+      const list = await api.listTags(namespace());
       setTags(list);
       // Drop selections for tags that no longer exist (merged away, deleted,
       // or renamed) so the action bar can't act on a stale name.
@@ -68,6 +79,18 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
     setLoading(false);
   };
   onMount(load);
+  // Switching namespace reloads the list and drops a selection that names tags
+  // from the other one.
+  createEffect(
+    on(
+      namespace,
+      () => {
+        clearSelection();
+        void load();
+      },
+      { defer: true },
+    ),
+  );
 
   const handleKey = (e: KeyboardEvent) => {
     if (e.key !== "Escape") return;
@@ -140,26 +163,28 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
       setPreview([]);
       return;
     }
-    pathsForUserTags(tagList, PREVIEW_LIMIT)
+    api.pathsWithTags(tagList, namespace(), PREVIEW_LIMIT)
       .then((paths) => token === previewToken && setPreview(paths))
       .catch(() => token === previewToken && setPreview([]));
   });
 
-  /** Run one edit, then reload the list and refresh the gallery behind. */
-  const run = async (action: () => Promise<TagEditResult>, describe: (r: TagEditResult) => string) => {
+  /** Run one edit, then reload the list and refresh the gallery behind.
+   *
+   *  There is no partial-failure count to report any more: a write that cannot
+   *  take the companion lock or cannot rename over the sidecar fails the whole
+   *  call, so the error message is the error rather than a tally beside a
+   *  success notice. */
+  const run = async (
+    action: () => Promise<{ changed: number }>,
+    describe: (changed: number) => string,
+  ) => {
     if (busy()) return;
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const result = await action();
-      setNotice(describe(result));
-      if (result.filesFailed > 0) {
-        setError(
-          `${result.filesFailed} file${result.filesFailed === 1 ? "" : "s"} could not be updated — ` +
-            "the companion sidecar is missing or not writable.",
-        );
-      }
+      const { changed } = await action();
+      setNotice(describe(changed));
       await load();
       props.onChanged?.();
     } catch (e) {
@@ -190,16 +215,17 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
     if (sources.length === 1) {
       const from = sources[0];
       run(
-        () => renameUserTag(from, to),
-        (r) =>
+        () => api.renameTag(from, to, namespace()),
+        (changed) =>
           merging
-            ? `Merged "${from}" into "${to}" across ${fileWord(r.filesChanged)}`
-            : `Renamed "${from}" to "${to}" across ${fileWord(r.filesChanged)}`,
+            ? `Merged "${from}" into "${to}" across ${fileWord(changed)}`
+            : `Renamed "${from}" to "${to}" across ${fileWord(changed)}`,
       );
     } else {
       run(
-        () => mergeUserTags(sources, to),
-        (r) => `Merged ${sources.length} tags into "${to}" across ${fileWord(r.filesChanged)}`,
+        () => api.mergeTags(sources, to, namespace()),
+        (changed) =>
+          `Merged ${sources.length} tags into "${to}" across ${fileWord(changed)}`,
       );
     }
     clearSelection();
@@ -208,12 +234,20 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
   const deleteSelected = () => {
     const tagList = selectedTags().map((t) => t.tag);
     if (tagList.length === 0) return;
+    // One command per tag: `delete_tag` names a single tag, because it is the
+    // inverse of `add_tags` for one name across whatever carries it.
     run(
-      () => deleteUserTags(tagList),
-      (r) =>
+      async () => {
+        let changed = 0;
+        for (const tag of tagList) {
+          changed += (await api.deleteTag(tag, namespace())).changed;
+        }
+        return { changed };
+      },
+      (changed) =>
         tagList.length === 1
-          ? `Deleted "${tagList[0]}" from ${fileWord(r.filesChanged)}`
-          : `Deleted ${tagList.length} tags from ${fileWord(r.filesChanged)}`,
+          ? `Deleted "${tagList[0]}" from ${fileWord(changed)}`
+          : `Deleted ${tagList.length} tags from ${fileWord(changed)}`,
     );
     clearSelection();
   };
@@ -246,6 +280,30 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
             }}
           >
             {label}
+          </button>
+        )}
+      </For>
+    </div>
+  );
+
+  /** Which namespace is being managed. A segmented control rather than two
+   *  panels: every action below applies identically to either one. */
+  const namespaceToggle = () => (
+    <div class="flex shrink-0 rounded overflow-hidden border border-neutral-800">
+      <For each={NAMESPACES}>
+        {(ns) => (
+          <button
+            onClick={() => setNamespace(ns.id)}
+            title={ns.blurb}
+            class="px-2.5 text-[11px] cursor-pointer transition-colors whitespace-nowrap"
+            classList={{
+              "h-9": isMobile(),
+              "h-7": !isMobile(),
+              "bg-teal-800/60 text-teal-100": namespace() === ns.id,
+              "bg-neutral-900 text-neutral-500 hover:text-neutral-300": namespace() !== ns.id,
+            }}
+          >
+            {ns.label}
           </button>
         )}
       </For>
@@ -297,6 +355,7 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
               <span class="text-sm font-medium text-neutral-200 whitespace-nowrap">Manage Tags</span>
               <Show when={!loading()}>{summary()}</Show>
               <div class="flex-1" />
+              {namespaceToggle()}
               {searchBox("w-52 h-7 text-xs")}
               {sortToggle()}
               {closeButton()}
@@ -311,6 +370,7 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
               {closeButton()}
             </div>
             <div class="flex items-center gap-2">
+              {namespaceToggle()}
               {searchBox("flex-1 min-w-0 h-9 text-sm")}
               {sortToggle()}
             </div>
@@ -435,7 +495,7 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
               <For each={preview()}>
                 {(path) => (
                   <img
-                    src={thumbUrl(path, "s")}
+                    src={thumbUrl(path, "js")}
                     alt=""
                     loading="lazy"
                     title={path}

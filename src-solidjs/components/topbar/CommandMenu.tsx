@@ -37,13 +37,11 @@ import {
   TrashIcon,
   AutoTagIcon,
   UploadIcon,
-  FolderIcon,
   GearIcon,
   type Icon,
 } from "./icons";
-import { capabilities } from "../../stores/capabilitiesStore";
-import { uploadsEnabled } from "../../stores/uploadStore";
-import { isWeb } from "../../lib/runtime";
+import { capabilities } from "../../stores/settingsStore";
+import { plugins } from "../../stores/activityStore";
 import { hapticTick } from "../../lib/haptics";
 
 /** What each command does. Supplied by `App`, which owns the panels' open
@@ -55,7 +53,6 @@ export interface CommandHandlers {
   openTrash: () => void;
   openAutoTag: () => void;
   openUpload: () => void;
-  openFolder: () => void;
   openSettings: () => void;
 }
 
@@ -63,7 +60,7 @@ interface Command {
   id: string;
   label: string;
   icon: Icon;
-  /** True when this command applies to the current runtime and gallery. */
+  /** True when this command applies to this client and this gallery. */
   available: () => boolean;
   run: () => void;
   /** Settings is separated from the actions above it by a rule. */
@@ -81,17 +78,20 @@ function commands(h: CommandHandlers): Command[] {
       label: "Upload photos",
       icon: UploadIcon,
       // The one entry gated on fetched host config — see rule 1 above. Absent
-      // rather than present-and-failing when the fetch has not landed.
-      available: () => isWeb() && uploadsEnabled(),
+      // rather than present-and-failing when the fetch has not landed, which
+      // is why `capabilities` defaults to the narrow answer.
+      available: () => capabilities().upload,
       run: h.openUpload,
     },
     {
       id: "autotag",
       label: "Auto-tagging",
       icon: AutoTagIcon,
-      // Desktop runs its own plugins; the web client enqueues for a worker and
-      // is useful even with none connected (the panel says so).
-      available: () => isWeb() || capabilities().plugins,
+      // Plugins are installed beside the viewer, not on the server, and the
+      // server could not run the models anyway — so on a `--serve` bind this
+      // list is empty and the entry is simply absent. An honest absence beats
+      // a disabled control that explains itself in a tooltip nobody opens.
+      available: () => plugins().length > 0,
       run: h.openAutoTag,
     },
     {
@@ -112,17 +112,10 @@ function commands(h: CommandHandlers): Command[] {
       id: "trash",
       label: "Trash",
       icon: TrashIcon,
-      available: () => capabilities().delete,
+      // Move-to-trash, list and restore are all `Device`: a restore writes a
+      // file back to a path the same client was allowed to delete it from.
+      available: () => true,
       run: h.openTrash,
-    },
-    {
-      id: "folder",
-      label: "Open folder…",
-      icon: FolderIcon,
-      // The native picker exists only on the desktop; the web client mirrors
-      // whichever gallery the host has open.
-      available: () => !isWeb(),
-      run: h.openFolder,
     },
     {
       id: "settings",

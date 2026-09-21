@@ -74,6 +74,24 @@ export interface JustifiedLayoutOptions {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
+/**
+ * How much taller than its natural height a row ending a group may be stretched
+ * to fill the width.
+ *
+ * A row that ends a group or the content never reached its commit height, so
+ * justifying it to the full width always makes it taller than the rows above —
+ * the only question is by how much. Up to about half again reads as one of
+ * them; beyond that it reads as a mistake, and the row is better left short.
+ *
+ * Measured at the real defaults (container 1600, gap 4, target 240): a row of
+ * four landscapes needs 1.10× and a row of three needs 1.48×, so both fill the
+ * width; two squares would need 2.7× and one landscape 4.4×, so both stay put.
+ * Rows of three or more close up, which is where the ragged edge was
+ * conspicuous, and the cases that cannot close up keep today's rendering
+ * rather than becoming double-height *and* still ragged.
+ */
+export const FINAL_ROW_STRETCH = 1.5;
+
 /** Default cap on the portrait row-height boost (see `orientationBoost`). */
 export const DEFAULT_ORIENTATION_BOOST = 1.6;
 /** Default aspect at/above which a row is unboosted (see `boostRefAspect`). */
@@ -135,18 +153,30 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
   let rowStart = 0; // first item index of the current row
   let sumAspect = 0;
 
-  // Emit a row covering items [rowStart, end). `justify=false` keeps the row at
-  // the target height (used for the trailing row of the content and of each
-  // group, so 1–2 leftover items aren't stretched grotesquely wide).
-  const flush = (end: number, justify: boolean) => {
+  // Emit a row covering items [rowStart, end). `isFinal` marks the row that
+  // ends the content or a group — the one that never reached its commit
+  // height, and so the only one where filling the width is a choice.
+  const flush = (end: number, isFinal: boolean) => {
     const n = end - rowStart;
     if (n <= 0) return;
     const totalGap = gap * (n - 1);
     const avail = containerWidth - totalGap;
-    // Trailing/group-final rows aren't justified to full width, but still honor
-    // the portrait boost so a leftover portrait row matches the boosted rows
-    // above it rather than snapping back to the base target.
-    let h = justify ? avail / sumAspect : targetFor(sumAspect / n);
+    const justifiedH = avail / sumAspect;
+    // A final row used to sit at its target height unconditionally, which left
+    // a ragged edge at **every group boundary** — and with monthly grouping on
+    // by default, that is not the end of the library, it is a dozen times down
+    // a scroll. It fills the width when doing so costs little height, and
+    // otherwise stays short: a lone image stretched to a full-width banner is
+    // worse than the gap it closes. `FINAL_ROW_STRETCH` is where that line is.
+    //
+    // The unstretched fallback keeps the portrait boost, so a leftover
+    // portrait row matches the boosted rows above it rather than snapping back
+    // to the base target.
+    let h = justifiedH;
+    if (isFinal) {
+      const natural = targetFor(sumAspect / n);
+      h = justifiedH <= natural * FINAL_ROW_STRETCH ? justifiedH : natural;
+    }
     h = clamp(h, minRowHeight, maxRowHeight);
 
     const cells: LayoutCell[] = [];
@@ -168,7 +198,7 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
   for (let i = 0; i < aspects.length; i++) {
     // Force a break before an item that starts a new group.
     if (groupBreak && groupBreak.has(i) && i > rowStart) {
-      flush(i, false);
+      flush(i, true);
     }
 
     const a = clamp(aspects[i] > 0 ? aspects[i] : 1, minAspect, maxAspect);
@@ -183,12 +213,13 @@ export function computeJustifiedLayout(opts: JustifiedLayoutOptions): JustifiedL
     // row has a taller target (see `targetFor`), so it commits earlier: fewer,
     // bigger images instead of many narrow slivers.
     if (justifiedH <= targetFor(sumAspect / n)) {
-      flush(i + 1, true);
+      flush(i + 1, false);
     }
   }
 
-  // Trailing partial row, left-aligned at target height.
-  flush(aspects.length, false);
+  // Trailing partial row: filled to the width when that is cheap, left short
+  // when it is not.
+  flush(aspects.length, true);
 
   const totalHeight = rows.length > 0 ? y - gap : 0;
   return { rows, rowTops, totalHeight };
@@ -212,4 +243,114 @@ export function rowIndexAtOffset(rowTops: number[], scrollY: number): number {
     }
   }
   return ans;
+}
+
+// ---------------------------------------------------------------------------
+// Holding the reader's place across a change
+// ---------------------------------------------------------------------------
+//
+// A justified grid reflows like text. Row height is `avail / sumAspect` over the
+// items that landed in the row, so removing one item repacks every row after it:
+// measured at the real defaults, one removal near the top displaces later items
+// by 18, 283, 11 and 29 px while total height moves ten. There is no single
+// displacement to subtract, and — the trap that cost a design — no function of a
+// layout and a scroll offset can recover one, because its only honest answer to
+// "how much content is above the viewport" is the top of whichever row straddles
+// the offset, which is within a row height of the offset in *every* layout.
+//
+// What survives a reflow is identity. These take an item, remembered from the
+// old layout, and say where to scroll so that item sits where it sat.
+//
+// They are index-based because that is all a layout knows. An index is not
+// stable across an insertion or a removal, so a caller holding one across a set
+// change must carry the item's own identity — the grid converts through its path
+// list. See `justifiedLayout.test.ts` for the reflow these exist to survive.
+
+/** The item whose position is kept across a set change, and where it sat. */
+export interface TopAnchor {
+  index: number;
+  /** Its row's top, as pixels below the top of the viewport. Normally ≤ 0. */
+  offset: number;
+}
+
+/** The item whose position is kept across a scale change, and where it sat. */
+export interface ScaleAnchor {
+  index: number;
+  /** Its row's centre, as a fraction of the viewport height from the top. */
+  fraction: number;
+}
+
+/** The row containing `index`, by binary search over each row's first item. */
+export function rowOfItem(layout: JustifiedLayout, index: number): number {
+  const { rows } = layout;
+  let lo = 0;
+  let hi = rows.length - 1;
+  let ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (rows[mid].cells[0].index <= index) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return ans;
+}
+
+/**
+ * The anchor for a **set change**: the item at the top of the viewport.
+ *
+ * The top edge rather than the centre, because a change inside the viewport has
+ * to stay local to itself. An anchor below the edit would be dragged by it, and
+ * holding it still would slide everything *above* the edit downward while the
+ * gap closed from below — two motions where there should be one. The topmost
+ * item is above any edit the reader can see, so it is unmoved by definition.
+ */
+export function topAnchor(layout: JustifiedLayout, scrollTop: number): TopAnchor | null {
+  if (layout.rows.length === 0) return null;
+  const row = layout.rows[rowIndexAtOffset(layout.rowTops, scrollTop)];
+  return { index: row.cells[0].index, offset: row.y - scrollTop };
+}
+
+/**
+ * The anchor for a **scale change**: the item nearest the middle of the screen.
+ *
+ * The centre rather than the top edge, because zoom scales everything at once
+ * and there is no unaffected item to hold — so the fixed point should be where
+ * the eye is, which is what every map and image viewer does. A *fraction* of
+ * the viewport rather than a pixel offset, so a rotation that changes the
+ * viewport's height keeps the same item in the same visual place rather than
+ * the same number of pixels down a screen of a different size.
+ */
+export function scaleAnchor(
+  layout: JustifiedLayout,
+  scrollTop: number,
+  viewportHeight: number,
+): ScaleAnchor | null {
+  if (layout.rows.length === 0 || viewportHeight <= 0) return null;
+  const row = layout.rows[rowIndexAtOffset(layout.rowTops, scrollTop + viewportHeight / 2)];
+  // The row's first cell. Every cell in a row shares a vertical position, so
+  // any of them holds the row equally well — and the first is the one whose
+  // index survives a repack most predictably, because rows are packed forward
+  // from it. Anchoring the middle cell instead was tried, on the theory that it
+  // tracks the photograph in front of the reader more closely as rows shed
+  // members; measured over a zoom it drifted 370px where this holds at zero.
+  return {
+    index: row.cells[0].index,
+    fraction: (row.y + row.height / 2 - scrollTop) / viewportHeight,
+  };
+}
+
+/** Where to scroll so `anchor`'s item sits where it sat, in the new layout. */
+export function scrollHolding(
+  layout: JustifiedLayout,
+  anchor: TopAnchor | ScaleAnchor,
+  viewportHeight: number,
+): number {
+  if (layout.rows.length === 0) return 0;
+  const row = layout.rows[rowOfItem(layout, anchor.index)];
+  return "offset" in anchor
+    ? row.y - anchor.offset
+    : row.y + row.height / 2 - anchor.fraction * viewportHeight;
 }
