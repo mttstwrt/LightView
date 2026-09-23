@@ -101,29 +101,36 @@ unmeasured here.
   uploads are enabled, and whether or not an upload is already running. When
   upload is unavailable or an upload is in flight, the drop is refused.
 
-### R4: Drag an item into ComfyUI, with its embedded metadata
+### R4: Get an image into ComfyUI with its embedded metadata, and no change to authentication
 
-**ComfyUI is the target.** Dragging a grid cell, or the viewer's image at fit
-zoom, with a mouse onto a ComfyUI canvas or node delivers **the original file,
-byte for byte**. So whatever the file carries arrives with it:
+ComfyUI is the main destination, and LightView runs both on the ComfyUI
+machine (`lightview <dir>`) and on a remote server (`--serve`). In both cases
+the file must reach ComfyUI **byte for byte**, so whatever it carries arrives
+with it:
 
 - the workflow and prompt a ComfyUI PNG keeps in its text chunks;
 - the equivalents in WebP EXIF and in video containers;
 - camera EXIF.
 
-**The drag never carries a thumbnail, a `?fit=` rendition, or a re-encode.**
-Any of those would strip the metadata, and the grid's cells show exactly those.
-
 "Metadata" here means what is **in the file**. LightView's own tags, ratings
 and notes live in sidecars. ComfyUI has nowhere to read them, and writing them
 into the file would modify an original, which LightView never does.
 
-This must work in any browser, with ComfyUI in a browser tab, because ComfyUI's
-drop handler is the same code everywhere (see
-[design.md](design.md#how-comfyui-reads-a-drop)). Dropping into a file manager
-is best effort and checked by hand, not a requirement.
+**R1 is how this is met, in both modes.** Download writes the original.
+Dragging the finished download out of the browser's download list, or out of
+a file manager, into ComfyUI is an ordinary file drop from another
+application. ComfyUI reads a file drop first, so the workflow loads.
 
-Dropping such a drag back onto LightView never uploads it.
+On the ComfyUI machine there is a second route that needs no code: an
+**Open With** entry in `server.toml` that opens the file manager with the file
+selected (see [design.md](design.md#local-mode-show-in-file-manager-no-code)).
+It saves making a copy in Downloads.
+
+**Direct drag from LightView into ComfyUI is on hold.** It cannot be done
+without a URL that works with no cookie, which is a change to authentication.
+The findings are recorded in
+[design.md](design.md#on-hold-direct-drag-into-comfyui), so the work can resume
+from them rather than from scratch.
 
 ## Non-goals
 
@@ -136,16 +143,10 @@ Dropping such a drag back onto LightView never uploads it.
 - **Resuming an interrupted download.** Range requests work, but browsers only
   resume a download when the response carries a validator (`ETag` or
   `Last-Modified`), and none is sent.
-- **Dragging several selected items out.** ComfyUI reads only the first URL in
-  a drop, and `DownloadURL` takes one file.
-- **Copy-and-paste into ComfyUI with metadata.** Chromium's async clipboard
-  decodes and re-encodes `image/png` on write, which drops the text chunks the
-  workflow lives in. Copy Image stays a bitmap copy.
-- **A ComfyUI-specific drag format.** ComfyUI's own asset panel also sets an
-  `application/x-comfy-asset-info` type, which is internal to ComfyUI. Plain
-  `text/uri-list` is all its drop handler needs.
-- **Drag-out on touch.** Long-press already opens the context menu, and a
-  touch drag would compete with it.
+- **Dragging anything out of LightView, for now.** See R4.
+- **Copy-and-paste into ComfyUI with metadata** from the browser. Chromium's
+  async clipboard decodes and re-encodes `image/png` on write, which drops the
+  text chunks the workflow lives in. Copy Image stays a bitmap copy.
 - **Saving to the iOS Photos library.** A download on iOS goes to Files. Getting
   it into Photos needs the Web Share API with the whole file already in memory,
   which is a different mechanism.
