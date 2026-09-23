@@ -45,15 +45,20 @@ that authorizes itself.
   the existing `serve_file`, and adds `Content-Disposition` to a 200 or 206.
 - **R4.** Three pieces:
   - **`server/drag_links.rs`** is an in-memory registry mapping a token to a
-    `RelPath` and an expiry. It sits beside the launch-token and session state,
+    `RelPath` and an expiry, **keyed by the token's SHA-256**. A lookup is a
+    hash-map probe on a digest, so it never compares attacker-supplied bytes
+    against a secret. It sits beside the launch-token and session state,
     because it is authorization state and not a service: the server owns who
     may ask.
   - A **`register_drag_link`** arm in the command table (`Device`). Like every
     other arm, it is two lines: a `require` and a call.
-  - **`GET /drag/{token}/{name}`**, in a **new route group** that is gated on
-    readiness but not on the cookie, because the token *is* the authorization.
-    It serves through the same `serve_file` and the same header helper as
-    `/download`.
+  - **`GET /drag/{token}/{name}`**, in a **new route group** with its own small
+    middleware. `guard_layer` (`routes.rs`) checks readiness, origin and cookie
+    in one function, so this group cannot reuse it. Its layer does two things:
+    it checks readiness, the same `state.is_ready()` call, and it adds the CORS
+    header on the way out, so a 503 and axum's own path rejections carry it
+    too. That is an axum `map_response`, not a new dependency. The route serves
+    through the same `serve_file` and header helper as `/download`.
 
 The pipeline is not involved in either route. The pipeline's job is turning a
 file into bytes a browser can show, and both routes exist to *not* do that.
@@ -74,17 +79,33 @@ or handles a 401.**
 | `components/upload/UploadSheet.tsx` | The pending list (files plus a left-out count) and the busy flag move up into `App` |
 | `components/shared/ContextMenu.tsx` | A **Download** entry: single item, any trust level. It awaits `ensureSession()`, then clicks a transient `<a href download>` |
 
-`startFileDrag`, **synchronously inside `dragstart`**:
+`lib/fileDrag.ts` works in two steps, because the drag payload must be set
+synchronously and the registration is a round trip.
 
-1. Generates a 32-byte token with `crypto.getRandomValues`.
-2. Sets `text/uri-list` to `location.origin + dragUrl(token, path)`.
-3. Sets `DownloadURL` to `application/octet-stream:<name>:<same URL>`, for
-   Chromium file managers.
-4. Fires `api.registerDragLink(token, path)` **without awaiting it**.
+1. **On `pointerdown`** (a mouse, the primary button, no modifier, on a
+   draggable element), it generates a 32-byte token with
+   `crypto.getRandomValues` and starts `api.registerDragLink(token, path)`,
+   keeping the promise and **catching** its failure.
+2. **On `dragstart`**, synchronously:
+   - If that registration has already failed, it sets nothing, so the drag
+     carries no payload and every target shows the no-drop cursor. That cursor
+     is the user-visible outcome, and nothing is left as an unhandled
+     rejection.
+   - Otherwise it sets `text/uri-list` to
+     `location.origin + dragUrl(token, path)`, and `DownloadURL` to
+     `application/octet-stream:<name>:<same URL>` for Chromium file managers.
 
-A drop cannot happen before the pointer has travelled to another window, and
-the registration is one small request, so it has landed long before ComfyUI
-fetches the link.
+Registering on press rather than at `dragstart` buys the whole drag as margin:
+the press, the threshold movement, and the trip to another window. That
+matters because loopback is HTTP/1.1. Chromium allows six sockets per host,
+the event stream holds one, and uncached thumbnails hold the rest while they
+generate, so the registration can queue. ComfyUI's cross-site fetch comes from
+a different connection partition and does not queue behind them. The margin is
+**unmeasured** (C6).
+
+A password lapse surfaces as the password modal on the press, which is where
+it would surface anyway: the viewer a click opens makes authenticated requests
+too. A press that never becomes a drag leaves a link that expires in a minute.
 
 ## Contract
 
@@ -118,20 +139,26 @@ the trash is `Device`.
 **3. `register_drag_link { token, path }` (R4), `Device`.**
 
 - `token` must be exactly 64 lowercase hex characters; anything else is refused.
-- A duplicate token is refused.
 - `path` is a `RelPath` with a `MediaType` extension that resolves under the
   root.
 - A registration lives **60 seconds**.
-- At most 256 live entries. Expired ones are purged on each insert, and a full
-  registry refuses.
+- At most 256 live entries. Expired ones are purged on each insert, and at the
+  cap **the oldest is evicted** rather than the new one refused. Registration
+  happens on every press, so a burst of clicks must not be able to block the
+  drag that follows. A device that floods the registry only evicts its own
+  links, and paired devices are already fully trusted.
+
+There is no duplicate-token check. Two independent 256-bit random values do not
+collide, and a client reusing its own token hurts only itself.
 
 **4. `GET /drag/{token}/{name}` (R4). No cookie.** This is the new trust
 surface.
 
 | | |
 |---|---|
-| Authorization | the token: registered, unexpired, and `name` equal to the registered file's basename. Anything else is 404 |
+| Authorization | the token alone: registered and unexpired. Anything else is 404. `{name}` exists only so that targets which name a file after the URL get the right name. It is not checked, because checking it protects nothing: a leaked URL already contains it |
 | Reuse | any number of fetches within the 60 seconds, because a file manager may send a `HEAD` before the `GET` |
+| Expiry | checked when a request **starts**. A response already streaming finishes, so a 4 GB clip is not cut off at the sixtieth second |
 | Body and headers | exactly as `/download`: the raw file, the same `Content-Type` and `Content-Disposition` |
 | CORS | `Access-Control-Allow-Origin: *` on **every** response of this route, the 404 included, so ComfyUI sees a clean non-OK response rather than a network error. No `Allow-Credentials`: there is no credential to allow |
 | Gating | 503 until ready, like everything past the bootstrap group |
@@ -150,6 +177,21 @@ the gesture already means:
 
 A leaked link gives whoever holds it, and can reach the bind, the image the
 user was in the act of handing to another application, for sixty seconds.
+
+**What the client-chosen token changes about forgery.** Today a forged command
+could at most *write* blind. A forged `register_drag_link` would let the forger
+pick the token, and then *read* the file through `/drag`. The forgery itself is
+stopped by the same three independent layers that stop every forged command:
+
+- **The `Origin` check**, which under `--serve` is `Sec-Fetch-Site`. Browsers
+  always send that header on a cross-site request. Only non-browser clients
+  omit it, and they hold no cookie.
+- **The JSON body**, which forces a CORS preflight that nothing answers.
+- **`SameSite=Strict`**, which keeps the cookie off a cross-site request.
+
+If all three fell, every command in the table would be forgeable, which would
+be the larger problem. The trust section of the server README has to say this
+explicitly rather than leave it implied.
 
 **5. The drag payload.** `text/uri-list` and `DownloadURL` both carry the
 `/drag` URL:
@@ -175,8 +217,12 @@ would be expiring within a minute anyway.
 - **One client-generated secret, the only one in the system.** Every other
   token is minted server-side. This one cannot be, because `dragstart` must set
   its data synchronously, before any round trip could return. That is an
-  *except*, stated here and in the module comment. It gives a client nothing:
-  a `Device` client can already read every file the token could name.
+  *except*, stated here and in the module comment. It gives a legitimate client
+  nothing it lacks, since a `Device` client can already read every file the
+  token could name. What it changes about forgery is argued under Contract 4.
+- **One small POST per mouse press on a cell**, because registration happens
+  on the press. The cost is a few hundred bytes on a connection that is already
+  open.
 - **One route for the file, beside `/media`:** `/media` is *bytes a browser
   can render*, and `/download` and `/drag` are *the file*. That replaces an
   `except` inside `media()` (alternative 2).
@@ -203,9 +249,20 @@ image drag both hand over the wrong bytes, and those are the only candidates.
 2. **A `text/uri-list` pointing at `/download` or `/media`.** ComfyUI's
    cookie-less fetch gets a 401 and no file. *Lost.*
 3. **Server-minted token on `pointerdown`,** so the client never chooses a
-   secret. That costs a round trip on every click, including ones that only
-   open the viewer, and it races when the drag starts before the response.
-   *Lost to the client-generated token's exactness.*
+   secret. The token would arrive asynchronously, and a drag that starts
+   before the response has no URL to carry. With a client-chosen token, the
+   URL is known at the press and only the registration is in flight. *Lost on
+   that race.*
+3a. **A small pool of server-minted tokens, fetched ahead of time** and bound
+   to a path on the press. That removes the client-chosen secret and the
+   read-forgery it enables. It adds a token lifecycle: minting, refilling, and
+   expiring tokens that were never bound. And it defends against an attack
+   that already has to beat the three layers every other command relies on.
+   *Lost narrowly, on cost in concepts. It is the first thing to adopt if any
+   of those layers is ever weakened.*
+3b. **The server waits briefly for a late registration** before answering 404.
+   That is a second mechanism for a race that registering on the press
+   already widens. *Lost unless C6 fails.*
 4. **A stateless HMAC token,** with no registry. It still needs a round trip,
    because the client cannot hold the key. It needs a new `hmac` dependency or
    a hand-rolled HMAC, and it cannot be refused once minted. The registry is
@@ -262,7 +319,8 @@ Each assumption is **unmeasured** unless it says otherwise.
 | C2 | ComfyUI and LightView are on the same machine, so the fetch is loopback to loopback: no TLS, and no Local Network Access prompt from Chrome | Under `--serve`, the browser must trust LightView's certificate (Settings → Connection) or the fetch fails. A ComfyUI page from the LAN fetching a loopback LightView triggers Chrome's local-network permission prompt | Manual, in whichever arrangement you use |
 | C3 | Your ComfyUI version has the URI fallback. It was read from current `main`. Older frontends had the same "files, else fetch the first URI" order as far as I recall, but that is not verified | An older ComfyUI ignores the drop | Manual |
 | C4 | A drag of a `<div>` carrying only strings puts nothing in `files`, so ComfyUI takes the URI branch | ComfyUI reads a synthesized file instead | Headless: Playwright's real in-page drag, asserting what a `drop` listener sees |
-| C5 | A ComfyUI `File` named after the whole URL is harmless. Workflow loading ignores the name. A LoadImage upload may get an odd filename | Adopt alternative 6 | Manual |
+| C5 | Dropping onto a LoadImage node feeds that node. On current `main`, node drops go through the same extraction, so it should. **On older frontends, LoadImage's own drop handler read only `dataTransfer.files`,** so a URL drop falls through to the canvas, and a workflow-bearing PNG would load as a workflow instead. Separately, ComfyUI names the `File` after the whole URL, and the uploaded name may look odd | Older ComfyUI: canvas drops work, node drops load the workflow instead. The name: adopt alternative 6 | Manual, with your version |
+| C6 | Registration, started on the press, lands before the drop, even queued behind thumbnail requests on HTTP/1.1 | ComfyUI's fetch gets a 404 and shows nothing. Next step: alternative 3b | Manual. Headless: a drag started immediately after a scroll that queues uncached thumbnails |
 | A2 | Chromium lands a `DownloadURL` drop in your file manager. Best effort only: X11 historically yes, Wayland reported broken for some file managers | File-manager drops do nothing. R4 is unaffected | Manual |
 | A4 | A same-origin `<a download>` clicked after an `await` still downloads without fresh user activation | Download needs a second tap after a password prompt | Headless Chromium; iOS by hand |
 | A5 | `(pointer: fine)` is false on phones and true on laptops | A phone gets a draggable cell that competes with long-press | The 390px run, and a phone |
@@ -307,12 +365,14 @@ which point at a missing client check rather than a wrong seam.
 3. The menu entry.
 
 **Phase 2: Drag into ComfyUI (R4).**
-1. `drag_links.rs`, with unit tests driven by an injected clock: expiry, the
-   256 cap, a duplicate, a malformed token, a basename mismatch.
+1. `drag_links.rs`, keyed by digest, with unit tests driven by an injected
+   clock: expiry, eviction of the oldest at the cap, and a malformed token.
 2. The `register_drag_link` arm.
-3. The `/drag` route in its own group, with CORS.
+3. The `/drag` route in its own group, whose layer checks readiness and adds
+   CORS to every response.
 4. `dragUrl` and `registerDragLink` in `ipc.ts`.
-5. `lib/fileDrag.ts`. `draggable` on `ThumbnailCell` when `(pointer: fine)`.
+5. `lib/fileDrag.ts`, which registers on the press and sets the payload on
+   `dragstart`. `draggable` on `ThumbnailCell` when `(pointer: fine)`.
    `draggable` on the viewer's image container for stills at zoom 1. Ctrl/Cmd-
    drag stays range-select, and the zoomed pan keeps its drag, because both
    call `preventDefault` on `mousedown`.
@@ -339,10 +399,11 @@ which point at a missing client check rather than a wrong seam.
   - **`/drag`**, in both modes:
     - Register a link with the cookie, then fetch it **without** any cookie:
       200, identical bytes, and `Access-Control-Allow-Origin: *`.
-    - An unregistered token, or a wrong name, returns 404 and still carries
-      the CORS header.
+    - An unregistered token returns 404 and still carries the CORS header.
+      So does a 503 before the gallery is ready.
     - A registration with no cookie returns 401.
     - A malformed token is refused.
+    - A registration POSTed with a foreign `Origin` returns 403.
 - **`grid.mjs`**, the built SPA in headless Chromium:
   - **ComfyUI's path, end to end short of ComfyUI itself.** The fixture is a
     PNG carrying a `workflow` text chunk, written by the script.
@@ -351,6 +412,10 @@ which point at a missing client check rather than a wrong seam.
     2. From a second page on another origin, the script runs ComfyUI's
        `fetchDroppedAsset` body verbatim against that URL.
     3. Expect identical bytes and the `workflow` chunk intact.
+    4. With the registration made to fail (the route stubbed to 500), the drag
+       carries no payload, and there is no unhandled rejection.
+    5. A drag started straight after a scroll that queues uncached thumbnails
+       still finds its link registered by the time a drop could fetch it (C6).
   - **Download:** fires a `download` event with the right name and identical
     bytes.
   - **Drop to upload:** a trusted file drop (CDP `Input.dispatchDragEvent`)
@@ -360,8 +425,9 @@ which point at a missing client check rather than a wrong seam.
   - No console errors and no failed requests, as now.
 - **Manual, with your ComfyUI:**
   - Drag a ComfyUI-generated PNG onto the canvas: the workflow loads.
-  - Drag one onto a LoadImage node: the image loads. Check the name it gets
-    (C5).
+  - Drag one onto a LoadImage node: the image should load into the node. On
+    an older ComfyUI the workflow may load instead (C5). Check the name it
+    gets.
   - Drag a video that carries a workflow.
   - Drag one image into your file manager (A2, best effort).
   - Download once on a phone, and once after the password window has lapsed.
@@ -384,4 +450,9 @@ which point at a missing client check rather than a wrong seam.
     what shaped that.
 - **`build-and-verify.md`:** add the new checks.
 - **`upload.rs`'s module comment:** "bounded" now names the mid-stream margin.
+- **`commands.rs`'s module comment** says "There is no third tier". It stays
+  true for trust levels, but it must now name the capability route group
+  beside the bootstrap group, or it reads as a contradiction.
+- **The route table in `routes.rs`'s module comment** gains `/download` and
+  `/drag`.
 - Delete this directory.
