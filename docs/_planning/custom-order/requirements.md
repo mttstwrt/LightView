@@ -29,15 +29,18 @@ stays where the date order puts it.**
 
 ### R1 — A Custom sort
 
-A sort named Custom, alongside the column sorts. Before anyone arranges
-anything it is identical to Date, newest first.
+A sort named Custom, alongside the column sorts. Files nobody arranged sort as
+Date sorts them, newest first, with ties broken by path — Date itself has no
+tiebreaker, so two shots in one second may swap places between the two sorts.
+Custom has no group headers: they would be labelled by a value the list is not
+ordered by.
 
 ### R2 — A file keeps the place it was given
 
 Moving a file puts it immediately after the file it was dropped behind, and it
 stays there across restarts, cache deletion, and other machines opening the same
-gallery. Files nobody moved keep their date order, and a new file lands where its
-date puts it.
+gallery — including when a file with a nearby date is imported later. Files
+nobody moved keep their date order, and a new file lands where its date puts it.
 
 ### R3 — A set given an order is one block
 
@@ -49,8 +52,9 @@ stays loose, and its members sort as individual files.
 ### R4 — A file is in at most one block
 
 A file appears once in the grid, so it cannot sit contiguously inside two
-blocks. Ordering a set that would put a file into a second block is refused, and
-the refusal names the file and the block it is already in.
+blocks. Ordering a set that would put a file into a second block is refused
+before anything is written, and the refusal names the file and the block it is
+already in.
 
 ### R5 — Dragging a member: inside reorders, outside moves the block
 
@@ -67,7 +71,10 @@ are never jumped over or reordered by a drop they could not see.
 ### R7 — Another machine's arrangement arrives
 
 A reorder made on one machine reaches every open window on every other machine
-sharing the gallery, as a refetch, without anyone touching anything.
+sharing the gallery, as a refetch, without anyone touching anything. Within
+moments where the watcher can see the write; within the hourly companion sweep
+where it cannot — a gallery on a client-side mount, which `inotify` does not
+see.
 
 ### R8 — Nothing a person cannot regenerate is spent on it
 
@@ -80,6 +87,24 @@ gallery that has no sidecars — which a cache format bump does.
 Arranging by mouse drag in the grid on the desktop. On a phone, and as a
 keyboardless path on the desktop, a "Move to…" command reaches every placement a
 drag can.
+
+### R10 — Every arrangement can be undone
+
+A file can be returned to its date position, a block can be dissolved, and
+taking a file out of a set takes it out of that set's block.
+
+## Limits, stated
+
+- **Two hosts can disagree about an unarranged video's date**, and so about its
+  place — a clip with only a container `creation_time` is read in the host's
+  time zone, and a host without `ffprobe` falls back to the file time. They
+  already disagree under Date. Arranged files do not: their keys are stored,
+  and so is the key of every file they were placed against.
+- **The arrangement is unavailable while a gallery is first indexed.** After a
+  cache deletion or an upgrade the sidecars are re-read in the background;
+  until that finishes Custom shows date order, and arranging is refused rather
+  than computed against a half-built index and written permanently into
+  sidecars.
 
 ## Out of scope
 
@@ -94,19 +119,17 @@ drag can.
 
 ## Decisions taken with the user
 
-- Unplaced files follow the date order; new files slot in by date. Accepted weak
-  spot: a placed file can drift from a neighbour whose date is later re-read or
-  which is renamed, because it was placed relative to that neighbour's key.
+- Unplaced files follow the date order; new files slot in by date.
 - Only ordered sets lock.
 - Inside reorders, outside moves the block.
 - Desktop mouse drag first.
 
 ## Open
 
-**Is "drop at the very top" a pin?** A key below every existing key also sorts
-above every file that arrives later, so an image dropped at the top stays there
-forever. An image dropped just after today's first image is anchored to that
-neighbour instead, and slides down as new files arrive. The two drops look
-identical on the day they are made. The design currently pins. The alternative
-gives a top drop a key just below the current first file's, so it behaves as the
-newest file in the gallery and slides down as later files arrive.
+**Is "drop at the very top" a pin?** Every other drop is anchored to the file
+it lands behind or in front of. A top drop has no file above it, so there are
+two readings. As a **pin**, it sorts above every file that arrives later, and
+stays at the top until moved. As an **anchor** to the current first file, it
+sits just above that file, and later arrivals land above it — exactly where they
+would have landed had it never been moved. Either is one branch in the key
+generator; the durable format does not care.
