@@ -35,7 +35,10 @@ Three facts shape everything below.
 2. **Only the browser holds the credential.** The session and device cookies
    are `HttpOnly; SameSite=Strict`. A drop target that is given a URL and
    fetches it itself (a file manager going through GVfs or KIO, a chat app
-   unfurling a link) gets a 401, not a photo.
+   unfurling a link) gets a 401, not a photo. **ComfyUI is exactly such a
+   target.** Its page is another origin, it fetches a dropped URL itself with a
+   plain `fetch`, and a cross-origin `fetch` sends no cookies (and a
+   `SameSite=Strict` cookie would not go cross-site anyway).
 3. **The upload path truncates anything over 2 MB, and reports success.**
    axum 0.8's `Multipart` limits a request body to 2 MB unless a
    `DefaultBodyLimit` says otherwise (axum 0.8.9 `src/extract/multipart.rs:58`),
@@ -98,18 +101,29 @@ unmeasured here.
   uploads are enabled, and whether or not an upload is already running. When
   upload is unavailable or an upload is in flight, the drop is refused.
 
-### R4: Drag an item out, carrying the original (gated, see below)
+### R4: Drag an item into ComfyUI, with its embedded metadata
 
-Dragging a grid cell, or the viewer's image at fit zoom, with a mouse delivers
-**the original file** to wherever it is dropped, on browsers that can do that.
-On browsers that cannot, the drag carries nothing: **never a thumbnail under
-the original's name, and never a bare URL** that the target will fetch without
-a credential. Dropping such a drag back onto LightView never uploads it.
+**ComfyUI is the target.** Dragging a grid cell, or the viewer's image at fit
+zoom, with a mouse onto a ComfyUI canvas or node delivers **the original file,
+byte for byte**. So whatever the file carries arrives with it:
 
-**R4 is gated on a manual check on your own desktop** (browser, display server,
-file manager). This platform matrix cannot be tested headlessly and the public
-evidence is mixed; see [design.md](design.md#assumptions). If the check fails,
-R4 is dropped rather than rebuilt around fallbacks.
+- the workflow and prompt a ComfyUI PNG keeps in its text chunks;
+- the equivalents in WebP EXIF and in video containers;
+- camera EXIF.
+
+**The drag never carries a thumbnail, a `?fit=` rendition, or a re-encode.**
+Any of those would strip the metadata, and the grid's cells show exactly those.
+
+"Metadata" here means what is **in the file**. LightView's own tags, ratings
+and notes live in sidecars. ComfyUI has nowhere to read them, and writing them
+into the file would modify an original, which LightView never does.
+
+This must work in any browser, with ComfyUI in a browser tab, because ComfyUI's
+drop handler is the same code everywhere (see
+[design.md](design.md#how-comfyui-reads-a-drop)). Dropping into a file manager
+is best effort and checked by hand, not a requirement.
+
+Dropping such a drag back onto LightView never uploads it.
 
 ## Non-goals
 
@@ -122,8 +136,14 @@ R4 is dropped rather than rebuilt around fallbacks.
 - **Resuming an interrupted download.** Range requests work, but browsers only
   resume a download when the response carries a validator (`ETag` or
   `Last-Modified`), and none is sent.
-- **Dragging several selected items out.** The drag format that carries a real
-  file (`DownloadURL`) takes one file.
+- **Dragging several selected items out.** ComfyUI reads only the first URL in
+  a drop, and `DownloadURL` takes one file.
+- **Copy-and-paste into ComfyUI with metadata.** Chromium's async clipboard
+  decodes and re-encodes `image/png` on write, which drops the text chunks the
+  workflow lives in. Copy Image stays a bitmap copy.
+- **A ComfyUI-specific drag format.** ComfyUI's own asset panel also sets an
+  `application/x-comfy-asset-info` type, which is internal to ComfyUI. Plain
+  `text/uri-list` is all its drop handler needs.
 - **Drag-out on touch.** Long-press already opens the context menu, and a
   touch drag would compete with it.
 - **Saving to the iOS Photos library.** A download on iOS goes to Files. Getting

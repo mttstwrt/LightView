@@ -3,55 +3,88 @@
 [requirements.md](requirements.md) · [server/](../../server/README.md) ·
 [frontend/](../../frontend/README.md)
 
+## How ComfyUI reads a drop
+
+R4 is built to fit this, so it comes first. ComfyUI's frontend
+([`src/utils/eventUtils.ts`](https://github.com/Comfy-Org/ComfyUI_frontend/blob/main/src/utils/eventUtils.ts),
+`extractFilesFromDragEvent`, read on `main` in September 2026) does three
+things, in order:
+
+1. It takes `dataTransfer.files`, minus any `image/bmp`. The BMP filter exists
+   because a browser dragging an `<img>` synthesizes a re-encoded bitmap rather
+   than the original.
+2. If there are none, it takes the first line of `text/uri-list` (or
+   `text/x-moz-url`) and calls **`fetch(uri)` with no options**, which means
+   CORS mode and no cookies on a cross-origin request.
+3. It wraps the response body in a `File`, named from ComfyUI's private
+   asset-info type if present and otherwise from the URI itself. A non-OK
+   response yields no file.
+
+Everything it then does (loading a workflow from PNG text chunks, WebP EXIF or
+a video container, or feeding a LoadImage node) reads that `File`'s bytes.
+
+So there are exactly two ways in. One is **real files in the `DataTransfer`**,
+which a page cannot supply for bytes it does not already hold (alternative 13).
+The other is **a URL ComfyUI can fetch with no cookie, across origins**.
+Everything LightView serves today needs the cookie. R4 therefore needs a URL
+that authorizes itself.
+
 ## Placement
 
-**Server: [`server/routes.rs`](../../../src-rust/src/server/routes.rs) and
-[`server/upload.rs`](../../../src-rust/src/server/upload.rs), and nothing below
-them.**
+**Server: [`server/routes.rs`](../../../src-rust/src/server/routes.rs),
+[`server/upload.rs`](../../../src-rust/src/server/upload.rs), and one new
+`server/drag_links.rs`. Nothing below the server layer changes.**
 
 - **R0.** The fix stays inside the upload route and `StagedUpload`:
   - The `/api/upload` route gets `DefaultBodyLimit::disable()`, on that route
     only.
   - A chunk or field error becomes an error response.
   - `StagedUpload::write` re-checks the free-space margin every 64 MiB written.
-    64 MiB is the granularity, so a single write can overshoot the margin by at
-    most that much; one `statvfs` per 64 MiB is nothing next to the write
-    itself.
-- **R1.** `GET /download/{*rel}` joins the `guarded` group beside `/media`, so
-  it inherits the auth layer and the readiness gate without restating either.
-  It does four things:
-  1. validates a `RelPath` and resolves it against the root;
-  2. refuses a path whose extension is not a `MediaType`;
-  3. calls the existing `serve_file`;
-  4. adds `Content-Disposition`, only to a 200 or 206.
+- **R1.** `GET /download/{*rel}` joins the `guarded` group beside `/media`. It
+  validates a `RelPath`, resolves it, refuses a non-`MediaType` extension, calls
+  the existing `serve_file`, and adds `Content-Disposition` to a 200 or 206.
+- **R4.** Three pieces:
+  - **`server/drag_links.rs`** is an in-memory registry mapping a token to a
+    `RelPath` and an expiry. It sits beside the launch-token and session state,
+    because it is authorization state and not a service: the server owns who
+    may ask.
+  - A **`register_drag_link`** arm in the command table (`Device`). Like every
+    other arm, it is two lines: a `require` and a call.
+  - **`GET /drag/{token}/{name}`**, in a **new route group** that is gated on
+    readiness but not on the cookie, because the token *is* the authorization.
+    It serves through the same `serve_file` and the same header helper as
+    `/download`.
 
-  No service or pipeline code is involved. The pipeline's job is turning a
-  file into bytes a browser can show, and this route exists to *not* do that,
-  so putting it there would make the pipeline learn about a caller that wants
-  its work skipped.
-
-The route depends on `path` and `companion::schema::MediaType`, as `upload.rs`
-already does. Dependencies still point downward.
+The pipeline is not involved in either route. The pipeline's job is turning a
+file into bytes a browser can show, and both routes exist to *not* do that.
+Dependencies still point downward: the routes use `path` and `MediaType`, as
+`upload.rs` already does.
 
 **Frontend: components call `lib/`, and only `lib/ipc.ts` builds a backend URL
 or handles a 401.**
 
 | Where | What |
 |---|---|
-| `lib/ipc.ts` | Adds `downloadUrl(path)` beside `mediaUrl`, and `ensureSession()`, which runs one cheap `invoke` so a lapsed password raises the existing shared challenge. `upload()` calls `ensureSession()` first, sends batches of at most 100, reports one progress fraction across all of them, and reads the `uploaded` list off an error body |
-| `lib/mediaExts.ts` | Adds `IMAGE_EXTS` beside `VIDEO_EXTS`, and `isMediaName(name)`, which trims dots the way `sanitize_name` does before reading the extension |
-| `lib/fileDrop.ts` (new) | The **one** set of window `dragover`/`drop` listeners, installed by `index.tsx` before anything renders, `/pair` included. For any drag whose types include `Files`, it always calls `preventDefault`. It hands a drop to whichever handler is registered and refuses it (`dropEffect = "none"`) when none is |
+| `lib/ipc.ts` | Adds `downloadUrl(path)`, `dragUrl(token, path)`, `api.registerDragLink`, and `ensureSession()`, which runs one cheap `invoke` so a lapsed password raises the existing shared challenge. `upload()` calls `ensureSession()` first, sends batches of at most 100, reports one progress fraction, and reads `uploaded` off an error body |
+| `lib/mediaExts.ts` | Adds `IMAGE_EXTS` beside `VIDEO_EXTS`, and `isMediaName(name)`, which trims dots the way `sanitize_name` does |
+| `lib/fileDrag.ts` (new) | `startFileDrag(event, path)`, described below. It also holds the "our own drag is active" flag, set on `dragstart` and cleared on `dragend` |
+| `ThumbnailCell.tsx`, `MediaViewer.tsx` | `draggable` plus `onDragStart → startFileDrag` |
+| `lib/fileDrop.ts` (new) | The one set of window `dragover`/`drop` listeners, installed by `index.tsx` before anything renders, `/pair` included. For any drag whose types include `Files` and is not our own, it always calls `preventDefault`. It hands a drop to the registered handler, or refuses it when none is registered |
 | `components/upload/DropZone.tsx` (new) | Registers the handler once the app is ready and uploads are enabled, and renders the overlay |
-| `components/upload/UploadSheet.tsx` | The pending list (files plus a left-out count) and the busy flag move up into `App`, so the picker and a drop write the same signal and a drop mid-upload is refused |
-| `components/shared/ContextMenu.tsx` | A **Download** entry: single item, any trust level, beside Copy Image. It awaits `ensureSession()`, then clicks a transient `<a href download>` |
-| `lib/fileDrag.ts` (new, R4 only) | `setFileDrag(dataTransfer, path)` builds the payload from `ipc.downloadUrl`. It also holds a module-level "our own drag is active" flag, set on `dragstart` and cleared on `dragend`, which `fileDrop.ts` checks |
-| `ThumbnailCell.tsx`, `MediaViewer.tsx` (R4 only) | `draggable` plus `onDragStart → setFileDrag` |
+| `components/upload/UploadSheet.tsx` | The pending list (files plus a left-out count) and the busy flag move up into `App` |
+| `components/shared/ContextMenu.tsx` | A **Download** entry: single item, any trust level. It awaits `ensureSession()`, then clicks a transient `<a href download>` |
 
-The drop guard and the drop handler are separate on purpose. The guard is page
-policy and must hold before the app exists. Handling a drop needs capabilities
-and the sheet, which exist only once the app is ready. One listener set with a
-pluggable handler gives both, without two sets of listeners racing over one
-event.
+`startFileDrag`, **synchronously inside `dragstart`**:
+
+1. Generates a 32-byte token with `crypto.getRandomValues`.
+2. Sets `text/uri-list` to `location.origin + dragUrl(token, path)`.
+3. Sets `DownloadURL` to `application/octet-stream:<name>:<same URL>`, for
+   Chromium file managers.
+4. Fires `api.registerDragLink(token, path)` **without awaiting it**.
+
+A drop cannot happen before the pointer has travelled to another window, and
+the registration is one small request, so it has landed long before ComfyUI
+fetches the link.
 
 ## Contract
 
@@ -65,111 +98,158 @@ response changes in two ways:
 
 The only client is `ipc.upload()`, which changes in the same commit.
 
-**2. A new wire route: `GET /download/{*rel}` (R1).** One side is the SPA's
-download anchor. The other side (R4 only) is the browser's own download
-manager, fulfilling a `DownloadURL` drag outside the page.
+**2. `GET /download/{*rel}` (R1).** The other side is the SPA's download
+anchor.
 
 | | |
 |---|---|
 | Trust | `Device`, the same as `/media`, which already serves these bytes for every format except HEIC/HEIF |
-| Gating | the `guarded` group: authenticated, and 503 until the scan and the watcher are ready |
-| Body | the file as it is on disk. `Range`/206 comes through `serve_file`. It sends no validator, so a download cannot resume (a non-goal) |
-| `Content-Type` | `mime_for(ext)`, so HEIC is `image/heic` |
-| `Content-Disposition` | 200 and 206 only, so a 404 or 416 body is never saved under a photo's name. `attachment; filename="<ASCII fallback>"; filename*=UTF-8''<RFC 5987>`. Control characters, CR and LF included, and `"` and `\` are replaced in the fallback. The value is built fallibly: a name that still cannot form a header gets a bare `attachment`, never a panic |
-| Refusal | 404 for an extension that is not a `MediaType`, the same answer as a missing file |
+| Gating | the `guarded` group: cookie, and 503 until ready |
+| Body | the file as it is on disk. `Range`/206 comes through `serve_file`. No validator is sent, so a download cannot resume |
+| `Content-Type` | `mime_for(ext)` |
+| `Content-Disposition` | 200 and 206 only. `attachment; filename="<ASCII fallback>"; filename*=UTF-8''<RFC 5987>`. Control characters, `"` and `\` are replaced in the fallback. The value is built fallibly, and a name that still cannot form a header gets a bare `attachment` |
+| Refusal | 404 for an extension that is not a `MediaType` |
 
-That refusal is deliberate but narrow. `/media` currently serves **any** existing
-file under the root: `RelPath` accepts `.lightview/…`, and nothing between the
-route and `serve_file` checks an extension. That is outside this plan and
-flagged separately. `/download` does not inherit the non-media half. It does
-still serve a media-named file inside `.lightview/trash/`, exactly as `/media`
-does today. That is no wider, because the trash is `Device` anyway.
+`/media` currently serves **any** existing file under the root. That is flagged
+separately. Neither new route inherits it. Both still serve a media-named file
+under `.lightview/trash/`, as `/media` does today, which is no wider, because
+the trash is `Device`.
 
-**3. The drag payload (R4):**
-`application/octet-stream:<basename>:<location.origin + downloadUrl(path)>`.
-The format splits on the first two colons, so a `:` in the basename (legal on
-Linux) is replaced with `_` in the *suggested name* only. Nothing else goes into
-the `DataTransfer`: no `text/uri-list`, no `text/plain`, no `Files`.
+**3. `register_drag_link { token, path }` (R4), `Device`.**
+
+- `token` must be exactly 64 lowercase hex characters; anything else is refused.
+- A duplicate token is refused.
+- `path` is a `RelPath` with a `MediaType` extension that resolves under the
+  root.
+- A registration lives **60 seconds**.
+- At most 256 live entries. Expired ones are purged on each insert, and a full
+  registry refuses.
+
+**4. `GET /drag/{token}/{name}` (R4). No cookie.** This is the new trust
+surface.
+
+| | |
+|---|---|
+| Authorization | the token: registered, unexpired, and `name` equal to the registered file's basename. Anything else is 404 |
+| Reuse | any number of fetches within the 60 seconds, because a file manager may send a `HEAD` before the `GET` |
+| Body and headers | exactly as `/download`: the raw file, the same `Content-Type` and `Content-Disposition` |
+| CORS | `Access-Control-Allow-Origin: *` on **every** response of this route, the 404 included, so ComfyUI sees a clean non-OK response rather than a network error. No `Allow-Credentials`: there is no credential to allow |
+| Gating | 503 until ready, like everything past the bootstrap group |
+
+**Why a self-authorizing URL is acceptable here, when the first draft
+rejected it.** The first draft's objection was a bearer link to a private
+photo leaking into a chat app. The bounds now make the exposure exactly what
+the gesture already means:
+
+- **One file.** The token names one path.
+- **The one being dragged.** It is minted per drag, by a session that already
+  passed the cookie and the password.
+- **For a minute.** It expires after 60 seconds.
+- **Only where the bind is reachable.** It is loopback in local mode and the
+  LAN under `--serve`.
+
+A leaked link gives whoever holds it, and can reach the bind, the image the
+user was in the act of handing to another application, for sixty seconds.
+
+**5. The drag payload.** `text/uri-list` and `DownloadURL` both carry the
+`/drag` URL:
+
+- **Nothing session-bound.** A target fetches the URL without a cookie.
+- **No thumbnail.** It would carry no metadata.
+- **No `Files`.** That keeps our own drag out of the upload path, and ComfyUI's
+  URI branch is the one we want it to take.
+- A `:` in the name is replaced with `_` in the `DownloadURL` field only,
+  because that format splits on colons.
 
 **Nothing durable changes.** There is no schema change, no `format_version`
-bump, no sidecar field and no settings key. Uploaded files land in `upload_dir`
-exactly as picked ones do today, except that they are now whole.
+bump, no sidecar field and no settings key. The drag registry is process
+memory, and a restart forgets it, which costs nothing, since every link in it
+would be expiring within a minute anyway.
 
 ## Cost in concepts
 
-- **One route, and one distinction to hold:** `/media` is *bytes a browser can
-  render*, and `/download` is *the file*. That replaces what would otherwise be
-  an `except` inside `media()` (alternative 2). **No `except` case is added
-  anywhere.**
-- **One menu entry.**
-- **One always-on drop guard with a pluggable handler, and one overlay.** The
-  rule is that a drop is handled only when its types include `Files`, it is not
-  our own drag, and a handler is registered.
-- **`ensureSession()`**, with two callers from the start: Download and upload.
-- **Two mirrored server facts** in the client: the image-extension list, which
-  joins the video list already mirrored in `mediaExts.ts` with a "keep in sync"
-  comment, and the number 100. This is a real cost. Publishing both in
-  `get_capabilities` would add wire contract for two values that change about
-  never.
+- **A third route group: authorized by a capability in the URL.** Until now
+  there were two: the unauthenticated bootstrap group, and everything else
+  behind the cookie. This is the largest cost in the plan. The server README's
+  trust section has to name it, its bounds, and the one route in it.
+- **One client-generated secret, the only one in the system.** Every other
+  token is minted server-side. This one cannot be, because `dragstart` must set
+  its data synchronously, before any round trip could return. That is an
+  *except*, stated here and in the module comment. It gives a client nothing:
+  a `Device` client can already read every file the token could name.
+- **One route for the file, beside `/media`:** `/media` is *bytes a browser
+  can render*, and `/download` and `/drag` are *the file*. That replaces an
+  `except` inside `media()` (alternative 2).
+- **One menu entry. One always-on drop guard with a pluggable handler, and one
+  overlay. `ensureSession()`**, with two callers.
+- **Two mirrored server facts** in the client: the image-extension list, beside
+  the video list already mirrored in `mediaExts.ts`, and the number 100.
 - **R0 adds nothing a reader must learn.** It makes the upload module's
-  existing claims ("streamed", "bounded", "cleaned up on every error path")
-  true.
-- **R4 only: one helper with two callers**, one flag, and `draggable` on two
-  elements.
+  existing claims true.
 
-**Could this be met by deleting something?** Only one candidate: remove the
-`preventDefault` calls and let the native menu and native image drag through.
-Both hand over the wrong bytes (alternatives 1 and 6), so nothing is deleted.
+**Could this be met by deleting something?** No. The native menu and native
+image drag both hand over the wrong bytes, and those are the only candidates.
 
 ## Alternatives
 
-1. **The native context menu**, either by dropping the `preventDefault` or by
-   passing Shift+right-click through. In the grid, the element under the
-   pointer is a thumbnail, so Save Image saves a few hundred pixels under the
-   original's name. In the viewer, a HEIC saves as JPEG bytes. It also loses
-   tag, rate and delete. *Lost on correctness.*
-2. **A `?download` flag on `/media`** instead of a new route. That is one fewer
-   route, but `media()` would gain a mode that switches off two of its three
-   branches, and every later reader of that handler would have to know which.
-   *Lost narrowly, on the `except`.*
-3. **Frontend only: `<a download href={mediaUrl(path)}>`.** No server change,
-   but an iPhone photo would silently download as a JPEG transcode, under a
-   `.heic` name unless renamed. *Lost on correctness.*
-4. **Batch download as a server-streamed ZIP.** It needs either a new
-   dependency or a hand-written ZIP writer, and a POST-bodied download that a
-   plain anchor cannot make. It also raises a question the trust table has
-   never had to answer: may a phone bulk-export the library? *Deferred until
-   someone needs it.*
-5. **Batch download as N anchor clicks.** Chromium asks permission for multiple
-   downloads, and iOS delivers only the first. *Lost.*
-6. **Drag-out by removing `draggable={false}` from the `<img>`s.** The grid
-   would hand over the thumbnail under the original's name, silently. *Lost on
-   correctness.*
-7. **A `text/uri-list` fallback for browsers without `DownloadURL`.** The target
-   fetches the URL without the cookie and saves a 401 body under a photo's
-   name. *Lost.*
-8. **Signed, cookie-less URLs, so a third party can fetch.** A bearer link to a
-   private photo, pasted into a chat app, is a leak. *Lost firmly.*
-9. **Put a real `File` into the `DataTransfer` at `dragstart`.** The bytes must
-   exist synchronously when the drag starts, and in the grid they do not.
+**For R4, the strongest objection first.**
+
+1. **Build no drag-out at all.** With R1, the user downloads the file and drags
+   it from the file manager into ComfyUI, and the metadata arrives intact. That
+   needs no new trust surface. *Lost only because ComfyUI is the stated main
+   target and this makes it two gestures and a detour per image.* If the new
+   route group is judged too costly, this is the fallback, and R1 already
+   delivers it.
+2. **A `text/uri-list` pointing at `/download` or `/media`.** ComfyUI's
+   cookie-less fetch gets a 401 and no file. *Lost.*
+3. **Server-minted token on `pointerdown`,** so the client never chooses a
+   secret. That costs a round trip on every click, including ones that only
+   open the viewer, and it races when the drag starts before the response.
+   *Lost to the client-generated token's exactness.*
+4. **A stateless HMAC token,** with no registry. It still needs a round trip,
+   because the client cannot hold the key. It needs a new `hmac` dependency or
+   a hand-rolled HMAC, and it cannot be refused once minted. The registry is
+   about thirty lines with no dependency. *Lost.*
+5. **Single-use tokens.** Tighter, but a file manager's `HEAD` before its
+   `GET` would spend the token. The 60-second life is the bound that matters.
    *Lost.*
-10. **Start uploading as soon as files are dropped, with no sheet.** It saves
-    one click, but the user never sees what was left out, and it would need a
-    second progress and result surface. *Lost on reusing the one sheet.*
-11. **The server skips an unsupported part instead of refusing the request.**
-    That fixes the refusal for every client, but a rejected file's bytes still
-    cross the network first. *The prefilter is kept.* The half of this that
-    matters, the server saying what landed when it fails, is adopted in R0.
-12. **Raise the body limit to a fixed ceiling** (say 8 GiB) instead of
-    disabling it. That is a knob with no principled value, and it still lets a
-    stream run the disk below the margin. A margin re-check bounds the thing
-    that actually runs out. *Lost.*
-13. **Name the upload folder in the overlay** by adding `upload_dir` to
-    `get_capabilities`. That is wire contract to decorate a message, and the
-    sheet has never named it. *Lost.*
-14. **Probe with `HEAD /download/…` instead of `ensureSession()`.** That also
-    catches a missing file, but it needs a second 401-handling path in
-    `ipc.ts`, beside `invoke`'s. *Lost to the one path.*
+6. **Put ComfyUI's private `application/x-comfy-asset-info` type in the
+   drag,** so ComfyUI names the file properly. That couples to an internal
+   format that can change without notice. *Deferred:* adopt it only if the
+   manual check shows a LoadImage upload named after the URL is actually a
+   problem (C5).
+
+**For R1 and R3, unchanged from the first draft.**
+
+7. **The native context menu.** It saves or copies the thumbnail in the grid,
+   and saves JPEG bytes for a HEIC in the viewer. *Lost on correctness.*
+8. **A `?download` flag on `/media`.** It would add a mode that switches off
+   two of that route's three branches. *Lost on the `except`.*
+9. **Frontend-only Download from `/media`.** A HEIC silently arrives as JPEG.
+   *Lost.*
+10. **Batch download**, either as a server ZIP (a new dependency, a POST-bodied
+    download, a bulk-export trust question) or as N anchor clicks (a
+    permission prompt; iOS delivers one). *Deferred, and lost, respectively.*
+11. **Remove `draggable={false}` from the `<img>`s.** The grid hands over the
+    thumbnail, and ComfyUI filters the synthesized bitmap anyway. *Lost.*
+12. **Copy and paste into ComfyUI.** Chromium re-encodes `image/png` on a
+    clipboard write, which strips the workflow chunks. *Lost for metadata.*
+13. **Put a real `File` in the `DataTransfer` at `dragstart`,** which ComfyUI
+    would read first. The whole original must already be in memory when the
+    drag starts, which in the grid it is not. Chromium also carries drag files
+    between pages as filesystem paths, so an in-memory `File` probably does
+    not survive into another tab (unmeasured). *Lost.*
+14. **Start uploading as soon as files are dropped, with no sheet.** *Lost on
+    reusing the one sheet.*
+15. **The server skips unsupported parts instead of refusing.** *The prefilter
+    is kept.* The server saying what landed on failure is adopted in R0.
+16. **A fixed body ceiling instead of disabling the limit.** It is a knob with
+    no principled value, and it does not stop a stream running the disk below
+    the margin. *Lost.*
+17. **Name the upload folder in the overlay.** That is wire contract for
+    decoration. *Lost.*
+18. **Probe with `HEAD /download/…` instead of `ensureSession()`.** That is a
+    second 401 path in `ipc.ts`. *Lost.*
 
 ## Assumptions
 
@@ -177,138 +257,131 @@ Each assumption is **unmeasured** unless it says otherwise.
 
 | # | Assumption | If wrong | How it gets measured |
 |---|---|---|---|
-| A0 | Uploads over 2 MB are truncated today. Established by reading axum 0.8.9 and `upload_route`, not by a live request | R0 shrinks to the error-path half, which is still needed | `drive.sh`: upload a 5 MB file and `cmp` it, **before** the fix, to record the failure |
-| A1 | Chromium's download manager sends the `SameSite=Strict` cookies when it fulfils a `DownloadURL` drag. It is browser-initiated, like a typed URL | The drag saves nothing useful. R4 is dropped | The gate below |
-| A2 | Chromium on your desktop lands a `DownloadURL` drop in your file manager. Public evidence: Chromium implemented this on Linux over X11's direct-save protocol (XDS), while under Wayland drops into some file managers (Dolphin, for one) are reported broken | R4 does nothing on your machine. It is dropped | The gate below |
-| A3 | `application/octet-stream` as the `DownloadURL` MIME does not change the saved name or extension | Wrong extension. Fix: mirror `mime_for` too | The gate below |
-| A4 | A same-origin `<a download>` clicked **after an `await`** still downloads, without fresh user activation, in Chromium, Firefox and iOS Safari | Download needs a second tap after a password prompt | Headless Chromium via Playwright's `download` event; iOS by hand |
-| A5 | `(pointer: fine)` is false on phones and true on laptops, touchscreen laptops included | A phone gets a draggable cell that competes with long-press | The 390px run, plus a phone at the gate |
-| A6 | A drop's `dataTransfer.files` lists a folder as an entry with no media extension | A folder reaches `upload()` and the request fails | Manual, at the gate |
+| A0 | Uploads over 2 MB are truncated today. Established by reading axum 0.8.9 and `upload_route`, not by a live request | R0 shrinks to its error-path half | `drive.sh` uploads a 5 MB file **before** the fix |
+| C1 | ComfyUI runs in a browser tab. If it is ComfyUI Desktop (Electron), the drop arrives as an OS-level drag, and `text/uri-list` is standard on every platform, so it probably still works | R4 needs a separate look for the desktop app | Manual |
+| C2 | ComfyUI and LightView are on the same machine, so the fetch is loopback to loopback: no TLS, and no Local Network Access prompt from Chrome | Under `--serve`, the browser must trust LightView's certificate (Settings → Connection) or the fetch fails. A ComfyUI page from the LAN fetching a loopback LightView triggers Chrome's local-network permission prompt | Manual, in whichever arrangement you use |
+| C3 | Your ComfyUI version has the URI fallback. It was read from current `main`. Older frontends had the same "files, else fetch the first URI" order as far as I recall, but that is not verified | An older ComfyUI ignores the drop | Manual |
+| C4 | A drag of a `<div>` carrying only strings puts nothing in `files`, so ComfyUI takes the URI branch | ComfyUI reads a synthesized file instead | Headless: Playwright's real in-page drag, asserting what a `drop` listener sees |
+| C5 | A ComfyUI `File` named after the whole URL is harmless. Workflow loading ignores the name. A LoadImage upload may get an odd filename | Adopt alternative 6 | Manual |
+| A2 | Chromium lands a `DownloadURL` drop in your file manager. Best effort only: X11 historically yes, Wayland reported broken for some file managers | File-manager drops do nothing. R4 is unaffected | Manual |
+| A4 | A same-origin `<a download>` clicked after an `await` still downloads without fresh user activation | Download needs a second tap after a password prompt | Headless Chromium; iOS by hand |
+| A5 | `(pointer: fine)` is false on phones and true on laptops | A phone gets a draggable cell that competes with long-press | The 390px run, and a phone |
+| A6 | A dropped folder appears in `files` with no media extension | A folder reaches `upload()` and the request fails | Manual |
 
-The self-drop question (does our own drag expose `Files`?) is not an
-assumption any more. The own-drag flag answers it either way, and costs three
-lines. `dragend` fires at the source, which for our own drag is this page.
-
-### The gate for R4
-
-This needs no code beyond R1. With R1 deployed, open LightView in the browser
-you use, paste the snippet below into the DevTools console, drag a grid cell to
-your file manager, and check that a file arrives with the right name, the right
-size and the right format. Try a HEIC if you have one.
-
-```js
-document.querySelectorAll("[data-vt-path]").forEach((c) => (c.draggable = true));
-document.addEventListener("dragstart", (e) => {
-  const p = e.target.closest?.("[data-vt-path]")?.dataset.vtPath;
-  if (!p) return;
-  const name = p.split("/").pop().replaceAll(":", "_");
-  const url = `${location.origin}/download/${p.split("/").map(encodeURIComponent).join("/")}`;
-  e.dataTransfer.setData("DownloadURL", `application/octet-stream:${name}:${url}`);
-}, true);
-```
-
-A file with the right bytes means A1 to A3 hold, and Phase 3 goes ahead.
-Anything else means R4 is dropped, and the result is recorded in the server
-docs so nobody retries it blind.
+The first draft's gate is gone. It existed to test whether Chromium's download
+manager would carry the cookie, and nothing in R4 depends on the cookie now.
+The fetch ComfyUI makes is an ordinary cross-origin `fetch`, which the headless
+suite can perform itself (see Verification).
 
 ## The two checks
 
-**Second implementation.** Every new shared piece has two callers from the
-start:
+**Second implementation.**
 
-- `fileDrag.ts`: the grid cell and the viewer.
-- `ensureSession()`: Download and upload.
-- `fileDrop.ts`'s pluggable handler: the pre-ready refusal and `DropZone`.
+- `fileDrag.ts` has two callers: the grid cell and the viewer.
+- `ensureSession()` has two: Download and upload.
+- The drop handler slot has two: the pre-ready refusal and `DropZone`.
+- The header helper has two: `/download` and `/drag`.
+- The drag registry has one consumer, and is concrete: a map and a clock, not
+  an interface.
 
-Nothing introduces an interface, a plugin point or a setting.
-
-**Seam.** Placement was not hard. The friction is the two mirrored limits, and
-the review showed why they have been invisible: the picker's `accept` looked
-like filtering and was not. That points at a missing client check, not at a
-wrong seam.
+**Seam.** The new route group is the one place this plan pushes on the
+architecture, and it is placed where the architecture says authorization
+lives: in the server, beside the other tokens, with the command table deciding
+who may mint one. The friction that remains is the mirrored upload limits,
+which point at a missing client check rather than a wrong seam.
 
 ## The work
 
-**Phase 0: Uploads land whole (R0).** This comes first because it stands alone:
-it is worth shipping even if nothing else in this plan is approved.
-1. In `drive.sh`, upload a 5 MB file and compare the bytes. Watch it fail
-   first, to record A0.
-2. Add `DefaultBodyLimit::disable()` to the upload route.
-3. Handle `Ok(None)`, `Ok(Some)` and `Err` in both loops; `Err` returns early
-   and `StagedUpload`'s `Drop` removes the temp file.
-4. Make error bodies JSON carrying `uploaded`.
-5. Re-check the margin in `write` every 64 MiB.
+**Phase 0: Uploads land whole (R0).** This stands alone and ships first.
+1. In `drive.sh`, upload a 5 MB file and compare it; watch it fail.
+2. `DefaultBodyLimit::disable()` on the upload route.
+3. Handle `Err` in both loops, which returns early and lets `StagedUpload`'s
+   `Drop` remove the temp file.
+4. JSON error bodies carrying `uploaded`.
+5. A margin re-check in `write`, every 64 MiB.
 
 **Phase 1: Download (R1).**
-1. Add the `download` route and a unit-tested header helper, covering ASCII,
-   non-ASCII, `"`, `\`, `:`, and CR/LF.
-2. Add `downloadUrl` and `ensureSession` in `ipc.ts`.
-3. Add the menu entry.
+1. The `/download` route and the header helper, unit-tested for ASCII,
+   non-ASCII, `"`, `\`, `:` and CR/LF.
+2. `downloadUrl` and `ensureSession` in `ipc.ts`.
+3. The menu entry.
 
-**Phase 2: Drop to upload (R3).**
-1. Add `isMediaName`, applied to picked files too.
+**Phase 2: Drag into ComfyUI (R4).**
+1. `drag_links.rs`, with unit tests driven by an injected clock: expiry, the
+   256 cap, a duplicate, a malformed token, a basename mismatch.
+2. The `register_drag_link` arm.
+3. The `/drag` route in its own group, with CORS.
+4. `dragUrl` and `registerDragLink` in `ipc.ts`.
+5. `lib/fileDrag.ts`. `draggable` on `ThumbnailCell` when `(pointer: fine)`.
+   `draggable` on the viewer's image container for stills at zoom 1. Ctrl/Cmd-
+   drag stays range-select, and the zoomed pan keeps its drag, because both
+   call `preventDefault` on `mousedown`.
+
+**Phase 3: Drop to upload (R3).**
+1. `isMediaName`, applied to picked files too.
 2. Batch `upload()`, with `ensureSession()` first.
-3. Lift the sheet's state into `App`; a drop appends and clears the result.
-4. Add `fileDrop.ts`, installed in `index.tsx`.
-5. Add `DropZone`. The overlay shows on a `dragover` carrying `Files`. It hides
-   on `drop`, on a `dragleave` whose `relatedTarget` is null, and after one
-   second without a `dragover`, as a backstop for unbalanced enter/leave
-   events. `dragend` does not fire for an external drag, so it cannot be
-   relied on.
-
-**Gate:** the console check above.
-
-**Phase 3: Drag out (R4), only if the gate passes.**
-1. Add `lib/fileDrag.ts`, and have `fileDrop.ts` check its flag.
-2. In `ThumbnailCell`: add `draggable` when `(pointer: fine)`, with
-   `onDragStart → setFileDrag`. Ctrl/Cmd-drag stays range-select, because its
-   `mousedown` already calls `preventDefault`.
-3. In `MediaViewer`: add `draggable` on the image container for stills at
-   zoom 1. Past 1×, the pan's `mousedown` `preventDefault` already wins.
+3. Lift the sheet's state into `App`. A drop appends to the list and clears
+   the result.
+4. `fileDrop.ts`, installed in `index.tsx`, ignoring our own drag.
+5. `DropZone`. The overlay hides on `drop`, on a `dragleave` with a null
+   `relatedTarget`, and after one second without a `dragover`.
 
 ## Verification
 
-- `cargo clippy --all-targets --all-features` clean. `cargo test`, including
-  the header helper and a margin re-check test.
+- `cargo clippy --all-targets --all-features` clean, and `cargo test`.
 - `npx tsc --noEmit` clean.
-- **`drive.sh`**, against the real binary over curl:
-  - A 5 MB upload lands byte for byte.
-  - A request cut off mid-part (curl's `--max-time`) leaves no file and no
-    `.lv-upload-*.tmp`.
-  - `/download` returns the fixture byte for byte, with
-    `Content-Disposition: attachment`.
-  - A range request returns 206.
-  - Both traversal spellings return 404.
-  - A non-media file returns 404, with no `Content-Disposition`.
-  - Unpaired requests under `--serve` return 401.
+- **`drive.sh`**, the real binary over curl:
+  - **Uploads:** a 5 MB upload lands byte for byte. A request cut off mid-part
+    leaves no file and no temp file.
+  - **`/download`:** the fixture byte for byte, with `attachment`. A range
+    returns 206. Traversal and a non-media file return 404. Unpaired requests
+    under `--serve` return 401.
+  - **`/drag`**, in both modes:
+    - Register a link with the cookie, then fetch it **without** any cookie:
+      200, identical bytes, and `Access-Control-Allow-Origin: *`.
+    - An unregistered token, or a wrong name, returns 404 and still carries
+      the CORS header.
+    - A registration with no cookie returns 401.
+    - A malformed token is refused.
 - **`grid.mjs`**, the built SPA in headless Chromium:
-  - Download fires a `download` event with the right suggested name and
-    identical bytes.
-  - A **trusted** file drop (CDP `Input.dispatchDragEvent` with real file paths;
-    a synthetic `drop` event never triggers the browser's navigation, so it
-    could not fail) carrying a PNG and a `.txt` opens the sheet with one file
-    listed and one left out, and the upload appears in the grid.
-  - The same drop with uploads disabled, and again mid-upload, leaves the URL
-    unchanged and nothing uploaded.
-  - Phase 3: a real mouse drag of a cell produces a `DownloadURL` payload.
-  - No console errors and no failed requests throughout, as now.
-- **Manual:** the gate, then one drag from the grid and one from the viewer on
-  your desktop, one download on a phone, and one Download after the password
-  window has lapsed.
+  - **ComfyUI's path, end to end short of ComfyUI itself.** The fixture is a
+    PNG carrying a `workflow` text chunk, written by the script.
+    1. A real mouse drag of its cell yields a `text/uri-list` and nothing in
+       `files` (C4).
+    2. From a second page on another origin, the script runs ComfyUI's
+       `fetchDroppedAsset` body verbatim against that URL.
+    3. Expect identical bytes and the `workflow` chunk intact.
+  - **Download:** fires a `download` event with the right name and identical
+    bytes.
+  - **Drop to upload:** a trusted file drop (CDP `Input.dispatchDragEvent`)
+    carrying a PNG and a `.txt` opens the sheet with one file listed and one
+    left out, and the upload appears in the grid. With uploads disabled, and
+    again mid-upload, the URL is unchanged and nothing is uploaded.
+  - No console errors and no failed requests, as now.
+- **Manual, with your ComfyUI:**
+  - Drag a ComfyUI-generated PNG onto the canvas: the workflow loads.
+  - Drag one onto a LoadImage node: the image loads. Check the name it gets
+    (C5).
+  - Drag a video that carries a workflow.
+  - Drag one image into your file manager (A2, best effort).
+  - Download once on a phone, and once after the password window has lapsed.
 
 ## On completion
 
 - **`server/README.md`:**
-  - `/download` in the routes table, and a short section on `/media` versus
-    `/download`.
-  - Under Uploads: the body limit, the mid-stream margin, the JSON error
-    carrying `uploaded`, and batching.
-  - If R4 was dropped, the gate's result.
-- **`architecture.md`:** add `/download` to the request diagram.
+  - The trust section gains the capability group, with its bounds and why it
+    exists.
+  - `/download` and `/drag` go in the routes table.
+  - A section on `/media` versus the file routes.
+  - Uploads gains the body limit, the mid-stream margin, the JSON error and
+    batching.
+- **`architecture.md`:** "Trust is a property of the bind" gains one paragraph
+    on the capability group, and the request diagram gains both routes.
 - **`frontend/README.md`:** under Chrome, add:
   - Download, and why it goes through `ensureSession`.
-  - The always-on drop guard and its pluggable handler.
-  - If built, drag-out, and why it carries nothing on non-Chromium browsers.
+  - The drop guard.
+  - Drag-out: why it carries a link rather than a file, and why ComfyUI is
+    what shaped that.
 - **`build-and-verify.md`:** add the new checks.
 - **`upload.rs`'s module comment:** "bounded" now names the mid-stream margin.
 - Delete this directory.
