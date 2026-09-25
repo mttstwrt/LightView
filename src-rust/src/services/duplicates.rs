@@ -253,9 +253,13 @@ impl Contributions {
     fn apply(self, companion: &mut CompanionFile) {
         merge_into(&mut companion.tags.user, self.user);
         merge_into(&mut companion.tags.set, self.set);
-        // The survivor's own arrangement wins; it was placed deliberately.
-        if companion.meta.order.is_none() {
-            companion.meta.order = self.order;
+        // The survivor's own arrangement wins; it was placed deliberately. A
+        // stale one — naming a set it has left — is not a place, so a copy's
+        // live arrangement replaces it.
+        if companion.honoured_order().is_none()
+            && let Some(order) = self.order
+        {
+            companion.meta.order = Some(order);
         }
         for (name, entry) in self.plugins {
             companion
@@ -323,6 +327,13 @@ mod tests {
         assert_eq!(order.key.as_deref(), Some("k1"));
         assert_eq!(order.set.as_deref(), Some("comic"));
         assert!(keeper.honoured_order().is_some(), "the survivor joined the block's set too");
+
+        // A survivor whose own order is stale inherits a live one.
+        let mut keeper = placed(&[], "stale", Some("renamed-away"));
+        let mut contributions = Contributions::default();
+        contributions.absorb(&placed(&["comic"], "k1", Some("comic")));
+        contributions.apply(&mut keeper);
+        assert_eq!(keeper.meta.order.clone().unwrap().key.as_deref(), Some("k1"));
 
         // A survivor someone already placed keeps its own place.
         let mut keeper = placed(&[], "mine", None);
