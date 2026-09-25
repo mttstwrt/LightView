@@ -1141,6 +1141,7 @@ fn media_type_str(path: &RelPath) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::test_gallery;
 
     /// The distinction the whole video branch turns on. A host with no ffmpeg
     /// has not looked at its clips, so its rows must stay in the candidate set;
@@ -1477,29 +1478,6 @@ mod tests {
                 "{} was not ignored",
                 ignored.display()
             );
-        }
-    }
-
-    fn test_gallery(root: &Path) -> Gallery {
-        use crate::autocomplete::engine::AutocompleteEngine;
-        use crate::cache::db::CacheDb;
-        use crate::pipeline::serve::ThumbService;
-        use crate::server::events::Events;
-
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = Root::open(root).unwrap();
-        let db = Arc::new(CacheDb::open_at(&cache_dir).unwrap());
-        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
-        let thumbs = Arc::new(ThumbService::new(db.clone(), root.clone(), pool, 1 << 20));
-        Gallery {
-            root,
-            db,
-            thumbs,
-            events: Arc::new(Events::new()),
-            autocomplete: Arc::new(AutocompleteEngine::new()),
-            settings: std::sync::RwLock::new(GallerySettings::default()),
-            cache_dir,
-            arrangeable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

@@ -23,11 +23,15 @@
 //! member's sidecar; trashing a member shrinks it silently. A set is not a
 //! durable object with an identity, it is a name several files agree on.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::autocomplete::engine::TagCount;
 use crate::cache::{index, meta};
-use crate::companion::schema::{CompanionFile, CoreMeta, MediaType};
+use crate::companion::schema::{CompanionFile, CoreMeta, MediaType, Order};
+use crate::sort::order_key;
 use crate::companion::writer::{modify_companion, Outcome, WriteError};
 use crate::path::{PathError, RelPath};
 use crate::server::events::Event;
@@ -95,6 +99,12 @@ pub async fn add(
 }
 
 /// Remove tags from a selection.
+///
+/// Taking a file out of a set also takes it out of that set's block: its
+/// order goes with the tag, and it returns to where its date puts it. Keeping
+/// the order would leave it sorted at the block's key, clumped beside the
+/// block without belonging to it — and a set deleted outright would leave
+/// every former member clumped at one shared key.
 pub async fn remove(
     gallery: &Gallery,
     paths: &[RelPath],
@@ -102,12 +112,29 @@ pub async fn remove(
     namespace: WritableNamespace,
 ) -> Result<usize, TagError> {
     let tags = tags.to_vec();
-    edit(gallery, paths, namespace, move |list| {
+    let edited = edit_companion(gallery, paths, move |_, companion| {
+        let list = namespace.field(companion);
         let before = list.len();
         list.retain(|t| !tags.contains(t));
-        list.len() != before
+        let mut changed = list.len() != before;
+        if namespace == WritableNamespace::Set && order_set_is(companion, |s| tags.contains(s)) {
+            companion.meta.order = None;
+            changed = true;
+        }
+        changed
     })
-    .await
+    .await?;
+    Ok(announce(gallery, edited).await)
+}
+
+/// Whether `companion`'s order names a set that `pred` picks.
+fn order_set_is(companion: &CompanionFile, pred: impl Fn(&String) -> bool) -> bool {
+    companion
+        .meta
+        .order
+        .as_ref()
+        .and_then(|o| o.set.as_ref())
+        .is_some_and(pred)
 }
 
 /// Rename a tag everywhere it appears.
@@ -122,7 +149,8 @@ pub async fn rename(
 ) -> Result<usize, TagError> {
     let members = members_of(gallery, from, namespace).await?;
     let (from, to) = (from.to_string(), to.to_string());
-    edit(gallery, &members, namespace, move |list| {
+    let edited = edit_companion(gallery, &members, move |_, companion| {
+        let list = namespace.field(companion);
         let mut changed = false;
         for tag in list.iter_mut() {
             if *tag == from {
@@ -133,12 +161,26 @@ pub async fn rename(
         // A file already carrying the destination would now carry it twice.
         list.sort();
         list.dedup();
+        // The block goes with its name.
+        if namespace == WritableNamespace::Set && order_set_is(companion, |s| *s == from) {
+            if let Some(order) = companion.meta.order.as_mut() {
+                order.set = Some(to.clone());
+            }
+            changed = true;
+        }
         changed
     })
-    .await
+    .await?;
+    Ok(announce(gallery, edited).await)
 }
 
 /// Fold several tags into one. Merging two clusters is this.
+///
+/// For sets, merging two ordered sets **concatenates** their blocks: the
+/// target's members in their order, then each source's in the order given,
+/// all under the lowest of their keys. Merge already rewrites every member's
+/// sidecar, so keeping each block's order whole costs no write that
+/// interleaving their positions would not.
 pub async fn merge(
     gallery: &Gallery,
     sources: &[String],
@@ -149,11 +191,20 @@ pub async fn merge(
     for source in sources {
         members.extend(members_of(gallery, source, namespace).await?);
     }
+    let placement = if namespace == WritableNamespace::Set {
+        concatenate_blocks(gallery, sources, target).await?
+    } else {
+        HashMap::new()
+    };
+    // The target's own block members are renumbered too.
+    members.extend(placement.keys().cloned());
     members.sort();
     members.dedup();
 
     let (sources, target) = (sources.to_vec(), target.to_string());
-    edit(gallery, &members, namespace, move |list| {
+    let placement = Arc::new(placement);
+    let edited = edit_companion(gallery, &members, move |path, companion| {
+        let list = namespace.field(companion);
         let before = list.clone();
         list.retain(|t| !sources.contains(t));
         if !list.contains(&target) {
@@ -161,9 +212,47 @@ pub async fn merge(
         }
         list.sort();
         list.dedup();
-        *list != before
+        let mut changed = *list != before;
+        if let Some(order) = placement.get(path)
+            && companion.meta.order.as_ref() != Some(order)
+        {
+            companion.meta.order = Some(order.clone());
+            changed = true;
+        }
+        changed
     })
-    .await
+    .await?;
+    Ok(announce(gallery, edited).await)
+}
+
+/// Where each member of the merged block goes: `target`'s block, then each
+/// source's, renumbered as one run under the lowest key among them. Empty when
+/// no source is a block, so merging plain sets writes nothing extra.
+async fn concatenate_blocks(
+    gallery: &Gallery,
+    sources: &[String],
+    target: &str,
+) -> Result<HashMap<RelPath, Order>, TagError> {
+    let conn = gallery.db.read().await;
+    let mut run = index::block_members(&conn, target)?;
+    let from_target = run.len();
+    for source in sources.iter().filter(|s| s.as_str() != target) {
+        run.extend(index::block_members(&conn, source)?);
+    }
+    drop(conn);
+    if run.len() == from_target {
+        return Ok(HashMap::new());
+    }
+    let key = run.iter().filter_map(|(_, row)| row.key.clone()).min();
+    let positions = order_key::spread(None, run.len());
+    Ok(run
+        .into_iter()
+        .zip(positions)
+        .map(|((path, _), pos)| {
+            let order = Order { key: key.clone(), set: Some(target.to_string()), pos: Some(pos) };
+            (path, order)
+        })
+        .collect())
 }
 
 /// Remove a tag from every file that carries it.
@@ -253,27 +342,50 @@ pub async fn record_view(gallery: &Gallery, path: &RelPath) -> Result<(), TagErr
     Ok(())
 }
 
-/// Apply one edit to a list of files, companion first, index second.
-///
-/// The closure reports whether it changed anything, so a no-op write never
-/// touches the durable tree — which matters over a mount, where a rewrite is
-/// an mtime change every other machine's index sweep then has to look at.
+/// Apply one edit to one namespace's tag list over a selection, and announce
+/// it.
 async fn edit(
     gallery: &Gallery,
     paths: &[RelPath],
     namespace: WritableNamespace,
     edit: impl Fn(&mut Vec<String>) -> bool + Send + Sync + 'static + Clone,
 ) -> Result<usize, TagError> {
-    let mut touched = Vec::new();
+    let edited = edit_companion(gallery, paths, move |_, c| edit(namespace.field(c))).await?;
+    Ok(announce(gallery, edited).await)
+}
+
+/// What one edit over a selection changed.
+#[derive(Debug, Default)]
+pub(crate) struct Edited {
+    /// The files whose sidecar was rewritten.
+    pub touched: Vec<RelPath>,
+    /// Whether any of them moved in the Custom order.
+    pub order_changed: bool,
+}
+
+/// Apply one edit to a list of files, companion first, index second.
+///
+/// The closure sees the file's path and its whole sidecar, and reports whether
+/// it changed anything, so a no-op write never touches the durable tree — which
+/// matters over a mount, where a rewrite is an mtime change every other
+/// machine's index sweep then has to look at. Announcing is the caller's: only
+/// it knows what kind of change it made.
+pub(crate) async fn edit_companion(
+    gallery: &Gallery,
+    paths: &[RelPath],
+    edit: impl Fn(&RelPath, &mut CompanionFile) -> bool + Send + Sync + 'static + Clone,
+) -> Result<Edited, TagError> {
+    let mut edited = Edited::default();
     for path in paths {
         let absolute = gallery.root.resolve(path)?;
         let edit = edit.clone();
         let media_type = media_type_for(path);
+        let rel = path.clone();
 
         // The lock blocks, and over the share it can block on another machine.
         let updated = tokio::task::spawn_blocking(move || {
             modify_companion(absolute.as_path(), media_type, |companion| {
-                if edit(namespace.field(companion)) {
+                if edit(&rel, companion) {
                     Outcome::Write(true)
                 } else {
                     Outcome::Leave(false)
@@ -286,22 +398,29 @@ async fn edit(
         if !updated {
             continue;
         }
-        touched.push(path.clone());
-        reindex(gallery, path).await?;
+        edited.touched.push(path.clone());
+        edited.order_changed |= reindex(gallery, path).await?;
     }
+    Ok(edited)
+}
 
-    if !touched.is_empty() {
-        let _ = gallery.refresh_autocomplete().await;
-        // Unconditional: this is the one path that *knows* tags moved. Moving a
-        // tag from one file to another leaves the vocabulary byte for byte the
-        // same while changing what a tag filter selects, so the vocabulary is
-        // the wrong thing to ask here.
-        gallery.events.send(Event::TagsIndexed);
-        let changed = touched.len();
-        gallery.events.send(Event::ItemsChanged { paths: touched });
-        return Ok(changed);
+/// Tell every client what a tag edit changed, and how many files it touched.
+async fn announce(gallery: &Gallery, edited: Edited) -> usize {
+    if edited.order_changed {
+        gallery.events.send(Event::OrderChanged);
     }
-    Ok(0)
+    if edited.touched.is_empty() {
+        return 0;
+    }
+    let _ = gallery.refresh_autocomplete().await;
+    // Unconditional: this is the one path that *knows* tags moved. Moving a
+    // tag from one file to another leaves the vocabulary byte for byte the
+    // same while changing what a tag filter selects, so the vocabulary is the
+    // wrong thing to ask here.
+    gallery.events.send(Event::TagsIndexed);
+    let changed = edited.touched.len();
+    gallery.events.send(Event::ItemsChanged { paths: edited.touched });
+    changed
 }
 
 /// Mutate `meta.core`, creating it if absent.
@@ -325,8 +444,9 @@ async fn write_core(
     Ok(())
 }
 
-/// Re-read one companion and replace its index rows.
-async fn reindex(gallery: &Gallery, path: &RelPath) -> Result<(), TagError> {
+/// Re-read one companion and replace its index rows. Reports whether the
+/// file moved in the Custom order.
+async fn reindex(gallery: &Gallery, path: &RelPath) -> Result<bool, TagError> {
     let absolute = gallery.root.resolve(path)?;
     let read = tokio::task::spawn_blocking(move || {
         let companion = crate::companion::reader::read_companion(absolute.as_path());
@@ -343,16 +463,16 @@ async fn reindex(gallery: &Gallery, path: &RelPath) -> Result<(), TagError> {
 
     let (companion, state) = read;
     let Ok(Some(companion)) = companion else {
-        return Ok(());
+        return Ok(false);
     };
 
     let conn = gallery.db.writer().await;
-    index::reindex_file(&conn, path, &companion)?;
+    let order_changed = index::reindex_file(&conn, path, &companion)?;
     if let Some(state) = state {
         index::set_state(&conn, path, state)?;
     }
     drop(conn);
-    Ok(())
+    Ok(order_changed)
 }
 
 /// Every tag in a writable namespace, with how many files carry it.
@@ -425,5 +545,148 @@ mod tests {
         WritableNamespace::Set.field(&mut c).push("burst-3".into());
         assert_eq!(c.tags.user, vec!["vacation"]);
         assert_eq!(c.tags.set, vec!["burst-3"]);
+    }
+
+    /// A gallery on disk whose files carry the given set and order, indexed.
+    async fn arranged(
+        dir: &std::path::Path,
+        files: &[(&str, &[&str], Option<Order>)],
+    ) -> Gallery {
+        let gallery = crate::services::test_gallery(dir);
+        for (name, sets, order) in files {
+            std::fs::write(dir.join(name), b"x").unwrap();
+            let path = RelPath::new(name).unwrap();
+            {
+                let conn = gallery.db.writer().await;
+                conn.execute(
+                    "INSERT INTO media_meta (path, media_type, file_size, mtime) VALUES (?1, 'image', 1, 1)",
+                    [name],
+                )
+                .unwrap();
+            }
+            let (sets, order) = (sets.iter().map(|s| s.to_string()).collect::<Vec<_>>(), order.clone());
+            let absolute = gallery.root.resolve(&path).unwrap();
+            modify_companion(absolute.as_path(), MediaType::Image, move |c| {
+                c.tags.set = sets;
+                c.meta.order = order;
+                Outcome::Write(())
+            })
+            .unwrap();
+            reindex(&gallery, &path).await.unwrap();
+        }
+        gallery
+    }
+
+    fn in_block(set: &str, key: &str, pos: &str) -> Option<Order> {
+        Some(Order { key: Some(key.into()), set: Some(set.into()), pos: Some(pos.into()) })
+    }
+
+    fn sidecar_order(gallery: &Gallery, name: &str) -> Option<Order> {
+        let absolute = gallery.root.resolve(&RelPath::new(name).unwrap()).unwrap();
+        crate::companion::reader::read_companion(absolute.as_path())
+            .unwrap()
+            .unwrap()
+            .meta
+            .order
+    }
+
+    async fn block(gallery: &Gallery, set: &str) -> Vec<String> {
+        let conn = gallery.db.read().await;
+        index::block_members(&conn, set)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p.as_str().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn taking_a_file_out_of_a_set_takes_it_out_of_the_block() {
+        let d = tempfile::tempdir().unwrap();
+        let gallery = arranged(
+            d.path(),
+            &[
+                ("a.jpg", &["comic"], in_block("comic", "K", "1")),
+                ("b.jpg", &["comic"], in_block("comic", "K", "2")),
+            ],
+        )
+        .await;
+        let mut events = gallery.events.subscribe();
+
+        let a = RelPath::new("a.jpg").unwrap();
+        remove(&gallery, &[a], &["comic".into()], WritableNamespace::Set).await.unwrap();
+
+        assert_eq!(sidecar_order(&gallery, "a.jpg"), None, "back to its date position");
+        assert_eq!(block(&gallery, "comic").await, ["b.jpg"]);
+        assert!(matches!(events.try_recv(), Ok(Event::OrderChanged)));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_set_dissolves_its_block() {
+        let d = tempfile::tempdir().unwrap();
+        let gallery = arranged(
+            d.path(),
+            &[
+                ("a.jpg", &["comic"], in_block("comic", "K", "1")),
+                ("b.jpg", &["comic"], in_block("comic", "K", "2")),
+            ],
+        )
+        .await;
+        delete(&gallery, "comic", WritableNamespace::Set).await.unwrap();
+        assert_eq!(sidecar_order(&gallery, "a.jpg"), None);
+        assert_eq!(sidecar_order(&gallery, "b.jpg"), None);
+        assert!(block(&gallery, "comic").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renaming_a_set_carries_its_block() {
+        let d = tempfile::tempdir().unwrap();
+        let gallery = arranged(
+            d.path(),
+            &[
+                ("a.jpg", &["comic"], in_block("comic", "K", "1")),
+                ("b.jpg", &["comic"], in_block("comic", "K", "2")),
+            ],
+        )
+        .await;
+        rename(&gallery, "comic", "manga", WritableNamespace::Set).await.unwrap();
+        assert_eq!(block(&gallery, "manga").await, ["a.jpg", "b.jpg"]);
+        assert!(block(&gallery, "comic").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merging_two_blocks_concatenates_them_under_the_lower_key() {
+        let d = tempfile::tempdir().unwrap();
+        let gallery = arranged(
+            d.path(),
+            &[
+                ("a.jpg", &["comic"], in_block("comic", "K2", "1")),
+                ("b.jpg", &["comic"], in_block("comic", "K2", "2")),
+                // Sorted by position it would interleave with the target's.
+                ("c.jpg", &["zine"], in_block("zine", "K1", "0")),
+                ("d.jpg", &["zine"], in_block("zine", "K1", "3")),
+            ],
+        )
+        .await;
+        merge(&gallery, &["zine".into()], "comic", WritableNamespace::Set).await.unwrap();
+        assert_eq!(block(&gallery, "comic").await, ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"] {
+            assert_eq!(sidecar_order(&gallery, name).unwrap().key.as_deref(), Some("K1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_tag_edit_leaves_the_order_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let gallery = arranged(d.path(), &[("a.jpg", &["comic"], in_block("comic", "K", "1"))]).await;
+        let mut events = gallery.events.subscribe();
+        let a = RelPath::new("a.jpg").unwrap();
+        add(&gallery, std::slice::from_ref(&a), &["comic".into()], WritableNamespace::User)
+            .await
+            .unwrap();
+        remove(&gallery, &[a], &["comic".into()], WritableNamespace::User).await.unwrap();
+        assert!(sidecar_order(&gallery, "a.jpg").is_some());
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, Event::OrderChanged), "a user tag is not an arrangement");
+        }
     }
 }

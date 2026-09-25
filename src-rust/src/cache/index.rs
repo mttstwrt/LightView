@@ -240,6 +240,25 @@ pub fn paths_with_tag(
     Ok(out)
 }
 
+/// Every file locked into `block`, in the block's order.
+pub fn block_members(conn: &Connection, block: &str) -> Result<Vec<(RelPath, OrderRow)>, CacheError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT path, key, pos FROM media_order WHERE block = ?1 ORDER BY pos NULLS LAST, path",
+    )?;
+    let rows = stmt.query_map([block], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            OrderRow { key: r.get(1)?, block: Some(block.to_string()), pos: r.get(2)? },
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, order) = row?;
+        out.push((RelPath::new(&path)?, order));
+    }
+    Ok(out)
+}
+
 /// Drop the index entirely, for a full rebuild.
 pub fn clear(conn: &Connection) -> Result<(), CacheError> {
     conn.execute_batch("DELETE FROM tag_index; DELETE FROM index_state; DELETE FROM media_order;")?;

@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cache::duplicates as finder;
-use crate::companion::schema::{CompanionFile, Location, MediaType, PluginTagEntry};
+use crate::companion::schema::{CompanionFile, Location, MediaType, Order, PluginTagEntry};
 use crate::companion::writer::{modify_companion, Outcome};
 use crate::path::RelPath;
 use crate::state::Gallery;
@@ -209,6 +209,10 @@ struct Contributions {
     user: Vec<String>,
     set: Vec<String>,
     plugins: std::collections::HashMap<String, PluginTagEntry>,
+    /// The arrangement the survivor inherits if it has none of its own: the
+    /// first in Custom order, so the merged file stays where the earliest of
+    /// its copies was put.
+    order: Option<Order>,
 }
 
 impl Contributions {
@@ -230,11 +234,29 @@ impl Contributions {
         }
         // `tags.auto` is deliberately not absorbed. It was the one writer of a
         // namespace nothing else created, and the namespace is gone.
+
+        // Only an honoured order: one naming a set the copy has left is a
+        // stale record, not a place. Its set comes along with the set tags, so
+        // the survivor joins that block.
+        if let Some(order) = companion.honoured_order() {
+            let earlier = match (&self.order, &order.key) {
+                (None, _) => true,
+                (Some(held), Some(key)) => held.key.as_ref().is_none_or(|k| key < k),
+                (Some(_), None) => false,
+            };
+            if earlier {
+                self.order = Some(order.clone());
+            }
+        }
     }
 
     fn apply(self, companion: &mut CompanionFile) {
         merge_into(&mut companion.tags.user, self.user);
         merge_into(&mut companion.tags.set, self.set);
+        // The survivor's own arrangement wins; it was placed deliberately.
+        if companion.meta.order.is_none() {
+            companion.meta.order = self.order;
+        }
         for (name, entry) in self.plugins {
             companion
                 .tags
@@ -274,6 +296,40 @@ mod tests {
         // A keeper in two sets is fine: suppression is pairwise co-membership,
         // so two sets do not become one through it.
         assert_eq!(keeper.tags.set, vec!["burst-3", "holiday"]);
+    }
+
+    fn placed(set: &[&str], key: &str, block: Option<&str>) -> CompanionFile {
+        let mut c = with_tags(&[], set);
+        c.meta.order = Some(Order {
+            key: Some(key.into()),
+            set: block.map(String::from),
+            pos: block.map(|_| "V".to_string()),
+        });
+        c
+    }
+
+    #[test]
+    fn the_survivor_inherits_the_earliest_arrangement_but_keeps_its_own() {
+        // Two copies, each in the same comic at a different key: the survivor
+        // takes the earlier place, and with it the block.
+        let mut keeper = with_tags(&[], &[]);
+        let mut contributions = Contributions::default();
+        contributions.absorb(&placed(&["comic"], "k2", Some("comic")));
+        contributions.absorb(&placed(&["comic"], "k1", Some("comic")));
+        // A stale order — its set is gone from the copy — is not a place.
+        contributions.absorb(&placed(&[], "k0", Some("renamed-away")));
+        contributions.apply(&mut keeper);
+        let order = keeper.meta.order.clone().unwrap();
+        assert_eq!(order.key.as_deref(), Some("k1"));
+        assert_eq!(order.set.as_deref(), Some("comic"));
+        assert!(keeper.honoured_order().is_some(), "the survivor joined the block's set too");
+
+        // A survivor someone already placed keeps its own place.
+        let mut keeper = placed(&[], "mine", None);
+        let mut contributions = Contributions::default();
+        contributions.absorb(&placed(&["comic"], "k1", Some("comic")));
+        contributions.apply(&mut keeper);
+        assert_eq!(keeper.meta.order.unwrap().key.as_deref(), Some("mine"));
     }
 
     #[test]

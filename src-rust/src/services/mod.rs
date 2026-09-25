@@ -16,3 +16,32 @@ pub mod media;
 pub mod settings;
 pub mod tags;
 pub mod trash;
+
+/// A gallery over `root` with a fresh cache, for the services' tests.
+#[cfg(test)]
+pub(crate) fn test_gallery(root: &std::path::Path) -> crate::state::Gallery {
+    use std::sync::Arc;
+
+    use crate::autocomplete::engine::AutocompleteEngine;
+    use crate::cache::db::CacheDb;
+    use crate::path::Root;
+    use crate::pipeline::serve::ThumbService;
+    use crate::server::events::Events;
+    use crate::services::settings::GallerySettings;
+
+    let cache_dir = tempfile::tempdir().unwrap().keep();
+    let root = Root::open(root).unwrap();
+    let db = Arc::new(CacheDb::open_at(&cache_dir).unwrap());
+    let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+    let thumbs = Arc::new(ThumbService::new(db.clone(), root.clone(), pool, 1 << 20));
+    crate::state::Gallery {
+        root,
+        db,
+        thumbs,
+        events: Arc::new(Events::new()),
+        autocomplete: Arc::new(AutocompleteEngine::new()),
+        settings: std::sync::RwLock::new(GallerySettings::default()),
+        cache_dir,
+        arrangeable: std::sync::atomic::AtomicBool::new(false),
+    }
+}
