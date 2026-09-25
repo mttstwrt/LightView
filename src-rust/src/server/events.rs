@@ -75,6 +75,15 @@ pub enum Event {
     ItemsChanged { paths: Vec<RelPath> },
     /// Tags were re-indexed from companions; the vocabulary may have moved.
     TagsIndexed,
+    /// Somebody moved a file in the Custom order — here, or on another machine
+    /// whose sidecar write the watcher or the sweep just read.
+    ///
+    /// **Its own event, because nothing else says it.** `TagsIndexed` fires
+    /// when the vocabulary moves, which a reorder never does, and
+    /// `ItemsChanged` makes a client patch rows in place, which cannot move one.
+    /// A client showing Custom answers this with one refetch; any other client
+    /// ignores it.
+    OrderChanged,
     /// A plugin run advanced. Throttled; see [`Events::job_progress`].
     JobProgress {
         plugin: String,
@@ -93,7 +102,9 @@ impl Event {
     /// `Resync` payload without the receiver having to guess.
     pub fn domain(&self) -> Domain {
         match self {
-            Event::FsChanged { .. } | Event::ItemsChanged { .. } => Domain::Items,
+            Event::FsChanged { .. } | Event::ItemsChanged { .. } | Event::OrderChanged => {
+                Domain::Items
+            }
             Event::TagsIndexed => Domain::Tags,
             Event::JobProgress { .. } | Event::JobFinished { .. } => Domain::Jobs,
             // A resync that is itself lagged is still a resync.
@@ -238,6 +249,8 @@ mod tests {
         );
         assert_eq!(Event::ItemsChanged { paths: vec![p] }.domain(), Domain::Items);
         assert_eq!(Event::TagsIndexed.domain(), Domain::Tags);
+        // A client that lagged past a reorder has to refetch the list.
+        assert_eq!(Event::OrderChanged.domain(), Domain::Items);
         assert_eq!(
             Event::JobFinished { plugin: "x".into(), error: None }.domain(),
             Domain::Jobs

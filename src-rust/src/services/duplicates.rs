@@ -180,9 +180,12 @@ pub async fn merge(gallery: &Gallery, plan: MergePlan) -> Result<MergeResult, Du
             crate::cache::db::forget_path(&conn, other)?;
         }
     }
-    crate::services::gallery::index_one(gallery, &plan.keeper)
+    let order_changed = crate::services::gallery::index_one(gallery, &plan.keeper)
         .await
         .map_err(|e| DuplicateError::Io(std::io::Error::other(e.to_string())))?;
+    if order_changed {
+        gallery.events.send(crate::server::events::Event::OrderChanged);
+    }
     if gallery.refresh_autocomplete().await {
         gallery
             .events

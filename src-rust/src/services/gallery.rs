@@ -143,9 +143,15 @@ pub async fn enrich_and_index(
     reindex_companions_if_the_indexer_changed(gallery).await?;
     backfill_exif(gallery).await?;
     backfill_locations(gallery, presence).await?;
-    reindex_companions(gallery, presence).await?;
-    // No event: this runs at open, before the vocabulary has ever been served,
-    // so there is no client holding a stale one.
+    let swept = reindex_companions(gallery, presence).await?;
+    gallery.arrangeable.store(true, std::sync::atomic::Ordering::Release);
+    // No tag event: this runs at open, before the vocabulary has ever been
+    // served, so there is no client holding a stale one. The order is
+    // different — the server answers before this pass, and a client that has
+    // already switched to Custom is showing the order as it was.
+    if swept.order_changed {
+        gallery.events.send(Event::OrderChanged);
+    }
     let _ = gallery.refresh_autocomplete().await;
     Ok(())
 }
@@ -515,10 +521,19 @@ async fn backfill_locations(
 /// and runs batched statements. Held as one pass, this blocked every thumbnail
 /// the grid was waiting on — tolerable once per open, and not once it runs
 /// every hour beside an hours-long stream of writes from another machine.
+/// What one companion sweep did.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Reindexed {
+    /// Companions re-read because they changed since the index last saw them.
+    pub count: usize,
+    /// Whether any of them moved a file in the Custom order.
+    pub order_changed: bool,
+}
+
 pub async fn reindex_companions(
     gallery: &Gallery,
     presence: &Arc<crate::util::presence::Presence>,
-) -> Result<usize, OpenError> {
+) -> Result<Reindexed, OpenError> {
     let known = {
         let conn = gallery.db.read().await;
         index::load_state(&conn)?
@@ -560,16 +575,17 @@ pub async fn reindex_companions(
     .map_err(|e| OpenError::Io(std::io::Error::other(e.to_string())))?;
 
     if scanned.is_empty() {
-        return Ok(0);
+        return Ok(Reindexed::default());
     }
 
     let count = scanned.len();
+    let mut order_changed = false;
     let mut owed = Vec::new();
     {
         let conn = gallery.db.writer().await;
         let tx = conn.unchecked_transaction()?;
         for (path, companion, state) in &scanned {
-            index::reindex_file(&conn, path, companion)?;
+            order_changed |= index::reindex_file(&conn, path, companion)?;
             index::set_state(&conn, path, *state)?;
             let mirror = meta::mirror_companion(&conn, path, companion)?;
             if mirror.missing_date_added.is_some() || mirror.missing_last_viewed.is_some() {
@@ -583,7 +599,7 @@ pub async fn reindex_companions(
     // companion does not. Written back outside the lock, because each one takes
     // the companion's own lock.
     complete_companions(gallery, owed, presence).await;
-    Ok(count)
+    Ok(Reindexed { count, order_changed })
 }
 
 /// How often the companion sweep runs.
@@ -619,8 +635,17 @@ pub fn spawn_companion_sweep(
         loop {
             tokio::time::sleep(COMPANION_SWEEP).await;
             match reindex_companions(&gallery, &presence).await {
-                Ok(0) => {}
-                Ok(n) => {
+                Ok(swept) => {
+                    // A sweep that failed at open leaves arranging refused
+                    // until one succeeds here.
+                    gallery.arrangeable.store(true, std::sync::atomic::Ordering::Release);
+                    if swept.order_changed {
+                        gallery.events.send(Event::OrderChanged);
+                    }
+                    if swept.count == 0 {
+                        continue;
+                    }
+                    let n = swept.count;
                     log::info!("companion sweep re-indexed {n} file(s)");
                     let _ = gallery.refresh_autocomplete().await;
                     // `tags`, not `items`: the vocabulary moved and so did what
@@ -680,7 +705,10 @@ async fn complete_companions(
 }
 
 /// Index one file's companion, for the watcher's add and companion branches.
-pub async fn index_one(gallery: &Gallery, path: &RelPath) -> Result<(), OpenError> {
+///
+/// Reports whether the file moved in the Custom order, for the caller to
+/// announce.
+pub async fn index_one(gallery: &Gallery, path: &RelPath) -> Result<bool, OpenError> {
     let absolute = gallery.root.resolve(path)?;
     let read = tokio::task::spawn_blocking(move || {
         let companion = reader::read_companion(absolute.as_path());
@@ -696,13 +724,13 @@ pub async fn index_one(gallery: &Gallery, path: &RelPath) -> Result<(), OpenErro
     .map_err(|e| OpenError::Io(std::io::Error::other(e.to_string())))?;
 
     let (Ok(Some(companion)), Some(state)) = read else {
-        return Ok(());
+        return Ok(false);
     };
     let conn = gallery.db.writer().await;
-    index::reindex_file(&conn, path, &companion)?;
+    let order_changed = index::reindex_file(&conn, path, &companion)?;
     index::set_state(&conn, path, state)?;
     meta::mirror_companion(&conn, path, &companion)?;
-    Ok(())
+    Ok(order_changed)
 }
 
 /// Check that this process can replace companions another machine wrote.
@@ -985,6 +1013,7 @@ async fn flush(
     removed: Vec<RelPath>,
     companions: Vec<RelPath>,
 ) {
+    let mut order_changed = false;
     if !added.is_empty() {
         let root = gallery.root.clone();
         let to_scan = added.clone();
@@ -1025,8 +1054,9 @@ async fn flush(
         // In the same breath, so a batch arriving with its sidecars is not
         // tagless until a restart.
         for file in &scanned {
-            if let Err(e) = index_one(gallery, &file.path).await {
-                log::warn!("could not index the companion for {}: {e}", file.path);
+            match index_one(gallery, &file.path).await {
+                Ok(changed) => order_changed |= changed,
+                Err(e) => log::warn!("could not index the companion for {}: {e}", file.path),
             }
         }
         // And its header read, for the same reason. A file arriving over rsync
@@ -1051,9 +1081,16 @@ async fn flush(
 
     let touched_tags = !companions.is_empty() || !added.is_empty();
     for path in &companions {
-        if let Err(e) = index_one(gallery, path).await {
-            log::warn!("could not re-index the companion for {path}: {e}");
+        match index_one(gallery, path).await {
+            Ok(changed) => order_changed |= changed,
+            Err(e) => log::warn!("could not re-index the companion for {path}: {e}"),
         }
+    }
+    if order_changed {
+        // How another machine's arrangement reaches this one: its sidecar
+        // write lands here like any other, and only a change to the order row
+        // is news — a rating or a view rewrites the sidecar too.
+        gallery.events.send(Event::OrderChanged);
     }
 
     if !added.is_empty() || !removed.is_empty() {
@@ -1306,7 +1343,43 @@ mod tests {
         // Once caught up, the stamp stands aside: nothing is owed a re-read.
         reindex_companions_if_the_indexer_changed(&gallery).await.unwrap();
         let owed = reindex_companions(&gallery, &presence).await.unwrap();
-        assert_eq!(owed, 0, "the one-shot fired twice");
+        assert_eq!(owed.count, 0, "the one-shot fired twice");
+    }
+
+    /// How another machine's arrangement reaches this one's clients — and why
+    /// a view does not: every photo looked at rewrites its sidecar.
+    #[tokio::test]
+    async fn the_watcher_announces_an_order_edit_and_not_a_view() {
+        use crate::companion::schema::Order;
+        use crate::companion::writer::{modify_companion, Outcome};
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.jpg"), b"x").unwrap();
+        let gallery = test_gallery(d.path());
+        let path = RelPath::new("a.jpg").unwrap();
+        let absolute = gallery.root.resolve(&path).unwrap();
+        {
+            let conn = gallery.db.writer().await;
+            conn.execute(
+                "INSERT INTO media_meta (path, media_type, file_size, mtime) VALUES ('a.jpg', 'image', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let write = |f: fn(&mut crate::companion::schema::CompanionFile)| {
+            modify_companion(absolute.as_path(), MediaType::Image, |c| {
+                f(c);
+                Outcome::Write(())
+            })
+            .unwrap();
+        };
+
+        write(|c| c.meta.order = Some(Order { key: Some("k".into()), ..Default::default() }));
+        assert!(index_one(&gallery, &path).await.unwrap(), "an order edit is news");
+
+        write(|c| {
+            c.meta.core.get_or_insert_default().last_viewed = Some("2026-01-01T00:00:00Z".into())
+        });
+        assert!(!index_one(&gallery, &path).await.unwrap(), "a view is not");
     }
 
     #[test]
@@ -1426,6 +1499,7 @@ mod tests {
             autocomplete: Arc::new(AutocompleteEngine::new()),
             settings: std::sync::RwLock::new(GallerySettings::default()),
             cache_dir,
+            arrangeable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

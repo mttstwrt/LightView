@@ -453,6 +453,7 @@ fn build_gallery(
         autocomplete: Arc::new(AutocompleteEngine::new()),
         settings: std::sync::RwLock::new(settings),
         cache_dir,
+        arrangeable: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
