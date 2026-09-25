@@ -11,5 +11,6 @@
 //! field produces fragmented headers rather than a silently different order —
 //! grouping describes the ordering, it does not impose one.
 
+pub mod order_key;
 pub mod sorter;
 pub mod grouper;
