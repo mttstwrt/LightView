@@ -217,6 +217,7 @@ mod tests {
                 width: None,
                 height: None,
                 thumbhash: None,
+                block: None,
             })
             .collect()
     }

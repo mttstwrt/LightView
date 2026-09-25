@@ -30,6 +30,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::path::RelPath;
+use crate::sort::order_key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +43,10 @@ pub enum SortField {
     LastViewed,
     DateAdded,
     LastRated,
+    /// Where a person put each file: see [`crate::sort::order_key`]. Takes no
+    /// direction and no sub-sort — the order is total and was arranged by
+    /// hand, so reversing it or breaking its ties means nothing.
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +96,9 @@ pub struct SortedItem {
     /// Base64 of the ~25-byte ThumbHash placeholder, when one has been
     /// computed.
     pub thumbhash: Option<String>,
+    /// The ordered set this file is locked into. Only ever set under
+    /// [`SortField::Custom`], the one sort in which a block is contiguous.
+    pub block: Option<String>,
 }
 
 /// What the grid orders, groups and labels a file by.
@@ -114,11 +122,15 @@ pub const SORT_DATE: &str = "COALESCE(m.date_taken, m.mtime)";
 /// The column list, kept beside the row mapper because the mapper is
 /// positional: inserting a column here without shifting every index there
 /// silently moves every field one place along.
-fn cols() -> String {
+///
+/// The last column is the block, which only the Custom statement joins in;
+/// every other sort selects `NULL` there so the mapper has one shape.
+fn cols(field: SortField) -> String {
+    let block = if field == SortField::Custom { "o.block" } else { "NULL" };
     format!(
         "m.path, {SORT_DATE}, m.file_size, m.media_type, m.rating, \
          m.color_label, m.last_viewed, m.date_added, m.last_rated, \
-         m.duration, m.width, m.height, m.thumbhash"
+         m.duration, m.width, m.height, m.thumbhash, {block}"
     )
 }
 
@@ -135,7 +147,31 @@ fn order_expr(field: SortField, order: SortOrder) -> String {
         SortField::LastViewed => format!("m.last_viewed {o} NULLS LAST"),
         SortField::DateAdded => format!("m.date_added {o} NULLS LAST"),
         SortField::LastRated => format!("m.last_rated {o} NULLS LAST"),
+        // A block sorts at its members' lowest key and a loose file at its
+        // own; a loose file tied with a block goes first, and the path makes
+        // the order total, so two queries never disagree about a tie.
+        SortField::Custom => format!(
+            "COALESCE(b.key, o.key, {}), o.block NULLS FIRST, o.pos NULLS LAST, m.path",
+            order_key::default_key("m")
+        ),
     }
+}
+
+/// Each block's key: the lowest among its members'.
+///
+/// A minimum rather than a value stored once, because there is nowhere to
+/// store it once — a set is a name several files agree on, not an object.
+/// Locking writes the minimum onto every member and a move rewrites every
+/// member, so they agree; if a move is interrupted, or another machine flushes
+/// halfway through one, the minimum still keeps the whole block in one place.
+fn blocks_cte() -> String {
+    format!(
+        "WITH blocks AS (\
+           SELECT o2.block AS block, MIN(COALESCE(o2.key, {})) AS key \
+           FROM media_order o2 JOIN media_meta m2 ON m2.path = o2.path \
+           WHERE o2.block IS NOT NULL GROUP BY o2.block) ",
+        order_key::default_key("m2")
+    )
 }
 
 /// What the caller asked the grid to show.
@@ -151,16 +187,26 @@ pub struct SortSpec {
 /// for the whole gallery; its bound values are supplied by the caller in the
 /// same order the compiler pushed them.
 pub fn items_sql(spec: &SortSpec, where_sql: Option<&str>) -> String {
+    let cols = cols(spec.field);
+    let filter = where_sql.map(|w| format!(" WHERE {w}")).unwrap_or_default();
+    if spec.field == SortField::Custom {
+        // The one statement that joins, and only to a table of three short
+        // strings per arranged file — nothing with a blob in it, which is what
+        // the no-join rule in this module's doc comment is about.
+        return format!(
+            "{}SELECT {cols} FROM media_meta m \
+             LEFT JOIN media_order o ON o.path = m.path \
+             LEFT JOIN blocks b ON b.block = o.block{filter} ORDER BY {}",
+            blocks_cte(),
+            order_expr(SortField::Custom, SortOrder::Asc)
+        );
+    }
     let mut order_clause = order_expr(spec.field, spec.order);
-    if let Some(sub) = spec.sub_field {
+    if let Some(sub) = spec.sub_field.filter(|&f| f != SortField::Custom) {
         order_clause.push_str(", ");
         order_clause.push_str(&order_expr(sub, spec.sub_order.unwrap_or(SortOrder::Desc)));
     }
-    let cols = cols();
-    match where_sql {
-        Some(w) => format!("SELECT {cols} FROM media_meta m WHERE {w} ORDER BY {order_clause}"),
-        None => format!("SELECT {cols} FROM media_meta m ORDER BY {order_clause}"),
-    }
+    format!("SELECT {cols} FROM media_meta m{filter} ORDER BY {order_clause}")
 }
 
 /// Map one row of [`items_sql`].
@@ -189,6 +235,7 @@ pub fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
         width: row.get(10)?,
         height: row.get(11)?,
         thumbhash: thumbhash.map(|h| base64::engine::general_purpose::STANDARD.encode(h)),
+        block: row.get(13)?,
     })
 }
 
@@ -196,7 +243,7 @@ pub fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SortedItem> {
 mod tests {
     use super::*;
 
-    pub(crate) const ALL_FIELDS: [SortField; 8] = [
+    pub(crate) const ALL_FIELDS: [SortField; 9] = [
         SortField::Date,
         SortField::Size,
         SortField::Name,
@@ -205,6 +252,7 @@ mod tests {
         SortField::LastViewed,
         SortField::DateAdded,
         SortField::LastRated,
+        SortField::Custom,
     ];
 
     /// Every `media_meta` column the ordering names, so the test below can
@@ -286,6 +334,125 @@ mod tests {
         // No join, and no path list round-tripping through the client.
         assert!(!sql.contains("JOIN"));
         assert!(!sql.contains("json_each"));
+    }
+
+    #[test]
+    fn only_custom_joins_and_never_to_a_tier_table() {
+        for field in ALL_FIELDS {
+            let spec = SortSpec { field, order: SortOrder::Desc, sub_field: None, sub_order: None };
+            let sql = items_sql(&spec, None);
+            assert!(!sql.contains("thumbs_"), "{field:?} reaches a tier table: {sql}");
+            assert_eq!(sql.contains("JOIN"), field == SortField::Custom, "{field:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn custom_ignores_direction_and_sub_sort() {
+        let a = items_sql(
+            &SortSpec {
+                field: SortField::Custom,
+                order: SortOrder::Desc,
+                sub_field: Some(SortField::Rating),
+                sub_order: Some(SortOrder::Asc),
+            },
+            None,
+        );
+        let b = items_sql(
+            &SortSpec { field: SortField::Custom, order: SortOrder::Asc, sub_field: None, sub_order: None },
+            None,
+        );
+        assert_eq!(a, b);
+    }
+
+    /// Run the Custom statement over a real schema.
+    fn custom_order(rows: &[(&str, i64)], order: &[(&str, &str, Option<&str>, Option<&str>)], filter: Option<&str>) -> Vec<(String, Option<String>)> {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::cache::db::CacheDb::open_at(dir.path()).unwrap();
+        let conn = db.writer_blocking();
+        for (path, date) in rows {
+            conn.execute(
+                "INSERT INTO media_meta (path, media_type, file_size, mtime, rating) VALUES (?1, 'image', 1, ?2, 1)",
+                rusqlite::params![path, date],
+            )
+            .unwrap();
+        }
+        for (path, key, block, pos) in order {
+            conn.execute(
+                "INSERT INTO media_order (path, key, block, pos) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![path, key, block, pos],
+            )
+            .unwrap();
+        }
+        let spec = SortSpec { field: SortField::Custom, order: SortOrder::Asc, sub_field: None, sub_order: None };
+        let sql = items_sql(&spec, filter);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], map_row)
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.path.as_str().to_string(), r.block)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn custom_reads_as_date_until_someone_arranges_it() {
+        let got = custom_order(&[("old.jpg", 100), ("new.jpg", 300), ("mid.jpg", 200)], &[], None);
+        let paths: Vec<_> = got.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["new.jpg", "mid.jpg", "old.jpg"]);
+    }
+
+    #[test]
+    fn a_placed_file_and_a_block_sort_where_their_keys_say() {
+        use crate::sort::order_key::{after, default_key_of};
+        let mid = default_key_of(200, "mid.jpg");
+        // `placed` is dated oldest but was put right behind `mid.jpg`.
+        let placed = after(&mid, None).unwrap();
+        // A block of two, locked at `new.jpg`'s position, pages in `pos` order
+        // regardless of their own dates; `p0` has no position yet and so comes
+        // last inside the block.
+        let block_key = default_key_of(300, "new.jpg");
+        let got = custom_order(
+            &[
+                ("new.jpg", 300),
+                ("mid.jpg", 200),
+                ("old.jpg", 100),
+                ("placed.jpg", 50),
+                ("p2.jpg", 10),
+                ("p1.jpg", 20),
+                ("p0.jpg", 30),
+            ],
+            &[
+                ("placed.jpg", &placed, None, None),
+                ("p1.jpg", &block_key, Some("comic"), Some("1")),
+                ("p2.jpg", &block_key, Some("comic"), Some("2")),
+                ("p0.jpg", &block_key, Some("comic"), None),
+            ],
+            None,
+        );
+        let paths: Vec<_> = got.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["new.jpg", "p1.jpg", "p2.jpg", "p0.jpg", "mid.jpg", "placed.jpg", "old.jpg"]
+        );
+        assert_eq!(got[1].1.as_deref(), Some("comic"));
+        assert_eq!(got[0].1, None);
+    }
+
+    #[test]
+    fn a_filter_keeps_the_relative_custom_order() {
+        use crate::sort::order_key::default_key_of;
+        let block_key = default_key_of(300, "a.jpg");
+        let got = custom_order(
+            &[("a.jpg", 300), ("b.jpg", 200), ("p2.jpg", 10), ("p1.jpg", 20)],
+            &[
+                ("p1.jpg", &block_key, Some("comic"), Some("1")),
+                ("p2.jpg", &block_key, Some("comic"), Some("2")),
+            ],
+            Some("m.path != 'a.jpg'"),
+        );
+        let paths: Vec<_> = got.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["p1.jpg", "p2.jpg", "b.jpg"]);
     }
 
     #[test]
