@@ -252,6 +252,25 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
     clearSelection();
   };
 
+  /** Dissolve the selected sets' blocks in the Custom order. The sets stay;
+   *  only their arrangement goes, and the files return to their date places. */
+  const unlockSelected = () => {
+    const names = selectedTags().map((t) => t.tag);
+    if (names.length === 0) return;
+    run(
+      async () => {
+        let changed = 0;
+        for (const name of names) changed += (await api.unlockSet(name)).changed;
+        return { changed };
+      },
+      (changed) =>
+        changed === 0
+          ? "Nothing to unlock: no file there was arranged"
+          : `Unlocked ${fileWord(changed)}; they are back in date order`,
+    );
+    clearSelection();
+  };
+
   // ── Pieces shared by both layouts ──────────────────────────────────────
 
   const searchBox = (extraClass: string) => (
@@ -583,6 +602,17 @@ export function TagManagerPanel(props: { onClose: () => void; onChanged?: () => 
               onConfirm={deleteSelected}
               class={isMobile() ? "h-9" : "h-7"}
             />
+            <Show when={namespace() === "set"}>
+              <button
+                onClick={unlockSelected}
+                disabled={busy()}
+                title="Keep the set, drop its arrangement in the Custom order"
+                class="px-2.5 text-[11px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200 disabled:opacity-40 whitespace-nowrap"
+                classList={{ "h-9": isMobile(), "h-7": !isMobile() }}
+              >
+                Unlock
+              </button>
+            </Show>
             <button
               onClick={clearSelection}
               class="px-2.5 text-[11px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"

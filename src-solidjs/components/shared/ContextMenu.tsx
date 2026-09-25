@@ -15,13 +15,22 @@
 
 import { Show, For, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { hasTouch } from "../../lib/runtime";
-import { rateItem, setItemColorLabel, colorLabelByPath } from "../../stores/galleryStore";
+import {
+  rateItem,
+  setItemColorLabel,
+  colorLabelByPath,
+  blockByPath,
+  setPlacing,
+  placeFirst,
+  arrange,
+  openLockDialog,
+} from "../../stores/galleryStore";
 import { api, mediaUrl } from "../../lib/ipc";
 import { COLOR_LABELS, COLOR_LABEL_HEX } from "../../lib/colorLabels";
 import { announceThumbRegenerated } from "../../lib/thumbRegeneration";
 import { isVideoPath } from "../../lib/mediaExts";
 import { plugins, loadPlugins } from "../../stores/activityStore";
-import { capabilities, isOwner } from "../../stores/settingsStore";
+import { capabilities, isOwner, sortField } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
 import { DirectoryPicker } from "./DirectoryPicker";
 
@@ -41,7 +50,7 @@ interface ContextMenuProps {
   hideViewOption?: boolean;
 }
 
-type SubMenu = "tag" | "rating" | "color" | "openWith" | "plugins" | null;
+type SubMenu = "tag" | "rating" | "color" | "arrange" | "openWith" | "plugins" | null;
 
 /** Which transfer the picker is open for, or null when it is closed. */
 type Transfer = { kind: "copy" | "move"; paths: string[] } | null;
@@ -383,6 +392,8 @@ export function ContextMenu(props: ContextMenuProps) {
                 label={isBatchContext() ? `Label ${props.selectedPaths!.size} Items` : "Colour Label"}
                 onClick={() => setSubMenu("color")}
               />
+              {/* Not "Move to…": that is the filesystem move below. */}
+              <MenuItem label="Arrange" onClick={() => setSubMenu("arrange")} />
             </>
             <Divider />
             <Show when={!isBatchContext()}>
@@ -456,6 +467,59 @@ export function ContextMenu(props: ContextMenuProps) {
                 +
               </button>
             </form>
+            <Divider />
+            <MenuItem label="Back" onClick={() => setSubMenu(null)} />
+          </Show>
+
+          {/* Arrange sub-menu: the Custom order. Placing is offered only under
+              Custom, where the neighbours on screen are the ones it places
+              against; locking and resetting mean the same under any sort. */}
+          <Show when={subMenu() === "arrange"}>
+            <div class="px-3 py-2 text-neutral-500">Arrange</div>
+            <Show when={sortField() === "custom" && !isBatchContext()}>
+              <MenuItem
+                label="Place After…"
+                onClick={() => {
+                  setPlacing(props.state!.path);
+                  props.onClose();
+                }}
+              />
+              <MenuItem
+                label="To the Top"
+                onClick={() => {
+                  void placeFirst(props.state!.path);
+                  props.onClose();
+                }}
+              />
+              <Divider />
+            </Show>
+            <MenuItem
+              label={isBatchContext() ? `Lock ${props.selectedPaths!.size} as a Set…` : "Lock as a Set…"}
+              onClick={() => {
+                openLockDialog(targetPaths());
+                props.onClose();
+              }}
+            />
+            <Show when={blockByPath().get(props.state!.path)}>
+              {(place) => (
+                <MenuItem
+                  label={`Unlock “${place().name}”`}
+                  onClick={() => {
+                    const name = place().name;
+                    void arrange(() => api.unlockSet(name));
+                    props.onClose();
+                  }}
+                />
+              )}
+            </Show>
+            <MenuItem
+              label={isBatchContext() ? `Reset ${props.selectedPaths!.size} to Date Order` : "Reset to Date Order"}
+              onClick={() => {
+                const paths = targetPaths();
+                void arrange(() => api.resetOrder(paths));
+                props.onClose();
+              }}
+            />
             <Divider />
             <MenuItem label="Back" onClick={() => setSubMenu(null)} />
           </Show>

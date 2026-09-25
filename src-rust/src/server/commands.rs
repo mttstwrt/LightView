@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use crate::path::RelPath;
 use crate::server::auth::Trust;
 use crate::services::tags::WritableNamespace;
-use crate::services::{duplicates, files, media, settings, tags, trash};
+use crate::services::{duplicates, files, media, order, settings, tags, trash};
 use crate::state::AppState;
 
 #[derive(Debug, thiserror::Error)]
@@ -171,6 +171,33 @@ pub async fn dispatch(
             let n = tags::delete(&gallery, &a.tag, a.namespace)
                 .await
                 .map_err(failed)?;
+            Ok(json!({ "changed": n }))
+        }
+        // ---- The Custom order ------------------------------------------------
+        "place" => {
+            require(state, Trust::Device)?;
+            let a: PlaceArgs = parse(args)?;
+            order::place(&gallery, &a.path, a.after.as_ref(), a.before.as_ref())
+                .await
+                .map_err(failed)?;
+            Ok(json!({ "ok": true }))
+        }
+        "lock_set" => {
+            require(state, Trust::Device)?;
+            let a: LockSetArgs = parse(args)?;
+            let n = order::lock_set(&gallery, &a.name, &a.paths).await.map_err(failed)?;
+            Ok(json!({ "changed": n }))
+        }
+        "unlock_set" => {
+            require(state, Trust::Device)?;
+            let a: UnlockSetArgs = parse(args)?;
+            let n = order::unlock_set(&gallery, &a.name).await.map_err(failed)?;
+            Ok(json!({ "changed": n }))
+        }
+        "reset_order" => {
+            require(state, Trust::Device)?;
+            let a: PathsArg = parse(args)?;
+            let n = order::reset_order(&gallery, &a.paths).await.map_err(failed)?;
             Ok(json!({ "changed": n }))
         }
         "set_rating" => {
@@ -536,6 +563,28 @@ struct TagWrite {
     paths: Vec<RelPath>,
     tags: Vec<String>,
     namespace: WritableNamespace,
+}
+
+/// The gap a drop landed in, named by the neighbours the person saw. Either
+/// may be absent: nothing above at the top of a view, nothing below at its end.
+#[derive(Deserialize)]
+struct PlaceArgs {
+    path: RelPath,
+    #[serde(default)]
+    after: Option<RelPath>,
+    #[serde(default)]
+    before: Option<RelPath>,
+}
+
+#[derive(Deserialize)]
+struct LockSetArgs {
+    name: String,
+    paths: Vec<RelPath>,
+}
+
+#[derive(Deserialize)]
+struct UnlockSetArgs {
+    name: String,
 }
 
 #[derive(Deserialize)]

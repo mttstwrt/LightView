@@ -77,6 +77,14 @@ trashes the rest as **one trash entry** — so one merge is one undo.
 member silently drops that member's set; a keeper ending up in two sets is fine,
 since suppression is pairwise.
 
+**Its place in the [Custom order](../query/README.md#the-custom-order) follows
+the same reasoning.** A keeper someone already placed keeps its own place.
+Otherwise it inherits the earliest arrangement among the copies it replaces —
+and with it that copy's block, whose set tag it has just absorbed — so the
+merged file stays where the first of its copies was put rather than dropping
+back to its date. A copy whose order names a set it had left carries no place
+to inherit.
+
 **The mtime stamp is the one place anything writes one**, and it is an explicit
 field of the plan rather than a side effect. Restoring a file with a rewritten
 mtime is silent data loss, so the operation that legitimately rewrites one says

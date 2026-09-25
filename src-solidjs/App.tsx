@@ -29,6 +29,7 @@ import { MediaViewer } from "./components/viewer/MediaViewer";
 import { ScrollBar, type ScrollIndicator } from "./components/shared/ScrollBar";
 import { SelectionBar } from "./components/gallery/SelectionBar";
 import { TagManagerPanel } from "./components/TagManagerPanel";
+import { LockSetDialog } from "./components/shared/LockSetDialog";
 import { AutoTagPanel } from "./components/AutoTagPanel";
 import { TopBar } from "./components/topbar/TopBar";
 import { TrashPanel } from "./components/TrashPanel";
@@ -66,12 +67,18 @@ import {
   groups,
   items,
   loading,
+  lockingPaths,
   mediaMetaByPath,
+  notice,
+  placeAfter,
+  placing,
   rateItem,
   selectAll,
   selectedPaths,
   selectionMode,
   setItems,
+  setLockingPaths,
+  setPlacing,
   setSelectedPaths,
   settingsOpen,
   setSettingsOpen,
@@ -313,6 +320,10 @@ export function App() {
         }
       }
     } else {
+      if (e.key === "Escape" && placing()) {
+        setPlacing(null);
+        return;
+      }
       if (e.key === "Escape") exitSelectionMode();
       if ((e.ctrlKey || e.metaKey) && e.key === "a") {
         e.preventDefault();
@@ -377,6 +388,15 @@ export function App() {
               itemMeta={mediaMetaByPath()}
               groupStarts={groups().map((g) => g.start_index)}
               onItemClick={(index) => {
+                // "Place after…" is waiting for this click: it names the file
+                // to place the waiting one behind, rather than opening it.
+                const waiting = placing();
+                if (waiting) {
+                  setPlacing(null);
+                  const target = displayPaths()[index];
+                  if (target && target !== waiting) void placeAfter(waiting, target);
+                  return;
+                }
                 clearSelection();
                 openViewer(index);
               }}
@@ -461,6 +481,34 @@ export function App() {
         </Show>
       </Show>
 
+      <Show when={placing()}>
+        <div
+          class="fixed top-16 left-1/2 -translate-x-1/2 z-[150] flex items-center gap-3 px-4 py-2 rounded-lg border border-amber-500/40 text-xs text-neutral-200"
+          style={{ background: "rgba(18, 18, 18, 0.95)", "backdrop-filter": "blur(12px)" }}
+        >
+          <span>Choose the photo to place it after</span>
+          <button
+            class="px-2 py-1 rounded bg-neutral-800 text-neutral-300 hover:bg-neutral-700 cursor-pointer"
+            onClick={() => setPlacing(null)}
+          >
+            Cancel
+          </button>
+        </div>
+      </Show>
+      <Show when={lockingPaths()}>
+        {(paths) => <LockSetDialog paths={paths()} onClose={() => setLockingPaths(null)} />}
+      </Show>
+      <Show when={notice()}>
+        {(message) => (
+          <div
+            role="status"
+            class="fixed bottom-20 left-1/2 -translate-x-1/2 z-[160] max-w-[90vw] px-4 py-2.5 rounded-lg border border-neutral-700 text-xs text-neutral-200"
+            style={{ background: "rgba(18, 18, 18, 0.95)", "backdrop-filter": "blur(12px)" }}
+          >
+            {message()}
+          </div>
+        )}
+      </Show>
       <Show when={pluginRun()}>
         <PluginToast />
       </Show>

@@ -193,11 +193,79 @@ for _ in $(seq 1 40); do
 done
 check "the watcher ingested a new file" "$(inv get_items | jq '.items | length')" "4"
 
+echo "== the Custom order =="
+# Arranging is refused until the open-time companion sweep has run; the checks
+# above waited on enrichment, but wait for this one honestly too.
+for _ in $(seq 1 25); do
+  LOCK=$(inv lock_set '{"name":"comic","paths":["clip.mp4","tall.png"]}')
+  echo "$LOCK" | jq -e '.changed' >/dev/null 2>&1 && break
+  sleep 0.2
+done
+echo "$LOCK" | jq -e '.changed == 2' >/dev/null && ok "lock_set locked two files" || bad "lock_set: $LOCK"
+CUSTOM=$(inv get_items '{"sort":"custom"}')
+check "a block keeps the order it was given" \
+  "$(echo "$CUSTOM" | jq -c '[.items[] | select(.block == "comic") | .path]')" '["clip.mp4","tall.png"]'
+check "a block is contiguous under Custom" \
+  "$(echo "$CUSTOM" | jq '.items | map(.path) | index("tall.png") - index("clip.mp4")')" "1"
+check "Custom has no group headers" \
+  "$(inv get_items '{"sort":"custom","group_by":{"type":"time_period","granularity":"month"}}' | jq -c .groups)" "[]"
+check "no other sort names a block" "$(inv get_items | jq '[.items[] | select(.block != null)] | length')" "0"
+
+inv place '{"path":"2026/january/wide.png","after":"tall.png","before":null}' >/dev/null
+check "a placed file lands right behind its anchor" \
+  "$(inv get_items '{"sort":"custom"}' | jq '.items | map(.path) | index("2026/january/wide.png") - index("tall.png")')" "1"
+jq -e '.meta.order.set == "comic" and (.meta.order.key | type) == "string" and (.meta.order.pos | type) == "string"' \
+  "$G/.lightview/companions/tall.png.lightview.json" >/dev/null \
+  && ok "the block lives in its members' sidecars" || bad "tall.png sidecar: $(jq -c .meta "$G/.lightview/companions/tall.png.lightview.json")"
+jq -e '.meta.order.set == null and (.meta.order.key | type) == "string"' \
+  "$G/2026/january/.lightview/companions/wide.png.lightview.json" >/dev/null \
+  && ok "a placement lives in the placed file's sidecar" || bad "wide.png sidecar"
+check "a file already in a block cannot join another" \
+  "$(code -b "$J" -H 'content-type: application/json' -H "origin: $BASE" \
+     -d '{"command":"lock_set","args":{"name":"zine","paths":["tall.png"]}}' "$BASE/api/invoke")" "500"
+grep -q 'already in the ordered set' "$WORK/body" && ok "the refusal names the block" || bad "refusal: $(cat "$WORK/body")"
+ARRANGED=$(inv get_items '{"sort":"custom"}' | jq -c '[.items[].path]')
+
+# Another machine's arrangement: a sidecar edited behind the server's back must
+# reach every open window as one event, and a view must not.
+curl -s -N -b "$J" -H "origin: $BASE" "$BASE/api/events" > "$WORK/events" &
+EVENTS_PID=$!
+sleep 0.5
+DROPPED="$G/2026/.lightview/companions/dropped.png.lightview.json"
+inv record_view '{"path":"2026/dropped.png"}' >/dev/null
+sleep 1
+grep -q 'order-changed' "$WORK/events" && bad "a view announced a reorder" || ok "a view is not a reorder"
+jq '.meta.order = {"key":"0"}' "$DROPPED" > "$WORK/edited.json" && mv "$WORK/edited.json" "$DROPPED"
+for _ in $(seq 1 20); do grep -q 'order-changed' "$WORK/events" && break; sleep 0.25; done
+grep -q 'order-changed' "$WORK/events" && ok "a sidecar edited elsewhere arrives as order-changed" || bad "no order-changed: $(tail -c 300 "$WORK/events")"
+kill $EVENTS_PID 2>/dev/null; wait $EVENTS_PID 2>/dev/null
+check "the hand-edited placement took effect" \
+  "$(inv get_items '{"sort":"custom"}' | jq -r '.items[0].path')" "2026/dropped.png"
+ARRANGED=$(inv get_items '{"sort":"custom"}' | jq -c '[.items[].path]')
+
 # A second launch opens the first one's window instead of refusing.
 SECOND=$("$BIN" "$G" --data-dir "$D" 2>/dev/null | head -1)
 [ "${SECOND%%/?t=*}" = "$BASE" ] && ok "a second launch printed the running URL" || bad "second launch: $SECOND"
 
 kill $OPEN_PID 2>/dev/null; wait $OPEN_PID 2>/dev/null
+
+echo "== the Custom order survives a lost cache =="
+# The cache is derived; the arrangement is not. Delete every cache this data
+# dir holds, reopen, and the order must come back from the sidecars alone.
+rm -rf "$D/cache"
+"$BIN" "$G" --data-dir "$D" > "$WORK/reopen.log" 2>"$WORK/reopen.err" &
+REOPEN_PID=$!
+for _ in $(seq 1 50); do [ -s "$WORK/reopen.log" ] && break; sleep 0.2; done
+URL=$(head -1 "$WORK/reopen.log"); BASE=${URL%%/?t=*}; TOKEN=${URL##*t=}
+J="$WORK/jar2"
+code -c "$J" -X POST -H 'content-type: application/json' -H "origin: $BASE" -d "{\"token\":\"$TOKEN\"}" "$BASE/auth/launch" >/dev/null
+for _ in $(seq 1 50); do
+  AGAIN=$(inv get_items '{"sort":"custom"}' | jq -c '[.items[].path]')
+  [ "$AGAIN" = "$ARRANGED" ] && break
+  sleep 0.2
+done
+check "a rebuilt cache restores the arrangement" "$AGAIN" "$ARRANGED"
+kill $REOPEN_PID 2>/dev/null; wait $REOPEN_PID 2>/dev/null
 
 echo "== lightview --serve : LAN, Device, TLS =="
 "$BIN" --serve "$G" --port 18443 --data-dir "$D" > "$WORK/serve.log" 2>"$WORK/serve.err" &

@@ -3,8 +3,8 @@
 [← docs](../README.md)
 
 **Responsible for** the sidecar files that hold everything a person put into
-the gallery — tags, sets, plugin results, rating, colour label, notes, location
-— and for the locking and atomicity that let two machines write one directory.
+the gallery — tags, sets, plugin results, rating, colour label, notes, location,
+where a file sits in the Custom order — and for the locking and atomicity that let two machines write one directory.
 
 **Not responsible for** the *index* built from them
 ([cache/](../cache/README.md)), or for deciding when to write one (the services
@@ -42,7 +42,11 @@ galleries written by older versions — but never written.
     "set":     ["burst-2026-01-04"],
     "plugins": { "wd": { "version": "2.0.0", "tags": ["beach", "dog"] } }
   },
-  "meta": { "core": { "rating": 4, "notes": "…" }, "plugins": {} }
+  "meta": {
+    "core": { "rating": 4, "notes": "…" },
+    "plugins": {},
+    "order": { "key": "4611686016727387904IMG_0001.jpgV", "set": "burst-2026-01-04", "pos": "V" }
+  }
 }
 ```
 
@@ -73,6 +77,30 @@ library rated before the field existed carried it nowhere durable and a rebuild
 dropped it — "sort by recently rated" quietly became "sort by nothing". The
 sweep now completes it from the index the same way it completes the other two,
 which recovers it on any library whose index still holds it.
+
+### The Custom order lives beside `core`
+
+`meta.order` is where a person put the file in the Custom order: a `key` that
+sorts it among all files, and, when it is locked into an ordered set, the `set`
+and its `pos` inside that block. See [query/](../query/README.md#the-custom-order)
+for what the fields mean.
+
+**It is on `meta`, not in `meta.core`, and that is the compatibility
+argument.** `CoreMeta` has no `extra`, so a field added there is dropped by
+every older build the next time it saves a rating. `meta` has `extra`, so an
+older build parses `order` into it and writes it back untouched: it ignores the
+arrangement and never destroys it. No schema version bump — the field is
+additive.
+
+**Every value is a string, from the first version.** A type change in a
+sidecar makes the whole file fail to deserialize, and `modify_companion` then
+refuses every write to it — including a rating.
+
+**`order.set` must name a set the file is in** for the order to count. This
+build removes `order` whenever it takes a file out of the set it names, so a
+mismatch comes from an older build renaming a set; the index then ignores the
+whole order, and nothing deletes it, because it is the only surviving record of
+the arrangement.
 
 ## One read-modify-write, under one lock
 
@@ -125,6 +153,9 @@ the lock is the decision. See
   created and nobody else can reach.
 - **Never remove a field without keeping `extra`.** The struct not modelling
   something is not permission to delete it from a user's file.
+- **Add a new application field beside `core`, not in it,** until `CoreMeta`
+  has an `extra` that every deployed build carries — and adding one now only
+  protects fields that come after it.
 - **Bump `CURRENT_SCHEMA_VERSION` for any breaking change**, and add a
   migration. Other installations read these files.
 - **Both writers need write permission on the directory and the lock file.**

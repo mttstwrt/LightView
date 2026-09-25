@@ -54,6 +54,24 @@ successful-but-empty read is indistinguishable from an absent one.
 Two mechanisms, and the line between them is what changed: the schema, or the
 reader.
 
+**A table a reader fills is a stamp, not a bump.** `schema_sql()` runs
+`CREATE TABLE IF NOT EXISTS` on every open, so a new table appears in an
+existing cache by itself; what it lacks is content, and that is a reader's
+catch-up. `media_order` is the first: the companion indexer learned to read
+`meta.order`, and a `companion_index_version` stamp clears `index_state` once so
+the companion sweep re-reads every sidecar and fills it. Changing an *existing*
+table's shape — a column, a type, an index a query relies on — is still a bump,
+so a silently mismatched schema still cannot happen.
+
+The line is drawn there because a bump is not free: it re-thumbnails every
+library, and on a gallery with no sidecars it erases `date_added`, `last_viewed`
+and `date_rated` for good — a cost every user would pay for a feature most of
+them never use. The stated cost of the stamp: two builds alternating on one
+machine share a cache, and a file the older build re-indexes is stamped without
+an order row, so the newer one skips it until its sidecar next changes; the
+older build's prune also leaves `media_order` rows behind, which nothing reads,
+since every statement starts from `media_meta`.
+
 ## The schema, and why the indexes are part of it
 
 ```
@@ -61,6 +79,7 @@ gallery_meta   key/value — format_version and the reader stamps
 media_meta     path PK · type · size · mtime · dates · rating · dimensions
                · duration · gps · colour label · thumbhash · exif_read
 tag_index      (path, namespace, tag) PK
+media_order    path PK · key · block · pos — only files a person arranged
 index_state    path PK · companion_mtime_nanos · companion_size
 thumbs_js      path PK · bytes · dimensions            128px
 thumbs_j       path PK · bytes · dimensions · phash     512px
@@ -151,6 +170,6 @@ a phase that takes the writer once and runs batched statements.
   The test will tell you, but the sweep is the reason.
 - **Do not hold the writer across anything slow.** If a pass needs to decode,
   read a file or wait on a process, split it.
-- **Bump `FORMAT_VERSION` for any schema change**, including an added column.
-  There is no other mechanism, and a silently mismatched schema is worse than a
-  rebuild.
+- **Bump `FORMAT_VERSION` for any change to an existing table**, including an
+  added column. A silently mismatched schema is worse than a rebuild. A *new*
+  table that a reader fills is a reader stamp instead — see above.

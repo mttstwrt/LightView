@@ -42,6 +42,15 @@ pub struct Gallery {
     /// This gallery's derived-cache directory, which is also where the lock and
     /// `instance.json` live.
     pub cache_dir: PathBuf,
+    /// Whether the Custom order may be changed yet.
+    ///
+    /// False until the first companion sweep of this open has finished. The
+    /// server answers before that sweep runs, and after a cache deletion or an
+    /// upgrade `media_order` is empty until it does — a placement computed then
+    /// would be written permanently into sidecars against keys that are not
+    /// there yet, and a lock would pass its one-block check against rows that
+    /// have not been read. Set once, never cleared.
+    pub arrangeable: std::sync::atomic::AtomicBool,
 }
 
 impl Gallery {
@@ -236,6 +245,7 @@ mod tests {
             autocomplete: Arc::new(AutocompleteEngine::new()),
             settings: std::sync::RwLock::new(GallerySettings::default()),
             cache_dir: cache_path,
+            arrangeable: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }

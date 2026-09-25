@@ -257,6 +257,21 @@ export const api = {
   pathsWithTags: (tags: string[], namespace: WritableNamespace, limit = 120) =>
     invoke<string[]>("paths_with_tags", { tags, namespace, limit }),
 
+  // --- The Custom order. All four refuse, with a message worth showing,
+  // until the gallery's first companion sweep has finished. ---
+  /** Move a file — or its whole block — into the gap between the two
+   *  neighbours the person saw. Either may be null at the edge of a view. */
+  place: (path: string, after: string | null, before: string | null) =>
+    invoke<{ ok: boolean }>("place", { path, after, before }),
+
+  /** Lock `paths`, in this order, into the ordered set `name`. */
+  lockSet: (name: string, paths: string[]) =>
+    invoke<{ changed: number }>("lock_set", { name, paths }),
+
+  unlockSet: (name: string) => invoke<{ changed: number }>("unlock_set", { name }),
+
+  resetOrder: (paths: string[]) => invoke<{ changed: number }>("reset_order", { paths }),
+
   // --- Tag writes. Every one names a namespace of `user` or `set`. ---
   addTags: (paths: string[], tags: string[], namespace: WritableNamespace) =>
     invoke<{ changed: number }>("add_tags", { paths, tags, namespace }),

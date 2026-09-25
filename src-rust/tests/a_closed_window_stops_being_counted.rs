@@ -63,6 +63,7 @@ async fn fixture() -> Fixture {
         autocomplete: Arc::new(AutocompleteEngine::new()),
         settings: std::sync::RwLock::new(GallerySettings::default()),
         cache_dir: dirs.cache().to_path_buf(),
+        arrangeable: std::sync::atomic::AtomicBool::new(false),
     });
     lightview::services::gallery::scan_and_index(&gallery).await.unwrap();
 

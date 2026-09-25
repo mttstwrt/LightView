@@ -115,7 +115,14 @@ pub async fn get_items(gallery: &Gallery, request: &ItemsRequest) -> Result<Item
         items.push(row?);
     }
 
-    let groups = grouper::compute_groups(&items, &request.group_by);
+    // No headers under Custom: the grid breaks a row at every group start, so
+    // month groups would split a block across rows, and a header labelled by
+    // a date the list is not ordered by is the thing the frontend forbids.
+    let groups = if request.sort == SortField::Custom {
+        Vec::new()
+    } else {
+        grouper::compute_groups(&items, &request.group_by)
+    };
     Ok(Items { items, groups })
 }
 

@@ -4,13 +4,34 @@
 // arrow keys is arithmetic and stays consistent with whatever the grid is
 // currently showing.
 
-import { createSignal } from "solid-js";
+import { createEffect, createRoot, createSignal, on } from "solid-js";
 import { api } from "../lib/ipc";
 import { displayPaths, setItems } from "./galleryStore";
 
 const [viewerOpen, setViewerOpen] = createSignal(false);
 const [viewerIndex, setViewerIndex] = createSignal(0);
 const [infoPanelOpen, setInfoPanelOpen] = createSignal(false);
+
+/** Keep the viewer on the same file when the list changes under it.
+ *
+ *  The index is only a position, so a refetch that reorders the list — an
+ *  arrangement arriving from another machine, a file added above — would
+ *  otherwise swap the photo on screen for whichever landed at that position.
+ *  A file that left the list keeps the old index, as before. */
+createRoot(() =>
+  createEffect(
+    on(
+      displayPaths,
+      (next, prev) => {
+        if (!viewerOpen() || !prev) return;
+        const path = prev[viewerIndex()];
+        const at = path === undefined ? -1 : next.indexOf(path);
+        if (at >= 0 && at !== viewerIndex()) setViewerIndex(at);
+      },
+      { defer: true },
+    ),
+  ),
+);
 
 export {
   viewerOpen, setViewerOpen,

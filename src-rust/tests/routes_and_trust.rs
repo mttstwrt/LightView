@@ -68,6 +68,7 @@ async fn harness(trust: Trust, password: Option<&str>) -> Harness {
         autocomplete: Arc::new(AutocompleteEngine::new()),
         settings: std::sync::RwLock::new(GallerySettings::default()),
         cache_dir: dirs.cache().to_path_buf(),
+        arrangeable: std::sync::atomic::AtomicBool::new(false),
     });
     lightview::services::gallery::scan_and_index(&gallery).await.unwrap();
 
@@ -581,6 +582,7 @@ async fn every_route_answers_503_until_the_watcher_is_armed() {
         autocomplete: Arc::new(AutocompleteEngine::new()),
         settings: std::sync::RwLock::new(GallerySettings::default()),
         cache_dir: dirs.cache().to_path_buf(),
+        arrangeable: std::sync::atomic::AtomicBool::new(false),
     });
 
     let mut state = AppState::new(gallery, Trust::Device, dirs.clone(), ServerConfig::default());

@@ -140,11 +140,18 @@ pub async fn enrich_and_index(
     presence: &Arc<crate::util::presence::Presence>,
 ) -> Result<(), OpenError> {
     reprobe_videos_if_the_reader_changed(gallery).await?;
+    reindex_companions_if_the_indexer_changed(gallery).await?;
     backfill_exif(gallery).await?;
     backfill_locations(gallery, presence).await?;
-    reindex_companions(gallery, presence).await?;
-    // No event: this runs at open, before the vocabulary has ever been served,
-    // so there is no client holding a stale one.
+    let swept = reindex_companions(gallery, presence).await?;
+    gallery.arrangeable.store(true, std::sync::atomic::Ordering::Release);
+    // No tag event: this runs at open, before the vocabulary has ever been
+    // served, so there is no client holding a stale one. The order is
+    // different — the server answers before this pass, and a client that has
+    // already switched to Custom is showing the order as it was.
+    if swept.order_changed {
+        gallery.events.send(Event::OrderChanged);
+    }
     let _ = gallery.refresh_autocomplete().await;
     Ok(())
 }
@@ -270,6 +277,40 @@ async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), Ope
             meta::mark_header_read(&conn, path)?;
         }
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Where the stamp of the companion indexer's version lives, per gallery.
+const COMPANION_INDEX_KEY: &str = "companion_index_version";
+
+/// Which companion indexer built this cache's companion-derived rows. Bump it
+/// when [`index::reindex_file`] learns to read something it used to ignore.
+///
+/// `1`: the Custom order's `meta.order`, indexed into `media_order`.
+const COMPANION_INDEX_VERSION: &str = "1";
+
+/// Re-read every sidecar once when the indexer has learned something new.
+///
+/// The same gate as [`reprobe_videos_if_the_reader_changed`], one level up:
+/// clearing `index_state` makes the companion sweep that follows re-read every
+/// sidecar instead of skipping the unchanged ones, and that re-read is what
+/// fills a table an older build never wrote. A `format_version` bump would do
+/// it too, by deleting the cache — and with it, on a gallery with no sidecars,
+/// every `date_added` and `last_viewed`, which nothing can restore.
+async fn reindex_companions_if_the_indexer_changed(gallery: &Gallery) -> Result<(), OpenError> {
+    let conn = gallery.db.writer().await;
+    if db::meta_get(&conn, COMPANION_INDEX_KEY)?.as_deref() == Some(COMPANION_INDEX_VERSION) {
+        return Ok(());
+    }
+    // One transaction, as for the video stamp: the clear and the stamp are one
+    // decision, and an exit between them would repeat the re-read next open.
+    let tx = conn.unchecked_transaction()?;
+    let owed = conn.execute("DELETE FROM index_state", [])?;
+    db::meta_set(&conn, COMPANION_INDEX_KEY, COMPANION_INDEX_VERSION)?;
+    tx.commit()?;
+    if owed > 0 {
+        log::info!("the companion indexer changed: {owed} sidecar(s) owed another read");
     }
     Ok(())
 }
@@ -480,10 +521,19 @@ async fn backfill_locations(
 /// and runs batched statements. Held as one pass, this blocked every thumbnail
 /// the grid was waiting on — tolerable once per open, and not once it runs
 /// every hour beside an hours-long stream of writes from another machine.
+/// What one companion sweep did.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Reindexed {
+    /// Companions re-read because they changed since the index last saw them.
+    pub count: usize,
+    /// Whether any of them moved a file in the Custom order.
+    pub order_changed: bool,
+}
+
 pub async fn reindex_companions(
     gallery: &Gallery,
     presence: &Arc<crate::util::presence::Presence>,
-) -> Result<usize, OpenError> {
+) -> Result<Reindexed, OpenError> {
     let known = {
         let conn = gallery.db.read().await;
         index::load_state(&conn)?
@@ -525,16 +575,17 @@ pub async fn reindex_companions(
     .map_err(|e| OpenError::Io(std::io::Error::other(e.to_string())))?;
 
     if scanned.is_empty() {
-        return Ok(0);
+        return Ok(Reindexed::default());
     }
 
     let count = scanned.len();
+    let mut order_changed = false;
     let mut owed = Vec::new();
     {
         let conn = gallery.db.writer().await;
         let tx = conn.unchecked_transaction()?;
         for (path, companion, state) in &scanned {
-            index::reindex_file(&conn, path, companion)?;
+            order_changed |= index::reindex_file(&conn, path, companion)?;
             index::set_state(&conn, path, *state)?;
             let mirror = meta::mirror_companion(&conn, path, companion)?;
             if mirror.missing_date_added.is_some() || mirror.missing_last_viewed.is_some() {
@@ -548,7 +599,7 @@ pub async fn reindex_companions(
     // companion does not. Written back outside the lock, because each one takes
     // the companion's own lock.
     complete_companions(gallery, owed, presence).await;
-    Ok(count)
+    Ok(Reindexed { count, order_changed })
 }
 
 /// How often the companion sweep runs.
@@ -584,8 +635,17 @@ pub fn spawn_companion_sweep(
         loop {
             tokio::time::sleep(COMPANION_SWEEP).await;
             match reindex_companions(&gallery, &presence).await {
-                Ok(0) => {}
-                Ok(n) => {
+                Ok(swept) => {
+                    // A sweep that failed at open leaves arranging refused
+                    // until one succeeds here.
+                    gallery.arrangeable.store(true, std::sync::atomic::Ordering::Release);
+                    if swept.order_changed {
+                        gallery.events.send(Event::OrderChanged);
+                    }
+                    if swept.count == 0 {
+                        continue;
+                    }
+                    let n = swept.count;
                     log::info!("companion sweep re-indexed {n} file(s)");
                     let _ = gallery.refresh_autocomplete().await;
                     // `tags`, not `items`: the vocabulary moved and so did what
@@ -645,7 +705,10 @@ async fn complete_companions(
 }
 
 /// Index one file's companion, for the watcher's add and companion branches.
-pub async fn index_one(gallery: &Gallery, path: &RelPath) -> Result<(), OpenError> {
+///
+/// Reports whether the file moved in the Custom order, for the caller to
+/// announce.
+pub async fn index_one(gallery: &Gallery, path: &RelPath) -> Result<bool, OpenError> {
     let absolute = gallery.root.resolve(path)?;
     let read = tokio::task::spawn_blocking(move || {
         let companion = reader::read_companion(absolute.as_path());
@@ -661,13 +724,13 @@ pub async fn index_one(gallery: &Gallery, path: &RelPath) -> Result<(), OpenErro
     .map_err(|e| OpenError::Io(std::io::Error::other(e.to_string())))?;
 
     let (Ok(Some(companion)), Some(state)) = read else {
-        return Ok(());
+        return Ok(false);
     };
     let conn = gallery.db.writer().await;
-    index::reindex_file(&conn, path, &companion)?;
+    let order_changed = index::reindex_file(&conn, path, &companion)?;
     index::set_state(&conn, path, state)?;
     meta::mirror_companion(&conn, path, &companion)?;
-    Ok(())
+    Ok(order_changed)
 }
 
 /// Check that this process can replace companions another machine wrote.
@@ -950,6 +1013,7 @@ async fn flush(
     removed: Vec<RelPath>,
     companions: Vec<RelPath>,
 ) {
+    let mut order_changed = false;
     if !added.is_empty() {
         let root = gallery.root.clone();
         let to_scan = added.clone();
@@ -990,8 +1054,9 @@ async fn flush(
         // In the same breath, so a batch arriving with its sidecars is not
         // tagless until a restart.
         for file in &scanned {
-            if let Err(e) = index_one(gallery, &file.path).await {
-                log::warn!("could not index the companion for {}: {e}", file.path);
+            match index_one(gallery, &file.path).await {
+                Ok(changed) => order_changed |= changed,
+                Err(e) => log::warn!("could not index the companion for {}: {e}", file.path),
             }
         }
         // And its header read, for the same reason. A file arriving over rsync
@@ -1016,9 +1081,16 @@ async fn flush(
 
     let touched_tags = !companions.is_empty() || !added.is_empty();
     for path in &companions {
-        if let Err(e) = index_one(gallery, path).await {
-            log::warn!("could not re-index the companion for {path}: {e}");
+        match index_one(gallery, path).await {
+            Ok(changed) => order_changed |= changed,
+            Err(e) => log::warn!("could not re-index the companion for {path}: {e}"),
         }
+    }
+    if order_changed {
+        // How another machine's arrangement reaches this one: its sidecar
+        // write lands here like any other, and only a change to the order row
+        // is news — a rating or a view rewrites the sidecar too.
+        gallery.events.send(Event::OrderChanged);
     }
 
     if !added.is_empty() || !removed.is_empty() {
@@ -1069,6 +1141,7 @@ fn media_type_str(path: &RelPath) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::test_gallery;
 
     /// The distinction the whole video branch turns on. A host with no ffmpeg
     /// has not looked at its clips, so its rows must stay in the candidate set;
@@ -1220,6 +1293,96 @@ mod tests {
         assert_eq!(owed(&gallery).await, None, "the one-shot fired twice");
     }
 
+    /// The companion stamp's whole reason to exist: a sidecar an older build
+    /// already indexed carries an order that build never wrote into the cache,
+    /// and its `index_state` says there is nothing to re-read.
+    #[tokio::test]
+    async fn the_companion_stamp_fills_an_order_an_older_build_skipped() {
+        use crate::companion::schema::Order;
+        use crate::companion::writer::{modify_companion, Outcome};
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.jpg"), b"x").unwrap();
+        let gallery = test_gallery(d.path());
+        let path = RelPath::new("a.jpg").unwrap();
+        let absolute = gallery.root.resolve(&path).unwrap();
+        modify_companion(absolute.as_path(), MediaType::Image, |c| {
+            c.meta.order = Some(Order { key: Some("k".into()), ..Default::default() });
+            Outcome::Write(())
+        })
+        .unwrap();
+        let state = index::IndexState::of(
+            &std::fs::metadata(reader::companion_path(
+                absolute.as_path(),
+                CompanionLocation::LightviewFolder,
+            ))
+            .unwrap(),
+        );
+        {
+            // What an older build leaves: the row, the stamp of the sidecar it
+            // read, and no order row, because it had no table to put one in.
+            let conn = gallery.db.writer().await;
+            conn.execute(
+                "INSERT INTO media_meta (path, media_type, file_size, mtime) VALUES ('a.jpg', 'image', 1, 1)",
+                [],
+            )
+            .unwrap();
+            index::set_state(&conn, &path, state).unwrap();
+        }
+        let presence = Arc::new(crate::util::presence::Presence::default());
+
+        reindex_companions(&gallery, &presence).await.unwrap();
+        async fn row(gallery: &Gallery, path: &RelPath) -> Option<index::OrderRow> {
+            let conn = gallery.db.read().await;
+            index::order_row(&conn, path).unwrap()
+        }
+        assert_eq!(row(&gallery, &path).await, None, "the skip gate hides it without the stamp");
+
+        reindex_companions_if_the_indexer_changed(&gallery).await.unwrap();
+        reindex_companions(&gallery, &presence).await.unwrap();
+        assert_eq!(row(&gallery, &path).await.and_then(|r| r.key).as_deref(), Some("k"));
+
+        // Once caught up, the stamp stands aside: nothing is owed a re-read.
+        reindex_companions_if_the_indexer_changed(&gallery).await.unwrap();
+        let owed = reindex_companions(&gallery, &presence).await.unwrap();
+        assert_eq!(owed.count, 0, "the one-shot fired twice");
+    }
+
+    /// How another machine's arrangement reaches this one's clients — and why
+    /// a view does not: every photo looked at rewrites its sidecar.
+    #[tokio::test]
+    async fn the_watcher_announces_an_order_edit_and_not_a_view() {
+        use crate::companion::schema::Order;
+        use crate::companion::writer::{modify_companion, Outcome};
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.jpg"), b"x").unwrap();
+        let gallery = test_gallery(d.path());
+        let path = RelPath::new("a.jpg").unwrap();
+        let absolute = gallery.root.resolve(&path).unwrap();
+        {
+            let conn = gallery.db.writer().await;
+            conn.execute(
+                "INSERT INTO media_meta (path, media_type, file_size, mtime) VALUES ('a.jpg', 'image', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let write = |f: fn(&mut crate::companion::schema::CompanionFile)| {
+            modify_companion(absolute.as_path(), MediaType::Image, |c| {
+                f(c);
+                Outcome::Write(())
+            })
+            .unwrap();
+        };
+
+        write(|c| c.meta.order = Some(Order { key: Some("k".into()), ..Default::default() }));
+        assert!(index_one(&gallery, &path).await.unwrap(), "an order edit is news");
+
+        write(|c| {
+            c.meta.core.get_or_insert_default().last_viewed = Some("2026-01-01T00:00:00Z".into())
+        });
+        assert!(!index_one(&gallery, &path).await.unwrap(), "a view is not");
+    }
+
     #[test]
     fn a_companion_path_maps_back_to_its_media() {
         let d = tempfile::tempdir().unwrap();
@@ -1315,28 +1478,6 @@ mod tests {
                 "{} was not ignored",
                 ignored.display()
             );
-        }
-    }
-
-    fn test_gallery(root: &Path) -> Gallery {
-        use crate::autocomplete::engine::AutocompleteEngine;
-        use crate::cache::db::CacheDb;
-        use crate::pipeline::serve::ThumbService;
-        use crate::server::events::Events;
-
-        let cache_dir = tempfile::tempdir().unwrap().keep();
-        let root = Root::open(root).unwrap();
-        let db = Arc::new(CacheDb::open_at(&cache_dir).unwrap());
-        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
-        let thumbs = Arc::new(ThumbService::new(db.clone(), root.clone(), pool, 1 << 20));
-        Gallery {
-            root,
-            db,
-            thumbs,
-            events: Arc::new(Events::new()),
-            autocomplete: Arc::new(AutocompleteEngine::new()),
-            settings: std::sync::RwLock::new(GallerySettings::default()),
-            cache_dir,
         }
     }
 }

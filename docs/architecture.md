@@ -50,7 +50,7 @@ rather than a lookup in a second list. See [server/](server/README.md).
                    counted by the server and by the services, read by the CLI
         ↑          take a connection or a struct; know nothing above them
   services         cache · pipeline · plugin
-                   media · gallery · tags · files · duplicates · trash · settings
+                   media · gallery · tags · order · files · duplicates · trash · settings
         ↑          take state or pieces of it; no HTTP types
   adapter          server (routes + one command table) · cli
 ```
@@ -113,7 +113,7 @@ rebuild rather than migrate. See [storage/](storage/README.md).
 | [pipeline/](pipeline/README.md) | one render path, four tiers, the coalescer, the byte budget, the idle worker |
 | [gallery/](gallery/README.md) | the initial scan, the watcher, how a new file becomes a grid cell |
 | [companion/](companion/README.md) | the sidecar format, the lock, and two machines writing one directory |
-| [query/](query/README.md) | the filter language, sort, grouping, autocomplete, and sets |
+| [query/](query/README.md) | the filter language, sort, grouping, autocomplete, sets, and the Custom order |
 | [duplicates/](duplicates/README.md) | perceptual hashing, grouping, and merging |
 | [plugins/](plugins/README.md) | the NDJSON protocol, the executor, input policy, the skip predicate |
 | [geocode/](geocode/README.md) | coordinates to place names, written as companion tags |

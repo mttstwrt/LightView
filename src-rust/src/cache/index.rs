@@ -1,5 +1,5 @@
-//! `tag_index` and the `index_state` bookkeeping that lets re-indexing skip
-//! unchanged companions.
+//! `tag_index`, `media_order`, and the `index_state` bookkeeping that lets
+//! re-indexing skip unchanged companions.
 //!
 //! Pure derived state: rebuilt from companion files, droppable at any time.
 //! Companions are the record of intent; this is the shape that makes filtering
@@ -48,10 +48,15 @@ impl IndexState {
     }
 }
 
-/// Replace every tag row for one path from its companion.
+/// Replace every tag row and the order row for one path from its companion.
 ///
 /// Replace rather than merge: a companion is the whole truth for a path, so a
 /// tag removed there must disappear here too.
+///
+/// **Reports whether the order row changed**, so each caller can tell clients
+/// holding the Custom sort to refetch. A change, not a write: every photo a
+/// person looks at rewrites its sidecar, and announcing each of those would
+/// refetch every Custom grid on every view.
 ///
 /// `index_state` is deliberately **not** stamped here. The caller knows which
 /// companion state it read, and stamping a different one would make the next
@@ -60,7 +65,7 @@ pub fn reindex_file(
     conn: &Connection,
     path: &RelPath,
     companion: &CompanionFile,
-) -> Result<(), CacheError> {
+) -> Result<bool, CacheError> {
     // One transaction for the delete plus every insert. Outside one, each
     // statement auto-commits, so re-indexing a file carrying twenty tags cost
     // twenty-one WAL commits — and the callers that matter are loops: renaming
@@ -82,10 +87,45 @@ pub fn reindex_file(
         }
     }
 
+    let before = order_row(conn, path)?;
+    let after = companion.honoured_order().map(|o| OrderRow {
+        key: o.key.clone(),
+        block: o.set.clone(),
+        pos: o.pos.clone(),
+    });
+    if before != after {
+        conn.prepare_cached("DELETE FROM media_order WHERE path = ?1")?
+            .execute([path.as_str()])?;
+        if let Some(row) = &after {
+            conn.prepare_cached(
+                "INSERT INTO media_order (path, key, block, pos) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(rusqlite::params![path.as_str(), row.key, row.block, row.pos])?;
+        }
+    }
+
     if let Some(tx) = tx {
         tx.commit()?;
     }
-    Ok(())
+    Ok(before != after)
+}
+
+/// One file's `media_order` row, as the index holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderRow {
+    pub key: Option<String>,
+    pub block: Option<String>,
+    pub pos: Option<String>,
+}
+
+/// The order row for `path`, or `None` when the file has no honoured order.
+pub fn order_row(conn: &Connection, path: &RelPath) -> Result<Option<OrderRow>, CacheError> {
+    let mut stmt = conn.prepare_cached("SELECT key, block, pos FROM media_order WHERE path = ?1")?;
+    let mut rows = stmt.query([path.as_str()])?;
+    Ok(match rows.next()? {
+        Some(r) => Some(OrderRow { key: r.get(0)?, block: r.get(1)?, pos: r.get(2)? }),
+        None => None,
+    })
 }
 
 /// Record which companion state the index reflects.
@@ -200,9 +240,28 @@ pub fn paths_with_tag(
     Ok(out)
 }
 
+/// Every file locked into `block`, in the block's order.
+pub fn block_members(conn: &Connection, block: &str) -> Result<Vec<(RelPath, OrderRow)>, CacheError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT path, key, pos FROM media_order WHERE block = ?1 ORDER BY pos NULLS LAST, path",
+    )?;
+    let rows = stmt.query_map([block], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            OrderRow { key: r.get(1)?, block: Some(block.to_string()), pos: r.get(2)? },
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, order) = row?;
+        out.push((RelPath::new(&path)?, order));
+    }
+    Ok(out)
+}
+
 /// Drop the index entirely, for a full rebuild.
 pub fn clear(conn: &Connection) -> Result<(), CacheError> {
-    conn.execute_batch("DELETE FROM tag_index; DELETE FROM index_state;")?;
+    conn.execute_batch("DELETE FROM tag_index; DELETE FROM index_state; DELETE FROM media_order;")?;
     Ok(())
 }
 
@@ -319,5 +378,44 @@ mod tests {
 
         set_state(&conn, &path, at_six).unwrap();
         assert_eq!(load_state(&conn).unwrap()["a.jpg"], at_six);
+    }
+
+    #[test]
+    fn the_order_row_follows_an_honoured_order_and_reports_only_changes() {
+        use crate::companion::schema::Order;
+        let dir = tempfile::tempdir().unwrap();
+        let db = db(dir.path());
+        let conn = db.writer_blocking();
+        let path = RelPath::new("a.jpg").unwrap();
+        let mut c = CompanionFile::new("a.jpg", MediaType::Image);
+
+        // No order: no row, and nothing to report.
+        assert!(!reindex_file(&conn, &path, &c).unwrap());
+        assert_eq!(order_row(&conn, &path).unwrap(), None);
+
+        // A loose placement.
+        c.meta.order = Some(Order { key: Some("k1".into()), ..Default::default() });
+        assert!(reindex_file(&conn, &path, &c).unwrap());
+        assert_eq!(
+            order_row(&conn, &path).unwrap(),
+            Some(OrderRow { key: Some("k1".into()), block: None, pos: None })
+        );
+        // The same sidecar again — a rating or a view rewrote it — is no news.
+        assert!(!reindex_file(&conn, &path, &c).unwrap());
+
+        // A block the file is in.
+        c.tags.set = vec!["comic".into()];
+        c.meta.order = Some(Order {
+            key: Some("k1".into()),
+            set: Some("comic".into()),
+            pos: Some("V".into()),
+        });
+        assert!(reindex_file(&conn, &path, &c).unwrap());
+        assert_eq!(order_row(&conn, &path).unwrap().unwrap().block.as_deref(), Some("comic"));
+
+        // An older build renamed the set: the stale order is ignored whole.
+        c.tags.set = vec!["comic-renamed".into()];
+        assert!(reindex_file(&conn, &path, &c).unwrap());
+        assert_eq!(order_row(&conn, &path).unwrap(), None);
     }
 }
