@@ -87,7 +87,7 @@ pub enum CacheError {
 /// every path-keyed maintenance operation instead of each one repeating the
 /// set — which is how tiers previously got left behind as orphaned rows.
 pub fn path_keyed_tables() -> impl Iterator<Item = &'static str> {
-    ["media_meta", "tag_index", "index_state"]
+    ["media_meta", "tag_index", "index_state", "media_order"]
         .into_iter()
         .chain(ThumbTier::ALL.into_iter().map(|t| t.table()))
 }
@@ -160,6 +160,20 @@ fn schema_sql() -> String {
     -- and the duplicate finder's set-membership scan. The primary key's
     -- leftmost column is `path`, which is what the sweep needs.
     CREATE INDEX IF NOT EXISTS idx_tag_ns ON tag_index(namespace, tag);
+
+    -- Where a person put a file in the Custom order: a row only for a file
+    -- whose sidecar carries an order the index honours. `block` is the ordered
+    -- set the file is locked into, and the partial index serves the statement's
+    -- per-block minimum. Added to caches that predate it by `IF NOT EXISTS`
+    -- and filled by the companion re-read stamp rather than a format bump: a
+    -- table a reader fills is a stamp; see docs/cache/README.md.
+    CREATE TABLE IF NOT EXISTS media_order (
+        path   TEXT PRIMARY KEY,
+        key    TEXT,
+        block  TEXT,
+        pos    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_block ON media_order(block) WHERE block IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS index_state (
         path                  TEXT PRIMARY KEY,
@@ -443,6 +457,8 @@ mod tests {
             [path],
         )
         .unwrap();
+        conn.execute("INSERT INTO media_order (path, key) VALUES (?1, 'k')", [path])
+            .unwrap();
         for tier in ThumbTier::ALL {
             conn.execute(
                 &format!(

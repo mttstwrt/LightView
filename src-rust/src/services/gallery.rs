@@ -140,6 +140,7 @@ pub async fn enrich_and_index(
     presence: &Arc<crate::util::presence::Presence>,
 ) -> Result<(), OpenError> {
     reprobe_videos_if_the_reader_changed(gallery).await?;
+    reindex_companions_if_the_indexer_changed(gallery).await?;
     backfill_exif(gallery).await?;
     backfill_locations(gallery, presence).await?;
     reindex_companions(gallery, presence).await?;
@@ -270,6 +271,40 @@ async fn probe_and_store(gallery: &Gallery, paths: &[RelPath]) -> Result<(), Ope
             meta::mark_header_read(&conn, path)?;
         }
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Where the stamp of the companion indexer's version lives, per gallery.
+const COMPANION_INDEX_KEY: &str = "companion_index_version";
+
+/// Which companion indexer built this cache's companion-derived rows. Bump it
+/// when [`index::reindex_file`] learns to read something it used to ignore.
+///
+/// `1`: the Custom order's `meta.order`, indexed into `media_order`.
+const COMPANION_INDEX_VERSION: &str = "1";
+
+/// Re-read every sidecar once when the indexer has learned something new.
+///
+/// The same gate as [`reprobe_videos_if_the_reader_changed`], one level up:
+/// clearing `index_state` makes the companion sweep that follows re-read every
+/// sidecar instead of skipping the unchanged ones, and that re-read is what
+/// fills a table an older build never wrote. A `format_version` bump would do
+/// it too, by deleting the cache — and with it, on a gallery with no sidecars,
+/// every `date_added` and `last_viewed`, which nothing can restore.
+async fn reindex_companions_if_the_indexer_changed(gallery: &Gallery) -> Result<(), OpenError> {
+    let conn = gallery.db.writer().await;
+    if db::meta_get(&conn, COMPANION_INDEX_KEY)?.as_deref() == Some(COMPANION_INDEX_VERSION) {
+        return Ok(());
+    }
+    // One transaction, as for the video stamp: the clear and the stamp are one
+    // decision, and an exit between them would repeat the re-read next open.
+    let tx = conn.unchecked_transaction()?;
+    let owed = conn.execute("DELETE FROM index_state", [])?;
+    db::meta_set(&conn, COMPANION_INDEX_KEY, COMPANION_INDEX_VERSION)?;
+    tx.commit()?;
+    if owed > 0 {
+        log::info!("the companion indexer changed: {owed} sidecar(s) owed another read");
     }
     Ok(())
 }
@@ -1218,6 +1253,60 @@ mod tests {
         }
         reprobe_videos_if_the_reader_changed(&gallery).await.unwrap();
         assert_eq!(owed(&gallery).await, None, "the one-shot fired twice");
+    }
+
+    /// The companion stamp's whole reason to exist: a sidecar an older build
+    /// already indexed carries an order that build never wrote into the cache,
+    /// and its `index_state` says there is nothing to re-read.
+    #[tokio::test]
+    async fn the_companion_stamp_fills_an_order_an_older_build_skipped() {
+        use crate::companion::schema::Order;
+        use crate::companion::writer::{modify_companion, Outcome};
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.jpg"), b"x").unwrap();
+        let gallery = test_gallery(d.path());
+        let path = RelPath::new("a.jpg").unwrap();
+        let absolute = gallery.root.resolve(&path).unwrap();
+        modify_companion(absolute.as_path(), MediaType::Image, |c| {
+            c.meta.order = Some(Order { key: Some("k".into()), ..Default::default() });
+            Outcome::Write(())
+        })
+        .unwrap();
+        let state = index::IndexState::of(
+            &std::fs::metadata(reader::companion_path(
+                absolute.as_path(),
+                CompanionLocation::LightviewFolder,
+            ))
+            .unwrap(),
+        );
+        {
+            // What an older build leaves: the row, the stamp of the sidecar it
+            // read, and no order row, because it had no table to put one in.
+            let conn = gallery.db.writer().await;
+            conn.execute(
+                "INSERT INTO media_meta (path, media_type, file_size, mtime) VALUES ('a.jpg', 'image', 1, 1)",
+                [],
+            )
+            .unwrap();
+            index::set_state(&conn, &path, state).unwrap();
+        }
+        let presence = Arc::new(crate::util::presence::Presence::default());
+
+        reindex_companions(&gallery, &presence).await.unwrap();
+        async fn row(gallery: &Gallery, path: &RelPath) -> Option<index::OrderRow> {
+            let conn = gallery.db.read().await;
+            index::order_row(&conn, path).unwrap()
+        }
+        assert_eq!(row(&gallery, &path).await, None, "the skip gate hides it without the stamp");
+
+        reindex_companions_if_the_indexer_changed(&gallery).await.unwrap();
+        reindex_companions(&gallery, &presence).await.unwrap();
+        assert_eq!(row(&gallery, &path).await.and_then(|r| r.key).as_deref(), Some("k"));
+
+        // Once caught up, the stamp stands aside: nothing is owed a re-read.
+        reindex_companions_if_the_indexer_changed(&gallery).await.unwrap();
+        let owed = reindex_companions(&gallery, &presence).await.unwrap();
+        assert_eq!(owed, 0, "the one-shot fired twice");
     }
 
     #[test]
