@@ -13,6 +13,7 @@ pub mod duplicates;
 pub mod files;
 pub mod gallery;
 pub mod media;
+pub mod order;
 pub mod settings;
 pub mod tags;
 pub mod trash;

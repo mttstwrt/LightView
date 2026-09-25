@@ -188,25 +188,38 @@ pub struct SortSpec {
 /// same order the compiler pushed them.
 pub fn items_sql(spec: &SortSpec, where_sql: Option<&str>) -> String {
     let cols = cols(spec.field);
-    let filter = where_sql.map(|w| format!(" WHERE {w}")).unwrap_or_default();
     if spec.field == SortField::Custom {
-        // The one statement that joins, and only to a table of three short
-        // strings per arranged file — nothing with a blob in it, which is what
-        // the no-join rule in this module's doc comment is about.
-        return format!(
-            "{}SELECT {cols} FROM media_meta m \
-             LEFT JOIN media_order o ON o.path = m.path \
-             LEFT JOIN blocks b ON b.block = o.block{filter} ORDER BY {}",
-            blocks_cte(),
-            order_expr(SortField::Custom, SortOrder::Asc)
-        );
+        return custom_statement(&cols, where_sql);
     }
+    let filter = where_sql.map(|w| format!(" WHERE {w}")).unwrap_or_default();
     let mut order_clause = order_expr(spec.field, spec.order);
     if let Some(sub) = spec.sub_field.filter(|&f| f != SortField::Custom) {
         order_clause.push_str(", ");
         order_clause.push_str(&order_expr(sub, spec.sub_order.unwrap_or(SortOrder::Desc)));
     }
     format!("SELECT {cols} FROM media_meta m{filter} ORDER BY {order_clause}")
+}
+
+/// The Custom order, selecting `cols`. Beside `m` for `media_meta`, the
+/// columns may name `o` (the file's own `media_order` row) and `b` (its
+/// block's key); `b.key` is the key a block member actually sorts at.
+///
+/// Shared with the order service, which reads the whole order to place a file
+/// in it — one definition, so the order a placement is computed against is
+/// the order the grid shows.
+///
+/// The one statement that joins, and only to a table of three short strings
+/// per arranged file: nothing with a blob in it, which is what the no-join rule
+/// in this module's doc comment is about.
+pub(crate) fn custom_statement(cols: &str, where_sql: Option<&str>) -> String {
+    let filter = where_sql.map(|w| format!(" WHERE {w}")).unwrap_or_default();
+    format!(
+        "{}SELECT {cols} FROM media_meta m \
+         LEFT JOIN media_order o ON o.path = m.path \
+         LEFT JOIN blocks b ON b.block = o.block{filter} ORDER BY {}",
+        blocks_cte(),
+        order_expr(SortField::Custom, SortOrder::Asc)
+    )
 }
 
 /// Map one row of [`items_sql`].
