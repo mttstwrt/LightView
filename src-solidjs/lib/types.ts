@@ -114,7 +114,9 @@ export type SortField =
   | "mediatype"
   | "lastviewed"
   | "dateadded"
-  | "lastrated";
+  | "lastrated"
+  /** Where a person put each file. Takes no direction and no sub-sort. */
+  | "custom";
 export type SortOrder = "asc" | "desc";
 
 export type GroupBy =
@@ -160,6 +162,9 @@ export interface SortedItem {
    *  generated once. Inlined here so the grid paints every cell blurry before
    *  any thumbnail request goes out. */
   thumbhash?: string | null;
+  /** The ordered set this file is locked into. Only ever set under the
+   *  Custom sort, the one sort in which a block is contiguous. */
+  block?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +307,8 @@ export type ServerEvent =
    *  answered with 500 metadata calls. */
   | { kind: "items-changed"; paths: string[] }
   | { kind: "tags-indexed" }
+  /** Somebody moved a file in the Custom order, here or on another machine. */
+  | { kind: "order-changed" }
   | { kind: "job-progress"; plugin: string; done: number; total: number }
   | { kind: "job-finished"; plugin: string; error: string | null }
   /** You may have missed something in these domains. Re-fetch exactly them. */

@@ -102,6 +102,40 @@ const colorLabelByPath = createMemo(() => {
   return map;
 });
 
+/** Where each file sits in its block, for the cell's marker and the
+ *  Arrange menu. Only filled under the Custom sort. */
+export interface BlockPlace {
+  name: string;
+  first: boolean;
+}
+
+const blockByPath = createMemo(() => {
+  const map = new Map<string, BlockPlace>();
+  let previous: string | null = null;
+  for (const item of items()) {
+    const name = item.block ?? null;
+    if (name) map.set(item.path, { name, first: name !== previous });
+    previous = name;
+  }
+  return map;
+});
+
+/** One short message for the person, such as why an arrangement was refused.
+ *  Replaced by the next, and cleared after a few seconds. */
+const [notice, setNoticeSignal] = createSignal<string | null>(null);
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+export function showNotice(message: string) {
+  setNoticeSignal(message);
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => setNoticeSignal(null), 5000);
+}
+
+/** The file waiting to be placed after the next cell the person picks. */
+const [placing, setPlacing] = createSignal<string | null>(null);
+
+/** The files the "Lock as a Set" dialog is open for, in display order. */
+const [lockingPaths, setLockingPaths] = createSignal<string[] | null>(null);
+
 const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
 
 /** Explicit multi-select. Desktop reaches selection through Ctrl/Cmd+click,
@@ -122,6 +156,12 @@ export {
   aspectByPath,
   mediaMetaByPath,
   colorLabelByPath,
+  blockByPath,
+  notice,
+  placing,
+  setPlacing,
+  lockingPaths,
+  setLockingPaths,
   groups,
   setGroups,
   selectedPaths,
@@ -152,16 +192,23 @@ let current: Query = {
 };
 
 
+/** Which query is newest. A response to an older one is dropped: two queries
+ *  in flight — a reorder here and the event it causes, or two quick sort
+ *  changes — can finish in either order, and the slower must not win. */
+let generation = 0;
+
 /** Run the one query and replace the list. */
 export async function refresh(next?: Partial<Query>) {
   current = { ...current, ...next };
+  const mine = ++generation;
   setLoading(true);
   try {
     const result = await api.items(current);
+    if (mine !== generation) return;
     setItems(result.items);
     setGroups(result.groups);
   } finally {
-    setLoading(false);
+    if (mine === generation) setLoading(false);
   }
 }
 
@@ -200,6 +247,11 @@ export async function applyEvent(event: ServerEvent) {
       // being cheaper than the payload they avoid.
       if (event.paths.length > PATCH_LIMIT) await refresh();
       else await Promise.all(event.paths.map(patchItem));
+      break;
+    case "order-changed":
+      // Only the Custom sort is ordered by arrangement; every other client
+      // is showing an order this cannot have moved.
+      if (current.sort === "custom") await refresh();
       break;
     case "tags-indexed":
       // The vocabulary moved. The item *list* moves with it only when the
@@ -308,4 +360,46 @@ export function toggleSelectionMode() {
 
 export function selectAll(paths: string[]) {
   setSelectedPaths(new Set<string>(paths));
+}
+
+// ---------------------------------------------------------------------------
+// Arranging the Custom order
+// ---------------------------------------------------------------------------
+
+/** Run one arrangement, one at a time: a second placement computed while the
+ *  first is still being written would be computed against the old order. A
+ *  refusal — the gallery still indexing, a file already in another block — is
+ *  shown rather than thrown. The list follows through `order-changed`. */
+let arranging: Promise<unknown> = Promise.resolve();
+export function arrange(run: () => Promise<unknown>): Promise<void> {
+  const next = arranging.then(run).then(
+    () => undefined,
+    (e: unknown) => showNotice(e instanceof Error ? e.message : String(e)),
+  );
+  arranging = next;
+  return next;
+}
+
+/** Place `path` right behind `after`, as the person sees them. The file after
+ *  `after` on screen is sent too: it is how the server tells a reorder inside
+ *  a block from a move of the whole block. */
+export function placeAfter(path: string, after: string) {
+  const paths = displayPaths();
+  const before = paths[paths.indexOf(after) + 1] ?? null;
+  return arrange(() => api.place(path, after, before === path ? null : before));
+}
+
+/** Place `path` above everything in view. Later arrivals still land above it:
+ *  it is anchored to the file that was first, not pinned. */
+export function placeFirst(path: string) {
+  const first = displayPaths().find((p) => p !== path) ?? null;
+  if (!first) return Promise.resolve();
+  return arrange(() => api.place(path, null, first));
+}
+
+/** Open the lock dialog for `paths`, ordered as they are on screen: a set is
+ *  locked in the order it is given, and a selection is a set with no order. */
+export function openLockDialog(paths: string[]) {
+  const at = new Map(displayPaths().map((p, i) => [p, i]));
+  setLockingPaths([...paths].sort((a, b) => (at.get(a) ?? 0) - (at.get(b) ?? 0)));
 }

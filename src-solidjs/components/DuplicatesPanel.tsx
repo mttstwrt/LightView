@@ -21,9 +21,10 @@ import { createSignal, Show, For, onCleanup } from "solid-js";
 import { api, thumbUrl, mediaUrl } from "../lib/ipc";
 import { setItems } from "../stores/galleryStore";
 import { isOwner } from "../stores/settingsStore";
-import type { DuplicateGroup, DuplicateItem, TagSuggestion } from "../lib/types";
+import type { DuplicateGroup, DuplicateItem } from "../lib/types";
 import { InfoPanel } from "./viewer/InfoPanel";
 import { MergeDialog } from "./MergeDialog";
+import { NameSetField } from "./shared/NameSetField";
 
 const THRESHOLD_PRESETS = [
   { label: "Exact", value: 0, desc: "Identical perceptual hash" },
@@ -504,103 +505,5 @@ function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void; onClic
         </button>
       </div>
     </div>
-  );
-}
-
-/** Name a duplicate group as a set.
- *
- *  The replacement for "not duplicates", and the reason it is a text field
- *  rather than a button: the old gesture recorded a negation nobody could see
- *  afterwards, and this one records a name that shows up in autocomplete, in
- *  `set:` filters and in the tag manager. Autocompletes over existing sets so a
- *  second burst from the same shoot joins the first rather than founding a
- *  near-duplicate name.
- */
-function NameSetField(props: { onName: (name: string) => void }) {
-  const [open, setOpen] = createSignal(false);
-  const [value, setValue] = createSignal("");
-  const [suggestions, setSuggestions] = createSignal<TagSuggestion[]>([]);
-
-  let lookup: ReturnType<typeof setTimeout> | undefined;
-  const onInput = (next: string) => {
-    setValue(next);
-    clearTimeout(lookup);
-    if (!next.trim()) {
-      setSuggestions([]);
-      return;
-    }
-    lookup = setTimeout(async () => {
-      try {
-        setSuggestions(await api.autocomplete(next.trim(), "set", 6));
-      } catch {
-        setSuggestions([]);
-      }
-    }, 150);
-  };
-  onCleanup(() => clearTimeout(lookup));
-
-  const commit = (name: string) => {
-    if (!name.trim()) return;
-    setOpen(false);
-    setValue("");
-    setSuggestions([]);
-    props.onName(name);
-  };
-
-  return (
-    <Show
-      when={open()}
-      fallback={
-        <button
-          onClick={() => setOpen(true)}
-          class="px-2 py-0.5 text-[10px] rounded cursor-pointer transition-colors bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-200"
-          title="These belong together — name them as a set. Files sharing a set are never offered as duplicates again."
-        >
-          Name a set
-        </button>
-      }
-    >
-      <div class="relative">
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            commit(value());
-          }}
-        >
-          <input
-            ref={(el) => queueMicrotask(() => el.focus())}
-            value={value()}
-            onInput={(e) => onInput(e.currentTarget.value)}
-            onBlur={() => setTimeout(() => setOpen(false), 150)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") {
-                e.stopPropagation();
-                setOpen(false);
-              }
-            }}
-            placeholder="Set name"
-            class="w-36 px-2 py-0.5 text-[10px] rounded bg-neutral-900 border border-neutral-700 text-neutral-200 outline-none focus:border-teal-700"
-          />
-        </form>
-        <Show when={suggestions().length > 0}>
-          <div class="absolute right-0 top-full mt-1 z-10 min-w-36 rounded border border-neutral-800 bg-neutral-950 py-1">
-            <For each={suggestions()}>
-              {(s) => (
-                <button
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    commit(s.tag);
-                  }}
-                  class="flex w-full items-baseline justify-between gap-2 px-2 py-0.5 text-left text-[10px] text-neutral-300 hover:bg-neutral-800"
-                >
-                  <span class="truncate">{s.tag}</span>
-                  <span class="shrink-0 text-neutral-600">{s.count}</span>
-                </button>
-              )}
-            </For>
-          </div>
-        </Show>
-      </div>
-    </Show>
   );
 }

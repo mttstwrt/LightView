@@ -1,6 +1,6 @@
 import { createSignal, createEffect, on, onMount, onCleanup, Show } from "solid-js";
 import { prefs } from "../../stores/settingsStore";
-import { selectionMode, colorLabelByPath } from "../../stores/galleryStore";
+import { selectionMode, colorLabelByPath, blockByPath } from "../../stores/galleryStore";
 import { mediaUrl } from "../../lib/ipc";
 import { COLOR_LABEL_HEX, type ColorLabel } from "../../lib/colorLabels";
 import { VIDEO_EXTS, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
@@ -122,6 +122,9 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
 
   const colorLabel = () =>
     (colorLabelByPath().get(props.path) as ColorLabel | undefined) ?? null;
+
+  /** The ordered set this cell is locked into, under the Custom sort. */
+  const block = () => blockByPath().get(props.path) ?? null;
 
   const isVideo = () => VIDEO_EXTS.has(ext());
 
@@ -522,6 +525,24 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
           "box-shadow": "0 0 0 1px rgba(0, 0, 0, 0.45)",
         }}
       />
+
+      {/* Block marker — a ring inside the cell rather than an outline, which
+          selection owns, so a selected member still reads as both. The first
+          member carries the set's name in the one free corner. */}
+      <div
+        class="absolute inset-0 pointer-events-none"
+        data-block={block()?.name}
+        style={{
+          display: block() ? undefined : "none",
+          "box-shadow": "inset 0 0 0 2px rgba(251, 191, 36, 0.75)",
+        }}
+      />
+      <span
+        class="absolute bottom-1.5 left-1.5 max-w-[70%] truncate px-1.5 py-0.5 text-[10px] text-amber-100 bg-black/60 rounded"
+        style={{ display: block()?.first ? undefined : "none" }}
+      >
+        {block()?.name}
+      </span>
 
       {/* Media badge — always present, toggled via display */}
       <span

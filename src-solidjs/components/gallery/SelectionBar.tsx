@@ -1,6 +1,7 @@
 import { Show, For, createSignal } from "solid-js";
 import { api } from "../../lib/ipc";
 import { isMobile } from "../../lib/runtime";
+import { openLockDialog } from "../../stores/galleryStore";
 
 interface SelectionBarProps {
   selectedPaths: Set<string>;
@@ -146,6 +147,13 @@ export function SelectionBar(props: SelectionBarProps) {
           </button>
           {ratingPopover()}
         </div>
+        <button
+          disabled={empty()}
+          class="px-3 h-9 shrink-0 bg-neutral-700 text-neutral-200 rounded text-xs cursor-pointer disabled:opacity-40"
+          onClick={() => openLockDialog(paths())}
+        >
+          Lock set
+        </button>
       </div>
     </div>
   );
@@ -196,6 +204,17 @@ export function SelectionBar(props: SelectionBarProps) {
         </button>
         {ratingPopover()}
       </div>
+
+      <div class="w-px h-5 bg-neutral-700" />
+
+      {/* One block in the Custom order, in the order they are on screen. */}
+      <button
+        disabled={empty()}
+        class="px-2 py-1 bg-neutral-700 hover:bg-neutral-600 text-neutral-300 rounded text-xs cursor-pointer transition-colors disabled:opacity-50"
+        onClick={() => openLockDialog(paths())}
+      >
+        Lock as set…
+      </button>
 
       <div class="w-px h-5 bg-neutral-700" />
 
