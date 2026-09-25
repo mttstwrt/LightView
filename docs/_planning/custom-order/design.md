@@ -219,27 +219,36 @@ list is not ordered by.
 
 Keys compare by bytes — SQLite's default `BINARY` collation, and Rust's `str`
 `Ord`, so the tests and the statement agree. Generated characters come from
-`0-9A-Za-z`, so a sidecar stays readable with `grep`, and a generated key never
-ends in `0`, so every key has room below it.
+printable ASCII without `"` and `\`, so a sidecar needs no escapes and stays
+readable with `grep`. The range has to reach below `0`: a default key ends in a
+path, and a neighbour whose path continues the anchor's with a space or a `-`
+(`a.jpg` and `a.jpg - copy.jpg`) leaves room only for characters that sort
+before `0`. A generated suffix never ends in the lowest character, a space, so
+every key has room below it.
 
 - `after(a, b)` — the shortest `a + suffix` below `b`. **Hugs `a`**: nothing can
   sort between a file and its anchor unless its own key extends the anchor's,
   which a default key can only do for a file with the same second and a path
   that extends the anchor's path.
-- `before(b, a)` — the mirror, hugging `b` from below, for a drop with nothing
-  visible above it.
-- `spread(a, b, n)` — `n` evenly spaced keys between two bounds, so locking a
+- `before(b, a)` — `b` with its last character replaced by one below it, when
+  that is still above `a`; otherwise `after(a, b)`. It hugs `b` from below, for
+  a drop with nothing visible above it, and applied to its own result it steps
+  further down the same position rather than shrinking.
+- `spread(a, n)` — `n` evenly spaced fixed-width keys after `a`, so locking a
   two-hundred-member set gives two-hundred short positions rather than
   successively longer ones.
 
-Placing between two neighbours whose keys are equal cannot produce a key between
-them. After the pruning rules above this arises only from two machines placing
-at the same spot at the same moment; `place` then re-keys the upper neighbour
-first — one more write — and places against the result.
+When no key fits — two neighbours with equal keys, or a path with a control
+character right where the anchor's ends — the generator says so rather than
+guessing. Equal keys arise, after the pruning rules above, only from two
+machines placing at the same spot at the same moment; `place` then re-keys the
+upper neighbour first — one more write — and places against the result.
 
-The top drop is the requirements' open question and one branch here: a **pin**
-is a key below every possible default key (`"3"`, then `"2V"`, …); an **anchor**
-is `before(key(first), None)`.
+**A drop at the very top anchors to the current first file** (decided with the
+user): its key is `before(key(first), None)`, the first file's key with its
+last character stepped down. That shares the first file's date digits, so any file that
+arrives later — a later date, so smaller digits — still sorts above it, exactly
+where it would have landed had nothing been moved.
 
 ### Wire
 

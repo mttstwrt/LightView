@@ -123,13 +123,7 @@ taking a file out of a set takes it out of that set's block.
 - Only ordered sets lock.
 - Inside reorders, outside moves the block.
 - Desktop mouse drag first.
-
-## Open
-
-**Is "drop at the very top" a pin?** Every other drop is anchored to the file
-it lands behind or in front of. A top drop has no file above it, so there are
-two readings. As a **pin**, it sorts above every file that arrives later, and
-stays at the top until moved. As an **anchor** to the current first file, it
-sits just above that file, and later arrivals land above it — exactly where they
-would have landed had it never been moved. Either is one branch in the key
-generator; the durable format does not care.
+- **A drop at the very top anchors to the current first file.** It sits just
+  above that file, and later arrivals land above it — exactly where they would
+  have landed had it never been moved. The alternative, a pin that stays above
+  every later arrival, was declined.
