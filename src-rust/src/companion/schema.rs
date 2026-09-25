@@ -102,6 +102,22 @@ impl CompanionFile {
         result
     }
 
+    /// The order the index should use, if any.
+    ///
+    /// `None` when `order.set` names a set this file is no longer in. This
+    /// build removes `order` whenever it takes a file out of the set it names,
+    /// so that state comes from an older build, which renames sets without
+    /// knowing about `order`. The whole order is ignored rather than just the
+    /// block: keeping the key would leave every former member clumped at one
+    /// shared key. Nothing deletes it either — it is the only surviving record
+    /// of the arrangement, and renaming the set back restores it.
+    pub fn honoured_order(&self) -> Option<&Order> {
+        let order = self.meta.order.as_ref()?;
+        match &order.set {
+            Some(set) if !self.tags.set.contains(set) => None,
+            _ => Some(order),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,9 +214,40 @@ pub struct MetaCollection {
     pub core: Option<CoreMeta>,
     #[serde(default)]
     pub plugins: HashMap<String, serde_json::Value>,
+    /// Where a person put this file in the Custom order.
+    ///
+    /// **Beside `core`, not in it**, and that placement is the compatibility
+    /// argument: `CoreMeta` has no `extra`, so a field added there is dropped
+    /// by any older build the next time it saves a rating. Here, an older
+    /// build parses the key into `extra` below and writes it back untouched —
+    /// it ignores the arrangement and never destroys it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
     /// As on [`TagCollection`]: unmodelled keys survive a write.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// A file's place in the Custom order.
+///
+/// Strings throughout, from the first version on, so the representation never
+/// has to change type — a type change in a sidecar makes the whole file fail
+/// to deserialize, and every write to it is then refused.
+///
+/// - `key` sorts the file among all others; see [`crate::sort::order_key`].
+///   When the file is in a block, every member carries the block's key.
+/// - `set` names the ordered set whose block the file belongs to. It is
+///   honoured only while the file is still in that set — see
+///   [`CompanionFile::honoured_order`].
+/// - `pos` orders the file inside its block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Order {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<String>,
 }
 
 /// The fields the application itself owns.
@@ -350,6 +397,59 @@ mod tests {
             reread["tags"]["auto"],
             serde_json::json!(["indoor", "night"])
         );
+    }
+
+    #[test]
+    fn an_older_build_keeps_the_order_it_does_not_know() {
+        // `MetaCollection` as it was before `order` existed: everything it
+        // does not model lands in `extra`, and goes back out on the next write.
+        #[derive(Serialize, Deserialize)]
+        struct OlderMeta {
+            #[serde(default)]
+            core: Option<CoreMeta>,
+            #[serde(default)]
+            plugins: HashMap<String, serde_json::Value>,
+            #[serde(flatten)]
+            extra: HashMap<String, serde_json::Value>,
+        }
+        let mut companion = CompanionFile::new("a.jpg", MediaType::Image);
+        companion.meta.order = Some(Order {
+            key: Some("4611686016727387904a.jpgV".into()),
+            set: Some("comic".into()),
+            pos: Some("V".into()),
+        });
+        let written = serde_json::to_value(&companion.meta).unwrap();
+
+        let mut older: OlderMeta = serde_json::from_value(written).unwrap();
+        older.core = Some(CoreMeta { rating: Some(5), ..Default::default() });
+        let rewritten = serde_json::to_value(&older).unwrap();
+
+        let reread: MetaCollection = serde_json::from_value(rewritten).unwrap();
+        assert_eq!(reread.order, companion.meta.order);
+    }
+
+    #[test]
+    fn a_sidecar_without_an_order_writes_none() {
+        let companion = CompanionFile::new("a.jpg", MediaType::Image);
+        let json = serde_json::to_value(&companion).unwrap();
+        assert!(json["meta"].get("order").is_none());
+    }
+
+    #[test]
+    fn an_order_naming_a_set_the_file_left_is_not_honoured() {
+        let mut companion = CompanionFile::new("a.jpg", MediaType::Image);
+        companion.meta.order = Some(Order {
+            key: Some("k".into()),
+            set: Some("comic".into()),
+            pos: Some("V".into()),
+        });
+        assert!(companion.honoured_order().is_none(), "not in the set at all");
+        companion.tags.set.push("comic".into());
+        assert!(companion.honoured_order().is_some());
+        // A loose placement names no set, and is always honoured.
+        companion.tags.set.clear();
+        companion.meta.order = Some(Order { key: Some("k".into()), ..Default::default() });
+        assert!(companion.honoured_order().is_some());
     }
 
     #[test]
