@@ -498,6 +498,141 @@ try {
     afterZoom !== null && Math.abs(afterZoom - zoomWatched.centre) <= 12,
   );
 
+  // ---- The Custom order ----------------------------------------------------
+  //
+  // Switched to through the sort menu and arranged through the context menu,
+  // the way a person does it; the server's own answer is the reference the
+  // screen is checked against. The removal above took p55-p59, so p54 is now
+  // the newest file.
+  const invoke = (command, args = {}) =>
+    page.evaluate(async ([c, a]) => {
+      const r = await fetch("/api/invoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ command: c, args: a }),
+      });
+      return r.json();
+    }, [command, args]);
+  const customItems = async () => (await invoke("get_items", { sort: "custom" })).items;
+  const customOrder = async () => (await customItems()).map((i) => i.path);
+  /** The photographs on screen, in reading order. */
+  const onScreen = () =>
+    page.evaluate((fn) => {
+      const pathOf = eval(fn);
+      return [...document.querySelectorAll("img[src*='/thumb/']")]
+        .map((img) => ({ p: pathOf(img), r: img.getBoundingClientRect() }))
+        .filter(({ r }) => r.bottom > 0 && r.top < window.innerHeight)
+        .sort((a, b) => Math.round(a.r.top) - Math.round(b.r.top) || a.r.left - b.r.left)
+        .map((x) => x.p);
+    }, PATH_OF);
+  const arrangeFrom = async (file, item) => {
+    await page.locator(`img[src*='${file}']`).first().click({ button: "right" });
+    await page.locator("button", { hasText: /^Arrange$/ }).click();
+    await page.locator("button", { hasText: item }).click();
+  };
+
+  // Undo the zoom above and go back to the top, so the files arranged below
+  // are the ones on screen.
+  for (let i = 0; i < 20; i++) {
+    await page.evaluate(() =>
+      window.dispatchEvent(
+        new WheelEvent("wheel", { deltaY: 120, deltaMode: 0, ctrlKey: true, bubbles: true, cancelable: true }),
+      ),
+    );
+    await page.waitForTimeout(40);
+  }
+  await page.evaluate((h) => {
+    document.querySelector(h).scrollTop = 0;
+  }, host);
+  await page.waitForTimeout(600);
+  await page.locator("button[title='Sort']").first().click();
+  await page.locator("button", { hasText: /^Custom$/ }).click();
+  await page.waitForTimeout(600);
+  check(
+    "an unarranged Custom order reads as Date",
+    JSON.stringify(await customOrder()) ===
+      JSON.stringify((await invoke("get_items", {})).items.map((i) => i.path)),
+  );
+
+  await arrangeFrom("p53.png", /^Lock as a Set…$/);
+  await page.locator("input[placeholder='Set name']").fill("comic");
+  await page.keyboard.press("Enter");
+  const marked = await page
+    .waitForSelector("[data-block='comic']", { state: "attached", timeout: 10_000 })
+    .then(() => true, () => false);
+  check("a locked file carries the block marker", marked);
+  check(
+    "the lock reached the server",
+    JSON.stringify((await customItems()).filter((i) => i.block === "comic").map((i) => i.path)) ===
+      JSON.stringify(["2026/p53.png"]),
+  );
+
+  await arrangeFrom("p51.png", /^To the Top$/);
+  const topped = await page
+    .waitForFunction(
+      async (fn) => {
+        const pathOf = eval(fn);
+        const imgs = [...document.querySelectorAll("img[src*='/thumb/']")]
+          .map((img) => ({ p: pathOf(img), r: img.getBoundingClientRect() }))
+          .sort((a, b) => Math.round(a.r.top) - Math.round(b.r.top) || a.r.left - b.r.left);
+        return imgs[0]?.p === "2026/p51.png";
+      },
+      PATH_OF,
+      { timeout: 10_000 },
+    )
+    .then(() => true, () => false);
+  check("To the Top moves the file first on screen", topped);
+  check("... and first in the server's order", (await customOrder())[0] === "2026/p51.png");
+
+  await arrangeFrom("p50.png", /^Place After…$/);
+  check(
+    "Place After shows what it is waiting for",
+    (await page.locator("text=Choose the photo to place it after").count()) === 1,
+  );
+  await page.locator("img[src*='p54.png']").first().click();
+  await page
+    .waitForFunction(
+      async () => {
+        const r = await fetch("/api/invoke", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ command: "get_items", args: { sort: "custom" } }),
+        });
+        const paths = (await r.json()).items.map((i) => i.path);
+        return paths.indexOf("2026/p50.png") === paths.indexOf("2026/p54.png") + 1;
+      },
+      null,
+      { timeout: 10_000 },
+    )
+    .catch(() => {});
+  const order = await customOrder();
+  check(
+    "Place After puts the file right behind the one picked",
+    order.indexOf("2026/p50.png") === order.indexOf("2026/p54.png") + 1,
+  );
+  await page.waitForTimeout(500);
+  check(
+    "the screen matches the server's Custom order",
+    JSON.stringify((await onScreen()).slice(0, 4)) === JSON.stringify(order.slice(0, 4)),
+  );
+
+  // The viewer walks the same order.
+  await page.locator("img[src*='p51.png']").first().click();
+  await page.waitForSelector("img[src*='/media/']", { timeout: 15_000 });
+  await page.keyboard.press("ArrowRight");
+  await page.waitForTimeout(400);
+  const shown = await page.evaluate(() =>
+    [...document.querySelectorAll("img[src*='/media/']")].map((i) =>
+      decodeURIComponent(i.getAttribute("src")),
+    ),
+  );
+  check(
+    `the viewer steps through Custom order (${order[1]})`,
+    shown.some((src) => src.includes(order[1])),
+  );
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+
   // Nothing is filtered out of either list. A 404 the page causes is a 404 a
   // user sees in their console, and "that one is fine" is how the missing
   // favicon link survived for as long as it did.

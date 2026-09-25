@@ -78,6 +78,10 @@ about to change.
   rebuild only restores where sidecars already exist.
 - **Companion sidecars are the only durable data.** Never write one outside
   `modify_companion`, and never drop a field without keeping `extra`.
+- **`DEFAULT_KEY`'s encoding is a durable format.** Custom-order keys stored in
+  sidecars were generated relative to it (`sort/order_key.rs`); changing the
+  offset, the width or the order of its parts silently moves every arranged
+  file relative to every unarranged one, in every gallery.
 - **A header read is recorded separately from what it found.** `exif_read`
   means "looked", not "found something" — a photo with no GPS and a screenshot
   with no EXIF block leave identical rows, so any gate phrased over the result

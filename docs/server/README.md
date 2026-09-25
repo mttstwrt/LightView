@@ -171,6 +171,7 @@ been missed.** A client re-fetches exactly those.
 | `fs-changed` | `{added, removed}` — **what changed**, so a client splices rather than re-fetching. One phone upload used to cost every connected client a full-library payload |
 | `items-changed` | `{paths}` — plural, and one per *operation*. Tagging 500 photos is one event, not 500 |
 | `tags-indexed` | the vocabulary moved, or a tag moved between files; the item list moves with it only under an active filter |
+| `order-changed` | a file moved in the Custom order — here, or on another machine whose sidecar write was just read. Domain `items`; only a client showing Custom refetches |
 | `job-progress` | throttled to one a second — the only high-rate producer on the channel |
 | `job-finished` | never throttled, or a run appears to stall at 99% |
 | `resync` | `{domains}` — you may have missed something in exactly these |
@@ -186,10 +187,33 @@ the vocabulary identical while changing what a filter selects. A caller that
 merely noticed a sidecar change asks the reload whether the vocabulary moved and
 stays quiet when it did not.
 
+**`order-changed` is its own event because nothing else says it.** A reorder
+never moves the vocabulary, so `tags-indexed` does not fire, and `items-changed`
+makes a client patch rows in place, which cannot move one. Every caller of
+[`reindex_file`](../../src-rust/src/cache/index.rs) that sees the file's order
+row *change* sends it — the watcher, both companion sweeps, the tag commands,
+the duplicate merge — and that is how an arrangement made on the desktop reaches
+the phone. A change rather than a write, because every photo looked at rewrites
+its sidecar. Where the watcher cannot see a write — a gallery on a client-side
+mount — it arrives with the hourly sweep instead.
+
 A keep-alive comment goes out every fifteen seconds. A phone's radio and every
 intermediary between it and the server will drop an idle connection, and a
 silent drop is what turns "reconnect and re-fetch" into "sit on a confidently
 wrong grid".
+
+## The Custom order's commands
+
+`place`, `lock_set`, `unlock_set` and `reset_order` are `Device`, like every
+tag write, and all four **refuse until the gallery's first companion sweep of
+this open has finished** — `Gallery::arrangeable`. The server answers before
+that sweep, and after a cache deletion or an upgrade the order table is empty
+until it runs; a placement computed then would be written permanently into
+sidecars against keys that are not there yet. The refusal carries a message the
+SPA shows. What the commands do is [query/](../query/README.md#the-custom-order).
+
+`place` takes the gap a drop landed in as the two neighbours the person saw,
+`after` and `before`, either of which may be absent at the edge of a view.
 
 ## TLS
 

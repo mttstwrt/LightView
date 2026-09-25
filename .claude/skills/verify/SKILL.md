@@ -31,15 +31,18 @@ it, not just the build. `npm run build` is the fix.
 the launch token redeemed once and refused twice, the dead-end 401 body, all
 four tiers as WebP, ETag/304, Range/206, traversal, the SPA fallback, a video
 thumbnail, the companion round trip, `set::` and `user::` filters, the watcher,
-and a second launch finding the lock. Served mode: TLS, `/cert`, pairing, five
+the Custom order (a lock, a placement, both in the sidecars, a hand-edited
+sidecar arriving as `order-changed` while a view does not, and the arrangement
+surviving a deleted cache), and a second launch finding the lock. Served mode: TLS, `/cert`, pairing, five
 `Owner` refusals, a cross-site POST, and device revocation. Then plugins: a run
 over a gallery containing a clip, a re-run that skips, a version bump that
 re-tags, `--filter` scoping, and two plugin names that are paths.
 
 `grid.mjs` covers what `tsc` cannot: cells placed by the justified layout,
 thumbnails that decoded, the viewer opening on a click, Escape closing it, a
-scroll, the settings sections, a plugin run started from the panel, and a
-390px relayout — asserting no console error and no failed request throughout.
+scroll, the settings sections, a plugin run started from the panel, the Custom
+order arranged from the sort menu and the Arrange submenu (lock, To the Top,
+Place After, the viewer walking it), and a 390px relayout — asserting no console error and no failed request throughout.
 
 ## Gotchas, learned the hard way
 

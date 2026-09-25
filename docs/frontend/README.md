@@ -83,10 +83,10 @@ gallery that lost photos.
 
 | Store | Holds |
 |---|---|
-| `galleryStore` | the one item list, the groups, the selection, and the event handler |
+| `galleryStore` | the one item list, the groups, the selection, the event handler, and arranging the Custom order |
 | `settingsStore` | per-client display preferences, the gallery's two settings, capabilities, sort state |
 | `filterStore` | the query text, the rating control, autocomplete state |
-| `viewerStore` | whether the viewer is open, which index, the info panel |
+| `viewerStore` | whether the viewer is open, which index, the info panel — re-anchored by path when the list reorders under it |
 | `activityStore` | installed plugins, the current run, outstanding thumbnail work |
 
 **One list, one query.** The filter used to be a client-side pass over a
@@ -115,7 +115,12 @@ indefinitely.
 A `fs-changed` removal **splices**; an addition falls back to one refetch,
 because the client cannot know where a new item sorts or whether it matches the
 active filter. An `items-changed` batch patches row by row up to a dozen and
-takes one query beyond that.
+takes one query beyond that. An `order-changed` refetches only when the grid is
+showing Custom — no other sort can have moved.
+
+**The newest query wins.** Two queries in flight — a reorder here and the event
+it causes, two quick sort changes — can finish in either order, so `refresh()`
+drops a response to anything but the latest.
 
 ## Chrome
 
@@ -133,6 +138,29 @@ local state alone — Settings → Connection is where the certificate install
 lives, so gating the only route to it on a server round trip deletes the
 recovery action in exactly the situation that needs it. And selection-scoped
 actions stay out, because the selection bar and the context menu own those.
+
+## Arranging the Custom order
+
+"Custom" is one more entry in the sort menu, without a direction arrow or a
+"Then by" list: the order was made by hand, so neither means anything. What it
+is and why is [query/](../query/README.md#the-custom-order).
+
+Arranging lives in the context menu's **Arrange** submenu — not "Move to…",
+which is the filesystem move. *Place After…* waits for the next cell clicked and
+places the file right behind it; *To the Top* places it above the first file in
+view. Both are offered only under Custom, where the neighbours on screen are the
+ones placed against. *Lock as a Set…*, *Unlock* and *Reset to Date Order* mean
+the same under any sort; locking is also in the selection bar, and unlocking in
+the tag manager's Sets tab.
+
+**One arrangement at a time.** A second placement computed while the first is
+still being written would be computed against the old order, so `arrange()`
+queues them. A refusal — the gallery still indexing, a file already in another
+block — is shown as a notice, not thrown. The grid follows through
+`order-changed`, like every other client.
+
+A block member carries an amber ring inside the cell — not an outline, which
+selection owns — and the first member its set's name.
 
 ## The grid
 
