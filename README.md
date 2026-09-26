@@ -111,20 +111,41 @@ gallery's path, and deleting all of it costs you time and nothing else.
 
 ## Building
 
+| Need | Why |
+|---|---|
+| Rust (2024 edition) | the binary |
+| Node 20+ | the SPA, which is **embedded into the binary** |
+| `libheif` ≥ 1.21 | linked, for HEIC/HEIF |
+| `ffmpeg` + `ffprobe` | at runtime, for video thumbnails and frame extraction |
+| `xdg-utils` | at runtime, to open a browser in local mode |
+
 ```sh
 npm ci && npm run build            # dist/ must exist before any cargo command
 cargo build --manifest-path src-rust/Cargo.toml --release
 ```
 
-Needs Rust (2024 edition), Node 20+, `libheif` ≥ 1.21 at build time, and
-`ffmpeg` at runtime. The libheif version is the one that bites on Debian-family
-distributions — see
-[docs/build-and-verify.md](docs/build-and-verify.md).
+The order is not optional: `dist/` is read by a macro in the library, so every
+Rust target — `check`, `test` and `clippy` included — fails without it.
 
-## Documentation
+**`libheif` ≥ 1.21 is the one that bites.** Arch tracks a current release, which
+is most of why the container image and the package target it; Ubuntu 24.04
+ships 1.17, so a Debian-family host needs a source build:
 
-[**docs/**](docs/README.md) describes how the system works and why.
-[docs/architecture.md](docs/architecture.md) is the place to start: the three
-modes, the trust model, the layers, and where a request and a file each go.
+```sh
+git clone --depth 1 --branch v1.21.2 https://github.com/strukturag/libheif
+cmake -S libheif -B libheif/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF
+cmake --build libheif/build --parallel && sudo cmake --install libheif/build
+sudo ldconfig
+export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+```
+
+## How it works
+
+There is no separate design wiki: each module opens with a header saying what
+it is responsible for and the rules it keeps, and each function with the rule
+it implements. Start at [`src-rust/src/lib.rs`](src-rust/src/lib.rs) for the
+layers, and [`src-solidjs/App.tsx`](src-solidjs/App.tsx) for the web client.
+`cargo doc --no-deps --document-private-items --open` renders the Rust side.
 
 Writing a tagger is [plugins/README.md](plugins/README.md).
