@@ -355,8 +355,20 @@ async fn select_paths(
     Ok(items.items.into_iter().map(|i| i.path).collect())
 }
 
-/// Everything the two serving modes do identically: scan, arm, open the gate,
-/// then enrich in the background.
+/// Open the gallery for serving, in the one order that loses no file: enforce
+/// the cache ceiling, sweep the trash, scan and index, arm the watcher, open
+/// the readiness gate, then start the background work (enrichment, the idle
+/// worker, the hourly companion sweep). Both serving modes call this; the
+/// cache lock is already held, taken when the database opened.
+///
+/// **The watcher is armed before the gate opens.** A file arriving between
+/// "the scan finished" and "the watcher is armed" is in neither, and nothing
+/// ever notices it; in the other order that window is the entire scan.
+///
+/// **Enrichment is a resume, not the only pass.** The watcher reads a new
+/// file's header itself as it ingests it, or a batch arriving over rsync or
+/// Samba would be dateless and placeless until a restart; the background pass
+/// covers whatever that missed, and whatever an interrupted session left.
 async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), String> {
     // The ceiling, at open. Leaving it to `lightview cache --prune` means a
     // folder processed once and never reopened leaves a cache nothing reclaims,
@@ -407,15 +419,9 @@ async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), Stri
     state.mark_ready();
 
     // Enrichment is slow and the grid does not need it to paint. **No guard is
-    // taken here.** It used to hold one for the life of the pass, on the
-    // grounds that the pass writes companions — but three of its four phases
-    // write only the derived cache, and the longest of them reads every header
-    // in the library. Holding a guard across all of that meant a session whose
-    // window had closed stayed alive until the whole library was enriched,
-    // which is the opposite of the rule it was serving. The guard now spans
-    // each `modify_companion` and nothing else, inside the two functions that
-    // call one, so an exit can land anywhere else in the pass — and
-    // `exif_read` makes the next open resume rather than restart.
+    // taken here**: the busy guard spans each `modify_companion` and nothing
+    // else (see `Presence::busy`), so a session whose window closed is not kept
+    // alive by a header read over the whole library.
     let enriching = gallery.clone();
     let enrich_presence = state.presence.clone();
     tokio::spawn(async move {

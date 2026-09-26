@@ -180,12 +180,11 @@ async fn backfill_exif(gallery: &Gallery) -> Result<(), OpenError> {
 
 /// How many headers are read before the batch is committed.
 ///
-/// The pass used to hold every result in memory and commit once at the end, so
-/// an interruption lost all of it. That is no longer a rare case: a local
-/// session now exits when its last window closes, and a first open of a large
-/// library is still enriching long after the user has looked at the first
-/// screen. Committing as it goes means an interrupted pass keeps what it read,
-/// and `exif_read` means the next open resumes instead of starting over.
+/// Committing as it goes means an interrupted pass keeps what it read, and
+/// `exif_read` means the next open resumes instead of starting over.
+/// Interruption is ordinary: a local session exits when its last window
+/// closes, and a first open of a large library is still enriching long after
+/// the user has looked at the first screen.
 const PROBE_BATCH: usize = 256;
 
 /// Read `paths`' metadata headers and record both what they said and that they
@@ -194,7 +193,8 @@ const PROBE_BATCH: usize = 256;
 /// **Which header depends on the file.** An image carries EXIF; a video carries
 /// what its container declares, which `ffprobe` reads. Both arrive as a
 /// [`meta::ProbedMedia`] and neither knows about the other — the branch is the
-/// only place the difference exists.
+/// only place the difference exists. A GIF takes the image branch: it has no
+/// EXIF either, and the grid animates it on its own rules, not on a duration.
 ///
 /// **Both facts are recorded, and they are different facts.** A file with no
 /// EXIF block leaves `date_taken` and the coordinates NULL, which is
