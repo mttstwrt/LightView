@@ -1,9 +1,11 @@
 //! The adapter: routes, one command table, and the trust level each entry
 //! requires.
 //!
-//! **There is one dispatch.** Every command from every client is an entry in
-//! [`commands`], which carries its own minimum trust as a field, so there is no
-//! second list that has to agree with it. Where each request goes:
+//! **The server owns who may ask; the services own what happens.** There is
+//! one dispatch: every command from every client is an entry in [`commands`],
+//! and each entry is a trust check and a call into a service, carrying its
+//! minimum trust as a field so no second list has to agree with it. Where each
+//! request goes:
 //!
 //! ```text
 //! POST /api/invoke ──→ commands ──→ services ──→ cache (SQLite)

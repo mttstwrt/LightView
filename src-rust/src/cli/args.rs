@@ -23,8 +23,8 @@
 //! ```
 //!
 //! **There is no `--no-browser`.** The launch URL is always printed, so a
-//! headless host does not need a flag to learn its own address — and section
-//! 6's verification recipe does not depend on one.
+//! headless host does not need a flag to learn its own address — and the verify
+//! recipe does not depend on one.
 
 use std::path::PathBuf;
 

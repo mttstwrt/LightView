@@ -1,9 +1,10 @@
 //! Whether anyone still has this gallery open, and whether it is safe to stop.
 //!
 //! `lightview <dir>` is started by a click — "Open with LightView" in a file
-//! manager — that nobody associates with a process lifetime. Closing the window
-//! left it serving nothing, holding the gallery lock, its watcher, its idle
-//! worker and its thread pool, until the user went looking for it.
+//! manager — that nobody associates with a process lifetime. Without a rule for
+//! when it ends, closing the window leaves it serving nothing while holding the
+//! gallery lock, its watcher, its idle worker and its thread pool, until the
+//! user goes looking for it.
 //!
 //! **The signal already existed: the SSE stream at `GET /api/events`.** A
 //! browser tears that connection down when the tab closes, and the fifteen-
@@ -75,6 +76,14 @@ impl Presence {
     /// Held by the SSE stream itself rather than by the handler that built it,
     /// so it is dropped when the response body is dropped — which is what
     /// "the client went away" looks like from here.
+    ///
+    /// A stream is not *exactly* a window, and the two places they differ are
+    /// harmless. `/pair` renders before the app mounts and holds no stream, but
+    /// it belongs to `--serve`, where the watchdog does not run. A window whose
+    /// stream has 401'd holds none either, but that state only arises across a
+    /// restart, so it is never the last window of the process it would end.
+    /// Transient dips — a reload, an `EventSource` reconnect — are absorbed by
+    /// [`GRACE`].
     pub fn window(self: &Arc<Self>) -> Window {
         self.windows.fetch_add(1, Ordering::Relaxed);
         self.seen_any.store(true, Ordering::Relaxed);
@@ -86,7 +95,16 @@ impl Presence {
     /// Take one around anything that writes a companion. Sidecars are the only
     /// durable data there is, and a `modify_companion` interrupted between its
     /// lock and its rename leaves a temp file in the user's gallery — the one
-    /// tree the design promises is safe to `rsync`.
+    /// tree the design promises is safe to `rsync`. Three writers run detached
+    /// from any request and need it: the open-time enrichment pass, the hourly
+    /// companion sweep, and a plugin run.
+    ///
+    /// **Around the `modify_companion` call and nothing else.** Held around a
+    /// whole pass, the guard covers a header read over every file in the
+    /// library, and a session whose window closed stays alive until that
+    /// finishes. Held around the write, an exit can land anywhere else and cost
+    /// nothing, because everything else those passes touch is derived —
+    /// `exif_read` makes the next open resume where this one stopped.
     pub fn busy(self: &Arc<Self>) -> Busy {
         self.busy.fetch_add(1, Ordering::Relaxed);
         Busy(Arc::clone(self))

@@ -17,8 +17,8 @@
 //! anything a browser on that host can be made to issue.
 //!
 //! Here that is structural rather than a check: `lightview <dir>` and
-//! `lightview --serve <dir>` are mutually exclusive on one gallery (section
-//! 3.3's one-process rule), so a process has exactly **one** listener and
+//! `lightview --serve <dir>` are mutually exclusive on one gallery (see
+//! [`crate::cli`]), so a process has exactly **one** listener and
 //! therefore one trust ceiling, fixed at bind. [`Trust`] lives in application
 //! state, nothing writes it after startup, and there is no request-derived path
 //! that could raise it.
@@ -44,7 +44,11 @@
 //! The token is 32 random bytes, **rotated on every redemption**, held in memory
 //! and mirrored into `<cache dir>/instance.json` at mode 0600. There is no TTL:
 //! single use plus rotation bounds exposure, and the file is readable only by
-//! the account that already owns the photos.
+//! the account that already owns the photos. The launch URL carrying it is
+//! printed to stdout unconditionally, so under a systemd user unit it lands in
+//! the journal — acceptable for a rotating single-use token on a
+//! process-private address, and the reason the password, which would not be,
+//! is read from stdin instead.
 
 use std::path::Path;
 use std::sync::Mutex;
