@@ -7,7 +7,9 @@
 //! cache, one second on `cifs` by default. The losing write is not the older
 //! one; it is whichever reader lost the race. So the whole operation happens
 //! inside [`modify_companion`], and there is no public way to write a companion
-//! without it.
+//! without it. The trash is the one thing that moves a companion without it —
+//! into an entry directory it has just created, and back to the write location
+//! on restore — and it never changes the file's contents.
 //!
 //! The lock is `fcntl` on a per-directory lock file, for reasons spelled out in
 //! [`crate::util::lock`]: `flock` would be coherent on one machine and
