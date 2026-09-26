@@ -588,9 +588,14 @@ fn into_rgba_tuple(dec: HeicDecode) -> (Vec<u8>, u32, u32, u32, u32) {
 /// **Why this exists at all:** the grid lays out by aspect ratio, and until a
 /// file has dimensions it is drawn as a 1:1 square and corrected when its
 /// thumbnail loads — which recomputes the whole justified layout and moves
-/// every row below it. Dimensions used to arrive only as a side effect of
-/// [`crate::pipeline::serve`] decoding a frame, so a file nobody had scrolled
-/// to had no shape. This is the cheap way to know it at index time instead.
+/// every row below it. Without a header read at index time, a file nobody has
+/// scrolled to has no shape until [`crate::pipeline::serve`] decodes a frame.
+///
+/// The `image` crate first, then a libheif handle; neither decodes a pixel.
+/// The libheif half is not optional — a library that is entirely HEIC is the
+/// case this was written for. libheif applies `irot`/`imir` to a handle's
+/// width and height (since 1.16; this project requires 1.21), so the numbers
+/// are *display* dimensions and agree with what the decode path reports.
 ///
 /// `None` for anything neither reader parses — RAW, and video, which has its
 /// own probe. "Don't know" must degrade to the placeholder the grid already

@@ -13,6 +13,10 @@
 //! | `jm` | 1280 | LRU     | the viewer's progressive underlay |
 //! | `jh` | 2560 | LRU     | high zoom |
 //!
+//! The small tiers are unbounded because every cell needs one and evicting
+//! them means regenerating them on the next scroll; the large ones are bounded
+//! because they exist only for what a person actually zoomed into.
+//!
 //! `js` exists because three panels — the tag manager, the duplicates panel and
 //! the merge dialog — render up to 120 thumbnails in an 88px grid. At 512px
 //! that is ~84 MB of decoded bitmaps instead of ~7.9 MB, roughly 34× the pixels

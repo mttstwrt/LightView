@@ -25,6 +25,11 @@
 //!
 //! Every unit re-checks idleness before starting, so a user who touches the
 //! grid gets the pool back within one batch rather than at the end of a sweep.
+//!
+//! **The hourly companion sweep is deliberately not one of the backlogs.**
+//! Yielding to anyone touching the grid is right for a thumbnail backfill and
+//! wrong for a tag written over the share, which has to reach the index whether
+//! or not someone is scrolling — see [`crate::services::gallery`].
 
 use std::sync::Arc;
 use std::time::Duration;
