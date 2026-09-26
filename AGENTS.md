@@ -17,8 +17,11 @@ fast_image_resize · libheif-rs — and TypeScript · SolidJS · Tailwind v4 · 
 ```
 src-rust/      the crate: one library, one binary
 src-solidjs/   the SPA, built into dist/ and embedded at compile time
-plugins/       the example tagger, and the protocol a plugin author reads
 ```
+
+Plugins live in their own repositories. The contract they are written against
+is the README's "Writing a plugin" section; the verify skill carries the one
+fixture plugin the tests install.
 
 ## Development commands
 
@@ -216,8 +219,7 @@ Beyond headers, a comment carries only what the code cannot:
 A header changes in the same commit as its code; one that contradicts its code
 is a bug.
 
-**Three prose files remain, each for a reader who does not read the code:**
-[`README.md`](README.md) for people running and building LightView,
-[`plugins/README.md`](plugins/README.md) for plugin authors, and this file for
-the rules and the commands. This file may name a rule in one line; the
-explanation lives in the header it points to.
+**Two prose files remain, each for a reader who does not read the code:**
+[`README.md`](README.md) for people running, building and writing plugins for
+LightView, and this file for the rules and the commands. This file may name a
+rule in one line; the explanation lives in the header it points to.

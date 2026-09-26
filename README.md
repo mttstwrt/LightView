@@ -109,6 +109,99 @@ photos — plain JSON, per directory, safe to grep, rsync and back up. Thumbnail
 and the index go into `$XDG_CACHE_HOME/lightview/`, keyed by a hash of the
 gallery's path, and deleting all of it costs you time and nothing else.
 
+## Writing a plugin
+
+A plugin tags media. LightView hands it images and it hands back tags; it never
+touches a companion file, a database or a video. Plugins are developed outside
+this repository, and this section is the contract they are written against.
+
+### Installing one
+
+A plugin is a directory under `$XDG_DATA_HOME/lightview/plugins/` (usually
+`~/.local/share/lightview/plugins/`) whose name matches the `name` in its
+`manifest.json`. Copying the directory there installs it — there is no install
+command, for the same reason the password and pairing are administered from a
+shell.
+
+The directory name is the identity, and the manifest's `name` is checked against
+it. LightView never builds a path from a name it was sent: it scans the install
+root, and a name either matches something it found or matches nothing. A request
+carries a plugin *name*, never a command, so no request can name something to
+execute.
+
+```
+lightview tag ~/photos --plugin wd-tagger
+lightview tag /mnt/nas/photos --plugin wd-tagger --filter 'NOT has::plugin.wd'
+```
+
+### The protocol
+
+One JSON object per line, both directions, over stdin and stdout.
+
+LightView sends `{"action":"tag","path":"/abs/path.webp"}` and expects **exactly
+one** result per request:
+
+```json
+{"path": "/abs/path.webp", "tags": ["dog", "beach"], "meta": {"…": "…"}}
+{"path": "/abs/path.webp", "error": "could not read"}
+```
+
+An error result is an answer, not a failure — it costs that file its tags and
+nothing else.
+
+**Emit each result as soon as it is ready. Never buffer stdin to EOF.** LightView
+keeps a bounded number of requests in flight and releases a slot only when a
+result comes back, so a plugin that waits for EOF deadlocks any job larger than
+that window. `LIGHTVIEW_JOB_TOTAL` in the environment carries the expected
+request count, for a plugin that wants to size a progress bar.
+
+A plugin is judged to have stopped answering if it moves 128 requests past one
+without answering it, or if it goes quiet for a long time *after* having answered
+something. A first run that spends ten minutes downloading a model is not a
+stall — no clock runs until the first result.
+
+### The manifest
+
+```json
+{
+  "name": "my-tagger",
+  "display_name": "My Tagger",
+  "version": "1.0.0",
+  "api_version": 1,
+  "description": "…",
+  "execution": { "type": "cli", "command": "python3", "args": ["{plugin_dir}/tagger.py"] },
+  "tag_prefix": "mine",
+  "input": { "max_edge": 512, "video_frames": 5 }
+}
+```
+
+`api_version` must be `1`. `{plugin_dir}` expands to the installed directory.
+
+`tag_prefix` is the namespace the tags land in — `plugin.mine` — and that bucket is
+**replaced wholesale** on each run, which is what makes re-running under a newer
+version a re-tag rather than a union with what the old model thought.
+
+`version` is the skip predicate. A file already carrying this plugin's tags at
+this version **or higher** is skipped, so a retrained model ships as a version
+bump and the next run re-tags the gallery.
+
+**`max_edge` is a cost, and 512 is the free one.** LightView serves the smallest
+cached thumbnail tier at least `max_edge` across — 128, 512, 1280 or 2560 —
+rounding up, never down, because a model handed a smaller image than it trained
+on has lost information it cannot recover. The tier the background worker warms
+is 512; a plugin declaring more pays one full thumbnail generation per image, on
+whatever machine runs the job. Models downsize internally, so 512 loses nothing
+for most taggers.
+
+**A plugin never sees a video.** LightView samples `video_frames` stills across a
+clip (default 5, capped at 16), sends them as ordinary requests, and merges the
+answers: a union of the tag sets, except that `rating:` is one choice rather than
+a set and gets a fresh argmax across the frames.
+
+The smallest plugin that conforms to all of this is the verification fixture in
+[`.claude/skills/verify/example-auto-tagger/`](.claude/skills/verify/example-auto-tagger/):
+dependency-free `python3`, about sixty lines.
+
 ## Building
 
 | Need | Why |
@@ -147,5 +240,3 @@ it is responsible for and the rules it keeps, and each function with the rule
 it implements. Start at [`src-rust/src/lib.rs`](src-rust/src/lib.rs) for the
 layers, and [`src-solidjs/App.tsx`](src-solidjs/App.tsx) for the web client.
 `cargo doc --no-deps --document-private-items --open` renders the Rust side.
-
-Writing a tagger is [plugins/README.md](plugins/README.md).

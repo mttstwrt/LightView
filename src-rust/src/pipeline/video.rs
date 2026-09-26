@@ -454,7 +454,7 @@ pub fn extract_frame_at(
 
 /// Evenly spaced sample timestamps across the middle 90% of a clip.
 ///
-/// Reproduces the sampling the bundled taggers each did for themselves before
+/// Reproduces the sampling the original taggers each did for themselves before
 /// frame extraction moved into the host, so converging on one implementation
 /// changed no output: the ends are trimmed because titles, fades and black
 /// leader cluster there, and a single-sample request takes the midpoint.
@@ -784,7 +784,7 @@ mod tests {
         dir
     }
 
-    /// The sampling the bundled taggers used to do themselves. Getting this
+    /// The sampling the original taggers used to do themselves. Getting this
     /// wrong would silently change every video's tags on the day host-side
     /// extraction landed, which is the one thing the move had to avoid.
     #[test]

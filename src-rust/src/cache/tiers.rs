@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(ThumbTier::smallest_at_least(128), Some(ThumbTier::Js));
         assert_eq!(ThumbTier::smallest_at_least(129), Some(ThumbTier::J));
         assert_eq!(ThumbTier::smallest_at_least(512), Some(ThumbTier::J));
-        // The bundled taggers declare 512 for exactly this reason: 1024 rounds
+        // Taggers declare 512 for exactly this reason: 1024 rounds
         // up to `jm`, which is a full generation per image on the server.
         assert_eq!(ThumbTier::smallest_at_least(1024), Some(ThumbTier::Jm));
         assert_eq!(ThumbTier::smallest_at_least(2560), Some(ThumbTier::Jh));

@@ -23,6 +23,10 @@
 //! carries the expected request count so a plugin never needs the read-to-EOF
 //! sizing pattern that caused it.
 //!
+//! Plugins are written in other repositories against the README's "Writing a
+//! plugin" section, so a change to the protocol or the manifest changes that
+//! section in the same commit.
+//!
 //! ## Why the staleness rules are counts, not clocks
 //!
 //! A tagger's first run legitimately produces nothing for minutes while it
