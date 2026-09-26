@@ -30,6 +30,7 @@ function Stroke(props: { size: number; children: any }) {
   );
 }
 
+/** Settings, the last entry in the command list. */
 export const GearIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <circle cx="12" cy="12" r="3" />
@@ -45,12 +46,14 @@ export const SelectIcon: Icon = (props) => (
   </Stroke>
 );
 
+/** Close a sheet or panel. */
 export const CloseIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <path d="M18 6L6 18M6 6l12 12" />
   </Stroke>
 );
 
+/** The phone's search button. */
 export const SearchIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <circle cx="11" cy="11" r="7" />
@@ -62,7 +65,7 @@ export const SearchIcon: Icon = (props) => (
  *
  *  Deliberately "more" rather than a `+`: the list contains Settings and
  *  Trash as readily as Upload, and a plus over-promises create while
- *  under-promising everything else (docs/frontend/chrome.md). */
+ *  under-promising everything else. */
 export const MoreIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none" />
@@ -71,6 +74,7 @@ export const MoreIcon: Icon = (props) => (
   </Stroke>
 );
 
+/** The tag manager. */
 export const TagIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <path d="M20.6 13.4l-7.2 7.2a2 2 0 0 1-2.8 0l-7.2-7.2a2 2 0 0 1-.6-1.4V4a1 1 0 0 1 1-1h8a2 2 0 0 1 1.4.6l7.4 7.4a2 2 0 0 1 0 2.8z" />
@@ -78,6 +82,7 @@ export const TagIcon: Icon = (props) => (
   </Stroke>
 );
 
+/** The duplicates panel. */
 export const DuplicateIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <rect x="9" y="9" width="11" height="11" rx="2" />
@@ -85,6 +90,7 @@ export const DuplicateIcon: Icon = (props) => (
   </Stroke>
 );
 
+/** The trash panel. */
 export const TrashIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
@@ -102,6 +108,7 @@ export const AutoTagIcon: Icon = (props) => (
   </Stroke>
 );
 
+/** Upload. */
 export const UploadIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <path d="M12 16V4m0 0L8 8m4-4l4 4" />

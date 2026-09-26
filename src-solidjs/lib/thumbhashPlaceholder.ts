@@ -24,6 +24,8 @@ const dataUrlCache = new Map<string, string>();
 let mapFor: SortedItem[] | null = null;
 let hashByPath = new Map<string, string>();
 
+/** The ThumbHash for `path` from the current item list, rebuilding the lookup
+ *  map only when the list itself has changed. */
 function lookupHash(path: string): string | undefined {
   const list = items();
   if (list !== mapFor) {
@@ -36,6 +38,7 @@ function lookupHash(path: string): string | undefined {
   return hashByPath.get(path);
 }
 
+/** Decode base64 into bytes. */
 function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);

@@ -6,11 +6,11 @@ import { maxScroll, scrollToY } from "./scrollHost";
 // "Start at bottom": land a freshly opened gallery at the end of the grid
 // instead of the top, so browsing runs bottom-to-top.
 //
-// This is deliberately *not* a one-shot scroll on open. Both grids report a
-// content height that keeps changing for a while after the first paint — the
-// justified grid re-flows as aspect ratios stream in, and either grid re-lays
-// out when the container is first measured — so a single jump would land at the
-// bottom of a shorter document and end up stranded mid-gallery. Instead the
+// This is deliberately *not* a one-shot scroll on open. The grid reports a
+// content height that keeps changing for a while after the first paint — it
+// re-flows as aspect ratios stream in, and re-lays out when the container is
+// first measured — so a single jump would land at the bottom of a shorter
+// document and end up stranded mid-gallery. Instead the
 // intent stays *armed*: every content-height change re-pins the view to the
 // bottom until the layout stops moving, or until the user scrolls and takes
 // over.
@@ -31,7 +31,7 @@ interface OpenAtBottomOptions {
   enabled: () => boolean;
   /** Identifies the open gallery; a change re-arms. Null when none is open. */
   galleryKey: () => string | null;
-  /** Full scrollable height of the grid, as the grids report it. */
+  /** Full scrollable height of the grid, as the grid reports it. */
   contentHeight: () => number;
 }
 

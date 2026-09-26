@@ -7,6 +7,12 @@
 //! writers on one `cache.db` behind an in-process mutex is the assumption that
 //! lock exists to make true.
 //!
+//! **A process has one gallery, bound at startup.** The root is canonicalized
+//! once, and the derived-cache directory, the lock, the watcher and every
+//! relative path key derive from that value, so they cannot disagree about what
+//! "the same gallery" is. Opening a different folder is a different process;
+//! no command moves a running one to another gallery.
+//!
 //! **A second launch opens the first one's window rather than refusing.** The
 //! package ships a `.desktop` file, so double-clicking a folder twice is an
 //! ordinary user action, and "refused: already running" is a bad answer to it —
@@ -56,6 +62,8 @@ pub async fn run() -> std::process::ExitCode {
     }
 }
 
+/// Resolve and create the state directories, then run the one command the
+/// invocation names.
 async fn dispatch(invocation: Invocation) -> Result<std::process::ExitCode, String> {
     let dirs = match &invocation.data_dir {
         Some(root) => Dirs::under(root),
@@ -225,21 +233,25 @@ async fn serve(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// `lightview tag <dir> --plugin <name> [--filter <expr>]`.
+/// `lightview tag <dir> --plugin <name> [--filter <expr>]`: run a plugin over
+/// a gallery on this machine and write its tags into the companions.
 ///
 /// **This is why there is no `--remote` mode and no worker binary.** The
-/// problem it solves is real: the server is an N100 that cannot run the models
-/// and the desktop has the GPU. An earlier design answered it with a
-/// distributed job broker — a worker registry with liveness TTLs,
-/// announce/claim/update/complete/fail, job pinning, two staleness clocks, a
-/// credential file, a pairing verb and a certificate pin — all of it to move
-/// bytes and results between two machines over HTTP.
+/// server is a small box that cannot run the models and the desktop has the
+/// GPU — but the desktop can mount the gallery, so it does not need a protocol
+/// between machines, it needs a path. This opens the gallery the way every
+/// other mode does, runs the plugin locally and writes companions. The server's
+/// own watcher picks them up, because a write arriving over the share is `smbd`
+/// writing to the local disk and `inotify` watches inodes. Nothing is claimed,
+/// heartbeated or pinned, and nothing needs a credential: the filesystem
+/// already answered the authentication question.
 ///
-/// The desktop can mount the gallery. So it does not need a protocol, it needs
-/// a path: this opens the gallery the way every other mode does, runs the
-/// plugin locally and writes companions. The server's own watcher picks them
-/// up, because a write arriving over the share is `smbd` writing to the local
-/// disk and `inotify` watches inodes.
+/// Two consequences. **The bytes move, not the decodes:** full files cross the
+/// mount and are decoded on the desktop — more bytes on the wire, far less
+/// server CPU, which is the right trade when the server is the bottleneck.
+/// **Tagging is started from a shell** unless the gallery is open in a local
+/// viewer, like the password and pairing; unattended tagging of what a phone
+/// uploads is a systemd timer around this verb.
 ///
 /// It takes the cache lock like any other mode, so it cannot run against a
 /// gallery this machine is already serving — the lock is what stops two
@@ -349,8 +361,20 @@ async fn select_paths(
     Ok(items.items.into_iter().map(|i| i.path).collect())
 }
 
-/// Everything the two serving modes do identically: scan, arm, open the gate,
-/// then enrich in the background.
+/// Open the gallery for serving, in the one order that loses no file: enforce
+/// the cache ceiling, sweep the trash, scan and index, arm the watcher, open
+/// the readiness gate, then start the background work (enrichment, the idle
+/// worker, the hourly companion sweep). Both serving modes call this; the
+/// cache lock is already held, taken when the database opened.
+///
+/// **The watcher is armed before the gate opens.** A file arriving between
+/// "the scan finished" and "the watcher is armed" is in neither, and nothing
+/// ever notices it; in the other order that window is the entire scan.
+///
+/// **Enrichment is a resume, not the only pass.** The watcher reads a new
+/// file's header itself as it ingests it, or a batch arriving over rsync or
+/// Samba would be dateless and placeless until a restart; the background pass
+/// covers whatever that missed, and whatever an interrupted session left.
 async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), String> {
     // The ceiling, at open. Leaving it to `lightview cache --prune` means a
     // folder processed once and never reopened leaves a cache nothing reclaims,
@@ -401,15 +425,9 @@ async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), Stri
     state.mark_ready();
 
     // Enrichment is slow and the grid does not need it to paint. **No guard is
-    // taken here.** It used to hold one for the life of the pass, on the
-    // grounds that the pass writes companions — but three of its four phases
-    // write only the derived cache, and the longest of them reads every header
-    // in the library. Holding a guard across all of that meant a session whose
-    // window had closed stayed alive until the whole library was enriched,
-    // which is the opposite of the rule it was serving. The guard now spans
-    // each `modify_companion` and nothing else, inside the two functions that
-    // call one, so an exit can land anywhere else in the pass — and
-    // `exif_read` makes the next open resume rather than restart.
+    // taken here**: the busy guard spans each `modify_companion` and nothing
+    // else (see `Presence::busy`), so a session whose window closed is not kept
+    // alive by a header read over the whole library.
     let enriching = gallery.clone();
     let enrich_presence = state.presence.clone();
     tokio::spawn(async move {
@@ -423,6 +441,9 @@ async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), Stri
     Ok(())
 }
 
+/// Assemble the open gallery around an already-opened database: the thumbnail
+/// pool sized from the hardware, the tier budget, the event channel and the
+/// autocomplete engine.
 fn build_gallery(
     root: Root,
     db: Arc<CacheDb>,
@@ -504,6 +525,8 @@ async fn list_devices(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// `lightview devices revoke <id>`: forget one paired device, and say whether
+/// there was one.
 async fn revoke_device(dirs: &Dirs, id: &str) -> Result<std::process::ExitCode, String> {
     let store = Devices::open(&dirs.devices_db())
         .map_err(|e| format!("could not open devices.db: {e}"))?;
@@ -578,6 +601,8 @@ fn show_cache(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// `lightview cache --prune`: evict least-recently-opened gallery caches down
+/// to the ceiling, sparing none, since no gallery is being opened.
 fn prune_cache(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     let config = load_config(dirs)?;
     let report = store::prune_to_ceiling(&dirs.galleries(), config.cache_ceiling_bytes(), None)
@@ -596,6 +621,7 @@ fn prune_cache(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// `server.toml`, or its defaults when there is none.
 fn load_config(dirs: &Dirs) -> Result<ServerConfig, String> {
     ServerConfig::load(&dirs.server_toml()).map_err(|e| e.to_string())
 }

@@ -1,15 +1,20 @@
+// The trash panel: what has been deleted, and restoring it or deleting it for
+// good. The rules it keeps are on `TrashPanel` below.
+
 import { createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { api } from "../lib/ipc";
 import { isOwner } from "../stores/settingsStore";
 import type { TrashEntry } from "../lib/types";
 import { ConfirmButton } from "./shared/ConfirmButton";
 
+/** A byte count as "12 KB" / "3.4 MB". */
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** A timestamp as a short local date. */
 function formatDate(ts: number): string {
   const d = new Date(ts * 1000);
   return d.toLocaleDateString(undefined, {

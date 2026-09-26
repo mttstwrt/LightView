@@ -48,10 +48,13 @@ export function encodePath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
+/** The URL of `path` at `tier`, encoded per segment. */
 export function thumbUrl(path: string, tier: ThumbTier): string {
   return `/thumb/${tier}/${encodePath(path)}`;
 }
 
+/** The URL of the original file, or of a `fit`-edge resize of it when `fit` is
+ *  given. */
 export function mediaUrl(path: string, fit?: number): string {
   const base = `/media/${encodePath(path)}`;
   return fit ? `${base}?fit=${fit}` : base;
@@ -79,6 +82,7 @@ export function onAuthInterruption(listener: Listener): () => void {
   return () => listeners.delete(listener);
 }
 
+/** Tell every listener about an auth interruption. */
 function announce(interruption: AuthInterruption) {
   for (const listener of listeners) listener(interruption);
 }
@@ -95,6 +99,8 @@ export function answerPasswordChallenge(accepted: boolean) {
   pendingPassword = null;
 }
 
+/** Raise the password prompt and resolve with whether it was accepted. Every
+ *  caller that hits a challenge while one is open shares it. */
 function challenge(): Promise<boolean> {
   // The shared promise. Twenty concurrent 401s raise one modal.
   if (!pendingPassword) {
@@ -108,6 +114,8 @@ function challenge(): Promise<boolean> {
 
 /** Whether this client is talking to a bind that has a pairing flow at all. */
 let hasPairing = true;
+/** Record whether this bind has a pairing flow, which decides what a later
+ *  plain 401 means. */
 export function setHasPairing(value: boolean) {
   hasPairing = value;
 }
@@ -125,6 +133,7 @@ export class IpcError extends Error {
   }
 }
 
+/** One raw `POST /api/invoke`, with no handling of the answer. */
 async function post(command: string, args: unknown): Promise<Response> {
   return fetch("/api/invoke", {
     method: "POST",
@@ -133,6 +142,9 @@ async function post(command: string, args: unknown): Promise<Response> {
   });
 }
 
+/** Run a command and return its result. A password challenge is answered and
+ *  the call retried; any other 401 is announced as "not paired" or "session
+ *  ended" and thrown; any other failure throws with the server's message. */
 export async function invoke<T>(command: string, args?: unknown): Promise<T> {
   let response = await post(command, args);
 
@@ -171,6 +183,8 @@ export interface AuthStatus {
   pairing: boolean;
 }
 
+/** Ask the server what kind of bind this is before anything authenticated goes
+ *  out, and remember whether it has pairing. */
 export async function authStatus(): Promise<AuthStatus> {
   const response = await fetch("/auth/status");
   const status = (await response.json()) as AuthStatus;
@@ -191,6 +205,8 @@ export async function redeemLaunchToken(token: string): Promise<boolean> {
   return response.ok;
 }
 
+/** Exchange a pairing code for this browser's device cookie; true when
+ *  accepted. */
 export async function redeemPairingCode(
   code: string,
   name: string,
@@ -203,6 +219,7 @@ export async function redeemPairingCode(
   return response.ok;
 }
 
+/** Answer the password challenge; true when accepted. */
 export async function submitPassword(password: string): Promise<boolean> {
   const response = await fetch("/auth/password", {
     method: "POST",

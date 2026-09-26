@@ -248,13 +248,14 @@ kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
 # ---------------------------------------------------------------------------
 echo "== plugins and tagging =="
 
-# Install the bundled example into this run's state directory. That is the
-# whole install procedure: a directory whose name matches its manifest's.
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+# Install the fixture tagger beside this script into this run's state
+# directory. That is the whole install procedure: a directory whose name
+# matches its manifest's.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # `--data-dir <root>` maps the three XDG roots to `<root>/{cache,data,config}`,
 # so the install root is `<root>/data/plugins`.
 mkdir -p "$D/data/plugins"
-cp -r "$REPO/plugins/example-auto-tagger" "$D/data/plugins/"
+cp -r "$HERE/example-auto-tagger" "$D/data/plugins/"
 
 # A gallery with a clip in it, so a video's companion has to gain a *merged*
 # tag entry rather than being silently skipped — the failure this codebase

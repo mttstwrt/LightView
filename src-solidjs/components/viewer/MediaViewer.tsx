@@ -63,6 +63,8 @@ interface MediaViewerProps {
   onContextMenu?: (e: MouseEvent, path: string, index: number) => void;
 }
 
+/** The viewer for the item at the current index, over the grid; its rules are
+ *  at the top of this file. */
 export function MediaViewer(props: MediaViewerProps) {
   const [loaded, setLoaded] = createSignal(false);
 

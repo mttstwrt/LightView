@@ -350,6 +350,7 @@ fn version_at_least(have: &str, want: &str) -> bool {
     true
 }
 
+/// The media type a path's extension implies; an unknown extension is an image.
 fn media_type_for(path: &RelPath) -> MediaType {
     std::path::Path::new(path.as_str())
         .extension()

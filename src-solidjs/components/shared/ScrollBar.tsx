@@ -1,3 +1,8 @@
+// The scrollbar LightView draws itself, so it can carry markers along the track
+// (a month, a letter, a size step) and a label beside the thumb. It is the only
+// one on screen: the gallery scrolls inside its own element, where the native
+// bar can be hidden.
+
 import { createSignal, createEffect, on, onMount, onCleanup, Show, For } from "solid-js";
 import { markScrollBarActive, markScrollBarReleased } from "../../lib/scrollDynamics";
 import { adjustmentTotal, scrollHost } from "../../lib/scrollHost";

@@ -7,17 +7,28 @@
 //!
 //! # The namespace is a parameter, not a parallel family
 //!
-//! Every tag-write operation was user-hardcoded: add, remove, the batch forms,
-//! rename, merge, delete. "The tag-write commands apply unchanged" for sets was
-//! therefore wrong. Each takes a [`WritableNamespace`] instead, which accepts
-//! `user` or `set` **and nothing else** — a plugin bucket is replaced wholesale
-//! by its own run, so writing into one through this path would be a second
-//! writer for something with a single owner.
+//! Every tag-write operation — add, remove, the batch forms, rename, merge,
+//! delete — takes a [`WritableNamespace`], which accepts `user` or `set` **and
+//! nothing else**. A plugin bucket is replaced wholesale by its own run, so
+//! writing into one through this path would be a second writer for something
+//! with a single owner; the type has no variant for it, so such a request fails
+//! to deserialize rather than reaching a check.
 //!
-//! That one parameter is the entire surface sets need: create is a batch add
-//! over a selection, rename is `rename`, merging two clusters is `merge`,
-//! delete is `delete`, and the tag manager lists both namespaces instead of
-//! one. No new file, no new table, no new wire format, no new filter syntax.
+//! # A set is a tag
+//!
+//! Set membership is one `set::` tag per member: a burst that is not forty
+//! duplicates (`set::vacation-burst-3`), a work that exists as several images
+//! (`set::kellys-comic`), a face cluster once someone has named it
+//! (`set::alice`). The namespace parameter is the entire surface sets need:
+//! create is a batch add over a selection, rename is `rename`, merging two
+//! clusters is `merge`, delete is `delete`, and the tag manager lists both
+//! namespaces. No new file, no new table, no new wire format, no new filter
+//! syntax — and a set is reconstructable from companions because it *is*
+//! companion content.
+//!
+//! **A set has no order of its own.** Its members appear in the gallery's sort,
+//! because a comic's pages are already `page01.jpg`, `page02.jpg`; an ordinal
+//! per member would be a second thing to keep in step with the filename.
 //!
 //! **Sets are cheap and fluid, deliberately.** Renaming one rewrites every
 //! member's sidecar; trashing a member shrinks it silently. A set is not a
@@ -45,6 +56,7 @@ pub enum WritableNamespace {
 }
 
 impl WritableNamespace {
+    /// The namespace as the companion and the filter language spell it.
     pub fn as_str(self) -> &'static str {
         match self {
             WritableNamespace::User => "user",
@@ -52,6 +64,7 @@ impl WritableNamespace {
         }
     }
 
+    /// The companion's tag list for this namespace.
     fn field(self, companion: &mut CompanionFile) -> &mut Vec<String> {
         match self {
             WritableNamespace::User => &mut companion.tags.user,
@@ -396,6 +409,7 @@ async fn members_of(
     Ok(index::paths_with_tag(&conn, namespace.as_str(), tag)?)
 }
 
+/// The media type a path's extension implies; an unknown extension is an image.
 fn media_type_for(path: &RelPath) -> MediaType {
     std::path::Path::new(path.as_str())
         .extension()

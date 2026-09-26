@@ -34,6 +34,7 @@ struct Cache {
     counter: u64,
 }
 
+/// The process-wide transcode cache, created on first use.
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE.get_or_init(|| {
@@ -44,6 +45,8 @@ fn cache() -> &'static Mutex<Cache> {
     })
 }
 
+/// The file's modification time, which with the path is the cache key — so an
+/// edited file is a miss.
 fn mtime_of(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
@@ -60,6 +63,8 @@ fn lookup(path: &str) -> Option<Vec<u8>> {
     Some(entry.jpeg.clone())
 }
 
+/// Cache a transcode under `(path, mtime)`, evicting the least recently stored
+/// entry when full. A file whose mtime cannot be read is not cached.
 fn store(path: &str, jpeg: Vec<u8>) {
     let Some(mtime) = mtime_of(path) else { return };
     let Ok(mut c) = cache().lock() else { return };

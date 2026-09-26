@@ -30,6 +30,8 @@ const IDLE_HIDE_MS = 3000;
  *  pointermove, so drags are throttled and the release always seeks. */
 const SEEK_THROTTLE_MS = 150;
 
+/** Seconds as "m:ss", or "h:mm:ss" past an hour; "0:00" for anything
+ *  unplayable. */
 function formatTime(s: number): string {
   if (!isFinite(s) || s < 0) return "0:00";
   const t = Math.floor(s);
@@ -41,6 +43,7 @@ function formatTime(s: number): string {
     : `${m}:${String(sec).padStart(2, "0")}`;
 }
 
+/** Play one video, starting muted if asked. */
 export function VideoPlayer(props: VideoPlayerProps) {
   let videoRef: HTMLVideoElement | undefined;
   let barRef: HTMLDivElement | undefined;
@@ -322,6 +325,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
   );
 }
 
+/** The unmuted speaker. */
 function VolumeIcon(props: { size: number }) {
   return (
     <svg width={props.size} height={props.size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -331,6 +335,7 @@ function VolumeIcon(props: { size: number }) {
   );
 }
 
+/** The muted speaker. */
 function MutedIcon(props: { size: number }) {
   return (
     <svg width={props.size} height={props.size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

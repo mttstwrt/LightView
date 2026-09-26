@@ -119,6 +119,8 @@ pub fn compute_groups(items: &[SortedItem], group_by: &GroupBy) -> Vec<GroupHead
 /// as comparing labels did.
 type PeriodKey = Option<(i32, u32, u32)>;
 
+/// The day, month or year `ts` falls in, as a comparable key; `None` when there
+/// is no representable timestamp.
 fn period_key(ts: Option<i64>, granularity: &Granularity) -> PeriodKey {
     use chrono::Datelike;
     let d = chrono::DateTime::from_timestamp(ts?, 0)?;
@@ -129,6 +131,8 @@ fn period_key(ts: Option<i64>, granularity: &Granularity) -> PeriodKey {
     })
 }
 
+/// The header text for `ts`'s period — "March 4, 2024", "March 2024" or "2024"
+/// — or "Unknown date".
 fn period_label(ts: Option<i64>, granularity: &Granularity) -> String {
     let Some(d) = ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)) else {
         return "Unknown date".to_string();
@@ -185,6 +189,8 @@ fn group_by_time(items: &[SortedItem], granularity: &Granularity) -> Vec<GroupHe
     groups
 }
 
+/// The header text for a media type, pluralized; an unknown type is shown
+/// as-is.
 fn format_media_type(t: &str) -> String {
     match t {
         "image" => "Images".to_string(),

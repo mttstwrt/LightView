@@ -33,6 +33,8 @@ export function hasTouch(): boolean {
   return cachedTouch;
 }
 
+/** Whether this is a phone-sized touch device: narrow *and* touch-capable, so a
+ *  narrow desktop window is not one. */
 function detectMobile(): boolean {
   return (
     typeof window !== "undefined" &&

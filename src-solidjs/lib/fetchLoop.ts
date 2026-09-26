@@ -1,11 +1,8 @@
 // ---------------------------------------------------------------------------
-// The grids' thumbnail fetch loop: two single-flight slots and the order in
-// which one pass through them runs.
-//
-// Every view that streams thumbnails wants the same schedule — evict what has
-// scrolled away, serve the cells the user is looking at, and only then
-// speculate. What differs between views is *what* each step does, so those
-// arrive as callbacks.
+// The grid's thumbnail fetch loop: two single-flight slots and the order in
+// which one pass through them runs — evict what has scrolled away, serve the
+// cells the user is looking at, and only then speculate. What each step does
+// arrives as a callback from the grid.
 //
 // The two slots are not one slot, and that is load-bearing. `inFlightFetch`
 // carries the drain of cells that are on screen right now and showing nothing;
@@ -13,13 +10,11 @@
 // blocked the visible drain for its whole duration, and a pass bails on its
 // first line when the slot is busy — so one 64-image precache of large photos
 // stalled *every* subsequent generation request for as long as it ran.
-// Measured in GalleryGrid on a 600-photo 12 MP gallery: a single background
-// batch issued a second after load held the slot for the entire session, and
-// cells the user scrolled to took 30 s to appear, left to the /thumb route's
-// one-at-a-time generate-on-miss behind that same batch. In JustifiedGrid,
-// where a speculative batch at mid/high detail is 1280/2560px decodes,
-// scrolling to a fresh row and waiting ten seconds for five images was the
-// *expected* behaviour whenever a warm happened to be in flight.
+// Measured on a 600-photo 12 MP gallery: a single background batch issued a
+// second after load held a shared slot for the entire session, and cells the
+// user scrolled to took 30 s to appear. At mid and high detail a speculative
+// batch is 1280/2560px decodes, so a fresh row waited ten seconds for five
+// images whenever a warm happened to be in flight.
 //
 // Speculation is deliberately not re-armed on completion (see `poke`), because
 // it is not free: landing-zone warms, look-ahead precache and background
@@ -82,10 +77,9 @@ export function createFetchLoop(opts: {
    * Issue one batch for cells that are on screen and showing nothing, via
    * `fetch`. Returns true if a batch went out.
    *
-   * This runs less often than the name suggests. Both `lightview://thumb` and
-   * `GET /thumb` go through `thumb_serve::get_or_generate`, which generates a
+   * This runs less often than the name suggests. `GET /thumb` generates a
    * missing thumbnail inside the request and only 404s once generation has
-   * actually failed — so the grids' 404-fed queue is a *recovery* path, not
+   * actually failed — so the grid's 404-fed queue is a *recovery* path, not
    * how a cold gallery fills. Measured over a cold 1200-image gallery in
    * Chromium: 880 thumbnail responses, none of them a 404.
    */

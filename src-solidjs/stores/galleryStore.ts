@@ -171,6 +171,12 @@ export async function refresh(next?: Partial<Query>) {
 
 /** Apply one server event.
  *
+ *  **A change applies at once, wherever it came from.** An item that stops
+ *  matching the filter disappears rather than lingering until the view is
+ *  re-run: the gallery has one owner, and a change they made on another device
+ *  is one they expect to see. Keeping the reader's place across it is the
+ *  grid's job, not the store's.
+ *
  *  **A filesystem change sends what changed, not everything.** Re-fetching the
  *  whole sorted list on any addition cost every connected client a
  *  full-library payload per phone upload — and dropped the active filter on
@@ -290,6 +296,7 @@ export function toggleSelection(path: string) {
   });
 }
 
+/** Deselect everything, staying in whatever selection mode is current. */
 export function clearSelection() {
   setSelectedPaths(new Set<string>());
 }
@@ -301,11 +308,13 @@ export function exitSelectionMode() {
   clearSelection();
 }
 
+/** Enter multi-select mode, or leave it and drop the selection. */
 export function toggleSelectionMode() {
   if (selectionMode()) exitSelectionMode();
   else setSelectionMode(true);
 }
 
+/** Select exactly `paths`. */
 export function selectAll(paths: string[]) {
   setSelectedPaths(new Set<string>(paths));
 }

@@ -10,12 +10,13 @@
 //!   A faster per-pixel decoder that lacks scaling is a net *loss* on camera
 //!   JPEGs, because it would decode sixteen times the pixels.
 //! * HEIC prefers an embedded thumbnail handle over decoding the full image.
-//! * Micro is derived from cached Standard bytes rather than from the original;
-//!   the derivation is in `commands::media`, but this is where the primitives
-//!   for it live.
 //!
-//! `docs/pipeline/jpeg-decode.md` has the measurements and the options that
-//! were rejected.
+//! Measured on the `thumbnailer` bench: a 4000×3000 JPEG to 512px is ~20 ms, of
+//! which ~16 ms is the decode. The one faster option that keeps DCT scaling is
+//! libjpeg-turbo, estimated at 2–4× on this path and not taken: it is a C build
+//! dependency, and the win has to be measured on real photos before it is
+//! worth that. DCT scaling cannot skip the entropy decode of the full stream, so
+//! no decoder makes this ten times faster.
 //!
 //! Source files are memory-mapped rather than read into a buffer, so a decoder
 //! that only touches part of the stream only faults in that part.
@@ -48,6 +49,7 @@ pub enum ResizeFilter {
 }
 
 impl ResizeFilter {
+    /// The filter's name as the settings and the wire spell it.
     pub fn as_str(self) -> &'static str {
         match self {
             ResizeFilter::Nearest => "nearest",
@@ -56,6 +58,7 @@ impl ResizeFilter {
         }
     }
 
+    /// The `fast_image_resize` algorithm that implements this filter.
     fn to_fir_alg(self) -> fir::ResizeAlg {
         match self {
             ResizeFilter::Nearest => fir::ResizeAlg::Nearest,
@@ -480,6 +483,12 @@ fn decode_jpeg_to_rgba(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u
     }
 }
 
+/// Decode a JPEG to RGBA at the smallest DCT scale (1/1 to 1/8) whose long edge
+/// still covers `target_edge`, returning the pixels, their size, and the
+/// source's full size.
+///
+/// This is the reason `jpeg-decoder` is the JPEG path: scaling inside the
+/// decode is what keeps a camera JPEG from costing sixteen times the pixels.
 fn decode_jpeg_to_rgba_inner(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
     let mmap = mmap_file(path)?;
     let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&mmap[..]));
@@ -574,6 +583,8 @@ pub fn decode_heic_natural(path: &Path) -> Result<HeicDecode, ThumbError> {
 }
 
 
+/// Flatten a HEIC decode into the `(rgba, width, height, src_width,
+/// src_height)` shape every decoder returns, expanding RGB to RGBA.
 fn into_rgba_tuple(dec: HeicDecode) -> (Vec<u8>, u32, u32, u32, u32) {
     let HeicDecode { pixels, width, height, src_width, src_height } = dec;
     let rgba = match pixels {
@@ -588,9 +599,14 @@ fn into_rgba_tuple(dec: HeicDecode) -> (Vec<u8>, u32, u32, u32, u32) {
 /// **Why this exists at all:** the grid lays out by aspect ratio, and until a
 /// file has dimensions it is drawn as a 1:1 square and corrected when its
 /// thumbnail loads — which recomputes the whole justified layout and moves
-/// every row below it. Dimensions used to arrive only as a side effect of
-/// [`crate::pipeline::serve`] decoding a frame, so a file nobody had scrolled
-/// to had no shape. This is the cheap way to know it at index time instead.
+/// every row below it. Without a header read at index time, a file nobody has
+/// scrolled to has no shape until [`crate::pipeline::serve`] decodes a frame.
+///
+/// The `image` crate first, then a libheif handle; neither decodes a pixel.
+/// The libheif half is not optional — a library that is entirely HEIC is the
+/// case this was written for. libheif applies `irot`/`imir` to a handle's
+/// width and height (since 1.16; this project requires 1.21), so the numbers
+/// are *display* dimensions and agree with what the decode path reports.
 ///
 /// `None` for anything neither reader parses — RAW, and video, which has its
 /// own probe. "Don't know" must degrade to the placeholder the grid already
@@ -619,6 +635,7 @@ fn heic_dimensions(path: &Path) -> Option<(u32, u32)> {
     Some((primary.width(), primary.height()))
 }
 
+/// Open a HEIC/HEIF/AVIF file and decode it; see [`decode_heic_from_ctx`].
 fn decode_heic_internal(
     path: &Path,
     target_edge: Option<u32>,
@@ -628,6 +645,9 @@ fn decode_heic_internal(
     decode_heic_from_ctx(&ctx, target_edge)
 }
 
+/// Decode the primary image of an open HEIF container, preferring an embedded
+/// thumbnail handle that [`pick_thumbnail_handle`] judges large enough for
+/// `target_edge`. `src_width`/`src_height` are always the primary's.
 fn decode_heic_from_ctx(
     ctx: &libheif_rs::HeifContext,
     target_edge: Option<u32>,

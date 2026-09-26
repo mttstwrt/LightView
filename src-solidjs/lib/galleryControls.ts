@@ -1,9 +1,7 @@
-// Shared gallery input controls. GalleryGrid (uniform grid) and JustifiedGrid
-// (aspect-preserving rows) render differently but should behave identically
-// under the pointer, so the input handling lives here once instead of being
-// copy-pasted into each. The bespoke *layout/streaming* logic stays in the
-// components; this module only owns the interaction state machines that don't
-// depend on how cells are placed.
+// The grid's pointer interaction: drag-select, click handling, and edge-scroll
+// while dragging. These are state machines that do not depend on how cells are
+// placed, so they live apart from the layout and streaming logic, which stays
+// in the component.
 
 import { createSignal, createEffect, onMount, onCleanup } from "solid-js";
 import { scrollToY, scrollTop, viewportHeight } from "./scrollHost";
@@ -12,7 +10,7 @@ import { scrollToY, scrollTop, viewportHeight } from "./scrollHost";
 // Selection: Ctrl/Cmd-drag range select + click-to-open / click-to-toggle.
 // -------------------------------------------------------------------------
 
-/** The selection-related props both grids already accept, in one shape. */
+/** The selection-related props the grid accepts, in one shape. */
 export interface SelectionControlProps {
   paths: string[];
   selectedPaths: Set<string>;
@@ -41,6 +39,9 @@ export interface DragSelectControls {
   handleBackgroundClick: (e: MouseEvent) => void;
 }
 
+/** Selection by pointer: Ctrl/Cmd-drag selects a range (added to the existing
+ *  selection), a click toggles, clears or opens, and the click that ends a drag
+ *  is swallowed. */
 export function createDragSelect(props: SelectionControlProps): DragSelectControls {
   const [isDragging, setIsDragging] = createSignal(false);
   const [dragStartIndex, setDragStartIndex] = createSignal(-1);

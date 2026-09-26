@@ -57,6 +57,7 @@ pub struct ThumbGenCoalescer {
 }
 
 impl ThumbGenCoalescer {
+    /// An empty coalescer: no slot held, no waiters.
     pub fn new() -> Self {
         Self::default()
     }
@@ -76,6 +77,8 @@ impl ThumbGenCoalescer {
         }
     }
 
+    /// Free `key`'s slot and wake everyone waiting on it. Called by the guard's
+    /// drop, so a cancelled generator releases too.
     fn release(&self, key: &ThumbKey) {
         let mut map = self.inner.lock().expect("coalescer mutex poisoned");
         if let Some(notify) = map.remove(key) {

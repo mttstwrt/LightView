@@ -1,3 +1,8 @@
+// The search box: the query text with autocomplete on the token being typed,
+// and the rating control beside it. On a phone the stars collapse into one
+// button with a popover, and the bar can open its lists upward from a bottom
+// sheet.
+
 import { createSignal, For, Show, onMount, onCleanup } from "solid-js";
 import { isMobile } from "../../lib/runtime";
 import {
@@ -23,6 +28,8 @@ interface FilterBarProps {
   onSubmit?: () => void;
 }
 
+/** The filter input. Enter applies the query; the autocomplete lookup for the
+ *  token being typed is debounced. */
 export function FilterBar(props: FilterBarProps) {
   let inputRef: HTMLInputElement | undefined;
   let debounceTimer: number | undefined;

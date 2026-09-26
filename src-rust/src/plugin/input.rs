@@ -4,8 +4,8 @@
 //! one request; a clip becomes `video_frames` stills sampled across it, sent as
 //! ordinary requests and merged afterwards. Every executor shares this
 //! machinery, so a plugin cannot behave differently depending on where it ran —
-//! and a plugin author never writes frame extraction, which is where the three
-//! bundled taggers each had their own slightly different version.
+//! and a plugin author never writes frame extraction, which is where the
+//! original taggers each had their own slightly different version.
 //!
 //! **Input is quantized up to a cached tier edge.** A plugin declares the
 //! longest edge it wants and the host serves the smallest tier at least that
@@ -15,8 +15,8 @@
 //!
 //! The payoff is conditional and the condition is worth stating where a plugin
 //! author will read it: **a plugin declaring an edge above the warmed tier pays
-//! one generation per image.** The idle worker warms `j` (512), which is why
-//! the bundled manifests declare 512. If a tagger genuinely needs `jm`, the
+//! one generation per image.** The idle worker warms `j` (512), which is why a
+//! tagger should declare 512. If a tagger genuinely needs `jm`, the
 //! answer is to warm `jm` for that gallery, not to absorb the decode silently.
 
 use std::collections::HashMap;

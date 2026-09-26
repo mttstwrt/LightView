@@ -13,6 +13,10 @@
 //! | `jm` | 1280 | LRU     | the viewer's progressive underlay |
 //! | `jh` | 2560 | LRU     | high zoom |
 //!
+//! The small tiers are unbounded because every cell needs one and evicting
+//! them means regenerating them on the next scroll; the large ones are bounded
+//! because they exist only for what a person actually zoomed into.
+//!
 //! `js` exists because three panels — the tag manager, the duplicates panel and
 //! the merge dialog — render up to 120 thumbnails in an 88px grid. At 512px
 //! that is ~84 MB of decoded bitmaps instead of ~7.9 MB, roughly 34× the pixels
@@ -65,6 +69,7 @@ impl ThumbTier {
         }
     }
 
+    /// The SQLite table holding this tier.
     pub fn table(self) -> &'static str {
         match self {
             ThumbTier::Js => "thumbs_js",
@@ -80,6 +85,7 @@ impl ThumbTier {
         matches!(self, ThumbTier::Jm | ThumbTier::Jh)
     }
 
+    /// The tier a `/thumb/{tier}/…` URL segment names, if any.
     pub fn from_segment(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|t| t.segment() == s)
     }
@@ -219,6 +225,7 @@ pub fn enforce_budget(
     Ok(conn.execute(&sql, [budget_bytes])?)
 }
 
+/// Seconds since the Unix epoch; zero if the clock is before it.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -237,7 +244,7 @@ mod tests {
         assert_eq!(ThumbTier::smallest_at_least(128), Some(ThumbTier::Js));
         assert_eq!(ThumbTier::smallest_at_least(129), Some(ThumbTier::J));
         assert_eq!(ThumbTier::smallest_at_least(512), Some(ThumbTier::J));
-        // The bundled taggers declare 512 for exactly this reason: 1024 rounds
+        // Taggers declare 512 for exactly this reason: 1024 rounds
         // up to `jm`, which is a full generation per image on the server.
         assert_eq!(ThumbTier::smallest_at_least(1024), Some(ThumbTier::Jm));
         assert_eq!(ThumbTier::smallest_at_least(2560), Some(ThumbTier::Jh));

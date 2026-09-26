@@ -16,7 +16,7 @@
 # post-install script.
 
 pkgname=lightview
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="A fast, plugin-extensible media gallery"
 arch=('x86_64')
@@ -46,6 +46,11 @@ build() {
   cd "$startdir"
   npm ci
   npm run build
+  # `--locked`, because Cargo.lock is committed and this build starts from a
+  # clean checkout: without it every dependency is re-resolved, and a
+  # semver-compatible upstream release could break the build with no change
+  # here and nothing in git to bisect. With it, a lock file that has drifted
+  # from Cargo.toml is a build error rather than a quiet re-resolution.
   cargo build --release --manifest-path src-rust/Cargo.toml --locked
 }
 

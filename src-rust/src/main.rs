@@ -4,6 +4,8 @@
 //! Keeping this file thin is what makes "one binary, three modes" a statement
 //! about the command line rather than about the architecture.
 
+/// Start logging (warnings only unless `RUST_LOG` says otherwise) and an async
+/// runtime, then hand the command line to [`lightview::cli::run`].
 fn main() -> std::process::ExitCode {
     // `RUST_LOG` if set, otherwise warnings only: a gallery open logs nothing
     // on a healthy run, so anything that does appear is worth reading.

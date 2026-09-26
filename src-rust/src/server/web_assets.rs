@@ -9,7 +9,12 @@
 //! exception.
 //!
 //! In a debug build `rust-embed` reads from disk, so a frontend rebuild takes
-//! effect without recompiling the Rust.
+//! effect without recompiling the Rust. A release build embeds the bytes, so an
+//! *incremental* release build after a frontend-only change can embed the
+//! previous bundle — Vite's hashed filenames are invented after cargo has
+//! decided what to rebuild. Nothing ships that way: the container image,
+//! `PKGBUILD` and the release workflow all build from a clean checkout, which
+//! is a cheaper guarantee than teaching cargo about `dist/`.
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -50,6 +55,7 @@ pub async fn serve(uri: axum::http::Uri) -> Response {
     }
 }
 
+/// A 200 carrying `body` as `mime`, cached forever unless it is the shell.
 fn respond(path: &str, mime: &str, body: Vec<u8>) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(

@@ -46,6 +46,9 @@ async function redeemLaunch(): Promise<void> {
   await redeemLaunchToken(token).catch(() => false);
 }
 
+/** Mount the right app: the pairing page on `/pair`, which needs no credential;
+ *  otherwise redeem the launch token, learn the bind's auth status, then mount
+ *  `App`. */
 async function boot() {
   const root = document.getElementById("root")!;
 

@@ -11,31 +11,23 @@ import {
 } from "./scrollHost";
 
 // ---------------------------------------------------------------------------
-// Shared scroll dynamics for the virtualized grid views.
+// Scroll dynamics for the grid: velocity, direction, and whether the view is
+// settled or warping.
 //
-// Owns the scroll listener on the gallery's scroll host (rAF-coalesced),
-// velocity/direction
-// tracking, and the WebKitGTK decode gate. Extracted from GalleryGrid /
-// JustifiedGrid so both share one implementation and one set of tuning
-// constants (same pattern as galleryControls.ts).
-//
-// The decode gate is gone with WebKitGTK. It existed because that engine
-// decoded images on the webview's main thread, so assigning a wall of new <img>
-// srcs mid-scroll buried the thread; its own contract said it was "always false
-// outside WebKitGTK", and outside is now everywhere. Browsers decode async off
-// the main thread, so new cells load while the scroll is still moving — which
-// is what keeps the virtual-scroll buffer useful on touch flings.
-//
-// `settled` and `warping` are *not* that gate and stay: they are about how many
-// cells are turning over, not about the cost of decoding one, and they are what
-// stop a scrub from assigning a source to every cell it flies past.
+// Owns the scroll listener on the gallery's scroll host (rAF-coalesced), and
+// the tuning constants every decision about "is the user flinging?" reads.
+// There is no decode gate: browsers decode off the main thread, so new cells
+// load while a scroll is still moving, which is what keeps the virtual-scroll
+// buffer useful on touch flings. `settled` and `warping` are about how many
+// cells are turning over, not about the cost of decoding one, and they are
+// what stop a scrub from assigning a source to every cell it flies past.
 // ---------------------------------------------------------------------------
 
 // A scroll frame older than this means scrolling has stopped — velocity()
 // reads 0 rather than the stale last-frame value.
 const VELOCITY_STALE_MS = 150;
 // Scroll speed (viewport-heights per second) above which newly revealed cells
-// are treated as pass-through: the grids give them the cheap rung (tiny tier)
+// are treated as pass-through: the grid gives them the cheap rung (tiny tier)
 // and upgrade to the target tier once scrolling settles. Wheel scrolling sits
 // well under this; touch flings and scrollbar drags exceed it.
 const FLING_VIEWPORTS_PER_SEC = 1.5;
@@ -45,7 +37,7 @@ const SETTLE_DEBOUNCE_MS = 150;
 // A single scroll frame moving more than this many viewports is a jump — the
 // user warped (scrollbar tap/drag, scroll-to-index) rather than scrolled.
 const JUMP_VIEWPORTS = 2;
-// Sustained scroll rate (viewport-heights per second) past which the grids stop
+// Sustained scroll rate (viewport-heights per second) past which the grid stops
 // giving new cells an <img> at all until it drops.
 //
 // This is not a fling. iOS lets you press and hold the system scroll indicator
@@ -105,7 +97,7 @@ const FLING_PROJECTION_S = 0.35;
  * True when the browser reports a constrained network: Save-Data enabled or a
  * 2g-class effective connection. Progressive — Safari lacks
  * `navigator.connection`, so this is false there and nothing changes. While
- * constrained, the grids hold cells at the cheap rung (skip tier upgrades)
+ * constrained, the grid holds cells at the cheap rung (skip tier upgrades)
  * and `bufferAheadRows` stops deepening the prefetch window, both of which
  * would spend the user's data budget on speculation.
  */
@@ -207,6 +199,9 @@ export interface ScrollDynamics {
   dispose: () => void;
 }
 
+/** Attach to the scroll host and track velocity, direction, and whether the
+ *  view is settled or warping, calling `onFrame` once per animation frame while
+ *  it scrolls. */
 export function createScrollDynamics(opts: {
   /** Current row pitch (px) — converts px/s into rows/s. */
   rowHeight: () => number;
@@ -260,11 +255,11 @@ export function createScrollDynamics(opts: {
     // Scrolling has stopped — collapse the tracked velocity to 0 immediately.
     // Without this, `velocity()` keeps reporting the last fling speed for up to
     // VELOCITY_STALE_MS after the final scroll frame. `scrollend` (which calls
-    // this) routinely fires inside that window, so the grids' scheduleFetch
+    // this) routinely fires inside that window, so the grid's scheduleFetch
     // would take the `velocity() > VELOCITY_FAST` fling branch — warming a
     // *projected* landing zone instead of generating thumbnails for the viewport
-    // the fling actually landed on. That left hard flicks with blank/late cells
-    // until the next 500ms poll or a manual scroll (docs/decisions/0007-two-zone-render-window.md).
+    // the fling actually landed on, leaving a hard flick's cells blank until the
+    // next 500ms poll or a manual scroll.
     vel = 0;
     // `warping` is deliberately NOT cleared here. Its own timer owns it, and
     // this function is not the reliable "scrolling stopped" signal it looks

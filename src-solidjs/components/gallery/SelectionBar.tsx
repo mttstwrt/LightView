@@ -1,3 +1,6 @@
+// The bar shown while files are selected: tag them, rate them, select all, or
+// clear.
+
 import { Show, For, createSignal } from "solid-js";
 import { api } from "../../lib/ipc";
 import { isMobile } from "../../lib/runtime";
@@ -12,6 +15,9 @@ interface SelectionBarProps {
   onClear: () => void;
 }
 
+/** The bar for the current selection. In mobile select mode it also shows with
+ *  nothing selected, and "Clear" reads "Done", because it is what leaves the
+ *  mode. */
 export function SelectionBar(props: SelectionBarProps) {
   const [tagInput, setTagInput] = createSignal("");
   const [busy, setBusy] = createSignal(false);

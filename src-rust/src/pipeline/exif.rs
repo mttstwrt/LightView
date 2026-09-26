@@ -131,6 +131,8 @@ fn dms_to_decimal(value: &Value) -> Option<f64> {
     Some(d + m / 60.0 + s / 3600.0)
 }
 
+/// The `idx`th component of a (signed) rational EXIF value as a float; `None`
+/// for any other value kind.
 fn rational_at(value: &Value, idx: usize) -> Option<f64> {
     match value {
         Value::Rational(v) => v.get(idx).map(|r| r.to_f64()),
@@ -154,6 +156,9 @@ fn apply_hemisphere(magnitude: f64, ref_value: &Value, negative_ref: u8) -> f64 
     }
 }
 
+/// Whether a coordinate is on the globe and is not the `0,0` a camera writes
+/// when it had no GPS lock — which is treated as missing, not as the Gulf of
+/// Guinea.
 fn is_plausible(lat: f64, lon: f64) -> bool {
     lat.is_finite()
         && lon.is_finite()

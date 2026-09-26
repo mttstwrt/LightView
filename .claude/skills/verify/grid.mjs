@@ -69,12 +69,13 @@ for (let i = 0; i < COUNT; i++) {
 }
 ok(`gallery built (${COUNT} files)`);
 
-// Install the bundled example tagger into this run's state directory, so the
-// plugin path is exercised from the UI as well as from `lightview tag`.
-// `--data-dir <root>` maps the three XDG roots to `<root>/{cache,data,config}`.
+// Install the fixture tagger beside this script into this run's state
+// directory, so the plugin path is exercised from the UI as well as from
+// `lightview tag`. `--data-dir <root>` maps the three XDG roots to
+// `<root>/{cache,data,config}`.
 const installRoot = join(state, "data", "plugins");
 execFileSync("mkdir", ["-p", installRoot]);
-execFileSync("cp", ["-r", join(repo, "plugins", "example-auto-tagger"), installRoot]);
+execFileSync("cp", ["-r", join(dirname(fileURLToPath(import.meta.url)), "example-auto-tagger"), installRoot]);
 ok("example tagger installed");
 
 // ---------------------------------------------------------------------------

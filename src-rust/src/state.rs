@@ -45,6 +45,7 @@ pub struct Gallery {
 }
 
 impl Gallery {
+    /// A snapshot of the gallery's settings as last loaded.
     pub fn settings(&self) -> GallerySettings {
         self.settings
             .read()
@@ -52,6 +53,8 @@ impl Gallery {
             .clone()
     }
 
+    /// Replace the gallery's settings, after a command writes `settings.toml`
+    /// or the watcher sees it change.
     pub fn set_settings(&self, next: GallerySettings) {
         *self.settings.write().expect("gallery settings poisoned") = next;
     }
@@ -120,6 +123,9 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Application state for one bind: no devices, no launch session and no
+    /// origin until the caller sets the ones its mode uses, and the readiness
+    /// gate closed.
     pub fn new(
         gallery: Arc<Gallery>,
         trust: Trust,
@@ -139,6 +145,7 @@ impl AppState {
         }
     }
 
+    /// Whether the readiness gate is open.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -173,6 +180,9 @@ pub struct Capabilities {
 }
 
 impl AppState {
+    /// What this client may do, for the UI to hide the rest: the trust level,
+    /// whether uploads are enabled, and whether the clipboard works — which
+    /// needs `Owner` and a working backend.
     pub fn capabilities(&self) -> Capabilities {
         Capabilities {
             trust: self.trust,

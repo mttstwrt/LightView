@@ -78,6 +78,8 @@ impl Default for AutocompleteEngine {
 }
 
 impl AutocompleteEngine {
+    /// An engine with an empty vocabulary; nothing is suggested until the first
+    /// refresh.
     pub fn new() -> Self {
         Self {
             tags: Arc::new(RwLock::new(Vec::new())),

@@ -21,6 +21,8 @@ export function ewmaImageLoadMs(): number {
   return ewma;
 }
 
+/** Fold one measured image load into the running average; the first sample
+ *  seeds it. */
 export function recordImageLoad(durationMs: number) {
   // Seed with the first sample so the estimate doesn't crawl up from 0.
   ewma = ewma === 0 ? durationMs : ewma + ALPHA * (durationMs - ewma);

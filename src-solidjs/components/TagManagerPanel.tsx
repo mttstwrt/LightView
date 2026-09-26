@@ -1,3 +1,6 @@
+// The tag manager: rename, merge and delete `user` and `set` tags across the
+// whole gallery. The rules it keeps are on `TagManagerPanel` below.
+
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { api, thumbUrl } from "../lib/ipc";
 import type { WritableNamespace } from "../lib/types";

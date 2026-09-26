@@ -46,6 +46,8 @@ type SubMenu = "tag" | "rating" | "color" | "openWith" | "plugins" | null;
 /** Which transfer the picker is open for, or null when it is closed. */
 type Transfer = { kind: "copy" | "move"; paths: string[] } | null;
 
+/** The menu for one file or the selection: the actions this client's trust
+ *  allows, with submenus for tags, open-with and copy or move. */
 export function ContextMenu(props: ContextMenuProps) {
   const [subMenu, setSubMenu] = createSignal<SubMenu>(null);
   const [tagInput, setTagInput] = createSignal("");
@@ -538,6 +540,7 @@ export function ContextMenu(props: ContextMenuProps) {
   );
 }
 
+/** One menu row; `danger` colours it as destructive. */
 function MenuItem(props: { label: string; onClick: () => void; danger?: boolean }) {
   return (
     <button
@@ -557,6 +560,7 @@ function MenuItem(props: { label: string; onClick: () => void; danger?: boolean 
   );
 }
 
+/** A separator between groups of rows. */
 function Divider() {
   return <div class="mx-2 border-t border-neutral-700/50" />;
 }

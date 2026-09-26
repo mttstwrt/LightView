@@ -1,7 +1,46 @@
-// The justified grid: aspect-preserving rows, zoomable.
+// The justified grid: aspect-preserving rows, virtualized and zoomable — the
+// one view of the gallery.
 //
-// Shares the loading machine with GalleryGrid (see
-// docs/frontend/grid-loading.md); what differs is policy.
+// Its problem is streaming thumbnails into a virtual scroller fast enough that
+// a fling lands on pictures rather than skeletons, without asking the server
+// for a screenful of full-resolution decodes every frame. The machine that
+// does it, in the order a cell meets it:
+//
+//  1. A virtual range. `recalcRange` reads the scroll host each frame and
+//     updates the row-range signals only when they change, so a scroll pixel
+//     is not a reactive recomputation.
+//  2. Two nested windows (`lib/scrollDynamics`): an outer rendered window at
+//     the cheap rung for deep look-ahead, and an inner full-resolution one.
+//     Both lean ahead of the scroll direction, and the ahead buffer grows by
+//     the rows a scroll covers in one measured image-load round trip
+//     (`lib/loadLatency`), capped so the DOM stays bounded.
+//  3. A resolution ladder (`lib/cellSources`). A cell gets the cheap rung
+//     while outside the inner window or during a fling, and upgrades once it
+//     sits inside with scrolling settled — usually off-screen, so the swap is
+//     never seen.
+//  4. 404-driven generation (`lib/thumbQueue`). A cell points at its tier URL
+//     optimistically; a miss queues generation. This is the recovery path —
+//     the idle worker and the look-ahead are what keep it rare.
+//  5. A bounded fetch loop (`lib/fetchLoop`), woken by a miss rather than
+//     polled, with speculation behind everything the user is waiting on, and
+//     ranked at drain time (`lib/loadPriority`).
+//  6. Landing-zone warming: a fling's destination is predictable, so the base
+//     tier around it is warmed on the server and then in the HTTP cache at low
+//     priority.
+//  7. ThumbHash placeholders (`lib/thumbhashPlaceholder`), inlined in the
+//     items payload, so every cell paints before any request goes out.
+//
+// **A scrub assigns nothing.** While `warping`, the window turns over every
+// frame, so no sources are assigned and no speculation starts; assignment
+// resumes on the frame the scrub slows down. A scrollbar gesture also holds the
+// ahead buffer at its base — a warp reports one enormous velocity and stops
+// dead, which is not the momentum the buffer bets on — and keeps the view
+// unsettled throughout, so a burst of stops costs one upgrade at the end.
+//
+// **Nothing moves except where the reader caused it to move.** A layout change
+// the reader did not make holds one item still — see the anchoring effect —
+// and nothing renders above the rows while they are populated, so a refetch
+// over a drawn grid is silent.
 //
 // Tier selection follows a hysteretic zoom level rather than a pixel size, so
 // small layout changes do not thrash between tiers. At mid and high detail it
@@ -105,6 +144,8 @@ const JH_PRECACHE_ROWS = 6;
 // that is mostly speculative — hence the much smaller high-tier cap.
 const BATCH_SIZE = 96;
 const HIGH_TIER_BATCH = 12;
+/** How many generations one drain may request for `tier`: the base tier is
+ *  cheap enough for a large batch, the high tiers are not. */
 const batchCapFor = (tier: ThumbTier) => (tier === "j" ? BATCH_SIZE : HIGH_TIER_BATCH);
 // Speculative warms (landing zone, background precache) use a much smaller
 // batch than the on-screen drain. Nothing can preempt a batch once it's issued
@@ -116,7 +157,7 @@ const batchCapFor = (tier: ThumbTier) => (tier === "j" ? BATCH_SIZE : HIGH_TIER_
 const SPECULATIVE_BATCH = 16;
 // Scroll velocity (px/s) above which the fetch loop treats the scroll as a
 // fling: near-viewport generation is skipped (cells fly past unseen) and the
-// projected landing zone is warmed instead. Matches GalleryGrid.
+// projected landing zone is warmed instead.
 const VELOCITY_FAST = 3000;
 // Detail levels by zoom. "base" serves the 512px "j" tier. When zoomed in, the
 // view serves the *original file* for cheap native-format images (sharp, no
@@ -132,14 +173,12 @@ const VELOCITY_FAST = 3000;
 // a 194px-wide thumbnail was backed by a 2560px image — around forty times the
 // pixels the screen can show, on the device least able to hold them.
 //
-// The values carry `GalleryGrid`'s TIER_UPSCALE_TOLERANCE, and for the same
-// reason: a tier that has to stretch slightly is barely visible, while stepping
-// up costs four times the memory per cell (measured — see
-// docs/frontend/grid-loading.md). Without it the two grids disagreed about how
-// much softness is acceptable, and this one stepped up the moment a tier was
-// stretched at all: a phone at two columns needs 576 physical px on the long
-// edge and so left the 512px "j" tier for the 1280px "jm" one to cover a 12%
-// gap. The bases are the row heights at which each tier's long edge is exactly
+// The values carry a TIER_UPSCALE_TOLERANCE: a tier that has to stretch
+// slightly is barely visible, while stepping up costs several times the memory
+// per cell (the measurement is on `MAX_DPR_SCALE` in `lib/runtime`). Without
+// it the grid steps up the moment a tier is stretched at all: a phone at two
+// columns needs 576 physical px on the long edge and so would leave the 512px
+// "j" tier for the 1280px "jm" one to cover a 12% gap. The bases are the row heights at which each tier's long edge is exactly
 // covered, assuming the ~1.5 landscape aspect these rows average.
 const TIER_UPSCALE_TOLERANCE = 1.25;
 const MID_UP = 360 * TIER_UPSCALE_TOLERANCE;
@@ -169,17 +208,17 @@ const ROW_HEIGHT_MAX = 600;
 
 type DetailLevel = "base" | "mid" | "high";
 
+/** The grid component; the machine it runs is described at the top of this
+ *  file. */
 export function JustifiedGrid(props: JustifiedGridProps) {
   const gap = () => prefs().grid_gap;
 
   // Aspect ratios recovered from loaded thumbnails, for the paths whose
   // dimensions the index still does not have.
   //
-  // That used to be every newly added file, because dimensions were written
-  // only as a side effect of generating a thumbnail — after the frontend had
-  // already fetched the sorted items. It is not any more: the watcher reads an
-  // image's header before it announces the file. What is left is a cache from
-  // before that change and the formats neither reader can parse, RAW and AVIF.
+  // The watcher reads an image's header before it announces the file, so what
+  // lands here is a cache indexed before headers were read at index time, and
+  // the formats neither backend reader can parse, which is RAW.
   //
   // The j/jm/jh tiers are all aspect-preserving, so a loaded cell's natural
   // pixel size gives the exact source aspect. Without this such cells lay out
@@ -314,7 +353,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   let containerRef: HTMLDivElement | undefined;
 
   // Shared pointer controls: Ctrl/Cmd-drag range select + click handling, and
-  // edge-scroll while dragging. Identical behavior in GalleryGrid.
+  // edge-scroll while dragging.
   const { isDragging, effectiveSelected, handleDragStart, handleDragEnter, handleItemClick, handleBackgroundClick } =
     createDragSelect(props);
   createEdgeScroll(isDragging);
@@ -349,6 +388,8 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   // Holding the reader's place across a relayout
   // -----------------------------------------------------------------------
   //
+  // **Nothing moves except where the reader caused it to move.**
+  //
   // The layout changes for reasons the reader cannot see: a photo arriving or
   // leaving anywhere in the library, a thumbnail decoding and revealing an
   // aspect the index did not have. Left alone, the content under the viewport
@@ -360,8 +401,10 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   //   the reader can see, so an edit on screen closes its own gap from below
   //   and nothing above it moves;
   //
-  //   a scale change — pin the item in the middle, because zoom moves
-  //   everything and the fixed point should be where the eye is.
+  //   a scale change — a zoom, or a width change from a rotation or a resized
+  //   window, which alters the column count the same way — pin the item in the
+  //   middle, because it moves everything and the fixed point should be where
+  //   the eye is.
   //
   // A viewport *height* change is neither. `computeJustifiedLayout` takes no
   // height, so the keyboard opening cannot reach this effect at all, and
@@ -829,7 +872,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   const drainQueued = (): boolean => {
     if (queue.queuedCount() === 0) return false;
 
-    // Drain-time prioritization (mirrors GalleryGrid): full-res window
+    // Drain-time prioritization: full-res window
     // first, then the rendered buffer by distance; leftovers outside the
     // rendered window are dropped and re-queue via 404 if scrolled back.
     const { picked, stale } = pickByPriority(
@@ -1035,7 +1078,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
     };
 
     // Ctrl+wheel zooms (changes the target row height) instead of scrolling.
-    // During a Ctrl+drag selection, fall through to scroll (mirrors GalleryGrid).
+    // During a Ctrl+drag selection, fall through to scroll.
     const detachWheel = createWheelScroll({
       onSettle: () => loop.schedule(),
       onZoomStart: () => {

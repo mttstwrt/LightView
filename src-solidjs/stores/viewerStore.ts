@@ -31,6 +31,8 @@ const VIEW_DWELL_MS = 700;
 
 let dwellTimer: number | null = null;
 
+/** Stop a pending view stamp, because the item left the screen before it
+ *  counted. */
 function cancelDwell() {
   if (dwellTimer !== null) {
     clearTimeout(dwellTimer);
@@ -57,18 +59,21 @@ function trackView(index: number) {
   }, VIEW_DWELL_MS);
 }
 
+/** Open the viewer at `index`, and start the dwell that stamps it viewed. */
 export function openViewer(index: number) {
   setViewerIndex(index);
   setViewerOpen(true);
   trackView(index);
 }
 
+/** Close the viewer and its info panel, cancelling any pending view stamp. */
 export function closeViewer() {
   setViewerOpen(false);
   setInfoPanelOpen(false);
   cancelDwell();
 }
 
+/** Step to the next item, stopping at the last, and start its dwell. */
 export function nextImage(totalCount: number) {
   setViewerIndex((prev) => {
     const next = Math.min(prev + 1, totalCount - 1);
@@ -77,6 +82,7 @@ export function nextImage(totalCount: number) {
   });
 }
 
+/** Step to the previous item, stopping at the first, and start its dwell. */
 export function prevImage() {
   setViewerIndex((prev) => {
     const next = Math.max(prev - 1, 0);
@@ -85,6 +91,7 @@ export function prevImage() {
   });
 }
 
+/** Show or hide the viewer's info panel. */
 export function toggleInfoPanel() {
   setInfoPanelOpen((prev) => !prev);
 }

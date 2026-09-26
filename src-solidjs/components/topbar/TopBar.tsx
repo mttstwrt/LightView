@@ -1,3 +1,9 @@
+// The chrome above the grid. On a desktop, one bar revealed on hover: the
+// filter, the sort, the command list and settings. On a phone, floating buttons
+// over an edge-to-edge grid — search top-left, Select top-right, the command
+// list in the thumb zone — that slide away as you scroll down, with the filter
+// and sort in a bottom sheet.
+
 import { Show, For, createSignal, createEffect, onCleanup, onMount } from "solid-js";
 import { FilterBar } from "./FilterBar";
 import { SortMenu } from "./SortMenu";
@@ -21,6 +27,7 @@ const MOBILE_REVEAL_AT_TOP = 40;
 // Scroll-delta threshold to trigger a direction change (anti-jitter).
 const MOBILE_DIR_THRESHOLD = 6;
 
+/** The top chrome for this device; `commands` is what the command list runs. */
 export function TopBar(props: TopBarProps) {
   const [hoverVisible, setHoverVisible] = createSignal(false);
   // Mobile: track-by-scroll-direction. Bar starts visible.
@@ -239,7 +246,7 @@ export function TopBar(props: TopBarProps) {
           list in the bottom-right thumb zone (rendered below, after the
           sheets). The top row sits below the safe-area inset so it clears the
           notch / dynamic island, and slides away on scroll-down off the
-          scroll-direction `visible()` signal. See docs/frontend/chrome.md. */}
+          scroll-direction `visible()` signal. */}
       <Show when={isMobile()}>
         {/* Search / filter button */}
         <button

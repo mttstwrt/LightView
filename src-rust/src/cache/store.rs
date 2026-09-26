@@ -169,6 +169,7 @@ fn free_bytes(path: &Path) -> Option<u64> {
         .map(|d| d.available_space())
 }
 
+/// The total size of every file under `dir`; unreadable entries count as zero.
 fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0;
     for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
@@ -179,6 +180,8 @@ fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// When a gallery's cache was last opened, from its `last_opened` file; zero —
+/// coldest — when absent or unreadable.
 fn read_last_opened(dir: &Path) -> i64 {
     std::fs::read_to_string(dir.join("last_opened"))
         .ok()

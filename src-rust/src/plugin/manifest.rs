@@ -73,10 +73,12 @@ pub struct Input {
     pub video_frames: u32,
 }
 
+/// The input edge a manifest that does not say gets.
 fn default_max_edge() -> u32 {
     DEFAULT_MAX_EDGE
 }
 
+/// The frames per clip a manifest that does not say gets.
 fn default_video_frames() -> u32 {
     DEFAULT_VIDEO_FRAMES
 }

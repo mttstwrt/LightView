@@ -40,6 +40,7 @@ export function findCellImage(path: string): HTMLImageElement | null {
   return best ?? (imgs.length ? imgs[imgs.length - 1] : null);
 }
 
+/** Whether the user has asked the OS for reduced motion. */
 export function prefersReducedMotion(): boolean {
   return (
     typeof window.matchMedia === "function" &&

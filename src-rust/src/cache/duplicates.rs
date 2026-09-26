@@ -313,6 +313,11 @@ pub fn group(input: &DuplicateInput, threshold: u32) -> Vec<DuplicateGroup> {
 
 /// Intersection of two small sorted lists of interned set ids.
 ///
+/// Ids rather than tag strings because this is the inner loop of the one
+/// quadratic algorithm in the tree, and co-membership is the common case, not
+/// the rare one: a path- or string-keyed probe would build owned strings for
+/// every near-match just to ask the question.
+///
 /// `Vec<Vec<u32>>` rather than a small-vector crate: an empty `Vec` does not
 /// allocate, and the overwhelmingly common case is a file in no set at all.
 fn shares_a_set(a: &[u32], b: &[u32]) -> bool {

@@ -146,6 +146,8 @@ fn tokenize(input: &str) -> Vec<String> {
 
 type ParseResult<'a> = Result<(FilterExpr, &'a [String]), ParseError>;
 
+/// Parse a run of `AND` expressions joined by `OR`, left-associative — the
+/// loosest binding.
 fn parse_or<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     let (mut left, mut rest) = parse_and(tokens)?;
     while !rest.is_empty() && rest[0].eq_ignore_ascii_case("OR") {
@@ -159,6 +161,7 @@ fn parse_or<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     Ok((left, rest))
 }
 
+/// Parse a run of terms joined by `AND`, left-associative.
 fn parse_and<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     let (mut left, mut rest) = parse_not(tokens)?;
     while !rest.is_empty() && rest[0].eq_ignore_ascii_case("AND") {
@@ -172,6 +175,7 @@ fn parse_and<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     Ok((left, rest))
 }
 
+/// Parse one term, negated if it starts with `NOT`.
 fn parse_not<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     if tokens.is_empty() {
         return Err(ParseError::UnexpectedEnd);
@@ -184,6 +188,7 @@ fn parse_not<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     }
 }
 
+/// Parse one term: a parenthesized group, or a single filter or tag token.
 fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     if tokens.is_empty() {
         return Err(ParseError::UnexpectedEnd);
@@ -284,6 +289,7 @@ fn parse_atom<'a>(tokens: &'a [String]) -> ParseResult<'a> {
     ))
 }
 
+/// Parse `rating>=N`, `rating<=N` or `rating=N`.
 fn parse_rating<'a>(token: &str, rest: &'a [String]) -> ParseResult<'a> {
     let (op, val_str) = if let Some(v) = token.strip_prefix("rating>=") {
         (CompareOp::Gte, v)
@@ -427,6 +433,8 @@ fn is_namespace_name(s: &str) -> bool {
     matches!(s, "user" | "set") || s.starts_with("plugin.")
 }
 
+/// The namespace a `ns::` prefix names; anything unrecognised searches every
+/// namespace rather than failing.
 fn parse_namespace(s: &str) -> TagNamespace {
     match s {
         "user" => TagNamespace::User,

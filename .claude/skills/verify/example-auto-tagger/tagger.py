@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Example auto-tagger plugin for LightView.
+The verification fixture: the smallest plugin that conforms to the protocol in
+the README's "Writing a plugin" section. drive.sh and grid.mjs install it to
+exercise the host's plugin path; they read its name, its `example` tag and its
+manifest version, so change those together with the scripts.
 
 Streaming protocol (newline-delimited JSON):
   Stdin:  {"action": "tag", "path": "/abs/path/img.jpg"}\n  ...
   Stdout: {"path": "...", "tags": [...], "meta": {...}}\n   ...
 
-The plugin emits one result per request as each line arrives (never buffer
-until EOF — remote hosts gate further input on results). The host handles
-all companion-file I/O, batching, and index updates.
+One result per request, written as each line arrives. Never buffer until EOF:
+the host releases an in-flight slot only when a result comes back.
 """
 
 import json
