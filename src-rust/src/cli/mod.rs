@@ -62,6 +62,8 @@ pub async fn run() -> std::process::ExitCode {
     }
 }
 
+/// Resolve and create the state directories, then run the one command the
+/// invocation names.
 async fn dispatch(invocation: Invocation) -> Result<std::process::ExitCode, String> {
     let dirs = match &invocation.data_dir {
         Some(root) => Dirs::under(root),
@@ -439,6 +441,9 @@ async fn start(state: &Arc<AppState>, gallery: &Arc<Gallery>) -> Result<(), Stri
     Ok(())
 }
 
+/// Assemble the open gallery around an already-opened database: the thumbnail
+/// pool sized from the hardware, the tier budget, the event channel and the
+/// autocomplete engine.
 fn build_gallery(
     root: Root,
     db: Arc<CacheDb>,
@@ -520,6 +525,8 @@ async fn list_devices(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// `lightview devices revoke <id>`: forget one paired device, and say whether
+/// there was one.
 async fn revoke_device(dirs: &Dirs, id: &str) -> Result<std::process::ExitCode, String> {
     let store = Devices::open(&dirs.devices_db())
         .map_err(|e| format!("could not open devices.db: {e}"))?;
@@ -594,6 +601,8 @@ fn show_cache(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// `lightview cache --prune`: evict least-recently-opened gallery caches down
+/// to the ceiling, sparing none, since no gallery is being opened.
 fn prune_cache(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     let config = load_config(dirs)?;
     let report = store::prune_to_ceiling(&dirs.galleries(), config.cache_ceiling_bytes(), None)
@@ -612,6 +621,7 @@ fn prune_cache(dirs: &Dirs) -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// `server.toml`, or its defaults when there is none.
 fn load_config(dirs: &Dirs) -> Result<ServerConfig, String> {
     ServerConfig::load(&dirs.server_toml()).map_err(|e| e.to_string())
 }

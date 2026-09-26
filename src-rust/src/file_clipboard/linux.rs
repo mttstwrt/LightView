@@ -26,6 +26,8 @@ use x11rb::protocol::xproto::ConnectionExt;
 
 use crate::file_clipboard::{build_uri_list, Error, Op};
 
+/// The process's one clipboard, created on first use and kept: a second one
+/// would replace the first as selection owner before anything pasted.
 fn clipboard() -> Result<&'static Mutex<Clipboard>, Error> {
     static CB: OnceLock<Mutex<Clipboard>> = OnceLock::new();
     if let Some(cb) = CB.get() {
@@ -41,6 +43,8 @@ pub fn available() -> bool {
     clipboard().is_ok()
 }
 
+/// Put `paths` on the `CLIPBOARD` selection as a `text/uri-list`, which a file
+/// manager pastes as files. A cut is written as a copy.
 pub fn write_files(paths: &[&Path], _op: Op) -> Result<(), Error> {
     let payload = build_uri_list(paths);
 

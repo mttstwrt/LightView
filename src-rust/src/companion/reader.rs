@@ -85,6 +85,8 @@ pub fn lock_path(media_path: &Path) -> PathBuf {
     companions_dir(media_path).join(".lock")
 }
 
+/// The companion's file name for a media file: its own name with
+/// `.lightview.json` appended.
 fn companion_file_name(media_path: &Path) -> std::ffi::OsString {
     media_path
         .file_name()

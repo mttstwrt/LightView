@@ -110,14 +110,18 @@ impl Presence {
         Busy(Arc::clone(self))
     }
 
+    /// How many windows are open now.
     pub fn windows(&self) -> usize {
         self.windows.load(Ordering::Relaxed)
     }
 
+    /// Whether any window has ever opened; the watchdog is not armed until one
+    /// has.
     pub fn seen_any(&self) -> bool {
         self.seen_any.load(Ordering::Relaxed)
     }
 
+    /// Whether durable work is in flight right now.
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Relaxed) > 0
     }

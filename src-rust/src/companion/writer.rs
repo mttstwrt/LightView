@@ -53,6 +53,7 @@ pub enum Outcome<T> {
 }
 
 impl<T> Outcome<T> {
+    /// The mutation's result, and whether it asked for a write.
     fn into_inner(self) -> (T, bool) {
         match self {
             Outcome::Write(v) => (v, true),

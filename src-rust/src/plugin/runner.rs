@@ -169,10 +169,12 @@ impl Session {
         })
     }
 
+    /// How many requests are awaiting a result.
     pub fn pending(&self) -> usize {
         self.pending.len()
     }
 
+    /// Whether another request fits in the pending window.
     pub fn has_room(&self) -> bool {
         self.pending.len() < MAX_PENDING
     }

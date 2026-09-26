@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::file_clipboard::{Error, Op};
 
+/// Not implemented on macOS: always an error.
 pub fn write_files(_paths: &[&Path], _op: Op) -> Result<(), Error> {
     Err(Error::Backend(
         "macOS backend not yet implemented".to_string(),

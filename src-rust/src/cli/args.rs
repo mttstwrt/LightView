@@ -78,10 +78,9 @@ pub enum Command {
 pub struct Invocation {
     pub command: Command,
     /// `--data-dir <path>`, which overrides all three XDG roots with
-    /// `<path>/{cache,data,config}`. One line in a compose file replaces the
-    /// volume mount the exe-relative layout needed — and one flag gives a test
-    /// its own private machine, which is what the two-tagging-machines test in
-    /// section 6 needs.
+    /// `<path>/{cache,data,config}`. One flag gives a container one volume and
+    /// a test its own private machine, which the two-tagging-machines test
+    /// needs.
     pub data_dir: Option<PathBuf>,
 }
 
@@ -115,6 +114,8 @@ where
     Ok(Invocation { command, data_dir })
 }
 
+/// Decide which verb `args` names and parse that verb's own arguments; no
+/// arguments at all is a request for help.
 fn parse_command(args: &[String]) -> Result<Command, String> {
     let Some(first) = args.first().map(String::as_str) else {
         return Ok(Command::Help);
@@ -232,6 +233,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
     }
 }
 
+/// `command`, if nothing follows the verb; an error naming the first extra
+/// argument otherwise.
 fn expect_no_more(args: &[String], command: Command) -> Result<Command, String> {
     match args.get(1) {
         None => Ok(command),

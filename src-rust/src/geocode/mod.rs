@@ -117,6 +117,7 @@ fn as_tag(name: &str) -> String {
     name.split_whitespace().collect::<Vec<_>>().join("_")
 }
 
+/// The gazetteer, parsed on first use and never freed.
 fn geocoder() -> &'static ReverseGeocoder {
     static GEOCODER: OnceLock<ReverseGeocoder> = OnceLock::new();
     GEOCODER.get_or_init(ReverseGeocoder::new)

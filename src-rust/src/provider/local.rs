@@ -13,10 +13,12 @@ pub struct LocalProvider {
 }
 
 impl LocalProvider {
+    /// A provider over the gallery at `root`.
     pub fn new(root: Root) -> Self {
         Self { root }
     }
 
+    /// The gallery root this provider reads.
     pub fn root(&self) -> &Root {
         &self.root
     }

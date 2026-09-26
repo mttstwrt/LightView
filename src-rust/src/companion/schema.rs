@@ -59,6 +59,7 @@ pub struct CompanionFile {
     pub meta: MetaCollection,
 }
 
+/// The media type an old companion without the field is read as.
 fn default_media_type() -> MediaType {
     MediaType::Image
 }
@@ -136,6 +137,7 @@ impl MediaType {
         }
     }
 
+    /// The media type as the companion and `media_meta` spell it.
     pub fn as_str(&self) -> &'static str {
         match self {
             MediaType::Image => "image",

@@ -253,6 +253,7 @@ impl Root {
 pub struct GalleryPath(PathBuf);
 
 impl GalleryPath {
+    /// The canonical absolute path, for opening.
     pub fn as_path(&self) -> &Path {
         &self.0
     }
