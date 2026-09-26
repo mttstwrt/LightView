@@ -59,6 +59,7 @@ export interface ThumbQueue<T> {
   prune(keep: (path: string) => boolean): number;
 }
 
+/** An empty generation queue: nothing pending, in flight, failed or warmed. */
 export function createThumbQueue<T = void>(): ThumbQueue<T> {
   const pending = new Map<string, T>();
   const flying = new Set<string>();

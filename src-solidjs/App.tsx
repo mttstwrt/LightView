@@ -111,6 +111,8 @@ type BootState =
    *  is not the process listening now. There is nothing to retry. */
   | { phase: "ended" };
 
+/** The shell: runs boot, then shows the grid, the viewer, the chrome and
+ *  whichever panel is open, and owns the keyboard map. */
 export function App() {
   const [boot, setBoot] = createSignal<BootState>({ phase: "opening" });
   const [duplicatesOpen, setDuplicatesOpen] = createSignal(false);
@@ -508,6 +510,8 @@ function SessionEnded() {
   );
 }
 
+/** The running plugin's name and progress, in the corner, while a run is in
+ *  flight. */
 function PluginToast() {
   const activity = () => pluginRun()!;
   const progress = () => {
@@ -545,6 +549,7 @@ function PluginToast() {
   );
 }
 
+/** Progress on thumbnail work the user asked for, in the corner, while it runs. */
 function ThumbnailToast() {
   const work = () => thumbWork()!;
   const progress = () => {

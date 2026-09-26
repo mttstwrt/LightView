@@ -18,11 +18,14 @@
 const LOADED_URLS_CAP = 4096;
 const loadedUrls = new Set<string>();
 
+/** Record that `url`'s bytes have been decoded, so a cell showing it again does
+ *  not fade in. */
 export function markUrlLoaded(url: string): void {
   if (loadedUrls.size >= LOADED_URLS_CAP) loadedUrls.clear();
   loadedUrls.add(url);
 }
 
+/** Whether `url` has been decoded before in this session. */
 export function hasUrlLoaded(url: string): boolean {
   return loadedUrls.has(url);
 }

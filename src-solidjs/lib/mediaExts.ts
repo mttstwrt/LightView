@@ -16,6 +16,7 @@ export function extOf(path: string): string {
   return dot >= 0 ? path.slice(dot + 1).toLowerCase() : "";
 }
 
+/** Whether the path's extension is a video format. */
 export function isVideoPath(path: string): boolean {
   return VIDEO_EXTS.has(extOf(path));
 }

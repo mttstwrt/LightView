@@ -108,6 +108,7 @@ function merge(stored: Partial<DisplayPrefs> | null): DisplayPrefs {
 
 const [prefs, setPrefsRaw] = createSignal<DisplayPrefs>(merge(loadPref(PREFS_KEY)));
 
+/** Update this client's display preferences and save them in this browser. */
 export function setPrefs(
   update: Partial<DisplayPrefs> | ((prev: DisplayPrefs) => DisplayPrefs),
 ) {
@@ -131,6 +132,8 @@ const [gallerySettings, setGallerySettings] = createSignal<GallerySettings>({
 
 export { gallerySettings };
 
+/** Fetch the gallery's own settings; on failure the defaults stand, since
+ *  refusing to open would be worse. */
 export async function loadGallerySettings() {
   try {
     setGallerySettings(await api.settings());
@@ -161,6 +164,7 @@ const [capabilities, setCapabilities] = createSignal<Capabilities>({
 
 export { capabilities };
 
+/** Fetch what this client may do; on failure the narrow default stands. */
 export async function loadCapabilities() {
   try {
     setCapabilities(await api.capabilities());

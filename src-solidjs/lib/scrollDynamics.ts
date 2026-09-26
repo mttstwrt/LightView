@@ -199,6 +199,9 @@ export interface ScrollDynamics {
   dispose: () => void;
 }
 
+/** Attach to the scroll host and track velocity, direction, and whether the
+ *  view is settled or warping, calling `onFrame` once per animation frame while
+ *  it scrolls. */
 export function createScrollDynamics(opts: {
   /** Current row pitch (px) — converts px/s into rows/s. */
   rowHeight: () => number;

@@ -28,6 +28,9 @@ function dateAccessor(field: SortField): ((item: SortedItem) => number | null) |
   }
 }
 
+/** The scrollbar's markers for `items` sorted by `field`: one at each boundary
+ *  of whatever the sort orders by — a month, a first letter, a size step, a
+ *  rating — placed as a fraction of the list. */
 export function buildScrollIndicators(items: SortedItem[], field: SortField): ScrollIndicator[] {
   if (items.length === 0) return [];
 
@@ -52,10 +55,12 @@ export function buildScrollIndicators(items: SortedItem[], field: SortField): Sc
 // thread on a large gallery. Hoisting the formatter makes the same walk ~40x
 // cheaper; the loop below additionally only formats at a month boundary.
 let _monthFmt: Intl.DateTimeFormat | undefined;
+/** "Mar 2024", with the formatter built once. */
 const monthFormat = (d: Date) =>
   (_monthFmt ??= new Intl.DateTimeFormat(undefined, { month: "short", year: "numeric" })).format(d);
 
 let _dayFmt: Intl.DateTimeFormat | undefined;
+/** "Mar 4, 2024", with the formatter built once. */
 const dayFormat = (d: Date) =>
   (_dayFmt ??= new Intl.DateTimeFormat(undefined, {
     day: "numeric",
@@ -63,6 +68,7 @@ const dayFormat = (d: Date) =>
     year: "numeric",
   })).format(d);
 
+/** A marker at each month boundary in a date-sorted list. */
 function buildDateIndicators(
   items: SortedItem[],
   getDate: (item: SortedItem) => number | null,
@@ -85,6 +91,7 @@ function buildDateIndicators(
   return dedupeIndicators(indicators);
 }
 
+/** A marker at each change of file name's first letter. */
 function buildNameIndicators(items: SortedItem[]): ScrollIndicator[] {
   const indicators: ScrollIndicator[] = [];
   let lastChar = "";
@@ -99,6 +106,7 @@ function buildNameIndicators(items: SortedItem[]): ScrollIndicator[] {
   return dedupeIndicators(indicators);
 }
 
+/** A byte count as a short "12 KB" / "3.4 MB" label. */
 function formatSizeShort(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
@@ -106,6 +114,8 @@ function formatSizeShort(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+/** A marker where the list crosses each fixed size step (100 KB, 500 KB, 1 MB,
+ *  …), in whichever direction it is sorted. */
 function buildSizeIndicators(items: SortedItem[]): ScrollIndicator[] {
   // Place indicators at size order-of-magnitude boundaries
   const thresholds = [
@@ -134,6 +144,7 @@ function buildSizeIndicators(items: SortedItem[]): ScrollIndicator[] {
   return dedupeIndicators(indicators);
 }
 
+/** A marker at each change of rating, labelled in stars or "Unrated". */
 function buildRatingIndicators(items: SortedItem[]): ScrollIndicator[] {
   const indicators: ScrollIndicator[] = [];
   let lastRating = -1;
@@ -158,6 +169,8 @@ function dedupeIndicators(indicators: ScrollIndicator[]): ScrollIndicator[] {
   return result;
 }
 
+/** The label for the scrollbar thumb at `fraction` down the list: the date,
+ *  name, size or rating of the item there. */
 export function getThumbLabelForItems(items: SortedItem[], field: SortField, fraction: number): string {
   if (items.length === 0) return "";
   const idx = Math.min(Math.floor(fraction * items.length), items.length - 1);

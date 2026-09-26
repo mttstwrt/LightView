@@ -22,6 +22,8 @@ export interface ThumbSwapper {
   cancelAll: () => void;
 }
 
+/** A swapper that decodes a new URL off-DOM and commits it only if the cell
+ *  still wants it, reporting a 404 as a miss. */
 export function createThumbSwapper(opts: {
   /** Current generation counter — swaps from a stale generation are dropped. */
   generation: () => number;

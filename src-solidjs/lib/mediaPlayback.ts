@@ -8,6 +8,8 @@
 const MAX_ENTRIES = 256;
 const positions = new Map<string, number>();
 
+/** Remember `time` as `path`'s position, as the most recently used entry,
+ *  dropping the least recently used past the cap. */
 function touch(path: string, time: number) {
   // Re-insert to move to the end (most-recently-used) for LRU eviction.
   positions.delete(path);

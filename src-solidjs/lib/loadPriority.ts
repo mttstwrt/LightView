@@ -38,6 +38,9 @@ export interface PriorityPick {
   stale: string[];
 }
 
+/** Choose up to `cap` queued paths to generate now, ranked against the current
+ *  windows at the moment of the call, and report which leftovers have gone
+ *  stale. */
 export function pickByPriority(
   queued: Iterable<string>,
   indexOf: (path: string) => number | undefined,

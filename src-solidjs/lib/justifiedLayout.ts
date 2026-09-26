@@ -72,6 +72,7 @@ export interface JustifiedLayoutOptions {
   groupStarts?: number[];
 }
 
+/** `v` limited to `[lo, hi]`. */
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /**

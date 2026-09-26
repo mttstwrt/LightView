@@ -8,6 +8,8 @@
 
 const PREFIX = "lightview.";
 
+/** This browser's saved value for `key`, or null when there is none or storage
+ *  is unavailable. */
 export function loadPref<T>(key: string): T | null {
   try {
     const raw = localStorage.getItem(PREFIX + key);
@@ -17,6 +19,8 @@ export function loadPref<T>(key: string): T | null {
   }
 }
 
+/** Save `value` for `key` in this browser; a storage failure (private mode, a
+ *  full quota) is ignored. */
 export function savePref(key: string, value: unknown): void {
   try {
     localStorage.setItem(PREFIX + key, JSON.stringify(value));

@@ -32,6 +32,8 @@ export interface PathIndex {
   pruneAbsent(...collections: PathKeyed[]): void;
 }
 
+/** An index from path to position in the current item list, and the pruning of
+ *  path-keyed sets when the list changes. */
 export function createPathIndex(): PathIndex {
   const index = new Map<string, number>();
 

@@ -78,6 +78,9 @@ export interface CellSources<R> {
   clear(opts?: { keepUrls?: boolean }): void;
 }
 
+/** The grid's per-cell source state: the URL each cell shows, the rung it came
+ *  from, and the swapper that upgrades it — kept together so eviction always
+ *  removes all three. */
 export function createCellSources<R>(opts: {
   /** The view's generation counter; a swap from a stale one is dropped. */
   generation: () => number;

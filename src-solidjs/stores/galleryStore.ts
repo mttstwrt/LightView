@@ -296,6 +296,7 @@ export function toggleSelection(path: string) {
   });
 }
 
+/** Deselect everything, staying in whatever selection mode is current. */
 export function clearSelection() {
   setSelectedPaths(new Set<string>());
 }
@@ -307,11 +308,13 @@ export function exitSelectionMode() {
   clearSelection();
 }
 
+/** Enter multi-select mode, or leave it and drop the selection. */
 export function toggleSelectionMode() {
   if (selectionMode()) exitSelectionMode();
   else setSelectionMode(true);
 }
 
+/** Select exactly `paths`. */
 export function selectAll(paths: string[]) {
   setSelectedPaths(new Set<string>(paths));
 }

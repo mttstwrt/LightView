@@ -39,6 +39,9 @@ export interface DragSelectControls {
   handleBackgroundClick: (e: MouseEvent) => void;
 }
 
+/** Selection by pointer: Ctrl/Cmd-drag selects a range (added to the existing
+ *  selection), a click toggles, clears or opens, and the click that ends a drag
+ *  is swallowed. */
 export function createDragSelect(props: SelectionControlProps): DragSelectControls {
   const [isDragging, setIsDragging] = createSignal(false);
   const [dragStartIndex, setDragStartIndex] = createSignal(-1);

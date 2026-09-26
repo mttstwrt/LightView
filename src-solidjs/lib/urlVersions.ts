@@ -36,6 +36,8 @@ export interface UrlVersions {
   clear(): void;
 }
 
+/** Per-path cache-busting counters plus one epoch, starting at zero so an
+ *  unbumped URL carries no `?v=` at all. */
 export function createUrlVersions(): UrlVersions {
   const versions = new Map<string, number>();
   let epoch = 0;
