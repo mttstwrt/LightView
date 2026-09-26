@@ -7,6 +7,12 @@
 //! writers on one `cache.db` behind an in-process mutex is the assumption that
 //! lock exists to make true.
 //!
+//! **A process has one gallery, bound at startup.** The root is canonicalized
+//! once, and the derived-cache directory, the lock, the watcher and every
+//! relative path key derive from that value, so they cannot disagree about what
+//! "the same gallery" is. Opening a different folder is a different process;
+//! no command moves a running one to another gallery.
+//!
 //! **A second launch opens the first one's window rather than refusing.** The
 //! package ships a `.desktop` file, so double-clicking a folder twice is an
 //! ordinary user action, and "refused: already running" is a bad answer to it —

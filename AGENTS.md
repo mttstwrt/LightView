@@ -77,7 +77,7 @@ Each rule is explained in the header of the module named after it.
 - **A process has one gallery, bound at startup.** There is no command that
   moves it to another folder. → `cli/mod.rs`
 - **Paths on the wire are gallery-relative, percent-encoded per segment**, `/`
-  left literal. → `src-solidjs/lib/ipc.ts`
+  left literal. → `server/routes.rs`
 - **The cache is outside the gallery and fully derived.** A `format_version`
   bump deletes and rebuilds it, and that is the only mechanism for a *schema*
   change. A **reader** learning to extract something new is not one: it stamps

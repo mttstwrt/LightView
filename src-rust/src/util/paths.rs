@@ -1,19 +1,15 @@
-//! Where LightView keeps machine-local state.
-//!
-//! Three XDG base directories, not one application directory and not the
-//! exe-relative `<exe_dir>/data/` this replaces. The exe-relative layout was a
-//! deliberate choice — a copied directory carried its own plugins and
-//! certificates — and it is directly incompatible with being installed as an
-//! ordinary package: `/usr/bin/lightview` would resolve its state to
-//! `/usr/bin/data/`, root-owned and unwritable, broken on first run.
-//!
-//! Three directories rather than one is *fewer* things to explain, because each
-//! is a standard location with an established meaning. "Which of these can I
-//! safely delete?" is answered by the path. A user emptying `~/.cache`, or
-//! systemd-tmpfiles sweeping it, is safe by construction rather than by a
-//! warning in a document.
+//! Where LightView keeps machine-local state, and the rule that decides what
+//! is machine-local: **everything durable lives in the gallery; everything
+//! derived lives here.**
 //!
 //! ```text
+//! <gallery>/                                    the user's photos, untouched
+//!   .lightview/
+//!     companions/<name>.lightview.json          per directory — tags, rating, notes
+//!     companions/.lock                          the fcntl lock for that directory
+//!     trash/<epoch_ms>_<seq>/<relative path>    one delete is one directory
+//!     settings.toml                             default filter, trash retention
+//!
 //! $XDG_CACHE_HOME/lightview/galleries/<sha256-of-canonical-root>/
 //!                                   cache.db    derived, disposable, budgeted
 //!                                   lock        the one-writer flock
@@ -23,14 +19,34 @@
 //! $XDG_CONFIG_HOME/lightview/       server.toml
 //! ```
 //!
-//! Per-*gallery* durable state does not live here at all — it lives in the
-//! gallery's own `.lightview/`, which is what lets a gallery move between
-//! machines intact.
+//! **The derived cache is outside the gallery** because the gallery is the one
+//! tree a person greps, rsyncs, backs up and syncs, and a SQLite database inside
+//! it breaks all four — a WAL on a network mount worst of all. Losing the cache
+//! costs time and nothing else, which is what lets a `format_version` bump
+//! delete and rebuild rather than migrate. Keying it on the SHA-256 of the
+//! *canonical* root makes a symlinked path and its target one gallery, not two.
+//! The cost is that a desktop tagging a NAS gallery over a mount builds its own
+//! cache for it, because it cannot read the server's; the ceiling in
+//! [`crate::cache::store`] is what bounds that.
+//!
+//! Callers must uphold two rules. **Never write a derived byte into the
+//! gallery** — it holds originals, companions, the trash and `settings.toml`,
+//! and nothing else. **Resolve against the canonical root**
+//! ([`crate::state::Gallery::root`]), never the path the user typed: the
+//! database keys, the watcher's `strip_prefix` and this directory's name agree
+//! only because they derive from one value.
+//!
+//! Three XDG base directories rather than one application directory, because
+//! each is a standard location with an established meaning: "which of these can
+//! I safely delete?" is answered by the path, and a user emptying `~/.cache`, or
+//! systemd-tmpfiles sweeping it, is safe by construction. An exe-relative
+//! `<exe_dir>/data/` would resolve an installed `/usr/bin/lightview` to a
+//! root-owned, unwritable `/usr/bin/data/`.
 //!
 //! [`Dirs`] is a value, constructed once in `main` and carried in application
 //! state, rather than a set of free functions reading a global. That is what
-//! makes two galleries with different `--data-dir` overrides coexist in one
-//! test process — which section 6's two-tagging-machines test needs.
+//! lets two galleries with different `--data-dir` overrides coexist in one test
+//! process, as the two-tagging-machines test needs.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

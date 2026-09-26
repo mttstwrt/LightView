@@ -19,11 +19,13 @@
 //! be no way past the auth layer the first time — and it is a route group, not
 //! a trust level. No *command* is reachable unauthenticated.
 //!
-//! **Paths on the wire are gallery-relative.** The encoding rule travels with
-//! them: percent-encode each segment independently and leave `/` literal, because
-//! axum decodes captures but rejects paths containing raw encoded slashes. A
-//! single `encodeURIComponent` over the whole path 404s every file in a
-//! subdirectory.
+//! **Paths on the wire are gallery-relative**, matching the database. The one
+//! exception is a copy or move *destination*, absolute by necessity and
+//! `Owner`-only ([`crate::path`] says why). The encoding rule travels with the
+//! relative ones: percent-encode each segment independently and leave `/`
+//! literal, because axum decodes captures but rejects paths containing raw
+//! encoded slashes. A single `encodeURIComponent` over the whole path 404s
+//! every file in a subdirectory.
 
 use std::sync::Arc;
 use std::time::Duration;
