@@ -92,6 +92,7 @@ impl Default for LaunchSession {
 }
 
 impl LaunchSession {
+    /// Mint a fresh launch token and the session it will be exchanged for.
     pub fn new() -> Self {
         Self {
             token: Mutex::new(random_hex::<32>()),
@@ -251,6 +252,8 @@ pub fn challenge_due(last_auth_at: Option<i64>, inactivity_secs: i64) -> bool {
     }
 }
 
+/// Compare two byte strings in time that depends only on their length, so a
+/// mismatching session cookie reveals nothing about where it differs.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -262,6 +265,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// `N` random bytes from the thread RNG, as lowercase hex.
 fn random_hex<const N: usize>() -> String {
     use rand::RngCore;
     use std::fmt::Write;
@@ -273,6 +277,7 @@ fn random_hex<const N: usize>() -> String {
     })
 }
 
+/// Seconds since the Unix epoch; zero if the clock is before it.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

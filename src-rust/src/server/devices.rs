@@ -99,6 +99,8 @@ pub struct Devices {
 }
 
 impl Devices {
+    /// Open (or create) the pairing database at `path`, with its schema
+    /// applied.
     pub fn open(path: &std::path::Path) -> Result<Self, AuthError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -118,14 +120,18 @@ impl Devices {
         })
     }
 
+    /// The one writer connection, awaited.
     pub async fn writer(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.writer.lock().await
     }
 
+    /// The one writer connection, for a caller outside the async runtime — the
+    /// CLI's administrative verbs.
     pub fn writer_blocking(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.writer.blocking_lock()
     }
 
+    /// A read-only connection from the pool.
     pub async fn read(&self) -> crate::cache::pool::PooledConn<'_> {
         self.readers.get().await
     }
@@ -283,6 +289,8 @@ pub fn needs_last_seen_touch(conn: &Connection, device_id: &str) -> bool {
     }
 }
 
+/// Stamp a device's `last_seen` with the current time, which is what `lightview
+/// devices` shows.
 pub fn touch_last_seen(conn: &Connection, device_id: &str) -> Result<(), AuthError> {
     conn.execute(
         "UPDATE devices SET last_seen = ?2 WHERE id = ?1",
@@ -300,6 +308,7 @@ pub fn mark_authenticated(conn: &Connection, device_id: &str) -> Result<(), Auth
     Ok(())
 }
 
+/// Every paired device, newest pairing first.
 pub fn list(conn: &Connection) -> Result<Vec<DeviceRow>, AuthError> {
     let mut stmt = conn.prepare(
         "SELECT id, name, created_at, last_seen FROM devices ORDER BY created_at DESC",
@@ -324,6 +333,8 @@ pub fn revoke(conn: &Connection, device_id: &str) -> Result<bool, AuthError> {
     Ok(conn.execute("DELETE FROM devices WHERE id = ?1", [device_id])? > 0)
 }
 
+/// Delete pairing codes past their expiry. Run before every redemption, so an
+/// expired code can never match.
 fn purge_expired(conn: &Connection) -> Result<(), AuthError> {
     conn.execute("DELETE FROM pairings WHERE expires_at < ?1", [now()])?;
     Ok(())
@@ -342,12 +353,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// SHA-256 of `input`, as lowercase hex. Secrets are stored only in this form.
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hex(&hasher.finalize())
 }
 
+/// Bytes as lowercase hex.
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut s, b| {
@@ -356,6 +369,7 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// `N` random bytes from the thread RNG.
 fn random_bytes<const N: usize>() -> [u8; N] {
     use rand::RngCore;
     let mut buf = [0u8; N];
@@ -363,11 +377,13 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     buf
 }
 
+/// A random `u32` from the thread RNG, for the six-digit PIN.
 fn random_u32() -> u32 {
     use rand::RngCore;
     rand::thread_rng().next_u32()
 }
 
+/// Seconds since the Unix epoch; zero if the clock is before it.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

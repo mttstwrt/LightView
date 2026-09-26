@@ -491,10 +491,13 @@ fn require(state: &AppState, required: Trust) -> Result<(), CommandError> {
     }
 }
 
+/// Deserialize a command's arguments, or fail as `BadArguments` naming what did
+/// not fit.
 fn parse<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CommandError> {
     serde_json::from_value(args).map_err(|e| CommandError::BadArguments(e.to_string()))
 }
 
+/// Wrap a service error as the command's failure, keeping only its message.
 fn failed(e: impl std::fmt::Display) -> CommandError {
     CommandError::Failed(e.to_string())
 }
@@ -527,6 +530,7 @@ struct AutocompleteArgs {
     limit: usize,
 }
 
+/// Autocomplete's default suggestion count.
 fn default_limit() -> usize {
     20
 }
@@ -577,6 +581,8 @@ struct PathsForTagsArgs {
     limit: usize,
 }
 
+/// How many paths a tag preview returns by default: as many as a panel's
+/// preview grid shows.
 fn default_preview_limit() -> usize {
     120
 }
@@ -627,6 +633,7 @@ struct DuplicateArgs {
     threshold: u32,
 }
 
+/// The duplicate finder's default Hamming distance.
 fn default_threshold() -> u32 {
     duplicates::DEFAULT_THRESHOLD
 }

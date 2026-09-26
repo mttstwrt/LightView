@@ -115,6 +115,7 @@ impl Default for Events {
 }
 
 impl Events {
+    /// An empty channel with no subscribers.
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(CAPACITY);
         Self {
@@ -148,6 +149,8 @@ impl Events {
         });
     }
 
+    /// A receiver for every event published from now on; nothing earlier is
+    /// replayed.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
     }

@@ -77,6 +77,7 @@ pub fn detect_lan_ip() -> Option<IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
+/// Where the certificate, key and metadata are persisted.
 fn tls_dir(dirs: &Dirs) -> PathBuf {
     dirs.tls()
 }
@@ -100,6 +101,11 @@ pub fn split_sans(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// The names the certificate covers: `localhost` and both loopback addresses,
+/// then the detected LAN address, then the operator's extras, deduplicated.
+///
+/// The order is fixed so the regenerate-on-change comparison does not churn as
+/// extras come and go.
 fn san_strings(lan_ip: Option<IpAddr>, extra: &[String]) -> Vec<String> {
     let mut sans = vec![
         "localhost".to_string(),
@@ -154,6 +160,9 @@ fn load_existing(dir: &Path, sans: &[String]) -> Option<TlsMaterial> {
     })
 }
 
+/// Mint a self-signed ECDSA certificate for `sans`, constrained by X.509
+/// `nameConstraints` to exactly those names, and return it with its expiry as a
+/// Unix timestamp.
 fn generate(sans: &[String]) -> Result<(TlsMaterial, i64), String> {
     let mut params = rcgen::CertificateParams::default();
     params
@@ -247,6 +256,11 @@ fn generate(sans: &[String]) -> Result<(TlsMaterial, i64), String> {
     ))
 }
 
+/// Write the certificate, the key (mode 0600) and the metadata that decides
+/// whether it is reused.
+///
+/// A failure is logged and not returned: the in-memory certificate still serves
+/// this session, and the next start regenerates.
 fn persist(dir: &PathBuf, material: &TlsMaterial, sans: &[String], not_after: i64) {
     let write_all = || -> std::io::Result<()> {
         fs::create_dir_all(dir)?;

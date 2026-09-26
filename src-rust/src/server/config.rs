@@ -113,14 +113,18 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// The cross-gallery cache ceiling, in bytes.
     pub fn cache_ceiling_bytes(&self) -> u64 {
         self.cache_ceiling_gb.saturating_mul(1024 * 1024 * 1024)
     }
 
+    /// How long a paired device may be idle before the password is asked again,
+    /// in seconds.
     pub fn inactivity_secs(&self) -> i64 {
         (self.inactivity_hours * 3600) as i64
     }
 
+    /// Whether a password is set; an empty hash means none.
     pub fn has_password(&self) -> bool {
         !self.password_hash.is_empty()
     }

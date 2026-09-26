@@ -55,6 +55,7 @@ pub async fn serve(uri: axum::http::Uri) -> Response {
     }
 }
 
+/// A 200 carrying `body` as `mime`, cached forever unless it is the shell.
 fn respond(path: &str, mime: &str, body: Vec<u8>) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(

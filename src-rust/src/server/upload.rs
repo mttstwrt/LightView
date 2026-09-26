@@ -219,6 +219,8 @@ pub fn upload_dir(root: &Root, configured: &str) -> Result<GalleryPath, UploadEr
     Ok(root.resolve(&rel)?)
 }
 
+/// `name` with ` (n)` inserted before its extension — the name a colliding
+/// upload tries next.
 fn dedupe_name(name: &str, n: usize) -> String {
     let path = Path::new(name);
     let stem = path
@@ -231,6 +233,8 @@ fn dedupe_name(name: &str, n: usize) -> String {
     }
 }
 
+/// Free space on the filesystem holding `path`, by the longest mount point that
+/// prefixes it; `None` if no mount matches.
 fn free_bytes(path: &Path) -> Option<u64> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     disks

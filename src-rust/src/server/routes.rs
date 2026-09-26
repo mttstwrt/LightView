@@ -92,6 +92,12 @@ pub fn router(state: Arc<AppState>) -> Router {
 // The guard: readiness, then origin, then authentication.
 // ---------------------------------------------------------------------------
 
+/// Admit a request to a guarded route, in order: 503 until the gallery is
+/// ready, 403 for a cross-origin write, then 401 unless the caller
+/// authenticates.
+///
+/// The order matters for the client: a 503 means "wait", and only once the gate
+/// is open does a 401 mean anything about the credential.
 async fn guard_layer(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -181,6 +187,9 @@ fn origin_ok(state: &AppState, request: &Request) -> bool {
     }
 }
 
+/// Decide whether a request's cookie is a credential this bind accepts: the
+/// launch session on loopback, a paired device on a served bind — which then
+/// also owes the password once its inactivity window has passed.
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Auth {
     match state.trust {
         Trust::Owner => {
@@ -231,6 +240,7 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Auth {
     }
 }
 
+/// The value of cookie `name` in the request, if present.
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     raw.split(';')
@@ -243,6 +253,7 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 // Bootstrap routes
 // ---------------------------------------------------------------------------
 
+/// Liveness, unauthenticated and ungated.
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -355,10 +366,13 @@ struct PairBody {
     name: String,
 }
 
+/// The name a pairing gets when the client supplies none.
 fn default_device_name() -> String {
     "device".to_string()
 }
 
+/// Exchange a pairing code for a device cookie. `Secure`, because a served bind
+/// is always HTTPS; 404 on a loopback bind, which has no pairing.
 async fn pair_redeem(State(state): State<Arc<AppState>>, Json(body): Json<PairBody>) -> Response {
     let Some(devices) = state.devices.as_ref() else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -395,6 +409,8 @@ struct Invoke {
     args: Value,
 }
 
+/// Run one command from the table and map its outcome to a status: 404 for an
+/// unknown name, 403 for insufficient trust, 400 for bad arguments.
 async fn invoke(State(state): State<Arc<AppState>>, Json(body): Json<Invoke>) -> Response {
     match commands::dispatch(&state, &body.command, body.args).await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
@@ -450,6 +466,11 @@ struct DirsQuery {
 // Events
 // ---------------------------------------------------------------------------
 
+/// The event stream: every event from subscription onward, as SSE, with a
+/// keep-alive.
+///
+/// The stream holds a presence window for as long as it is open, which is how
+/// the process knows a local tab is still there.
 async fn sse(State(state): State<Arc<AppState>>) -> Sse<impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
     let mut rx = state.gallery.events.subscribe();
     // Counted for the life of the *stream*, not of this function: the guard is
@@ -477,6 +498,8 @@ async fn sse(State(state): State<Arc<AppState>>) -> Sse<impl futures::Stream<Ite
 // Bytes
 // ---------------------------------------------------------------------------
 
+/// One tier of one file, generated on a miss, with an ETag so a revalidation is
+/// a 304. A 404 means generation failed, not merely that nothing was cached.
 async fn thumb(
     State(state): State<Arc<AppState>>,
     UrlPath((tier, rel)): UrlPath<(String, String)>,
@@ -529,6 +552,8 @@ struct MediaQuery {
     fit: Option<u32>,
 }
 
+/// The original file, with Range support; a `?fit=` resize for a still; and a
+/// JPEG transcode for HEIC, which no browser renders.
 async fn media(
     State(state): State<Arc<AppState>>,
     UrlPath(rel): UrlPath<String>,
@@ -685,6 +710,8 @@ async fn serve_file(
         .into_response()
 }
 
+/// The `Content-Type` for a media extension, `application/octet-stream` when
+/// unknown.
 fn mime_for(extension: &str) -> &'static str {
     match extension {
         "jpg" | "jpeg" => "image/jpeg",
@@ -721,6 +748,9 @@ fn weak_etag(bytes: &[u8]) -> String {
 // Upload
 // ---------------------------------------------------------------------------
 
+/// Stream each part of a multipart upload into the configured upload directory
+/// and return where each landed. Indexing is not done here: the watcher ingests
+/// what lands.
 async fn upload_route(State(state): State<Arc<AppState>>, mut multipart: axum::extract::Multipart) -> Response {
     if !state.config.uploads_enabled {
         return (StatusCode::NOT_FOUND, "not found").into_response();
