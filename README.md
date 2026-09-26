@@ -68,6 +68,38 @@ lightview password [--clear]       set the gallery password, read from stdin
 lightview cache [--prune]          show or trim the derived-cache directory
 ```
 
+## Filtering
+
+The search box takes a small query language:
+
+```
+vacation                          any namespace
+user::vacation                    one namespace
+set::kellys-comic                 set membership
+plugin.wd::beach                  a plugin's tags
+"two words"                       a tag containing a space
+NOT plugin.wd::indoor             negation
+rating>=4                         rating
+date=2024   date>=2024-01-01      capture date — a year, a year-month, or a day
+added<=2024-06   viewed>=2023     date added, last viewed
+width>=1920   height<=1080        pixel dimensions
+size>=10mb   size<=500kb          file size (b/kb/mb/gb)
+type:video                        media type
+color:red                         colour label
+has::user   has::set              namespace existence
+has:geo     missing:geo           whether coordinates exist at all
+(a OR b) AND NOT set::burst       grouping
+```
+
+`OR` binds loosest, then `AND`, then `NOT`; parentheses override. Years are
+always four digits. A **set** is just a tag in the `set` namespace, so a burst,
+a comic or a face cluster is grouped by tagging its members.
+
+`date=` means the date a photo was *taken*, so a screenshot or a video with no
+capture date never matches it. The grid still sorts those files by their
+modification time, and the info panel says which of the two dates you are
+seeing.
+
 ## Where your data lives
 
 **Everything durable is in your gallery; everything derived is not.**
