@@ -209,6 +209,8 @@ struct Contributions {
 }
 
 impl Contributions {
+    /// Add one non-keeper's tags: its user and set tags, and each plugin bucket
+    /// unless a newer version of that plugin's bucket is already held.
     fn absorb(&mut self, companion: &CompanionFile) {
         self.user.extend(companion.tags.user.iter().cloned());
         // Without this, merging a set member silently drops that member's set.
@@ -229,6 +231,9 @@ impl Contributions {
         // namespace nothing else created, and the namespace is gone.
     }
 
+    /// Fold the contributions into the keeper's companion. User and set tags
+    /// union; a plugin bucket is added only where the keeper has none, so the
+    /// keeper's own bucket is always kept.
     fn apply(self, companion: &mut CompanionFile) {
         merge_into(&mut companion.tags.user, self.user);
         merge_into(&mut companion.tags.set, self.set);
@@ -242,6 +247,7 @@ impl Contributions {
     }
 }
 
+/// Union `extra` into `target`, sorted and without duplicates.
 fn merge_into(target: &mut Vec<String>, extra: Vec<String>) {
     target.extend(extra);
     target.sort();

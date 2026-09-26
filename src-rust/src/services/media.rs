@@ -69,12 +69,15 @@ impl Default for ItemsRequest {
     }
 }
 
+/// The grid's default sort field: by date.
 fn default_sort() -> SortField {
     SortField::Date
 }
+/// The grid's default order: newest first.
 fn default_order() -> SortOrder {
     SortOrder::Desc
 }
+/// The grid's default grouping: none.
 fn default_group() -> GroupBy {
     GroupBy::None
 }
@@ -246,6 +249,7 @@ pub struct TierPresence {
     pub bytes: Option<i64>,
 }
 
+/// Which tiers are cached for `path`, with each one's edge and stored size.
 pub async fn get_tiers(
     gallery: &Gallery,
     path: &RelPath,

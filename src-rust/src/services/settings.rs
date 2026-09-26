@@ -95,6 +95,7 @@ impl GallerySettings {
         Ok(current)
     }
 
+    /// The trash retention window, in seconds.
     pub fn trash_retention_secs(&self) -> i64 {
         (self.trash_retention_days * 24 * 3600) as i64
     }

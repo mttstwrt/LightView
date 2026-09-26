@@ -56,6 +56,7 @@ pub enum WritableNamespace {
 }
 
 impl WritableNamespace {
+    /// The namespace as the companion and the filter language spell it.
     pub fn as_str(self) -> &'static str {
         match self {
             WritableNamespace::User => "user",
@@ -63,6 +64,7 @@ impl WritableNamespace {
         }
     }
 
+    /// The companion's tag list for this namespace.
     fn field(self, companion: &mut CompanionFile) -> &mut Vec<String> {
         match self {
             WritableNamespace::User => &mut companion.tags.user,
@@ -407,6 +409,7 @@ async fn members_of(
     Ok(index::paths_with_tag(&conn, namespace.as_str(), tag)?)
 }
 
+/// The media type a path's extension implies; an unknown extension is an image.
 fn media_type_for(path: &RelPath) -> MediaType {
     std::path::Path::new(path.as_str())
         .extension()

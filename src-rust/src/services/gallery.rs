@@ -1050,6 +1050,8 @@ async fn reload_settings(gallery: &Gallery) {
     }
 }
 
+/// The media type a path's extension implies; an unknown extension is an image,
+/// since the scan only admits known media.
 fn media_type_of(path: &RelPath) -> MediaType {
     Path::new(path.as_str())
         .extension()
@@ -1058,6 +1060,7 @@ fn media_type_of(path: &RelPath) -> MediaType {
         .unwrap_or(MediaType::Image)
 }
 
+/// The media type as `media_meta.media_type` spells it.
 fn media_type_str(path: &RelPath) -> &'static str {
     match media_type_of(path) {
         MediaType::Image => "image",

@@ -78,6 +78,8 @@ fn valid_entry_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit() || b == b'_')
 }
 
+/// An entry id as a `RelPath` under the trash root, refusing anything that is
+/// not a plain entry directory name.
 fn entry_id_rel(id: &str) -> Result<RelPath, TrashError> {
     if !valid_entry_id(id) {
         return Err(TrashError::BadEntryId(id.to_string()));
@@ -261,6 +263,8 @@ pub fn purge_all(gallery: &Root) -> Result<usize, TrashError> {
     purge_older_than(gallery, i64::MAX)
 }
 
+/// Remove every trash entry whose deletion time is before `cutoff_ms`, and
+/// return how many went. A gallery with no trash has nothing to purge.
 fn purge_older_than(gallery: &Root, cutoff_ms: i64) -> Result<usize, TrashError> {
     let trash = gallery.as_path().join(TRASH_DIR);
     let mut removed = 0;
@@ -345,6 +349,7 @@ fn prune_empty_dirs(from: &Path, stop_at: &Path) {
     }
 }
 
+/// Seconds since the Unix epoch; zero if the clock is before it.
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
