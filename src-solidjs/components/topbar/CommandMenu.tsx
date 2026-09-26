@@ -5,7 +5,7 @@
 // and is rendered two ways: a dropdown behind an icon in the desktop top bar,
 // and a sheet behind a floating button in the phone's thumb zone. The settings
 // panel is not a third rendering; it keeps only configuration, and opening it
-// is the last entry in this list. See docs/frontend/chrome.md.
+// is the last entry in this list.
 //
 // Both triggers are *substitutions*: the desktop icon took the gear's place in
 // the top-bar row, the mobile button took the upload FAB's. Neither surface

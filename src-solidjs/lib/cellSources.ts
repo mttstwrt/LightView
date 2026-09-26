@@ -4,23 +4,22 @@
 // Three structures that only make sense together: the path → URL store the
 // render reads, the path → rung map recording which resolution that URL came
 // from, and the off-DOM swapper that upgrades a cell without flashing a
-// skeleton. Every view that streams thumbnails needs all three, and needs them
-// to agree — which is the reason they live here rather than in each view.
+// skeleton. They have to agree, which is the reason they live together here
+// rather than as three pieces of the grid's state.
 //
 // Disagreement is silent, and both directions have already been hit:
 //
 // - drop the URL but keep the rung, and the cell is *permanently un-evictable*,
-//   because the rung map is the index eviction walks. GalleryGrid carries a
-//   comment about exactly this, from the jump handler that used to clear the
-//   rung map and orphan every cell displayed before the jump.
+//   because the rung map is the index eviction walks — a jump handler that
+//   clears the rung map alone orphans every cell displayed before the jump.
 // - drop the rung but leave the swap running, and an abandoned `Image` keeps
 //   fetching and decoding with nothing left to commit it to.
 //
 // So `evict` and `clear` do the whole tail, and a view cannot do half of it.
 //
-// The rung is the view's own vocabulary: GalleryGrid's is a `ThumbTier`
-// (s/m/l), JustifiedGrid's is `"cheap" | "full"` because a cell there may be
-// showing a `?fit=` resize of the original, which is not a tier at all.
+// The rung is a type parameter, and the grid's is `"cheap" | "full"` rather
+// than a `ThumbTier`, because a cell may be showing a `?fit=` resize of the
+// original, which is not a tier at all.
 // ---------------------------------------------------------------------------
 
 import { batch } from "solid-js";

@@ -17,7 +17,7 @@
 // window, so a caller that runs early, or a view that never registers one, sees
 // exactly the old behaviour.
 //
-// The host must be `position: relative` — `recalcRange` in both grids measures
+// The host must be `position: relative` — the grid's `recalcRange` measures
 // its content with `offsetTop`, which is relative to the nearest positioned
 // ancestor, and that has to be the same origin `scrollTop` counts from.
 

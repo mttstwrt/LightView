@@ -62,7 +62,7 @@ export const SearchIcon: Icon = (props) => (
  *
  *  Deliberately "more" rather than a `+`: the list contains Settings and
  *  Trash as readily as Upload, and a plus over-promises create while
- *  under-promising everything else (docs/frontend/chrome.md). */
+ *  under-promising everything else. */
 export const MoreIcon: Icon = (props) => (
   <Stroke size={props.size}>
     <circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none" />

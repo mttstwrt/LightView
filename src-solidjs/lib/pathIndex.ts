@@ -1,18 +1,17 @@
 // ---------------------------------------------------------------------------
-// Reverse index from path to position in the view's item list.
+// Reverse index from path to position in the grid's item list, and the pruning
+// of per-path state when that list changes underneath it (a delete, a filter,
+// a re-sort).
 //
-// Every grid needs O(1) "where is this path now?" for eviction and for
-// drain-time prioritization, and every grid has to reconcile its per-path
-// state when the list changes underneath it (a delete, a filter, a re-sort).
-// Both halves were duplicated verbatim; the pruning half is the one worth
-// sharing, because getting it wrong is invisible — a stale entry in a `Set`
-// keyed by path silently suppresses future work for whatever path reuses it.
+// The grid needs O(1) "where is this path now?" for eviction and drain-time
+// prioritization. Pruning is the half that is easy to get wrong invisibly: a
+// stale entry in a `Set` keyed by path silently suppresses future work for
+// whatever path reuses it.
 //
-// The reconciliation stays in each view's own effect. Views hold different
-// side sets (JustifiedGrid also prunes its high-tier precache memo and its
-// measured aspects), and the *order* matters: reindex first, then compute what
-// went, then prune. Passing a set list in is enough sharing; folding the effect
-// in would mean parameterizing every view's extra state.
+// The reconciliation itself stays in the grid's effect, because the *order*
+// matters — reindex first, then compute what went, then prune — and the grid
+// prunes side state this module does not know about (its high-tier precache
+// memo and its measured aspects).
 // ---------------------------------------------------------------------------
 
 /** Anything keyed by path that this module can prune. Both `Set<string>` and

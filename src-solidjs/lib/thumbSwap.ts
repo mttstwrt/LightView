@@ -5,9 +5,8 @@
 // decode. Instead, the new URL is decoded off-DOM first and only swapped into
 // the cell's thumb map on success — the previous image stays on screen with no
 // skeleton flash. A 404 (cold tier) leaves the old image up and reports a miss
-// so the caller can queue generation. Extracted from JustifiedGrid's zoom-swap
-// logic; used by both grids for the cheap-rung → target-tier upgrade
-// (docs/decisions/0007-two-zone-render-window.md).
+// so the caller can queue generation. Used for the cheap-rung → target-rung
+// upgrade and for the swap a zoom makes.
 //
 // In-flight decodes are tracked per path so they can be cancelled when a cell
 // is evicted or the gallery resets — otherwise each abandoned upgrade keeps an

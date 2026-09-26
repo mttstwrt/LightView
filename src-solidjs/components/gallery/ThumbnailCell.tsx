@@ -508,7 +508,7 @@ export function ThumbnailCell(props: ThumbnailCellProps) {
       {/* Colour label — a dot in the corner opposite the selection check, so a
           labelled cell reads at a glance without opening the menu. Read from
           the store rather than threaded through props, like `selectionMode`
-          above: both grids render this component and neither has to know. */}
+          above: the grid renders this component and does not have to know. */}
       <span
         class="absolute top-1.5 right-1.5 w-3 h-3 rounded-full"
         style={{

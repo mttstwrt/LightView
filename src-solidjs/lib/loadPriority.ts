@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Drain-time prioritization for the grids' thumbnail-generation queues.
+// Drain-time prioritization for the grid's thumbnail-generation queue.
 //
 // Queued paths accumulate while scrolling (each 404'd cell enqueues itself),
 // so by the time a batch is drained the scroll may be somewhere else
@@ -15,16 +15,11 @@
 //           as stale for the caller to drop (a cell re-queues itself via 404
 //           if it ever scrolls back)
 //
-// This models a view whose windows are *contiguous ranges of item indices* —
-// true of anything that lays items out in reading order down a scroller, which
-// both grids do. It is the one shared grid primitive that would not carry over
-// unchanged to a view laid out in two dimensions: an infinite spiral canvas
-// (docs/todo.md C2) shows an off-centre 2D window, which in index terms is
-// several disjoint runs rather than one range, and wants ranking by distance
-// from the viewport centre instead. Generalizing that is deliberately left
-// until such a view exists, since the shape it needs is a guess until then —
-// the natural move is to lift the zone→rank mapping into a parameter and keep
-// this function as the range-based case.
+// This models windows that are *contiguous ranges of item indices* — true of
+// anything that lays items out in reading order down a scroller. A view laid
+// out in two dimensions would show several disjoint index runs and want
+// ranking by distance from the viewport centre instead; that is deliberately
+// not generalized until such a view exists.
 // ---------------------------------------------------------------------------
 
 export interface PriorityZones {

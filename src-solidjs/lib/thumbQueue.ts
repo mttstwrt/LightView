@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// The generation queue every grid view keeps for its cells.
+// The grid's thumbnail-generation queue.
 //
 // A cell points its <img> optimistically at a tier URL; a cached thumbnail
 // loads instantly, an uncached one 404s and the cell reports a miss. This is
@@ -8,12 +8,10 @@
 // has already covered. All four sets have to agree, and a path leaking into
 // one of them is silent — the cell simply never loads again.
 //
-// The payload is what a view needs to remember alongside the path. GalleryGrid
-// has nothing to remember (every cell wants the same tier) and instantiates it
-// at `void`; JustifiedGrid stores the tier that actually 404'd, because a
-// cheap-rung cell there is showing the base "j" tier while the detail level
-// says the target is "jh" — regenerating the target neither fixes the miss nor
-// is cheap. Same structure, different payload, rather than two queues.
+// The payload is what the grid remembers alongside the path: the tier that
+// actually 404'd, because a cheap-rung cell is showing the base "j" tier while
+// the detail level says the target is "jh" — regenerating the target neither
+// fixes the miss nor is cheap.
 // ---------------------------------------------------------------------------
 
 export interface ThumbQueue<T> {

@@ -239,7 +239,7 @@ export function TopBar(props: TopBarProps) {
           list in the bottom-right thumb zone (rendered below, after the
           sheets). The top row sits below the safe-area inset so it clears the
           notch / dynamic island, and slides away on scroll-down off the
-          scroll-direction `visible()` signal. See docs/frontend/chrome.md. */}
+          scroll-direction `visible()` signal. */}
       <Show when={isMobile()}>
         {/* Search / filter button */}
         <button
