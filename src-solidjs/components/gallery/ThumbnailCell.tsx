@@ -1,3 +1,8 @@
+// One cell of the grid: a thumbnail over its ThumbHash placeholder, fading in
+// the first time its bytes are seen, with the selection check, the colour label
+// and a VID/GIF badge — and short videos and GIFs autoplaying within a budget
+// while on screen.
+
 import { createSignal, createEffect, on, onMount, onCleanup, Show } from "solid-js";
 import { prefs } from "../../stores/settingsStore";
 import { selectionMode, colorLabelByPath } from "../../stores/galleryStore";
@@ -69,6 +74,7 @@ function releaseGifSlot(token: symbol): void {
 const MAX_AUTOPLAY_VIDEOS = 8;
 const autoplayingVideos = new Set<symbol>();
 
+/** Reserve a video autoplay slot for `token`. Returns whether one is held. */
 function acquireVideoSlot(token: symbol): boolean {
   if (autoplayingVideos.has(token)) return true;
   if (autoplayingVideos.size >= MAX_AUTOPLAY_VIDEOS) return false;
@@ -76,6 +82,7 @@ function acquireVideoSlot(token: symbol): boolean {
   return true;
 }
 
+/** Give back `token`'s video autoplay slot. */
 function releaseVideoSlot(token: symbol): void {
   autoplayingVideos.delete(token);
 }
@@ -86,6 +93,8 @@ type InViewCb = (inView: boolean) => void;
 let sharedObserver: IntersectionObserver | null = null;
 const inViewCallbacks = new WeakMap<Element, InViewCb>();
 
+/** Call `cb` whenever `el` enters or leaves the viewport, through the one
+ *  shared observer; the returned function stops it. */
 function observeInView(el: Element, cb: InViewCb): () => void {
   if (!sharedObserver) {
     sharedObserver = new IntersectionObserver(
@@ -105,6 +114,9 @@ function observeInView(el: Element, cb: InViewCb): () => void {
   };
 }
 
+/** Render one cell. A 404 is reported through `onError` so the grid can queue
+ *  generation; a load reports its natural size so the grid can learn an aspect
+ *  it did not have. */
 export function ThumbnailCell(props: ThumbnailCellProps) {
   const [errored, setErrored] = createSignal(false);
   const [hovered, setHovered] = createSignal(false);

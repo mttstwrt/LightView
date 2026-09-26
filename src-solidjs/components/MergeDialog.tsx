@@ -1,3 +1,7 @@
+// The merge dialog: fold a group of duplicates onto one keeper. The dialog
+// resolves every conflict and the backend applies the answer without
+// second-guessing it.
+
 import { createSignal, createMemo, Show, For, onMount, onCleanup } from "solid-js";
 import { api, thumbUrl } from "../lib/ipc";
 import type { MediaMeta, MergePlan } from "../lib/types";
@@ -9,17 +13,20 @@ type MergeCandidate = MediaMeta;
 /** `[lat, lon]`, as the index holds it. */
 type MergeGps = [number, number];
 
+/** A byte count as "12 KB" / "3.4 MB". */
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Pixel dimensions as "4032×3024", or empty when unknown. */
 function formatRes(w: number | null, h: number | null): string {
   if (w == null || h == null) return "";
   return `${w}×${h}`;
 }
 
+/** A timestamp as a local date and time, or "—" when there is none. */
 function formatDate(ts: number | null): string {
   if (ts == null) return "—";
   return new Date(ts * 1000).toLocaleString(undefined, {
@@ -31,15 +38,18 @@ function formatDate(ts: number | null): string {
   });
 }
 
+/** The last segment of a gallery path. */
 function fileName(path: string): string {
   return path.split("/").pop() || path;
 }
 
+/** Whether two locations are the same, treating two absent ones as equal. */
 function gpsEq(a: MergeGps | null, b: MergeGps | null): boolean {
   if (a == null || b == null) return a === b;
   return a[0] === b[0] && a[1] === b[1];
 }
 
+/** A location as "lat, lon" to four decimal places. */
 function formatGps(g: MergeGps): string {
   return `${g[0].toFixed(4)}, ${g[1].toFixed(4)}`;
 }
@@ -424,6 +434,7 @@ export function MergeDialog(props: {
   );
 }
 
+/** One field of the merge: its label, an optional hint, and the choices. */
 function FieldRow(props: { label: string; hint?: string; children: any }) {
   return (
     <section class="flex flex-col gap-1.5">
@@ -440,6 +451,8 @@ function FieldRow(props: { label: string; hint?: string; children: any }) {
   );
 }
 
+/** A row of mutually exclusive choices, one per distinct value among the
+ *  copies. */
 function PickChips(props: {
   options: { key: string; label: string; selected: boolean; onPick: () => void }[];
 }) {
@@ -463,6 +476,7 @@ function PickChips(props: {
   );
 }
 
+/** The distinct non-null values, in first-seen order. */
 function uniqueValues<T>(vals: (T | null)[]): T[] {
   const out: T[] = [];
   for (const v of vals) {

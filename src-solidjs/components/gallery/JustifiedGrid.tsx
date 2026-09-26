@@ -144,6 +144,8 @@ const JH_PRECACHE_ROWS = 6;
 // that is mostly speculative — hence the much smaller high-tier cap.
 const BATCH_SIZE = 96;
 const HIGH_TIER_BATCH = 12;
+/** How many generations one drain may request for `tier`: the base tier is
+ *  cheap enough for a large batch, the high tiers are not. */
 const batchCapFor = (tier: ThumbTier) => (tier === "j" ? BATCH_SIZE : HIGH_TIER_BATCH);
 // Speculative warms (landing zone, background precache) use a much smaller
 // batch than the on-screen drain. Nothing can preempt a batch once it's issued
@@ -206,6 +208,8 @@ const ROW_HEIGHT_MAX = 600;
 
 type DetailLevel = "base" | "mid" | "high";
 
+/** The grid component; the machine it runs is described at the top of this
+ *  file. */
 export function JustifiedGrid(props: JustifiedGridProps) {
   const gap = () => prefs().grid_gap;
 

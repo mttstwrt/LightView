@@ -25,6 +25,8 @@ import { displayPaths } from "../stores/galleryStore";
 import { loadPlugins, plugins, run } from "../stores/activityStore";
 import { api } from "../lib/ipc";
 
+/** The panel: choose an installed plugin and run it over what the current
+ *  filter shows, with the run's progress; Escape closes it. */
 export function AutoTagPanel(props: { onClose: () => void }) {
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") {

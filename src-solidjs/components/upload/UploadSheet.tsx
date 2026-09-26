@@ -154,6 +154,7 @@ export function UploadSheet(props: { open: boolean; onClose: () => void }) {
   );
 }
 
+/** A byte count as "12 KB" / "3.4 MB". */
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;

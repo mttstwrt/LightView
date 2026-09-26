@@ -595,6 +595,7 @@ function Section(props: { label: string; children: any }) {
   );
 }
 
+/** A labelled settings control. */
 function Field(props: { label: string; children: any }) {
   return (
     <div class="flex flex-col gap-1">
@@ -604,12 +605,14 @@ function Field(props: { label: string; children: any }) {
   );
 }
 
+/** Small explanatory text under a control. */
 function Note(props: { children: any }) {
   return (
     <p class="text-[10px] text-neutral-500 -mt-1 pl-0.5 leading-relaxed">{props.children}</p>
   );
 }
 
+/** One choice in a row of mutually exclusive options. */
 function Chip(props: { active: boolean; onClick: () => void; children: any }) {
   return (
     <button
@@ -626,6 +629,7 @@ function Chip(props: { active: boolean; onClick: () => void; children: any }) {
   );
 }
 
+/** A number field for sizes, bounded 1–4000. */
 function NumberInput(props: { value: number; title: string; onChange: (n: number) => void }) {
   return (
     <input
@@ -643,6 +647,7 @@ function NumberInput(props: { value: number; title: string; onChange: (n: number
   );
 }
 
+/** A labelled on/off switch. */
 function Toggle(props: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
     <label class="flex items-center justify-between cursor-pointer group">

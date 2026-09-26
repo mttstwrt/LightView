@@ -32,23 +32,28 @@ const THRESHOLD_PRESETS = [
   { label: "Loose", value: 12, desc: "Similar composition" },
 ] as const;
 
+/** A byte count as "12 KB" / "3.4 MB". */
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Pixel dimensions as "4032×3024", or "Unknown". */
 function formatRes(w: number | null, h: number | null): string {
   if (w == null || h == null) return "Unknown";
   return `${w}\u00D7${h}`;
 }
 
+/** A timestamp as a short local date, or empty when there is none. */
 function formatDate(ts: number | null): string {
   if (ts == null) return "";
   const d = new Date(ts * 1000);
   return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
+/** The panel: scan at a chosen threshold, show each group of near-identical
+ *  files, and trash copies or open the merge dialog for a group. */
 export function DuplicatesPanel(props: { onClose: () => void }) {
   const [groups, setGroups] = createSignal<DuplicateGroup[]>([]);
   const [scanning, setScanning] = createSignal(false);
@@ -432,6 +437,7 @@ export function DuplicatesPanel(props: { onClose: () => void }) {
   );
 }
 
+/** One copy in a group: its thumbnail, name and facts, with a trash button. */
 function DuplicateCard(props: { item: DuplicateItem; onTrash: () => void; onClick: () => void }) {
   const fileName = () => {
     const parts = props.item.path.split("/");

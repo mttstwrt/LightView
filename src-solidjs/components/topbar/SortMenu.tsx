@@ -22,10 +22,14 @@ const SORT_OPTIONS: { field: SortField; label: string }[] = [
   { field: "lastrated", label: "Recently Rated" },
 ];
 
+/** The order a sort field starts in: A–Z for name and media type, newest or
+ *  largest first for everything else. */
 function defaultOrder(field: SortField): SortOrder {
   return field === "name" || field === "mediatype" ? "asc" : "desc";
 }
 
+/** The sort field, direction, sub-sort and grouping picker; `dropUp` opens it
+ *  upward from a bottom sheet. */
 export function SortMenu(props: { dropUp?: boolean }) {
   const [open, setOpen] = createSignal(false);
 

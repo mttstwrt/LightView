@@ -35,6 +35,8 @@ interface Place {
   path: string;
 }
 
+/** Walk the server's directories from the gallery root and hand back the one
+ *  chosen, as an absolute path. */
 export function DirectoryPicker(props: {
   title: string;
   confirmLabel: string;

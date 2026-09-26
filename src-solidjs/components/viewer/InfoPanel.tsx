@@ -1,3 +1,8 @@
+// The viewer's info panel: a file's facts, its tags by namespace, and its
+// rating, colour label, notes and location. Dates say `Taken` when there is a
+// capture time and `Modified` when there is not, which is also why the file
+// sits where it does in the grid.
+
 import { Show, For, createSignal, createEffect, on, onCleanup, onMount } from "solid-js";
 import { api } from "../../lib/ipc";
 import { rateItem } from "../../stores/galleryStore";
@@ -11,6 +16,7 @@ import { SWIPE_DISMISS_PX, SWIPE_VELOCITY } from "../../lib/touch";
 // slides up and can be flicked down to dismiss; on desktop it's the side panel.
 const sheetMode = hasTouch();
 
+/** A byte count as "12.3 KB" / "4.56 GB". */
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -18,6 +24,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+/** A timestamp as a local date and time. */
 function formatDate(unixTimestamp: number): string {
   const d = new Date(unixTimestamp * 1000);
   return d.toLocaleDateString(undefined, {
@@ -29,6 +36,8 @@ function formatDate(unixTimestamp: number): string {
   });
 }
 
+/** The panel for one file. A tag chip filters the gallery to that tag, except a
+ *  tag containing a space, which the query language cannot express. */
 export function InfoPanel(props: {
   path: string;
   filename: string;
@@ -494,6 +503,7 @@ export function InfoPanel(props: {
   );
 }
 
+/** One "label: value" line; `breakAll` lets a long path wrap anywhere. */
 function InfoRow(props: { label: string; value: string; breakAll?: boolean }) {
   return (
     <div>
