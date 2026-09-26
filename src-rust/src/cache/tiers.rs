@@ -69,6 +69,7 @@ impl ThumbTier {
         }
     }
 
+    /// The SQLite table holding this tier.
     pub fn table(self) -> &'static str {
         match self {
             ThumbTier::Js => "thumbs_js",
@@ -84,6 +85,7 @@ impl ThumbTier {
         matches!(self, ThumbTier::Jm | ThumbTier::Jh)
     }
 
+    /// The tier a `/thumb/{tier}/…` URL segment names, if any.
     pub fn from_segment(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|t| t.segment() == s)
     }
@@ -223,6 +225,7 @@ pub fn enforce_budget(
     Ok(conn.execute(&sql, [budget_bytes])?)
 }
 
+/// Seconds since the Unix epoch; zero if the clock is before it.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

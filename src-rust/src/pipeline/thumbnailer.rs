@@ -49,6 +49,7 @@ pub enum ResizeFilter {
 }
 
 impl ResizeFilter {
+    /// The filter's name as the settings and the wire spell it.
     pub fn as_str(self) -> &'static str {
         match self {
             ResizeFilter::Nearest => "nearest",
@@ -57,6 +58,7 @@ impl ResizeFilter {
         }
     }
 
+    /// The `fast_image_resize` algorithm that implements this filter.
     fn to_fir_alg(self) -> fir::ResizeAlg {
         match self {
             ResizeFilter::Nearest => fir::ResizeAlg::Nearest,
@@ -481,6 +483,12 @@ fn decode_jpeg_to_rgba(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u
     }
 }
 
+/// Decode a JPEG to RGBA at the smallest DCT scale (1/1 to 1/8) whose long edge
+/// still covers `target_edge`, returning the pixels, their size, and the
+/// source's full size.
+///
+/// This is the reason `jpeg-decoder` is the JPEG path: scaling inside the
+/// decode is what keeps a camera JPEG from costing sixteen times the pixels.
 fn decode_jpeg_to_rgba_inner(path: &Path, target_edge: u32) -> Result<(Vec<u8>, u32, u32, u32, u32), ThumbError> {
     let mmap = mmap_file(path)?;
     let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&mmap[..]));
@@ -575,6 +583,8 @@ pub fn decode_heic_natural(path: &Path) -> Result<HeicDecode, ThumbError> {
 }
 
 
+/// Flatten a HEIC decode into the `(rgba, width, height, src_width,
+/// src_height)` shape every decoder returns, expanding RGB to RGBA.
 fn into_rgba_tuple(dec: HeicDecode) -> (Vec<u8>, u32, u32, u32, u32) {
     let HeicDecode { pixels, width, height, src_width, src_height } = dec;
     let rgba = match pixels {
@@ -625,6 +635,7 @@ fn heic_dimensions(path: &Path) -> Option<(u32, u32)> {
     Some((primary.width(), primary.height()))
 }
 
+/// Open a HEIC/HEIF/AVIF file and decode it; see [`decode_heic_from_ctx`].
 fn decode_heic_internal(
     path: &Path,
     target_edge: Option<u32>,
@@ -634,6 +645,9 @@ fn decode_heic_internal(
     decode_heic_from_ctx(&ctx, target_edge)
 }
 
+/// Decode the primary image of an open HEIF container, preferring an embedded
+/// thumbnail handle that [`pick_thumbnail_handle`] judges large enough for
+/// `target_edge`. `src_width`/`src_height` are always the primary's.
 fn decode_heic_from_ctx(
     ctx: &libheif_rs::HeifContext,
     target_edge: Option<u32>,

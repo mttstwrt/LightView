@@ -363,6 +363,8 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), CacheEr
     Ok(())
 }
 
+/// Open the writer connection with WAL and the pragmas the writer was measured
+/// with.
 fn open_writer(path: &Path) -> Result<Connection, CacheError> {
     let conn = Connection::open(path)?;
     // Carried over because they were measured. `synchronous=NORMAL` in
@@ -378,6 +380,8 @@ fn open_writer(path: &Path) -> Result<Connection, CacheError> {
     Ok(conn)
 }
 
+/// The `format_version` the file was built with, or `None` for a file with no
+/// tables yet.
 fn stored_format_version(conn: &Connection) -> Result<Option<i64>, CacheError> {
     // A fresh file has no tables at all, which is a missing version, not an
     // error.
@@ -394,6 +398,8 @@ fn stored_format_version(conn: &Connection) -> Result<Option<i64>, CacheError> {
     Ok(meta_get(conn, "format_version")?.and_then(|v| v.parse().ok()))
 }
 
+/// Delete the database and its `-wal` and `-shm` files; ones already gone are
+/// not an error.
 fn remove_database(path: &Path) -> std::io::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let p = PathBuf::from(format!("{}{}", path.display(), suffix));

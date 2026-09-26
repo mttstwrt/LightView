@@ -54,6 +54,8 @@ pub struct AccessMarks {
 }
 
 impl AccessMarks {
+    /// Buffer an access to a bounded tier's row; unbounded tiers are ignored,
+    /// since they are never evicted.
     fn record(&self, tier: ThumbTier, path: &RelPath) {
         if !tier.bounded() {
             return;
@@ -66,6 +68,7 @@ impl AccessMarks {
             .push(path.clone());
     }
 
+    /// Take every buffered access, leaving the buffer empty.
     fn drain(&self) -> HashMap<ThumbTier, Vec<RelPath>> {
         std::mem::take(&mut *self.inner.lock().expect("access marks poisoned"))
     }
@@ -94,6 +97,8 @@ impl Default for Activity {
 }
 
 impl Activity {
+    /// Record that a user-driven request landed now. Speculative work must
+    /// never call this, or the idle worker believes someone is always looking.
     pub fn mark(&self) {
         self.last_request.store(now(), Ordering::Relaxed);
     }
@@ -120,6 +125,8 @@ pub struct ThumbService {
 }
 
 impl ThumbService {
+    /// A thumbnail service over `db`, generating on `pool` and holding the two
+    /// bounded tiers to `budget_bytes` each.
     pub fn new(
         db: Arc<CacheDb>,
         root: Root,
@@ -305,6 +312,7 @@ async fn on_pool<T: Send + 'static>(
     rx.await.ok()
 }
 
+/// Seconds since the Unix epoch; zero if the clock is before it.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

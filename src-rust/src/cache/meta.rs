@@ -246,6 +246,8 @@ pub fn all_paths(conn: &Connection) -> Result<Vec<RelPath>, CacheError> {
     Ok(out)
 }
 
+/// An RFC 3339 companion timestamp as Unix seconds; `None` if it does not
+/// parse.
 fn parse_rfc3339(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
@@ -259,6 +261,7 @@ pub fn to_rfc3339(ts: i64) -> String {
         .to_rfc3339()
 }
 
+/// Seconds since the Unix epoch; zero if the clock is before it.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

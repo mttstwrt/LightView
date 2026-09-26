@@ -80,6 +80,9 @@ pub struct VideoInfo {
 static FFMPEG_PRESENT: OnceLock<bool> = OnceLock::new();
 static FFPROBE_PRESENT: OnceLock<bool> = OnceLock::new();
 
+/// Whether `bin` runs at all, asked once per process and remembered. Asked
+/// before probing, because a probe cannot tell a missing binary from an
+/// unreadable file.
 fn binary_present(bin: &str, cache: &OnceLock<bool>) -> bool {
     *cache.get_or_init(|| {
         Command::new(bin)
@@ -109,11 +112,13 @@ pub fn ffprobe_available() -> bool {
 
 type ProbeCache = Mutex<HashMap<PathBuf, (Option<SystemTime>, VideoInfo)>>;
 
+/// The process-wide probe memo, created on first use.
 fn probe_cache() -> &'static ProbeCache {
     static CACHE: OnceLock<ProbeCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The file's modification time, the second half of the probe memo's key.
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
@@ -147,6 +152,8 @@ pub fn probe(path: &Path) -> Result<VideoInfo, ThumbError> {
     Ok(info)
 }
 
+/// Run `ffprobe` on one file and read its display dimensions (rotation
+/// applied), duration, capture date and location from the container.
 fn probe_uncached(path: &Path) -> Result<VideoInfo, ThumbError> {
     // `-show_streams`/`-show_format` rather than a targeted `-show_entries`:
     // the rotation lives in a nested `side_data_list` whose `-show_entries`
@@ -272,6 +279,8 @@ fn parse_offset_datetime(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset
         .ok()
 }
 
+/// The first container tag whose key mentions "location" and whose value parses
+/// as ISO 6709.
 fn location_from_tags(tags: &serde_json::Value) -> Option<Location> {
     tags.as_object()?
         .iter()
@@ -367,6 +376,8 @@ fn rotation_of(stream: &serde_json::Value) -> i32 {
     }
 }
 
+/// Whether a rotation of `degrees` turns portrait into landscape or back, so
+/// width and height trade places.
 fn rotation_swaps_axes(degrees: i32) -> bool {
     degrees == 90 || degrees == 270
 }
@@ -483,6 +494,9 @@ fn cover_dims(w: u32, h: u32, target_edge: u32) -> (u32, u32) {
     (sw, sh)
 }
 
+/// Run `ffmpeg` for one frame at `w`×`h` (display-oriented), seeking first if
+/// `seek` is given, and return its raw RGBA bytes — which must be exactly
+/// `expected` long, or the frame is an error rather than a smear.
 fn run_frame(
     path: &Path,
     seek: Option<&str>,
