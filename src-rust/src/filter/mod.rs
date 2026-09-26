@@ -10,7 +10,8 @@
 //! otherwise be unquotable. And a bare word searches every namespace, because
 //! that is what someone typing into a search box means.
 //!
-//! See `docs/query/README.md` for the language reference.
+//! A change to the syntax changes the README's Filtering table in the same
+//! commit: that table is how a user learns the language.
 
 pub mod ast;
 pub mod parser;

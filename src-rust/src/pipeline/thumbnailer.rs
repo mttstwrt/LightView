@@ -10,12 +10,13 @@
 //!   A faster per-pixel decoder that lacks scaling is a net *loss* on camera
 //!   JPEGs, because it would decode sixteen times the pixels.
 //! * HEIC prefers an embedded thumbnail handle over decoding the full image.
-//! * Micro is derived from cached Standard bytes rather than from the original;
-//!   the derivation is in `commands::media`, but this is where the primitives
-//!   for it live.
 //!
-//! `docs/pipeline/jpeg-decode.md` has the measurements and the options that
-//! were rejected.
+//! Measured on the `thumbnailer` bench: a 4000×3000 JPEG to 512px is ~20 ms, of
+//! which ~16 ms is the decode. The one faster option that keeps DCT scaling is
+//! libjpeg-turbo, estimated at 2–4× on this path and not taken: it is a C build
+//! dependency, and the win has to be measured on real photos before it is
+//! worth that. DCT scaling cannot skip the entropy decode of the full stream, so
+//! no decoder makes this ten times faster.
 //!
 //! Source files are memory-mapped rather than read into a buffer, so a decoder
 //! that only touches part of the stream only faults in that part.
