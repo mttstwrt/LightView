@@ -231,21 +231,25 @@ async fn serve(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// `lightview tag <dir> --plugin <name> [--filter <expr>]`.
+/// `lightview tag <dir> --plugin <name> [--filter <expr>]`: run a plugin over
+/// a gallery on this machine and write its tags into the companions.
 ///
 /// **This is why there is no `--remote` mode and no worker binary.** The
-/// problem it solves is real: the server is an N100 that cannot run the models
-/// and the desktop has the GPU. An earlier design answered it with a
-/// distributed job broker — a worker registry with liveness TTLs,
-/// announce/claim/update/complete/fail, job pinning, two staleness clocks, a
-/// credential file, a pairing verb and a certificate pin — all of it to move
-/// bytes and results between two machines over HTTP.
+/// server is a small box that cannot run the models and the desktop has the
+/// GPU — but the desktop can mount the gallery, so it does not need a protocol
+/// between machines, it needs a path. This opens the gallery the way every
+/// other mode does, runs the plugin locally and writes companions. The server's
+/// own watcher picks them up, because a write arriving over the share is `smbd`
+/// writing to the local disk and `inotify` watches inodes. Nothing is claimed,
+/// heartbeated or pinned, and nothing needs a credential: the filesystem
+/// already answered the authentication question.
 ///
-/// The desktop can mount the gallery. So it does not need a protocol, it needs
-/// a path: this opens the gallery the way every other mode does, runs the
-/// plugin locally and writes companions. The server's own watcher picks them
-/// up, because a write arriving over the share is `smbd` writing to the local
-/// disk and `inotify` watches inodes.
+/// Two consequences. **The bytes move, not the decodes:** full files cross the
+/// mount and are decoded on the desktop — more bytes on the wire, far less
+/// server CPU, which is the right trade when the server is the bottleneck.
+/// **Tagging is started from a shell** unless the gallery is open in a local
+/// viewer, like the password and pairing; unattended tagging of what a phone
+/// uploads is a systemd timer around this verb.
 ///
 /// It takes the cache lock like any other mode, so it cannot run against a
 /// gallery this machine is already serving — the lock is what stops two
