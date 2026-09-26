@@ -7,11 +7,22 @@
 //! module is a pure function over two floats.
 //!
 //! **Why the names are written to companion files** (by the gallery's
-//! open-time location backfill) when the coordinate deliberately is not: the coordinate lives in the file's own EXIF and any photo tool can
-//! recover it, so mirroring it into a sidecar would be redundant. The *name* is
-//! not in the file — recovering it needs the gazetteer below, at a particular
-//! version — so it is the one part of this that would not survive the gallery
-//! being read by anything other than LightView.
+//! open-time location backfill) when the coordinate deliberately is not: the
+//! coordinate lives in the file's own metadata and any photo tool can recover
+//! it, so mirroring it into a sidecar would be redundant. The *name* is not in
+//! the file — recovering it needs the gazetteer below, at a particular version
+//! — so it is the one part of this that would not survive the gallery being
+//! read by anything other than LightView. The names land as a versioned plugin
+//! bucket like any tagger's, which is what lets a gallery tagged by an older
+//! gazetteer be spotted and re-tagged.
+//!
+//! **Videos take part on the same terms, and that creates files.** The
+//! backfill selects on coordinates, not on kind, so a geotagged clip — its
+//! coordinate read from the container by [`crate::pipeline::video`] — gets a
+//! sidecar written for it exactly as a photo does. On a camera roll full of
+//! phone video that means new `.lightview.json` files in the gallery tree. That
+//! is the intent: a video nobody can find by place is missing from half the
+//! searches.
 //!
 //! **Matching is approximate, by construction.** The gazetteer is GeoNames
 //! cities1000 (every populated place of 1,000 people or more) and the lookup is
