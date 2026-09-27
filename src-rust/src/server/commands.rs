@@ -130,7 +130,7 @@ pub async fn dispatch(
             Ok(json!(
                 tags::paths_with_tags(&gallery, &a.tags, a.namespace, a.limit)
                     .await
-                    .map_err(failed)?
+                    .map_err(tag_failed)?
             ))
         }
         "add_tags" => {
@@ -138,7 +138,7 @@ pub async fn dispatch(
             let a: TagWrite = parse(args)?;
             let n = tags::add(&gallery, &a.paths, &a.tags, a.namespace)
                 .await
-                .map_err(failed)?;
+                .map_err(tag_failed)?;
             Ok(json!({ "changed": n }))
         }
         "remove_tags" => {
@@ -146,7 +146,7 @@ pub async fn dispatch(
             let a: TagWrite = parse(args)?;
             let n = tags::remove(&gallery, &a.paths, &a.tags, a.namespace)
                 .await
-                .map_err(failed)?;
+                .map_err(tag_failed)?;
             Ok(json!({ "changed": n }))
         }
         "rename_tag" => {
@@ -154,7 +154,7 @@ pub async fn dispatch(
             let a: TagRename = parse(args)?;
             let n = tags::rename(&gallery, &a.from, &a.to, a.namespace)
                 .await
-                .map_err(failed)?;
+                .map_err(tag_failed)?;
             Ok(json!({ "changed": n }))
         }
         "merge_tags" => {
@@ -162,7 +162,7 @@ pub async fn dispatch(
             let a: TagMerge = parse(args)?;
             let n = tags::merge(&gallery, &a.sources, &a.target, a.namespace)
                 .await
-                .map_err(failed)?;
+                .map_err(tag_failed)?;
             Ok(json!({ "changed": n }))
         }
         "delete_tag" => {
@@ -170,7 +170,15 @@ pub async fn dispatch(
             let a: TagDelete = parse(args)?;
             let n = tags::delete(&gallery, &a.tag, a.namespace)
                 .await
-                .map_err(failed)?;
+                .map_err(tag_failed)?;
+            Ok(json!({ "changed": n }))
+        }
+        "order_set" => {
+            require(state, Trust::Device)?;
+            let a: SetOrder = parse(args)?;
+            let n = tags::order_set(&gallery, &a.set, &a.paths)
+                .await
+                .map_err(tag_failed)?;
             Ok(json!({ "changed": n }))
         }
         "set_rating" => {
@@ -502,6 +510,15 @@ fn failed(e: impl std::fmt::Display) -> CommandError {
     CommandError::Failed(e.to_string())
 }
 
+/// A tag operation's error: a name the caller should not have sent is a bad
+/// argument, anything else a failure.
+fn tag_failed(e: tags::TagError) -> CommandError {
+    match e {
+        tags::TagError::InvalidSetName(_) => CommandError::BadArguments(e.to_string()),
+        e => failed(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Argument shapes. Every path is a `RelPath`, which validates on deserialize.
 // ---------------------------------------------------------------------------
@@ -560,6 +577,14 @@ struct TagMerge {
 struct TagDelete {
     tag: String,
     namespace: WritableNamespace,
+}
+
+/// A set and the order its members should take. No namespace: only a set has
+/// an order.
+#[derive(Deserialize)]
+struct SetOrder {
+    set: String,
+    paths: Vec<RelPath>,
 }
 
 #[derive(Deserialize)]

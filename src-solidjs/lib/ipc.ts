@@ -290,6 +290,13 @@ export const api = {
   deleteTag: (tag: string, namespace: WritableNamespace) =>
     invoke<{ changed: number }>("delete_tag", { tag, namespace }),
 
+  /** Put a set in the order given: the listed members take positions 1..n,
+   *  every other member loses its position, and an empty list clears the
+   *  order. The one writer of positions — drag, Reverse, Lock and Clear are
+   *  all this call. No namespace: only a set has an order. */
+  orderSet: (set: string, paths: string[]) =>
+    invoke<{ changed: number }>("order_set", { set, paths }),
+
   /** A selection, always — rating one photo is a selection of one, and the
    *  server answers with a single `items-changed` however many there are. */
   setRating: (paths: string[], rating: number | null) =>

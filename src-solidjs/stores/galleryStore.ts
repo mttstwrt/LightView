@@ -19,6 +19,10 @@ const [galleryPath, setGalleryPath] = createSignal<string | null>(null);
 const [loading, setLoading] = createSignal(false);
 const [items, setItems] = createSignal<SortedItem[]>([]);
 const [groups, setGroups] = createSignal<GroupHeader[]>([]);
+/** The set the grid is showing, when the filter is exactly one: the grid is
+ *  then in that set's order and may be reordered. The server decides, because
+ *  only it parses the filter. */
+const [currentSet, setCurrentSet] = createSignal<string | null>(null);
 
 /** True when two path lists name the same files in the same order. */
 const sameOrder = (a: string[], b: string[]) =>
@@ -124,6 +128,7 @@ export {
   colorLabelByPath,
   groups,
   setGroups,
+  currentSet,
   selectedPaths,
   setSelectedPaths,
   selectionMode,
@@ -160,6 +165,7 @@ export async function refresh(next?: Partial<Query>) {
     const result = await api.items(current);
     setItems(result.items);
     setGroups(result.groups);
+    setCurrentSet(result.set ?? null);
   } finally {
     setLoading(false);
   }
@@ -175,7 +181,8 @@ export async function refresh(next?: Partial<Query>) {
  *  matching the filter disappears rather than lingering until the view is
  *  re-run: the gallery has one owner, and a change they made on another device
  *  is one they expect to see. Keeping the reader's place across it is the
- *  grid's job, not the store's.
+ *  grid's job, not the store's. The one wait is while a set is being dragged
+ *  or its order written: the refetch is held until then (`holdRefreshes`).
  *
  *  **A filesystem change sends what changed, not everything.** Re-fetching the
  *  whole sorted list on any addition cost every connected client a
@@ -195,7 +202,7 @@ export async function applyEvent(event: ServerEvent) {
           return next;
         });
       }
-      if (event.added.length > 0) await refresh();
+      if (event.added.length > 0) await refreshForEvent();
       break;
     }
     case "items-changed":
@@ -204,7 +211,7 @@ export async function applyEvent(event: ServerEvent) {
       // enough that patching row by row would cost more than one query takes
       // the query instead — the crossover is where the per-row calls stop
       // being cheaper than the payload they avoid.
-      if (event.paths.length > PATCH_LIMIT) await refresh();
+      if (event.paths.length > PATCH_LIMIT) await refreshForEvent();
       else await Promise.all(event.paths.map(patchItem));
       break;
     case "tags-indexed":
@@ -212,7 +219,7 @@ export async function applyEvent(event: ServerEvent) {
       // active filter names a tag — which the client cannot tell without
       // parsing the query, so any active filter re-runs and no filter does
       // nothing. Autocomplete refreshes itself on the next keystroke.
-      if (current.filter.trim()) await refresh();
+      if (current.filter.trim()) await refreshForEvent();
       break;
     case "resync":
       // Typed lag recovery: re-fetch exactly the domains named. `tags` alone
@@ -221,12 +228,22 @@ export async function applyEvent(event: ServerEvent) {
         event.domains.includes("items") ||
         (event.domains.includes("tags") && current.filter.trim())
       ) {
-        await refresh();
+        await refreshForEvent();
       }
       break;
     default:
       break;
   }
+}
+
+/** The refresh an event asks for: now, or once nothing holds refreshes back.
+ *  See `holdRefreshes`. */
+function refreshForEvent(): Promise<void> {
+  if (holds > 0) {
+    refreshOwed = true;
+    return Promise.resolve();
+  }
+  return refresh();
 }
 
 /** Above this many changed rows, one query beats N metadata calls. Not
@@ -281,6 +298,82 @@ export async function setItemColorLabel(path: string, label: string | null) {
   setItems((list) =>
     list.map((item) => (item.path === path ? { ...item, color_label: label } : item)),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Reordering a set
+// ---------------------------------------------------------------------------
+
+/** How many things are holding event-driven refreshes back: a drag under way,
+ *  and a reorder being written. */
+let holds = 0;
+/** Whether an event asked for a refresh while one was held. */
+let refreshOwed = false;
+
+/** Hold back the refreshes server events ask for, until the matching
+ *  `releaseRefreshes`.
+ *
+ *  While a drag is under way, a refresh would move cells out from under the
+ *  pointer; while a reorder is being written, the `tags-indexed` each write
+ *  ends with would fetch an order *older* than the one on screen and snap the
+ *  grid back, then forward again. Held refreshes collapse into one, run when
+ *  the last hold is released. A refresh the reader asks for — a new filter or
+ *  sort — is not an event's and is never held. */
+export function holdRefreshes() {
+  holds++;
+}
+
+/** Release one `holdRefreshes`, running the refresh it held back if it was the
+ *  last. */
+export function releaseRefreshes() {
+  holds = Math.max(0, holds - 1);
+  if (holds === 0 && refreshOwed) {
+    refreshOwed = false;
+    void refresh();
+  }
+}
+
+/** The order waiting behind the one being written, if any. */
+let queuedOrder: { set: string; paths: string[] } | null = null;
+let writingOrder = false;
+
+/** Show a set in a new order at once, and write it.
+ *
+ *  **One reorder is written at a time.** A first reorder writes every member's
+ *  sidecar and takes seconds over a share, and a reader drags again in that
+ *  time. Two writes in flight would interleave per file on the server, or the
+ *  older could land last; so a reorder made while one is being written replaces
+ *  whatever is queued behind it, and goes when the write finishes. Only the
+ *  latest order matters, and it is the one on screen.
+ *
+ *  A failure refreshes from the server rather than guessing: a write that
+ *  stopped partway leaves a mixed order, and the reader should see that one. */
+export async function reorderSet(set: string, paths: string[]) {
+  const rank = new Map(paths.map((path, i) => [path, i]));
+  const at = (path: string) => rank.get(path) ?? paths.length;
+  setItems((list) => [...list].sort((a, b) => at(a.path) - at(b.path)));
+
+  if (writingOrder) {
+    queuedOrder = { set, paths };
+    return;
+  }
+  writingOrder = true;
+  holdRefreshes();
+  try {
+    let next: { set: string; paths: string[] } | null = { set, paths };
+    while (next) {
+      queuedOrder = null;
+      await api.orderSet(next.set, next.paths);
+      next = queuedOrder;
+    }
+  } catch (err) {
+    console.error("Reorder failed:", err);
+    queuedOrder = null;
+    refreshOwed = true;
+  } finally {
+    writingOrder = false;
+    releaseRefreshes();
+  }
 }
 
 // ---------------------------------------------------------------------------

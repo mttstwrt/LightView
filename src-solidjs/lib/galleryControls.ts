@@ -1,10 +1,11 @@
-// The grid's pointer interaction: drag-select, click handling, and edge-scroll
-// while dragging. These are state machines that do not depend on how cells are
-// placed, so they live apart from the layout and streaming logic, which stays
-// in the component.
+// The grid's pointer interaction: drag-select, reordering a set, click
+// handling, and edge-scroll while dragging. These are state machines that do
+// not depend on how cells are placed, so they live apart from the layout and
+// streaming logic, which stays in the component.
 
-import { createSignal, createEffect, onMount, onCleanup } from "solid-js";
+import { createSignal, createEffect, onMount, onCleanup, type Accessor } from "solid-js";
 import { scrollToY, scrollTop, viewportHeight } from "./scrollHost";
+import { moveBlock, type Gap } from "./reorder";
 
 // -------------------------------------------------------------------------
 // Selection: Ctrl/Cmd-drag range select + click-to-open / click-to-toggle.
@@ -144,6 +145,160 @@ export function createDragSelect(props: SelectionControlProps): DragSelectContro
   };
 
   return { isDragging, effectiveSelected, handleDragStart, handleDragEnter, handleItemClick, handleBackgroundClick };
+}
+
+// -------------------------------------------------------------------------
+// Reordering a set: plain mouse-drag a cell to a gap.
+// -------------------------------------------------------------------------
+
+/** How far the mouse must travel with the button down before a press is a
+ *  drag rather than a click — enough to absorb the jitter of a firm click, so
+ *  opening the viewer is never a reorder. */
+const REORDER_SLOP_PX = 6;
+
+export interface ReorderProps {
+  /** Whether the grid is a set view, where a drag reorders. */
+  enabled: () => boolean;
+  paths: () => readonly string[];
+  selectedPaths: () => ReadonlySet<string>;
+  /** The gap under a viewport point, in the grid's layout. */
+  gapAt: (clientX: number, clientY: number) => Gap | null;
+  /** The full new order, after a drop that changed it. */
+  onReorder: (paths: string[]) => void;
+  /** Called when a press becomes a drag, and once when that drag ends. */
+  onLift?: () => void;
+  onSettle?: () => void;
+}
+
+export interface ReorderControls {
+  /** What is being dragged, or null when nothing is. */
+  lifted: Accessor<ReadonlySet<string> | null>;
+  /** Where the dragged block would land if released now. */
+  gap: Accessor<Gap | null>;
+  /** Cell `onPointerDown`. */
+  handlePointerDown: (path: string, e: PointerEvent) => void;
+}
+
+/** Reordering by mouse: press a cell and move past the slop to lift it — with
+ *  the rest of the selection, if it is selected — then release over a gap to
+ *  put it there. Esc puts it back.
+ *
+ *  **Mouse only.** On touch a drag is a scroll and a long press is the context
+ *  menu, and neither may become a reorder; a touch device reorders from the
+ *  sort menu instead. Checked by pointer type rather than by `isMobile()`, so a
+ *  laptop with a touchscreen still drags with its mouse.
+ *
+ *  **Ctrl/Cmd still selects.** A modified press is left to drag-select, which
+ *  is why this needs no mode of its own: a plain drag did nothing before. */
+export function createReorderDrag(props: ReorderProps): ReorderControls {
+  const [lifted, setLifted] = createSignal<ReadonlySet<string> | null>(null);
+  const [gap, setGap] = createSignal<Gap | null>(null);
+  /** The press in progress. `cancelled` after Esc, so its release does
+   *  nothing — not even the click that would open the viewer. */
+  let press: { path: string; x: number; y: number; cancelled: boolean } | null = null;
+  let pointer = { x: 0, y: 0 };
+
+  const handlePointerDown = (path: string, e: PointerEvent) => {
+    if (!props.enabled() || e.pointerType !== "mouse" || e.button !== 0) return;
+    if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    press = { path, x: e.clientX, y: e.clientY, cancelled: false };
+  };
+
+  const settle = () => {
+    setLifted(null);
+    setGap(null);
+    props.onSettle?.();
+  };
+
+  onMount(() => {
+    const onMove = (e: PointerEvent) => {
+      if (!press || press.cancelled) return;
+      pointer = { x: e.clientX, y: e.clientY };
+      if (!lifted()) {
+        if (Math.hypot(e.clientX - press.x, e.clientY - press.y) < REORDER_SLOP_PX) return;
+        const selected = props.selectedPaths();
+        setLifted(selected.has(press.path) ? new Set(selected) : new Set([press.path]));
+        props.onLift?.();
+      }
+      setGap(props.gapAt(pointer.x, pointer.y));
+    };
+
+    // Edge-scroll moves the content under a still pointer, so the gap is
+    // re-read on scroll as well as on movement.
+    const onScroll = () => {
+      if (lifted()) setGap(props.gapAt(pointer.x, pointer.y));
+    };
+
+    const onUp = () => {
+      if (!press) return;
+      const { cancelled } = press;
+      press = null;
+      const moving = lifted();
+      if (cancelled) swallowNextClick();
+      if (!moving) return;
+      swallowNextClick();
+      const target = gap();
+      if (target) {
+        const order = props.paths();
+        const next = moveBlock(order, moving, target.index);
+        // Reorder before settling: the caller takes its own hold on refreshes
+        // synchronously, so the grid's is released into it rather than into a
+        // refresh that would fetch the old order.
+        if (next.some((p, i) => p !== order[i])) props.onReorder(next);
+      }
+      settle();
+    };
+
+    // The browser took the pointer away mid-press: nothing was dropped, so
+    // nothing moves — unlike a release, which lands wherever the gap was.
+    const onCancel = () => {
+      if (!press) return;
+      press = null;
+      if (lifted()) settle();
+    };
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || !lifted() || !press) return;
+      // Ours alone: the same Esc must not also close a panel or the viewer.
+      e.stopPropagation();
+      press.cancelled = true;
+      settle();
+    };
+
+    window.addEventListener("pointermove", onMove, { passive: true });
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    window.addEventListener("keydown", onKey, true);
+    onCleanup(() => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("scroll", onScroll, { capture: true });
+      window.removeEventListener("keydown", onKey, true);
+      if (lifted()) props.onSettle?.();
+    });
+  });
+
+  return { lifted, gap, handlePointerDown };
+}
+
+/** Eat the click the browser fires after a drop.
+ *
+ *  It lands on the nearest common ancestor of where the press and the release
+ *  happened — after a drag, usually the grid's background, whose handler clears
+ *  the selection — so a flag checked in the cell's own click handler would not
+ *  be consumed there and would eat the reader's next real click instead. A
+ *  capture listener on the window sees the click first wherever it lands, and
+ *  is gone by the next task if none comes, because the click follows the
+ *  release within the same one. */
+function swallowNextClick() {
+  const eat = (e: MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+  };
+  window.addEventListener("click", eat, { capture: true, once: true });
+  setTimeout(() => window.removeEventListener("click", eat, { capture: true }), 0);
 }
 
 // -------------------------------------------------------------------------

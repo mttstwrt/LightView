@@ -1,14 +1,22 @@
-// Sort field, direction, sub-sort, and grouping.
+// Sort field, direction, sub-sort, and grouping — and, in a set view, the set's
+// own order.
 //
 // Changing any of them re-runs the filter *and* the sort together rather than
 // re-sorting what is on screen: the backend returns the ordered list, so a
 // client-side re-sort would have to reimplement the tiebreakers and would drift
 // from them.
+//
+// The set actions keep that rule. None of them sorts: Reverse turns the order
+// on screen around and Lock records it as it stands, so "oldest first" is Clear,
+// then Date ascending, then Lock — the server's sort, written down. In a set
+// view the fields below still matter: they order the members that have no
+// position yet, after the ones that do.
 
 import { createSignal, Show, For, onCleanup } from "solid-js";
 import { isMobile } from "../../lib/runtime";
 import { sortField, setSortField, sortOrder, setSortOrder, subSortField, setSubSortField, subSortOrder, setSubSortOrder, groupBy } from "../../stores/settingsStore";
-import { refresh } from "../../stores/galleryStore";
+import { currentSet, displayPaths, refresh, reorderSet } from "../../stores/galleryStore";
+import { ConfirmButton } from "../shared/ConfirmButton";
 import type { SortField, SortOrder } from "../../lib/types";
 
 const SORT_OPTIONS: { field: SortField; label: string }[] = [
@@ -103,6 +111,12 @@ export function SortMenu(props: { dropUp?: boolean }) {
   // Sub-sort options: everything except the current primary field
   const subOptions = () => SORT_OPTIONS.filter((o) => o.field !== sortField());
 
+  /** Write `paths` as the set's order and close the menu. */
+  const orderSet = (set: string, paths: string[]) => {
+    setOpen(false);
+    void reorderSet(set, paths);
+  };
+
   return (
     <div class="relative shrink-0">
       <button
@@ -110,6 +124,12 @@ export function SortMenu(props: { dropUp?: boolean }) {
         class="shrink-0 flex items-center gap-1 px-2.5 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors cursor-pointer"
         title="Sort"
       >
+        {/* The set's order comes first in a set view, and the field after it
+            orders only the members without a position — so both are named. */}
+        <Show when={currentSet() !== null}>
+          <span class="text-teal-300">Set order</span>
+          <span class="text-neutral-600 mx-0.5">/</span>
+        </Show>
         <span>{currentLabel()}</span>
         <span class="text-neutral-500">{orderIcon(sortOrder())}</span>
         {/* Sub-sort is secondary detail — hidden on mobile to keep the bar
@@ -136,6 +156,43 @@ export function SortMenu(props: { dropUp?: boolean }) {
             border: "1px solid rgba(255,255,255,0.08)",
           }}
         >
+          <Show when={currentSet()}>
+            {(set) => (
+              <>
+                <div class="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-neutral-500 truncate">
+                  Set order · {set()}
+                </div>
+                <div class="px-3 pb-1.5 text-[11px] leading-snug text-neutral-500">
+                  <Show when={!isMobile()} fallback="Members without a position follow, in the sort below.">
+                    Drag thumbnails to reorder. Members without a position follow, in the sort below.
+                  </Show>
+                </div>
+                <div class="flex items-center gap-1.5 px-3 pb-2">
+                  <button
+                    class="px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors text-neutral-300 bg-neutral-800 hover:bg-neutral-700"
+                    title="Turn the order on screen around"
+                    onClick={() => orderSet(set(), [...displayPaths()].reverse())}
+                  >
+                    Reverse
+                  </button>
+                  <button
+                    class="px-2.5 py-1 text-[10px] rounded cursor-pointer transition-colors text-neutral-300 bg-neutral-800 hover:bg-neutral-700"
+                    title="Give every member the place it has on screen now"
+                    onClick={() => orderSet(set(), [...displayPaths()])}
+                  >
+                    Lock
+                  </button>
+                  <ConfirmButton
+                    label="Clear"
+                    confirmLabel="Clear order?"
+                    onConfirm={() => orderSet(set(), [])}
+                  />
+                </div>
+                <div class="mx-2 my-1 border-t border-neutral-700/50" />
+              </>
+            )}
+          </Show>
+
           {/* Primary sort */}
           <div class="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-neutral-500">
             Sort by

@@ -75,7 +75,7 @@ The search box takes a small query language:
 ```
 vacation                          any namespace
 user::vacation                    one namespace
-set::kellys-comic                 set membership
+set::kellys-comic                 set membership — alone, the set in its own order
 plugin.wd::beach                  a plugin's tags
 "two words"                       a tag containing a space
 NOT plugin.wd::indoor             negation
@@ -93,7 +93,18 @@ has:geo     missing:geo           whether coordinates exist at all
 
 `OR` binds loosest, then `AND`, then `NOT`; parentheses override. Years are
 always four digits. A **set** is just a tag in the `set` namespace, so a burst,
-a comic or a face cluster is grouped by tagging its members.
+a comic or a face cluster is grouped by tagging its members — select them and
+add them with the selection bar switched to **Set**.
+
+A set can also have an **order** of its own, for a comic saved strip by strip or
+anything else whose files don't sort into the right sequence. Filter to exactly
+`set::name` and the grid shows the set in its order: drag thumbnails to
+rearrange it with a mouse, or use the sort menu's **Reverse**, **Lock** (keep
+the order on screen) and **Clear**. Members that have no place yet follow the
+ordered ones, in whatever sort you've chosen. Any wider query — `set::name AND
+rating>=4`, say — sorts normally. In the sidecar a member's place is a suffix on
+its entry, `"set": ["kellys-comic::3"]`, so a set name can't itself end in `::`
+and digits.
 
 `date=` means the date a photo was *taken*, so a screenshot or a video with no
 capture date never matches it. The grid still sorts those files by their

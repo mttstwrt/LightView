@@ -77,6 +77,26 @@ pub enum FilterExpr {
     },
 }
 
+impl FilterExpr {
+    /// The set this expression names, when it is exactly one `set::` term and
+    /// nothing else.
+    ///
+    /// That is what makes a view *the set* rather than a query that happens to
+    /// touch one, and so what puts the grid in the set's own order. Anything
+    /// wider — another term alongside it, an `OR`, a `NOT`, a bare name that
+    /// could also be a user tag — is a query, ordered like any other; it may
+    /// show part of a set, or two, and neither has one order to give it.
+    pub fn sole_set(&self) -> Option<&str> {
+        match self {
+            FilterExpr::Tag {
+                namespace: TagNamespace::Set,
+                value,
+            } => Some(value),
+            _ => None,
+        }
+    }
+}
+
 /// Which numeric column a [`FilterExpr::Numeric`] targets.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

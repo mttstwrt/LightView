@@ -22,11 +22,26 @@
 //! from the *index* is a decision; dropping it from the *file* is data loss,
 //! and this is the line between them.
 //!
+//! **A set entry is `name` or `name::N`.** `N` is this file's position in the
+//! set: where the grid shows it when the filter is exactly that set. It is a
+//! suffix on the string rather than a field of its own because membership and
+//! position are one fact — a rename, a removal or a merge rewrites the one
+//! string, and cannot leave a position behind for a set the file has left. Only
+//! this file sees the suffix: the index splits it off ([`split_set_entry`]), so
+//! everything else still knows a set by its name.
+//!
+//! That changes what an existing field means, and `CURRENT_SCHEMA_VERSION` is
+//! deliberately **not** bumped for it. A build refuses a sidecar newer than
+//! itself, so a bump would make an older build refuse every sidecar this one
+//! rewrites. Without it an older build degrades instead of failing: it takes
+//! `comic::3` for a set of its own and its remove and rename miss such an
+//! entry, but it reads the file and round-trips the string untouched.
+//!
 //! `Location` is decimal degrees, WGS-84, with altitude in metres above sea
 //! level when present.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Current schema version. Increment on breaking changes.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -80,29 +95,68 @@ impl CompanionFile {
         }
     }
 
-    /// Every tag this file contributes to the index, as `(namespace, tag)`.
+    /// Every tag this file contributes to the index, as `(namespace, tag,
+    /// position)`, in list order.
+    ///
+    /// A set entry contributes its bare name, with its position beside it; every
+    /// other tag has no position. The order matters: the index keeps the first
+    /// row per name, and [`TagCollection::one_entry_per_set`] keeps the first
+    /// entry — the same one.
     ///
     /// `tags.auto` is deliberately **not** enumerated. Old sidecars may carry
     /// it and it round-trips untouched through `TagCollection::extra`, but the
     /// namespace no longer exists in the query language and folding it into
     /// `user::` would silently promote machine output to user intent — the one
     /// boundary this format exists to keep.
-    pub fn all_tags(&self) -> Vec<(String, String)> {
+    pub fn all_tags(&self) -> Vec<(String, String, Option<u32>)> {
         let mut result = Vec::new();
         for tag in &self.tags.user {
-            result.push(("user".to_string(), tag.clone()));
+            result.push(("user".to_string(), tag.clone(), None));
         }
-        for tag in &self.tags.set {
-            result.push(("set".to_string(), tag.clone()));
+        for entry in &self.tags.set {
+            let (name, position) = split_set_entry(entry);
+            result.push(("set".to_string(), name.to_string(), position));
         }
         for (plugin_name, entry) in &self.tags.plugins {
             for tag in &entry.tags {
-                result.push((format!("plugin.{}", plugin_name), tag.clone()));
+                result.push((format!("plugin.{}", plugin_name), tag.clone(), None));
             }
         }
         result
     }
 
+}
+
+/// Split a `tags.set` entry into the set's name and this file's position in it.
+///
+/// **The position is the digits after the last `::`, and nothing else is.**
+/// `a::b::3` is set `a::b` at position 3; `a::b` and `comic::x` are names with
+/// no position. Reading from the right is what lets a name contain `::` at all,
+/// and it is also why a name may not *end* in `::<digits>`: it would read back
+/// as a shorter name plus a position, so the tag service refuses such a name
+/// on the way in.
+pub fn split_set_entry(entry: &str) -> (&str, Option<u32>) {
+    if let Some(at) = entry.rfind("::") {
+        let (name, digits) = (&entry[..at], &entry[at + 2..]);
+        let all_digits = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        if !name.is_empty() && all_digits {
+            // Out of `u32` range reads as part of the name rather than failing:
+            // no writer produces it, so it can only be a name someone chose.
+            if let Ok(position) = digits.parse() {
+                return (name, Some(position));
+            }
+        }
+    }
+    (entry, None)
+}
+
+/// The `tags.set` entry that [`split_set_entry`] reads back as `(name,
+/// position)`.
+pub fn set_entry(name: &str, position: Option<u32>) -> String {
+    match position {
+        Some(position) => format!("{name}::{position}"),
+        None => name.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +231,20 @@ pub struct TagCollection {
     /// newer one adds — round-tripped untouched.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl TagCollection {
+    /// Keep the first entry for each set name and drop the rest.
+    ///
+    /// A file holds one place in a set. This drops exactly what the reader
+    /// already ignores — [`CompanionFile::all_tags`] is in list order and the
+    /// index keeps the first row per name — so it never changes what a file
+    /// means; it only stops a dead second entry being written back.
+    pub fn one_entry_per_set(&mut self) {
+        let mut seen = HashSet::new();
+        self.set
+            .retain(|entry| seen.insert(split_set_entry(entry).0.to_string()));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -338,7 +406,7 @@ mod tests {
         let mut parsed: CompanionFile = serde_json::from_str(old).unwrap();
 
         // Not indexed: the namespace no longer exists in the query language.
-        let namespaces: Vec<_> = parsed.all_tags().into_iter().map(|(n, _)| n).collect();
+        let namespaces: Vec<_> = parsed.all_tags().into_iter().map(|(n, _, _)| n).collect();
         assert!(!namespaces.contains(&"auto".to_string()));
 
         // Not destroyed: the next rating change must not erase them.
@@ -370,11 +438,57 @@ mod tests {
 
         let all = companion.all_tags();
         assert_eq!(all.len(), 4);
-        assert!(all.contains(&("user".into(), "vacation".into())));
-        assert!(all.contains(&("set".into(), "kellys-comic".into())));
+        assert!(all.contains(&("user".into(), "vacation".into(), None)));
+        assert!(all.contains(&("set".into(), "kellys-comic".into(), None)));
         assert!(all.contains(&(
             "plugin.face-recognition".into(),
-            "person:alice".into()
+            "person:alice".into(),
+            None
         )));
+    }
+
+    #[test]
+    fn a_set_entry_splits_at_the_last_double_colon_followed_by_digits() {
+        assert_eq!(split_set_entry("comic"), ("comic", None));
+        assert_eq!(split_set_entry("comic::3"), ("comic", Some(3)));
+        // A name may contain `::`; only trailing digits are a position.
+        assert_eq!(split_set_entry("a::b::3"), ("a::b", Some(3)));
+        assert_eq!(split_set_entry("a::b"), ("a::b", None));
+        assert_eq!(split_set_entry("comic::x"), ("comic::x", None));
+        assert_eq!(split_set_entry("comic::"), ("comic::", None));
+        assert_eq!(split_set_entry("::3"), ("::3", None));
+        assert_eq!(split_set_entry("comic::-3"), ("comic::-3", None));
+        assert_eq!(split_set_entry("comic::99999999999"), ("comic::99999999999", None));
+    }
+
+    #[test]
+    fn a_set_entry_round_trips() {
+        for (name, position) in [("comic", None), ("comic", Some(1)), ("a::b", Some(12))] {
+            assert_eq!(split_set_entry(&set_entry(name, position)), (name, position));
+        }
+    }
+
+    #[test]
+    fn the_index_sees_a_set_by_its_name_with_the_position_beside_it() {
+        let mut c = CompanionFile::new("a.jpg", MediaType::Image);
+        c.tags.set = vec!["comic::3".into(), "burst".into()];
+        let all = c.all_tags();
+        assert!(all.contains(&("set".into(), "comic".into(), Some(3))));
+        assert!(all.contains(&("set".into(), "burst".into(), None)));
+    }
+
+    #[test]
+    fn one_entry_per_set_keeps_the_first() {
+        let mut tags = TagCollection {
+            set: vec![
+                "comic::3".into(),
+                "burst".into(),
+                "comic::7".into(),
+                "comic".into(),
+            ],
+            ..Default::default()
+        };
+        tags.one_entry_per_set();
+        assert_eq!(tags.set, vec!["comic::3", "burst"]);
     }
 }
