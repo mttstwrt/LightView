@@ -61,7 +61,7 @@ import { createStore, reconcile } from "solid-js/store";
 import { isMobile, renderScale } from "../../lib/runtime";
 import { createWheelScroll } from "../../lib/wheelScroll";
 import { prefs, setPrefs } from "../../stores/settingsStore";
-import { durationByPath } from "../../stores/galleryStore";
+import { durationByPath, holdRefreshes, releaseRefreshes } from "../../stores/galleryStore";
 import { api, thumbUrl, mediaUrl } from "../../lib/ipc";
 import type { ThumbTier } from "../../lib/types";
 import { onThumbRegenerated } from "../../lib/thumbRegeneration";
@@ -78,7 +78,8 @@ import {
   type ScaleAnchor,
   type TopAnchor,
 } from "../../lib/justifiedLayout";
-import { createDragSelect, createEdgeScroll } from "../../lib/galleryControls";
+import { createDragSelect, createEdgeScroll, createReorderDrag } from "../../lib/galleryControls";
+import { gapAt, isPermutation } from "../../lib/reorder";
 import { createScrollDynamics, constrainedNetwork } from "../../lib/scrollDynamics";
 import {
   adjustBy,
@@ -115,6 +116,11 @@ interface JustifiedGridProps {
   onItemContextMenu?: (e: MouseEvent, path: string, index: number) => void;
   loading: boolean;
   onContentHeight?: (height: number) => void;
+  /** True when the grid is showing exactly one set, in that set's order: a
+   *  mouse drag then reorders it, and a reorder holds the scroll offset. */
+  setView?: boolean;
+  /** The set's full new order, after a drop that changed it. */
+  onReorder?: (paths: string[]) => void;
 }
 
 // Two-zone render buffer beyond the viewport, ahead of / behind scroll. The
@@ -351,12 +357,28 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   const [generation, setGeneration] = createSignal(0);
 
   let containerRef: HTMLDivElement | undefined;
+  /** The positioned track the cells sit in — the layout's coordinate frame. */
+  let trackRef: HTMLDivElement | undefined;
 
-  // Shared pointer controls: Ctrl/Cmd-drag range select + click handling, and
-  // edge-scroll while dragging.
+  // Shared pointer controls: Ctrl/Cmd-drag range select + click handling,
+  // plain-drag reordering in a set view, and edge-scroll while either drags.
   const { isDragging, effectiveSelected, handleDragStart, handleDragEnter, handleItemClick, handleBackgroundClick } =
     createDragSelect(props);
-  createEdgeScroll(isDragging);
+  const reorder = createReorderDrag({
+    enabled: () => !!props.setView && !!props.onReorder,
+    paths: () => props.paths,
+    selectedPaths: () => props.selectedPaths,
+    gapAt: (clientX, clientY) => {
+      if (!trackRef) return null;
+      const origin = trackRef.getBoundingClientRect();
+      return gapAt(layout(), clientX - origin.left, clientY - origin.top);
+    },
+    onReorder: (paths) => props.onReorder?.(paths),
+    // A refresh mid-drag would move cells out from under the pointer.
+    onLift: holdRefreshes,
+    onSettle: releaseRefreshes,
+  });
+  createEdgeScroll(() => isDragging() || reorder.lifted() !== null);
 
   // -----------------------------------------------------------------------
   // Layout
@@ -439,6 +461,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
       if (reader.height === 0) noteReaderPosition();
 
       const scaled = row !== wasScale.row || width !== wasScale.width;
+      // In a set view a reorder is the reader's own doing, and holds the
+      // offset. Following the top item would chase the very cell they just
+      // dragged down the set, and send the view to the far end on Reverse.
+      // Outside a set view a re-sort still follows the top item, as it
+      // always has: there the reader asked for a new order, not a nudge.
+      if (!scaled && props.setView && isPermutation(wasPaths, paths)) return;
       const anchor = scaled
         ? (zoomHold ?? scaleAnchor(previous, reader.top, reader.height))
         : holdTopAcrossSetChange(previous, wasPaths, paths);
@@ -1198,7 +1226,15 @@ export function JustifiedGrid(props: JustifiedGridProps) {
   createEffect(on(totalHeight, (h) => { props.onContentHeight?.(h); }));
 
   return (
-    <div ref={containerRef} class="w-full" style={{ "user-select": isDragging() ? "none" : undefined }} onClick={handleBackgroundClick}>
+    <div
+      ref={containerRef}
+      class="w-full"
+      style={{
+        "user-select": isDragging() ? "none" : undefined,
+        cursor: reorder.lifted() ? "grabbing" : undefined,
+      }}
+      onClick={handleBackgroundClick}
+    >
       <Show when={!props.loading && props.paths.length === 0}>
         <div class="flex items-center justify-center h-screen text-neutral-500 text-sm">
           No media files found
@@ -1224,6 +1260,7 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
       <Show when={props.paths.length > 0}>
         <div
+          ref={trackRef}
           style={{
             position: "relative",
             height: `${totalHeight()}px`,
@@ -1245,7 +1282,12 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                       left: `${g()!.x}px`,
                       width: `${g()!.width}px`,
                       height: `${g()!.height}px`,
+                      // What is being dragged stays in place, dimmed, until
+                      // the drop: reflowing a justified grid mid-drag would
+                      // repack every row under the pointer.
+                      opacity: reorder.lifted()?.has(path) ? 0.35 : undefined,
                     }}
+                    onPointerDown={(e) => reorder.handlePointerDown(path, e)}
                   >
                     <ThumbnailCell
                       path={path}
@@ -1270,6 +1312,26 @@ export function JustifiedGrid(props: JustifiedGridProps) {
               );
             }}
           </For>
+          <Show when={reorder.gap()}>
+            {(target) => (
+              <div
+                data-reorder-gap
+                style={{
+                  position: "absolute",
+                  // Centred on the cell edge, which sits in the middle of
+                  // the gap between two cells.
+                  left: `${target().x - 2}px`,
+                  top: `${target().y}px`,
+                  width: "4px",
+                  height: `${target().height}px`,
+                  background: "#3b82f6",
+                  "border-radius": "2px",
+                  "pointer-events": "none",
+                  "z-index": 5,
+                }}
+              />
+            )}
+          </Show>
         </div>
       </Show>
     </div>

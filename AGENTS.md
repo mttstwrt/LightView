@@ -87,6 +87,9 @@ Each rule is explained in the header of the module named after it.
   its version in `gallery_meta` and clears `exif_read` for the rows it owns, so
   a library catches up without losing `date_added` and `last_viewed` — which a
   rebuild only restores where sidecars already exist. → `cache/db.rs`
+- **A set entry is `name` or `name::N`, and only the sidecar sees the suffix.**
+  The index stores the bare name, every tag operation compares names, and only
+  `order_set` writes a position. → `services/tags.rs`
 - **Companion sidecars are the only durable data.** Never write one outside
   `modify_companion`, and never drop a field without keeping `extra`.
   → `companion/writer.rs`

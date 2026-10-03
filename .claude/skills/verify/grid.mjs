@@ -499,6 +499,150 @@ try {
     afterZoom !== null && Math.abs(afterZoom - zoomWatched.centre) <= 12,
   );
 
+  // ---- A set keeps the order it is given ---------------------------------
+  //
+  // Forty files in one set, ordered oldest-first and viewed as that set. The
+  // checks that matter here are the two about the scroll offset, and they are
+  // built to fail on a grid that follows its top item across a reorder — the
+  // behaviour outside a set view. That item is the first cell of the row at
+  // the top edge, so the drag moves exactly that cell, and Reverse moves every
+  // cell. Both need room to scroll either way: at the end of the content the
+  // browser clamps a chasing view back to where it was, and the check would
+  // pass on the broken build, as an earlier draft of it did.
+  for (let i = 0; i < 8; i++) {
+    // Undo the zoom above, so a row holds several cells again.
+    await page.evaluate(() =>
+      window.dispatchEvent(
+        new WheelEvent("wheel", {
+          deltaY: 120, deltaMode: 0, ctrlKey: true, bubbles: true, cancelable: true,
+        }),
+      ),
+    );
+    await page.waitForTimeout(90);
+  }
+  await page.setViewportSize({ width: 1280, height: 600 });
+  const invoke = (command, args) =>
+    page.evaluate(async ([command, args]) => {
+      const r = await fetch("/api/invoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ command, args }),
+      });
+      return r.json();
+    }, [command, args]);
+  const members = Array.from({ length: 40 }, (_, i) => `2026/p${String(i).padStart(2, "0")}.png`);
+  await invoke("add_tags", { paths: members, tags: ["strip"], namespace: "set" });
+  await invoke("order_set", { set: "strip", paths: members });
+  const setOrder = async () =>
+    (await invoke("get_items", { filter: "set::strip" })).items.map((i) => i.path);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  check("the set is in the order it was given", same(await setOrder(), members));
+
+  await filterInput.fill("set::strip");
+  await filterInput.press("Enter");
+  await page.waitForTimeout(1500);
+  check("the sort button says the view is in the set's order", (await page.locator("text=Set order").count()) > 0);
+
+  const scrollTopNow = () => page.evaluate((sel) => document.querySelector(sel).scrollTop, host);
+
+  /** Every rendered set cell: path and box on screen. */
+  const cellBoxes = () =>
+    page.evaluate((fn) => {
+      const pathOf = eval(fn);
+      return [...document.querySelectorAll("img[src*='/thumb/']")].map((img) => {
+        const cell = img.closest("div[style*='position: absolute']").getBoundingClientRect();
+        return { path: pathOf(img), x: cell.left, y: cell.top, w: cell.width, h: cell.height };
+      });
+    }, PATH_OF);
+
+  /** Scroll so the row holding content offset `target` starts just above the
+   *  viewport's top edge: its first cell is then the grid's top anchor, and
+   *  most of it shows below the top bar. */
+  const parkRowAtTop = async (target) => {
+    await page.evaluate(([sel, y]) => { document.querySelector(sel).scrollTop = y; }, [host, target]);
+    await page.waitForTimeout(500);
+    const top = await scrollTopNow();
+    const straddling = (await cellBoxes())
+      .filter((c) => c.y <= 0 && c.y + c.h > 0)
+      .sort((a, b) => a.x - b.x)[0];
+    await page.evaluate(([sel, y]) => { document.querySelector(sel).scrollTop = y; }, [host, top + straddling.y + 4]);
+    await page.waitForTimeout(700);
+  };
+
+  const scrollRoom = await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    return el.scrollHeight - el.clientHeight;
+  }, host);
+  check(`the set view has room to scroll both ways (${scrollRoom}px)`, scrollRoom > 500);
+
+  await parkRowAtTop(Math.round(scrollRoom / 3));
+  const before = await setOrder();
+  const boxes = await cellBoxes();
+  const anchor = boxes.filter((c) => c.y <= 0 && c.y + c.h > 0).sort((a, b) => a.x - b.x)[0];
+  const lastOnScreen = boxes
+    .filter((c) => c.y > 0 && c.y + c.h < 600 - 10)
+    .sort((a, b) => before.indexOf(b.path) - before.indexOf(a.path))[0];
+
+  if (anchor && lastOnScreen && anchor.y + anchor.h > 120) {
+    // The anchor, dropped just after the last cell wholly on screen.
+    const topBefore = await scrollTopNow();
+    const grab = { x: anchor.x + anchor.w / 2, y: (Math.max(anchor.y, 80) + anchor.y + anchor.h) / 2 };
+    await page.mouse.move(grab.x, grab.y);
+    await page.mouse.down();
+    await page.mouse.move(grab.x + 20, grab.y + 20, { steps: 4 });
+    await page.mouse.move(lastOnScreen.x + lastOnScreen.w * 0.8, lastOnScreen.y + lastOnScreen.h / 2, { steps: 12 });
+    check("a drag shows where the cell will land", (await page.locator("[data-reorder-gap]").count()) === 1);
+    await page.mouse.up();
+    await page.waitForTimeout(1500);
+
+    const expected = before.filter((p) => p !== anchor.path);
+    expected.splice(expected.indexOf(lastOnScreen.path) + 1, 0, anchor.path);
+    check(`dropping ${anchor.path} after ${lastOnScreen.path} writes that order`, same(await setOrder(), expected));
+    const topAfter = await scrollTopNow();
+    check(
+      `a drop holds the scroll offset rather than following the dragged cell (${topBefore} -> ${topAfter})`,
+      Math.abs(topAfter - topBefore) <= 1,
+    );
+    check("the drop did not open the viewer", (await page.locator("img[src*='/media/']").count()) === 0);
+
+    // Esc mid-drag puts it back, and the release that follows does nothing.
+    const orderBeforeEsc = await setOrder();
+    const onScreen = (await cellBoxes()).filter((c) => c.y > 80 && c.y + c.h < 590);
+    const [a, b] = onScreen;
+    await page.mouse.move(b.x + b.w / 2, b.y + b.h / 2);
+    await page.mouse.down();
+    await page.mouse.move(a.x + a.w * 0.2, a.y + a.h / 2, { steps: 10 });
+    await page.keyboard.press("Escape");
+    await page.mouse.up();
+    await page.waitForTimeout(800);
+    check("Esc mid-drag leaves the order alone", same(await setOrder(), orderBeforeEsc));
+    check("the release after Esc opens nothing", (await page.locator("img[src*='/media/']").count()) === 0);
+
+    // A plain click after all that still opens the viewer.
+    await page.mouse.click(a.x + a.w / 2, a.y + a.h / 2);
+    await page.waitForSelector("img[src*='/media/']", { timeout: 20_000 }).catch(() => {});
+    check("a click after a drop still opens the viewer", (await page.locator("img[src*='/media/']").count()) > 0);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(600);
+  } else {
+    bad("no top-anchor cell could be grabbed, so the drag went unchecked");
+  }
+
+  // Reverse, from the sort menu: every cell moves, the top anchor to the far
+  // half of the set, and the view stays where it was.
+  await parkRowAtTop(Math.round(scrollRoom / 3));
+  const orderBeforeReverse = await setOrder();
+  const topBeforeReverse = await scrollTopNow();
+  await page.locator("button[title='Sort']").first().click();
+  await page.locator("button", { hasText: /^Reverse$/ }).first().click();
+  await page.waitForTimeout(2000);
+  check("Reverse writes the order backwards", same(await setOrder(), [...orderBeforeReverse].reverse()));
+  const topAfterReverse = await scrollTopNow();
+  check(
+    `Reverse holds the scroll offset (${topBeforeReverse} -> ${topAfterReverse})`,
+    Math.abs(topAfterReverse - topBeforeReverse) <= 1,
+  );
+
   // Nothing is filtered out of either list. A 404 the page causes is a 404 a
   // user sees in their console, and "that one is fine" is how the missing
   // favicon link survived for as long as it did.

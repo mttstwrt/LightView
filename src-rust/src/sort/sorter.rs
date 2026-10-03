@@ -21,6 +21,15 @@
 //! debounced keystroke, to a phone — to save re-running one indexed SQL scan.
 //! The `WHERE` fragment arrives here instead.
 //!
+//! **A set view orders by position first.** When the filter is exactly one set
+//! (see [`crate::filter::ast::FilterExpr::sole_set`]), the statement leads with
+//! each member's place in that set, ascending, and the requested sort follows it
+//! — so a member with no position yet comes after every member with one, in the
+//! order the grid would otherwise give it, and a set nobody has ordered looks
+//! exactly as it did before sets had an order. It is a correlated lookup
+//! through `tag_index`'s primary key rather than a join, and it is absent from
+//! every other view, so the statement the whole-gallery grid runs is unchanged.
+//!
 //! Every column is qualified with the `m` alias even though there is nothing to
 //! be ambiguous with today. The habit is what a join *reintroduced* once
 //! already: `path` and `media_type` existed on both tables, and an unqualified
@@ -139,6 +148,19 @@ fn order_expr(field: SortField, order: SortOrder) -> String {
     }
 }
 
+/// The `ORDER BY` term for a member's place in the set bound at `?{set_param}`.
+///
+/// Ascending and always so: the set's order *is* the order, and reversing it is
+/// a write, not a view. `NULLS LAST` puts members without a position after the
+/// ordered ones, where the requested sort then places them.
+fn position_expr(set_param: usize) -> String {
+    format!(
+        "(SELECT ti.position FROM tag_index ti \
+          WHERE ti.path = m.path AND ti.namespace = 'set' AND ti.tag = ?{set_param}) \
+         ASC NULLS LAST"
+    )
+}
+
 /// What the caller asked the grid to show.
 #[derive(Debug, Clone, Copy)]
 pub struct SortSpec {
@@ -149,10 +171,23 @@ pub struct SortSpec {
 }
 
 /// Build the statement. `where_sql` is the compiled filter fragment, or `None`
-/// for the whole gallery; its bound values are supplied by the caller in the
-/// same order the compiler pushed them.
-pub fn items_sql(spec: &SortSpec, where_sql: Option<&str>) -> String {
-    let mut order_clause = order_expr(spec.field, spec.order);
+/// for the whole gallery, and `params` already holds its bound values in the
+/// order the compiler pushed them. `set` puts the view in that set's order;
+/// its name is pushed onto `params` here and referenced by position, never
+/// interpolated — like a filter literal, it comes from the network.
+pub fn items_sql(
+    spec: &SortSpec,
+    where_sql: Option<&str>,
+    set: Option<&str>,
+    params: &mut Vec<String>,
+) -> String {
+    let mut order_clause = String::new();
+    if let Some(set) = set {
+        params.push(set.to_string());
+        order_clause.push_str(&position_expr(params.len()));
+        order_clause.push_str(", ");
+    }
+    order_clause.push_str(&order_expr(spec.field, spec.order));
     if let Some(sub) = spec.sub_field {
         order_clause.push_str(", ");
         order_clause.push_str(&order_expr(sub, spec.sub_order.unwrap_or(SortOrder::Desc)));
@@ -262,7 +297,7 @@ mod tests {
             sub_field: None,
             sub_order: None,
         };
-        let sql = items_sql(&spec, None);
+        let sql = items_sql(&spec, None, None, &mut Vec::new());
         assert!(sql.contains(&format!("ORDER BY {SORT_DATE} DESC")), "{sql}");
         assert!(sql.contains(SORT_DATE), "the selected date must be the sorted one");
         // `mtime` is NOT NULL, so the coalesced value never is and a null
@@ -281,12 +316,71 @@ mod tests {
             sub_field: None,
             sub_order: None,
         };
-        let sql = items_sql(&spec, Some("m.rating >= ?1"));
+        let sql = items_sql(&spec, Some("m.rating >= ?1"), None, &mut vec!["4".into()]);
         assert!(sql.contains("WHERE m.rating >= ?1"));
         assert!(sql.contains(&format!("ORDER BY {SORT_DATE} DESC")));
         // No join, and no path list round-tripping through the client.
         assert!(!sql.contains("JOIN"));
         assert!(!sql.contains("json_each"));
+    }
+
+    /// A set view leads with the position and binds the set's name after the
+    /// filter's own parameters, so the filter's numbering is untouched.
+    #[test]
+    fn a_set_view_orders_by_position_before_the_requested_sort() {
+        let spec = SortSpec {
+            field: SortField::Date,
+            order: SortOrder::Desc,
+            sub_field: None,
+            sub_order: None,
+        };
+        let mut params = vec!["comic".to_string(), "set".to_string()];
+        let sql = items_sql(
+            &spec,
+            Some("EXISTS (SELECT 1 FROM tag_index ti WHERE ti.path = m.path AND ti.namespace = ?2 AND ti.tag = ?1)"),
+            Some("comic"),
+            &mut params,
+        );
+        assert_eq!(params, vec!["comic", "set", "comic"]);
+        let order_by = sql.split("ORDER BY ").nth(1).unwrap();
+        assert!(order_by.starts_with("(SELECT ti.position FROM tag_index ti"), "{order_by}");
+        assert!(order_by.contains("ti.tag = ?3) ASC NULLS LAST"), "{order_by}");
+        assert!(order_by.ends_with(&format!(", {SORT_DATE} DESC")), "{order_by}");
+        assert!(!sql.contains("JOIN"));
+    }
+
+    #[test]
+    fn the_position_term_qualifies_every_column() {
+        // As for the sort fields: a bare column is an "ambiguous column name"
+        // the day a join lands. Here there are two tables in play, so every
+        // column must carry the alias of the one it means.
+        let e = position_expr(1);
+        for col in ["path", "namespace", "tag", "position"] {
+            let mut from = 0;
+            while let Some(i) = e[from..].find(col) {
+                let at = from + i;
+                let qualified = (at >= 2 && &e[at - 2..at] == "m.")
+                    || (at >= 3 && &e[at - 3..at] == "ti.")
+                    // `tag_index` is the table itself.
+                    || e[at..].starts_with("tag_index");
+                assert!(qualified, "unqualified `{col}` in the position term: {e}");
+                from = at + col.len();
+            }
+        }
+    }
+
+    #[test]
+    fn any_other_view_is_the_statement_it_was() {
+        let spec = SortSpec {
+            field: SortField::Date,
+            order: SortOrder::Desc,
+            sub_field: None,
+            sub_order: None,
+        };
+        let mut params = Vec::new();
+        let sql = items_sql(&spec, None, None, &mut params);
+        assert!(params.is_empty());
+        assert!(!sql.contains("tag_index"), "{sql}");
     }
 
     #[test]
@@ -297,7 +391,7 @@ mod tests {
             sub_field: Some(SortField::Name),
             sub_order: Some(SortOrder::Asc),
         };
-        let sql = items_sql(&spec, None);
+        let sql = items_sql(&spec, None, None, &mut Vec::new());
         assert!(sql.ends_with("ORDER BY m.rating DESC NULLS LAST, m.path ASC"));
     }
 }

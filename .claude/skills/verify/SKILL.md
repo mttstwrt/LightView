@@ -30,16 +30,25 @@ it, not just the build. `npm run build` is the fix.
 `drive.sh` walks both serving modes. Local mode: the random `127.x.x.x` bind,
 the launch token redeemed once and refused twice, the dead-end 401 body, all
 four tiers as WebP, ETag/304, Range/206, traversal, the SPA fallback, a video
-thumbnail, the companion round trip, `set::` and `user::` filters, the watcher,
-and a second launch finding the lock. Served mode: TLS, `/cert`, pairing, five
+thumbnail, the companion round trip, `set::` and `user::` filters, a set's
+order (the `name::N` sidecar entry, the set view, a rename carrying it, a name
+refused, an empty order clearing it), the watcher, and a second launch finding
+the lock. Served mode: TLS, `/cert`, pairing, five
 `Owner` refusals, a cross-site POST, and device revocation. Then plugins: a run
 over a gallery containing a clip, a re-run that skips, a version bump that
 re-tags, `--filter` scoping, and two plugin names that are paths.
 
 `grid.mjs` covers what `tsc` cannot: cells placed by the justified layout,
 thumbnails that decoded, the viewer opening on a click, Escape closing it, a
-scroll, the settings sections, a plugin run started from the panel, and a
-390px relayout — asserting no console error and no failed request throughout.
+scroll, the settings sections, a plugin run started from the panel, a 390px
+relayout, and a set reordered by a real mouse drag, by Esc mid-drag, and by
+Reverse from the sort menu — asserting no console error and no failed request
+throughout.
+
+The two set checks that hold the scroll offset are only worth anything with
+room to scroll: at the end of the content the browser clamps a view that chased
+the dragged cell back to where it was, and they pass on the broken build. They
+park the grid a third of the way down a 600px-tall viewport for that reason.
 
 ## Gotchas, learned the hard way
 

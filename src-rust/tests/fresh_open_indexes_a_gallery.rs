@@ -92,7 +92,8 @@ fn items(conn: &rusqlite::Connection, where_sql: Option<&str>, params: &[String]
         sub_field: None,
         sub_order: None,
     };
-    let sql = items_sql(&spec, where_sql);
+    let mut params = params.to_vec();
+    let sql = items_sql(&spec, where_sql, None, &mut params);
     let mut stmt = conn.prepare(&sql).unwrap();
     let bound: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
     stmt.query_map(bound.as_slice(), map_row)

@@ -478,6 +478,23 @@ mod tests {
     }
 
     #[test]
+    fn only_a_filter_that_is_exactly_one_set_is_that_set() {
+        let sole = |q: &str| parse_filter(q).unwrap().sole_set().map(str::to_string);
+        assert_eq!(sole("set::comic").as_deref(), Some("comic"));
+        // A group of one is the term itself.
+        assert_eq!(sole("( set::comic )").as_deref(), Some("comic"));
+        assert_eq!(sole("set::\"two words\"").as_deref(), Some("two words"));
+
+        assert_eq!(sole("set::comic AND rating>=3"), None);
+        assert_eq!(sole("set::a OR set::b"), None);
+        assert_eq!(sole("NOT set::comic"), None);
+        // A bare name could be a user tag as well; it is a query, not a set.
+        assert_eq!(sole("comic"), None);
+        assert_eq!(sole("user::comic"), None);
+        assert_eq!(sole("set"), None);
+    }
+
+    #[test]
     fn a_tag_containing_a_space_can_be_named() {
         // Without quoting this is two tokens and the query is unparseable —
         // while autocomplete happily offers such tags.

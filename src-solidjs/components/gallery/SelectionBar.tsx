@@ -1,9 +1,14 @@
-// The bar shown while files are selected: tag them, rate them, select all, or
-// clear.
+// The bar shown while files are selected: tag them, add them to a set, rate
+// them, select all, or clear.
+//
+// Adding to a set is the same input with the namespace switched, because a set
+// *is* a tag in the `set` namespace. It is the everyday way into a set — the
+// Duplicates panel names one only for a burst it found.
 
 import { Show, For, createSignal } from "solid-js";
 import { api } from "../../lib/ipc";
 import { isMobile } from "../../lib/runtime";
+import type { WritableNamespace } from "../../lib/types";
 
 interface SelectionBarProps {
   selectedPaths: Set<string>;
@@ -20,6 +25,7 @@ interface SelectionBarProps {
  *  mode. */
 export function SelectionBar(props: SelectionBarProps) {
   const [tagInput, setTagInput] = createSignal("");
+  const [namespace, setNamespace] = createSignal<WritableNamespace>("user");
   const [busy, setBusy] = createSignal(false);
   const [showRating, setShowRating] = createSignal(false);
 
@@ -33,7 +39,7 @@ export function SelectionBar(props: SelectionBarProps) {
     if (!tag || busy() || empty()) return;
     setBusy(true);
     try {
-      await api.addTags(paths(), [tag], "user");
+      await api.addTags(paths(), [tag], namespace());
       setTagInput("");
     } catch (err) {
       console.error("Batch tag failed:", err);
@@ -54,6 +60,30 @@ export function SelectionBar(props: SelectionBarProps) {
       setBusy(false);
     }
   };
+
+  const placeholder = () => (namespace() === "set" ? "Add to set..." : "Add tag...");
+
+  /** Tag or Set: which namespace the input adds to. */
+  const namespaceToggle = (buttonClass: string) => (
+    <div class="flex shrink-0 rounded overflow-hidden border border-neutral-700">
+      <For each={[["user", "Tag"], ["set", "Set"]] as const}>
+        {([ns, label]) => (
+          <button
+            type="button"
+            class={`${buttonClass} cursor-pointer transition-colors`}
+            classList={{
+              "bg-neutral-600 text-neutral-100": namespace() === ns,
+              "bg-neutral-800 text-neutral-500 hover:text-neutral-300": namespace() !== ns,
+            }}
+            aria-pressed={namespace() === ns}
+            onClick={() => setNamespace(ns)}
+          >
+            {label}
+          </button>
+        )}
+      </For>
+    </div>
+  );
 
   // Star popover — identical either way, but it drops *up* from a bottom-edge
   // mobile bar and from the floating desktop pill alike.
@@ -125,11 +155,12 @@ export function SelectionBar(props: SelectionBarProps) {
 
       <div class="flex items-center gap-2">
         <form onSubmit={handleAddTag} class="flex items-center gap-2 flex-1 min-w-0">
+          {namespaceToggle("px-2 h-9 text-xs")}
           <input
             type="text"
             value={tagInput()}
             onInput={(e) => setTagInput(e.currentTarget.value)}
-            placeholder="Add tag..."
+            placeholder={placeholder()}
             // 16px keeps iOS Safari from zooming the page on focus.
             class="flex-1 min-w-0 px-2.5 h-9 bg-neutral-800 border border-neutral-700 rounded text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
             style={{ "font-size": "16px" }}
@@ -139,7 +170,7 @@ export function SelectionBar(props: SelectionBarProps) {
             disabled={busy() || empty()}
             class="px-3 h-9 shrink-0 bg-neutral-700 text-neutral-200 rounded text-xs cursor-pointer disabled:opacity-40"
           >
-            Tag
+            Add
           </button>
         </form>
         <div class="relative shrink-0">
@@ -173,11 +204,12 @@ export function SelectionBar(props: SelectionBarProps) {
 
       {/* Tag input */}
       <form onSubmit={handleAddTag} class="flex items-center gap-1">
+        {namespaceToggle("px-1.5 py-1 text-xs")}
         <input
           type="text"
           value={tagInput()}
           onInput={(e) => setTagInput(e.currentTarget.value)}
-          placeholder="Add tag..."
+          placeholder={placeholder()}
           class="w-28 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
         />
         <button
@@ -185,7 +217,7 @@ export function SelectionBar(props: SelectionBarProps) {
           disabled={busy() || empty()}
           class="px-2 py-1 bg-neutral-700 hover:bg-neutral-600 text-neutral-300 rounded text-xs cursor-pointer transition-colors disabled:opacity-50"
         >
-          Tag
+          Add
         </button>
       </form>
 

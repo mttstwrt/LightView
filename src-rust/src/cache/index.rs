@@ -74,11 +74,14 @@ pub fn reindex_file(
     conn.prepare_cached("DELETE FROM tag_index WHERE path = ?1")?
         .execute([path.as_str()])?;
     {
+        // `OR IGNORE` keeps the first row per name, which is the entry the
+        // companion writer keeps when a file names one set twice.
         let mut stmt = conn.prepare_cached(
-            "INSERT OR IGNORE INTO tag_index (path, namespace, tag) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO tag_index (path, namespace, tag, position)
+             VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for (namespace, tag) in companion.all_tags() {
-            stmt.execute(rusqlite::params![path.as_str(), namespace, tag])?;
+        for (namespace, tag, position) in companion.all_tags() {
+            stmt.execute(rusqlite::params![path.as_str(), namespace, tag, position])?;
         }
     }
 
@@ -267,6 +270,34 @@ mod tests {
         assert!(namespaces.contains(&"user".to_string()));
         assert!(namespaces.contains(&"set".to_string()));
         assert!(!namespaces.contains(&"auto".to_string()));
+    }
+
+    #[test]
+    fn a_set_is_indexed_by_name_with_its_position_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db(dir.path());
+        let conn = db.writer_blocking();
+        let path = RelPath::new("a.jpg").unwrap();
+
+        let mut c = CompanionFile::new("a.jpg", MediaType::Image);
+        c.tags.set = vec!["comic::3".into(), "burst".into()];
+        reindex_file(&conn, &path, &c).unwrap();
+
+        // Everything that matches on `tag` sees the name alone.
+        let tags = tags_for_file(&conn, &path).unwrap();
+        assert!(tags.contains(&("set".to_string(), "comic".to_string())));
+        assert_eq!(paths_with_tag(&conn, "set", "comic").unwrap(), vec![path.clone()]);
+
+        let position = |tag: &str| -> Option<u32> {
+            conn.query_row(
+                "SELECT position FROM tag_index WHERE path = 'a.jpg' AND namespace = 'set' AND tag = ?1",
+                [tag],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(position("comic"), Some(3));
+        assert_eq!(position("burst"), None);
     }
 
     #[test]

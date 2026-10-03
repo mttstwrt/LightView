@@ -59,7 +59,12 @@ use crate::util::lock::DirLock;
 /// permanently. Those rows cannot be repaired in place, because nothing
 /// distinguishes "probed, found nothing" from "never probed"; that is the
 /// distinction the new column exists to record.
-pub const FORMAT_VERSION: i64 = 2;
+///
+/// 3 adds `tag_index.position`, a set member's place in its set. An existing
+/// cache would read NULL for every row: right for a sidecar written before sets
+/// had an order, wrong for one that already carries a `name::N` entry, and only
+/// a re-read of every companion finds those.
+pub const FORMAT_VERSION: i64 = 3;
 
 /// How many read connections, at most.
 const READ_POOL_MAX: usize = 6;
@@ -153,7 +158,13 @@ fn schema_sql() -> String {
     CREATE TABLE IF NOT EXISTS tag_index (
         path        TEXT NOT NULL,
         namespace   TEXT NOT NULL,
+        -- A set's bare name, never its `name::N` sidecar entry: the filter,
+        -- autocomplete and the tag operations all match on this column.
         tag         TEXT NOT NULL,
+        -- This file's place in the set, for a `set` row whose entry carries
+        -- one; NULL for every other row. Read through the primary key, one
+        -- lookup per row of a set view, so it needs no index of its own.
+        position    INTEGER,
         PRIMARY KEY (path, namespace, tag)
     );
     -- Serves the filter's EXISTS subqueries, autocomplete's refresh aggregate,

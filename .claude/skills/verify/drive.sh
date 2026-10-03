@@ -178,6 +178,30 @@ echo "$(inv get_items '{"filter":"set::burst-3"}')" | jq -e '.items | length == 
 echo "$(inv get_items '{"filter":"user::vacation"}')" | jq -e '.items | length == 1' >/dev/null \
   && ok "a user:: filter runs against the index" || bad "user filter"
 
+# A set's order: written into the sidecars as `name::N`, read back as the order
+# of a view that is exactly that set, carried by a rename, and cleared by an
+# empty order.
+inv add_tags '{"paths":["tall.png","clip.mp4","2026/january/wide.png"],"tags":["strip"],"namespace":"set"}' >/dev/null
+inv order_set '{"set":"strip","paths":["clip.mp4","2026/january/wide.png","tall.png"]}' >/dev/null
+jq -e '.tags.set == ["burst-3","strip::3"]' "$COMPANION" >/dev/null \
+  && ok "a member's place is a suffix on its set entry" || bad "companion set: $(jq -c .tags.set "$COMPANION")"
+VIEW=$(inv get_items '{"filter":"set::strip"}')
+echo "$VIEW" | jq -e '[.items[].path] == ["clip.mp4","2026/january/wide.png","tall.png"] and .set == "strip" and (.groups | length) == 0' >/dev/null \
+  && ok "a filter that is exactly one set shows it in its own order" \
+  || bad "set view: $(echo "$VIEW" | jq -c '{set, groups: (.groups | length), paths: [.items[].path]}')"
+inv get_items '{"filter":"set::strip AND type:image"}' | jq -e '.set == null' >/dev/null \
+  && ok "a query wider than the set is not the set's view" || bad "a wider query reported a set"
+inv rename_tag '{"from":"strip","to":"comic","namespace":"set"}' >/dev/null
+inv get_items '{"filter":"set::comic"}' | jq -e '[.items[].path] == ["clip.mp4","2026/january/wide.png","tall.png"]' >/dev/null \
+  && ok "a rename to a new name carries the order" || bad "the rename lost the order"
+check "a set name that would read back as a position is refused" \
+  "$(code -b "$J" -H 'content-type: application/json' -H "origin: $BASE" \
+     -d '{"command":"add_tags","args":{"paths":["tall.png"],"tags":["ch::2"],"namespace":"set"}}' \
+     "$BASE/api/invoke")" "400"
+inv order_set '{"set":"comic","paths":[]}' >/dev/null
+jq -e '.tags.set == ["burst-3","comic"]' "$COMPANION" >/dev/null \
+  && ok "an empty order clears every position" || bad "companion set after clear: $(jq -c .tags.set "$COMPANION")"
+
 # A plugin namespace must not be writable through the tag commands.
 check "a plugin namespace is refused" \
   "$(code -b "$J" -H 'content-type: application/json' -H "origin: $BASE" \

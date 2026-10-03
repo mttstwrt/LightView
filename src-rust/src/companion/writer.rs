@@ -21,6 +21,12 @@
 //!
 //! `modified` is stamped here rather than by the caller, so every write carries
 //! an accurate timestamp regardless of which path produced it.
+//!
+//! **One entry per set is enforced here too**, for the same reason: this is the
+//! one point every writer passes through. The tag operations and the duplicate
+//! merge each keep it already; this is the backstop for the one that forgets,
+//! and it can only drop what the reader was ignoring anyway — see
+//! [`crate::companion::schema::TagCollection::one_entry_per_set`].
 
 use std::path::Path;
 
@@ -94,6 +100,7 @@ pub fn modify_companion<T>(
         return Ok(value);
     }
 
+    companion.tags.one_entry_per_set();
     companion.modified = chrono::Utc::now().to_rfc3339();
     let json = serde_json::to_string_pretty(&companion)?;
     write_durable(
@@ -186,6 +193,20 @@ mod tests {
         let read = read_companion(&m).unwrap().unwrap();
         assert_eq!(read.meta.core.unwrap().rating, Some(5));
         assert_eq!(read.tags.user, vec!["later"]);
+    }
+
+    #[test]
+    fn a_write_never_leaves_a_file_in_one_set_twice() {
+        let d = tempfile::tempdir().unwrap();
+        let m = media(d.path());
+        modify_companion(&m, MediaType::Image, |c| {
+            c.tags.set = vec!["comic::2".into(), "comic::5".into(), "burst".into()];
+            Outcome::Write(())
+        })
+        .unwrap();
+
+        let read = read_companion(&m).unwrap().unwrap();
+        assert_eq!(read.tags.set, vec!["comic::2", "burst"]);
     }
 
     #[test]
