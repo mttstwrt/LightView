@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cache::duplicates as finder;
-use crate::companion::schema::{CompanionFile, Location, MediaType, PluginTagEntry};
+use crate::companion::schema::{split_set_entry, CompanionFile, Location, MediaType, PluginTagEntry};
 use crate::companion::writer::{modify_companion, Outcome};
 use crate::path::RelPath;
 use crate::state::Gallery;
@@ -234,9 +234,15 @@ impl Contributions {
     /// Fold the contributions into the keeper's companion. User and set tags
     /// union; a plugin bucket is added only where the keeper has none, so the
     /// keeper's own bucket is always kept.
+    ///
+    /// Sets union **by name, keeper first**: a file holds one place in a set,
+    /// and the survivor keeps its own. Two members of one set are never offered
+    /// as a pair, but a third file can bridge them into one group, and a union
+    /// of raw strings would then hand the survivor whichever position happens
+    /// to sort first.
     fn apply(self, companion: &mut CompanionFile) {
-        merge_into(&mut companion.tags.user, self.user);
-        merge_into(&mut companion.tags.set, self.set);
+        merge_into(&mut companion.tags.user, self.user, user_tag_name);
+        merge_into(&mut companion.tags.set, self.set, set_name);
         for (name, entry) in self.plugins {
             companion
                 .tags
@@ -247,11 +253,23 @@ impl Contributions {
     }
 }
 
-/// Union `extra` into `target`, sorted and without duplicates.
-fn merge_into(target: &mut Vec<String>, extra: Vec<String>) {
+/// A user tag is its own name.
+fn user_tag_name(tag: &str) -> &str {
+    tag
+}
+
+/// A set entry is known by its name, not its position.
+fn set_name(entry: &str) -> &str {
+    split_set_entry(entry).0
+}
+
+/// Union `extra` into `target`, sorted, with one entry per `name` — the first,
+/// so `target`'s own entry wins over a contributed one.
+fn merge_into(target: &mut Vec<String>, extra: Vec<String>, name: fn(&str) -> &str) {
+    let mut seen = std::collections::HashSet::new();
     target.extend(extra);
+    target.retain(|t| seen.insert(name(t).to_string()));
     target.sort();
-    target.dedup();
 }
 
 #[cfg(test)]
@@ -263,6 +281,17 @@ mod tests {
         c.tags.user = user.iter().map(|s| s.to_string()).collect();
         c.tags.set = set.iter().map(|s| s.to_string()).collect();
         c
+    }
+
+    #[test]
+    fn the_keeper_keeps_its_own_place_in_a_set() {
+        // Lexicographically `comic::12` sorts first; the keeper's `comic::3`
+        // must still be the one that survives.
+        let mut keeper = with_tags(&[], &["comic::3"]);
+        let mut contributions = Contributions::default();
+        contributions.absorb(&with_tags(&[], &["comic::12", "burst"]));
+        contributions.apply(&mut keeper);
+        assert_eq!(keeper.tags.set, vec!["burst", "comic::3"]);
     }
 
     #[test]

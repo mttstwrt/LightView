@@ -134,6 +134,11 @@ export interface GroupHeader {
 export interface Items {
   items: SortedItem[];
   groups: GroupHeader[];
+  /** The set this view is, when the filter is exactly one `set::` term: the
+   *  items are then in that set's order, ungrouped, and the view may be
+   *  reordered. Null for every other view. The server says so because only it
+   *  parses the filter. */
+  set: string | null;
 }
 
 export interface SortedItem {

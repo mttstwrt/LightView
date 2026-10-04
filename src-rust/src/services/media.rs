@@ -5,6 +5,12 @@
 //! the `WHERE` clause of the same statement the sort orders, and grouping is an
 //! in-memory pass over the result.
 //!
+//! **A filter that is exactly one set is that set's view.** It is shown in the
+//! set's own order (see [`crate::sort::sorter`]) and ungrouped — a group break
+//! is a forced row break, which would cut a strip wherever two members happen
+//! to fall in different months — and the response names the set, so the client
+//! knows it may reorder what it is showing without having to parse the query.
+//!
 //! That replaces a two-step shape in which a filter command returned a
 //! `Vec<String>` of paths, the *client* handed them straight back, and
 //! `json_each` re-expanded them. At 20k matches that is roughly a megabyte of
@@ -87,6 +93,9 @@ fn default_group() -> GroupBy {
 pub struct Items {
     pub items: Vec<SortedItem>,
     pub groups: Vec<GroupHeader>,
+    /// The set this view is, when the filter is exactly one; `None` for any
+    /// other view.
+    pub set: Option<String>,
 }
 
 /// Run the one query.
@@ -99,14 +108,17 @@ pub async fn get_items(gallery: &Gallery, request: &ItemsRequest) -> Result<Item
     };
 
     let mut params: Vec<String> = Vec::new();
-    let where_sql = if request.filter.trim().is_empty() {
+    let expr = if request.filter.trim().is_empty() {
         None
     } else {
-        let expr = parse_filter(&request.filter).map_err(|e| MediaError::Filter(e.to_string()))?;
-        Some(crate::filter::evaluator::to_sql(&expr, &mut params))
+        Some(parse_filter(&request.filter).map_err(|e| MediaError::Filter(e.to_string()))?)
     };
+    let where_sql = expr
+        .as_ref()
+        .map(|e| crate::filter::evaluator::to_sql(e, &mut params));
+    let set = expr.as_ref().and_then(|e| e.sole_set()).map(str::to_string);
 
-    let sql = sorter::items_sql(&spec, where_sql.as_deref());
+    let sql = sorter::items_sql(&spec, where_sql.as_deref(), set.as_deref(), &mut params);
     let conn = gallery.db.read().await;
     let mut stmt = conn.prepare(&sql)?;
     let bound: Vec<&dyn rusqlite::ToSql> =
@@ -118,8 +130,11 @@ pub async fn get_items(gallery: &Gallery, request: &ItemsRequest) -> Result<Item
         items.push(row?);
     }
 
-    let groups = grouper::compute_groups(&items, &request.group_by);
-    Ok(Items { items, groups })
+    let groups = match set {
+        Some(_) => Vec::new(),
+        None => grouper::compute_groups(&items, &request.group_by),
+    };
+    Ok(Items { items, groups, set })
 }
 
 /// Everything the info panel shows about one file.

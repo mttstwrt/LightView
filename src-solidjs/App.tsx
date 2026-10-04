@@ -61,6 +61,7 @@ import {
   aspectByPath,
   applyEvent as applyGalleryEvent,
   clearSelection,
+  currentSet,
   displayPaths,
   exitSelectionMode,
   groups,
@@ -68,6 +69,7 @@ import {
   loading,
   mediaMetaByPath,
   rateItem,
+  reorderSet,
   selectAll,
   selectedPaths,
   selectionMode,
@@ -157,7 +159,10 @@ export function App() {
   let indicatorCache:
     | { items: SortedItem[]; field: SortField; value: ScrollIndicator[] }
     | null = null;
+  // A set view has neither: it is in the set's own order, where a date or a
+  // size label on the scrollbar would describe an order that is not there.
   const scrollIndicators = (): ScrollIndicator[] => {
+    if (currentSet() !== null) return [];
     const list = items();
     const field = sortField();
     if (!indicatorCache || indicatorCache.items !== list || indicatorCache.field !== field) {
@@ -166,7 +171,7 @@ export function App() {
     return indicatorCache.value;
   };
   const thumbLabel = (fraction: number) =>
-    getThumbLabelForItems(items(), sortField(), fraction);
+    currentSet() !== null ? "" : getThumbLabelForItems(items(), sortField(), fraction);
 
   // -------------------------------------------------------------------------
   // Boot
@@ -392,6 +397,11 @@ export function App() {
               }}
               loading={loading()}
               onContentHeight={setGalleryContentHeight}
+              setView={currentSet() !== null}
+              onReorder={(paths) => {
+                const set = currentSet();
+                if (set !== null) void reorderSet(set, paths);
+              }}
             />
           </div>
           {/* Outside the host on purpose. It is `fixed`, so a fixed element's

@@ -6,7 +6,7 @@
 import { Show, For, createSignal, createEffect, on, onCleanup, onMount } from "solid-js";
 import { api } from "../../lib/ipc";
 import { rateItem } from "../../stores/galleryStore";
-import type { MediaMeta, TierPresence } from "../../lib/types";
+import type { MediaMeta, TierPresence, WritableNamespace } from "../../lib/types";
 import { ScrollBar } from "../shared/ScrollBar";
 import { hasTouch } from "../../lib/runtime";
 import { setInfoPanelOpen } from "../../stores/viewerStore";
@@ -109,10 +109,12 @@ export function InfoPanel(props: {
     }
   };
 
-  const handleRemoveTag = async (tag: string) => {
+  /** Take this file out of a user tag or a set. A plugin's tags are its own
+   *  run's to replace, so they carry no remove. */
+  const handleRemoveTag = async (namespace: WritableNamespace, tag: string) => {
     if (!props.path) return;
     try {
-      await api.removeTags([props.path], [tag], "user");
+      await api.removeTags([props.path], [tag], namespace);
       void reload(props.path);
     } catch (err) {
       console.error("Failed to remove tag:", err);
@@ -133,6 +135,10 @@ export function InfoPanel(props: {
 
   // The filter tokenizer splits on whitespace — a tag with spaces would parse
   // as garbage, so only offer tap-to-filter for tags the language can express.
+  /** The namespace as a writable one, or null for a plugin's. */
+  const writable = (namespace: string): WritableNamespace | null =>
+    namespace === "user" || namespace === "set" ? namespace : null;
+
   const tagFilterable = (tag: string) => !!props.onTagFilter && !/\s/.test(tag);
 
   const tagsByNamespace = () => {
@@ -375,7 +381,7 @@ export function InfoPanel(props: {
                         <For each={nsTags}>
                           {(t) => (
                             <Show
-                              when={namespace === "user"}
+                              when={writable(namespace)}
                               fallback={
                                 <Show
                                   when={tagFilterable(t.tag)}
@@ -407,7 +413,7 @@ export function InfoPanel(props: {
                                 </Show>
                                 <button
                                   class="text-neutral-500 hover:text-neutral-200 cursor-pointer"
-                                  onClick={() => handleRemoveTag(t.tag)}
+                                  onClick={() => handleRemoveTag(writable(namespace)!, t.tag)}
                                   aria-label={`Remove tag ${t.tag}`}
                                 >
                                   &times;

@@ -57,6 +57,25 @@ export function FilterBar(props: FilterBarProps) {
     return { token: match[1], start: cursorPos - match[1].length };
   };
 
+  /** A token's tag namespace prefix, if it has one, and the text after it.
+   *
+   *  Only a tag namespace counts — `user`, `set`, `plugin.*` — split at the
+   *  first `::` as the parser splits it. That prefix scopes the lookup and is
+   *  kept when a suggestion is picked: typing `set::com` and picking `comic`
+   *  must give `set::comic`, the set's own view, rather than a bare `comic`
+   *  that also matches user tags. Any other prefix (`has::`) is left to the
+   *  unscoped lookup, as before. */
+  const tagNamespaceOf = (token: string): { namespace: string | null; rest: string } => {
+    const at = token.indexOf("::");
+    if (at < 0) return { namespace: null, rest: token };
+    const namespace = token.slice(0, at);
+    const isTagNamespace =
+      namespace === "user" || namespace === "set" || namespace.startsWith("plugin.");
+    return isTagNamespace
+      ? { namespace, rest: token.slice(at + 2) }
+      : { namespace: null, rest: token.split("::").pop()! };
+  };
+
   const handleInput = (value: string) => {
     setAcQuery(value);
     setAcSelectedIndex(0);
@@ -74,8 +93,9 @@ export function FilterBar(props: FilterBarProps) {
         return;
       }
 
-      // Strip leading NOT/namespace prefix for autocomplete lookup
-      const lookupToken = token.includes("::") ? token.split("::").pop()! : token;
+      // Strip the namespace prefix for the lookup, scoping it when the prefix
+      // names a tag namespace.
+      const { namespace, rest: lookupToken } = tagNamespaceOf(token);
       if (!lookupToken) {
         setAcSuggestions([]);
         setAcOpen(false);
@@ -83,7 +103,7 @@ export function FilterBar(props: FilterBarProps) {
       }
 
       try {
-        const suggestions = await api.autocomplete(lookupToken);
+        const suggestions = await api.autocomplete(lookupToken, namespace ?? undefined);
         setAcSuggestions(suggestions);
         setAcOpen(suggestions.length > 0);
       } catch {
@@ -95,13 +115,16 @@ export function FilterBar(props: FilterBarProps) {
   const insertSuggestion = (suggestion: { namespace: string; tag: string }) => {
     const value = acQuery();
     const cursorPos = inputRef?.selectionStart ?? value.length;
-    const { start } = getCurrentToken(value, cursorPos);
+    const { token, start } = getCurrentToken(value, cursorPos);
 
-    // Both namespace and tag suggestions insert the bare value.
-    // Namespace suggestions insert e.g. "plugin.wd", tag suggestions
-    // insert the bare tag name. Users can manually type namespace::tag
-    // to narrow to a specific namespace.
-    const replacement = suggestion.tag;
+    // Namespace suggestions insert e.g. "plugin.wd"; tag suggestions insert
+    // the bare tag, unless the token was typed under a tag namespace — then
+    // every suggestion came from that namespace and keeps its prefix.
+    const { namespace } = tagNamespaceOf(token);
+    const replacement =
+      namespace && suggestion.namespace !== "_namespace"
+        ? `${namespace}::${suggestion.tag}`
+        : suggestion.tag;
 
     const before = value.slice(0, start);
     const after = value.slice(cursorPos);
