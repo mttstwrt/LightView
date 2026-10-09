@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use bytes::Bytes;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -626,6 +627,136 @@ async fn capabilities_tell_a_client_what_it_may_not_do() {
     let caps: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(caps["trust"], "device");
     assert_eq!(caps["clipboard"], false);
+}
+
+// ---------------------------------------------------------------------------
+// Uploads
+// ---------------------------------------------------------------------------
+
+/// The opening of one file part of a multipart body.
+fn part_header(boundary: &str, name: &str) -> String {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+         filename=\"{name}\"\r\nContent-Type: image/jpeg\r\n\r\n"
+    )
+}
+
+/// A multipart body for `files`, as the frames a network would deliver.
+///
+/// Frames rather than one buffer, because a single frame larger than a body
+/// limit is refused whole and lands nothing, whereas a phone's upload arrives in
+/// pieces and is cut off partway through a file — the case that matters.
+fn multipart_frames(boundary: &str, files: &[(&str, &[u8])]) -> Vec<Bytes> {
+    const FRAME: usize = 64 * 1024;
+    let mut frames = Vec::new();
+    for (name, data) in files {
+        frames.push(Bytes::from(part_header(boundary, name)));
+        for chunk in data.chunks(FRAME) {
+            frames.push(Bytes::copy_from_slice(chunk));
+        }
+        frames.push(Bytes::from_static(b"\r\n"));
+    }
+    frames.push(Bytes::from(format!("--{boundary}--\r\n")));
+    frames
+}
+
+/// `len` bytes that differ from one position to the next, so a file cut short
+/// can never compare equal to the whole one.
+fn payload(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add((i >> 8) as u8).wrapping_add(seed))
+        .collect()
+}
+
+/// A paired device's `POST /api/upload` with `body`.
+fn upload_request(cookie: &str, boundary: &str, body: Body) -> Request<Body> {
+    Harness::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/api/upload")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .unwrap(),
+        DEVICE_COOKIE,
+        cookie,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upload_larger_than_the_framework_default_lands_whole() {
+    // axum caps a `Multipart` request at 2 MiB unless the route says otherwise,
+    // and the cap is on the whole request, all files together. A phone photo is
+    // two to eight megabytes, so without the route's own setting the first file
+    // is cut off at the boundary and the rest never arrive.
+    let h = harness(Trust::Device, None).await;
+    let cookie = h.pair().await;
+
+    let big = payload(3 * 1024 * 1024, 1);
+    let small = payload(4096, 2);
+    let frames = multipart_frames("lv-boundary", &[("big.jpg", &big), ("small.jpg", &small)]);
+    let body = Body::from_stream(futures::stream::iter(
+        frames.into_iter().map(Ok::<_, std::io::Error>),
+    ));
+
+    let (status, text) = h.send(upload_request(&cookie, "lv-boundary", body)).await;
+    assert_eq!(status, StatusCode::OK, "body: {text}");
+    let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["uploaded"].as_array().unwrap().len(), 2, "body: {text}");
+
+    let uploads = h._gallery_dir.path().join("Uploads");
+    assert_eq!(
+        std::fs::read(uploads.join("big.jpg")).unwrap(),
+        big,
+        "the large file landed cut short"
+    );
+    assert_eq!(std::fs::read(uploads.join("small.jpg")).unwrap(), small);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_that_dies_mid_part_commits_nothing_and_says_so() {
+    // A read error is not an end of file. Treating it as one renames the bytes
+    // received so far into the gallery as a finished photo and answers 200, and
+    // that truncated file is what gets a half a thumbnail.
+    let h = harness(Trust::Device, None).await;
+    let cookie = h.pair().await;
+
+    let whole = payload(1024, 3);
+    let mut frames = multipart_frames("lv-boundary", &[("whole.jpg", &whole)]);
+    frames.pop(); // the closing boundary: this request never gets that far
+    frames.push(Bytes::from(part_header("lv-boundary", "cut.jpg")));
+    frames.push(Bytes::from(payload(10 * 1024, 4)));
+    let stream = futures::stream::iter(
+        frames
+            .into_iter()
+            .map(Ok::<_, std::io::Error>)
+            .chain(std::iter::once(Err(std::io::Error::other("connection reset")))),
+    );
+
+    let (status, text) = h
+        .send(upload_request(&cookie, "lv-boundary", Body::from_stream(stream)))
+        .await;
+    assert!(
+        !status.is_success(),
+        "a request that died mid-part answered {status}: {text}"
+    );
+    assert!(
+        text.contains("after 1 file"),
+        "the refusal should say how many files landed: {text}"
+    );
+
+    let mut names: Vec<String> = std::fs::read_dir(h._gallery_dir.path().join("Uploads"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["whole.jpg"],
+        "a partial file, or its temp file, was left in the gallery"
+    );
 }
 
 /// Minimal percent-encoding for a query value.
