@@ -1,7 +1,6 @@
 //! The one write channel from a device.
 //!
-//! Five things are load-bearing here, and every one of them was a real defect
-//! in what this replaces.
+//! Six things are load-bearing here, each the failure a line prevents.
 //!
 //! 1. **The filename is reduced to a basename and the extension must resolve to
 //!    a known media type.** The allowlist admits no `.json`, `.svg` or `.html`,
@@ -35,11 +34,21 @@
 //!    neither the scan nor the watcher will ever see it. Invisible litter, in
 //!    the one tree the design tells the user is safe to `grep` and `rsync`.
 //!
-//! And **uploads are bounded**, which they never were. Each part used to be
-//! held in RAM in full, with unbounded parts per request and unbounded
-//! concurrent requests: a paired phone could OOM the NAS with a handful of
-//! parallel POSTs. Each part streams to the temp file, the part count is
-//! capped, and a disk below the margin refuses.
+//! 6. **A part is committed only after its last byte arrived.** A read error is
+//!    not an end of file: treating it as one renames the bytes received so far
+//!    into the gallery as a finished photo, which the thumbnailer then draws
+//!    half of. The handler commits only after the part ends cleanly, and any
+//!    error drops the [`StagedUpload`] instead — see [`crate::server::routes`].
+//!
+//! **Uploads are bounded by what can actually run out.** Each part streams to
+//! the temp file, so no part sits in RAM; the part count is capped
+//! ([`MAX_PARTS`]); and free space is checked when a part starts and again every
+//! [`RECHECK_EVERY`] bytes while it streams, so the [`FREE_SPACE_MARGIN`] holds
+//! for the cache and the sidecars that share the volume. There is deliberately
+//! **no cap on the request body**: axum's default is 2 MiB for the whole
+//! request, which cuts a phone photo off partway, and any fixed number is a
+//! guess against a multi-gigabyte clip. [`crate::server::routes::router`] lifts
+//! it for this route alone.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -53,6 +62,10 @@ pub const MAX_PARTS: usize = 100;
 
 /// Refuse when the destination filesystem has less than this free.
 pub const FREE_SPACE_MARGIN: u64 = 512 * 1024 * 1024;
+
+/// Bytes streamed between free-space re-checks. A check scans the mount table,
+/// so it is made once per this many bytes rather than once per write.
+pub const RECHECK_EVERY: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
@@ -126,15 +139,21 @@ pub struct StagedUpload {
     temp: PathBuf,
     file: Option<std::fs::File>,
     committed: bool,
+    /// Free space below which a write refuses. Always [`FREE_SPACE_MARGIN`]
+    /// outside tests, which raise it to force a refusal.
+    margin: u64,
+    /// Bytes written since free space was last checked.
+    unchecked: u64,
 }
 
 impl StagedUpload {
-    /// Open a temp file beside where the upload will land.
+    /// Open a temp file beside where the upload will land, refusing a disk that
+    /// is already below the margin.
     ///
     /// Dot-prefixed and with no media extension, which is the only reason the
     /// watcher and the scan do not see it.
     pub fn create(dir: &Path) -> Result<Self, UploadError> {
-        if free_bytes(dir).is_some_and(|free| free < FREE_SPACE_MARGIN) {
+        if below_margin(dir, FREE_SPACE_MARGIN) {
             return Err(UploadError::NoSpace);
         }
         let temp = dir.join(format!(".lv-upload-{}.tmp", uuid::Uuid::new_v4()));
@@ -143,13 +162,33 @@ impl StagedUpload {
             temp,
             file: Some(file),
             committed: false,
+            margin: FREE_SPACE_MARGIN,
+            unchecked: 0,
         })
     }
 
-    /// Append a chunk. Streaming, so a 4 GB video never sits in RAM.
+    /// Append a chunk, refusing once free space has fallen below the margin.
+    ///
+    /// Streaming, so a 4 GB video never sits in RAM — and so the margin has to
+    /// be re-checked here: checking only when the part starts lets one large
+    /// part run the volume to `ENOSPC` while the cache and the companion
+    /// sidecars, the only durable data, share it. The check runs every
+    /// [`RECHECK_EVERY`] bytes, after the write, so it sees the space this chunk
+    /// took.
     pub fn write(&mut self, chunk: &[u8]) -> Result<(), UploadError> {
         if let Some(file) = self.file.as_mut() {
             file.write_all(chunk)?;
+        }
+        self.unchecked += chunk.len() as u64;
+        if self.unchecked >= RECHECK_EVERY {
+            self.unchecked = 0;
+            if self
+                .temp
+                .parent()
+                .is_some_and(|dir| below_margin(dir, self.margin))
+            {
+                return Err(UploadError::NoSpace);
+            }
         }
         Ok(())
     }
@@ -231,6 +270,15 @@ fn dedupe_name(name: &str, n: usize) -> String {
         Some(ext) => format!("{stem} ({n}).{ext}"),
         None => format!("{stem} ({n})"),
     }
+}
+
+/// Whether the filesystem holding `dir` has less than `margin` free.
+///
+/// A mount [`free_bytes`] cannot find reads as *not* below: there is nothing to
+/// compare, so on such a filesystem (some FUSE and network mounts) neither check
+/// refuses anything.
+fn below_margin(dir: &Path, margin: u64) -> bool {
+    free_bytes(dir).is_some_and(|free| free < margin)
 }
 
 /// Free space on the filesystem holding `path`, by the longest mount point that
@@ -346,6 +394,30 @@ mod tests {
             mtime.unix_seconds() >= before - 5,
             "a file with no capture time should keep the upload time"
         );
+    }
+
+    #[test]
+    fn a_disk_that_falls_below_the_margin_refuses_mid_stream() {
+        let d = tempfile::tempdir().unwrap();
+        if free_bytes(d.path()).is_none() {
+            // No mount for the temp dir: the check has nothing to compare, and
+            // the assertion below would fail for the wrong reason.
+            eprintln!("skipped: no mount found for {}", d.path().display());
+            return;
+        }
+        {
+            let mut staged = StagedUpload::create(d.path()).unwrap();
+            // Every disk is below this margin, so the first re-check refuses.
+            staged.margin = u64::MAX;
+            // A small write is under the re-check interval and is not checked.
+            staged.write(&[0u8; 4096]).unwrap();
+            assert!(matches!(
+                staged.write(&vec![0u8; RECHECK_EVERY as usize]),
+                Err(UploadError::NoSpace)
+            ));
+        }
+        // And the refused part left nothing behind.
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0);
     }
 
     #[test]

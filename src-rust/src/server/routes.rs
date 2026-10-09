@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path as UrlPath, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -72,7 +72,14 @@ pub fn router(state: Arc<AppState>) -> Router {
     let guarded = Router::new()
         .route("/api/invoke", post(invoke))
         .route("/api/events", get(sse))
-        .route("/api/upload", post(upload_route))
+        // The one route whose job is to carry large bodies. axum caps a
+        // `Multipart` request at 2 MiB by default — for the whole request, all
+        // files together — which cuts a phone photo off partway. What bounds an
+        // upload instead is in the header of `server::upload`.
+        .route(
+            "/api/upload",
+            post(upload_route).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/dirs", get(dirs))
         .route("/thumb/{tier}/{*rel}", get(thumb))
         .route("/media/{*rel}", get(media))
@@ -751,6 +758,17 @@ fn weak_etag(bytes: &[u8]) -> String {
 /// Stream each part of a multipart upload into the configured upload directory
 /// and return where each landed. Indexing is not done here: the watcher ingests
 /// what lands.
+///
+/// **A part is committed only after its last byte arrived.** A read error is not
+/// an end of file: treating it as one renames the bytes received so far into the
+/// gallery as a finished photo, and that cut-off file is what the thumbnailer
+/// then draws half of. So `commit` is reachable only through `Ok(None)` from the
+/// part, and every error drops the [`StagedUpload`] — and with it the temp file —
+/// instead. Files received whole before the failure stay, and the refusal says
+/// how many ([`refuse`]).
+///
+/// The route lifts axum's default body limit ([`router`]), so what bounds an
+/// upload is in [`crate::server::upload`].
 async fn upload_route(State(state): State<Arc<AppState>>, mut multipart: axum::extract::Multipart) -> Response {
     if !state.config.uploads_enabled {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -763,38 +781,68 @@ async fn upload_route(State(state): State<Arc<AppState>>, mut multipart: axum::e
     let mut landed = Vec::new();
     let mut parts = 0usize;
 
-    while let Ok(Some(mut field)) = multipart.next_field().await {
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return refuse(e.status(), e.body_text(), landed.len()),
+        };
         parts += 1;
         if parts > upload::MAX_PARTS {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "too many files").into_response();
+            return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too many files", landed.len());
         }
         let Some(raw_name) = field.file_name().map(str::to_string) else {
             continue;
         };
         let name = match upload::sanitize_name(&raw_name) {
             Ok(n) => n,
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            Err(e) => return refuse(StatusCode::BAD_REQUEST, e, landed.len()),
         };
 
         let mut staged = match StagedUpload::create(directory.as_path()) {
             Ok(s) => s,
-            Err(e) => return (StatusCode::INSUFFICIENT_STORAGE, e.to_string()).into_response(),
+            Err(e) => return refuse(upload_status(&e), e, landed.len()),
         };
-        // Streamed, so a 4 GB clip never sits in RAM. The staged file cleans
-        // itself up on every early return below.
-        while let Ok(Some(chunk)) = field.chunk().await {
-            if let Err(e) = staged.write(&chunk) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        // Streamed, so a 4 GB clip never sits in RAM. Only `Ok(None)` ends the
+        // part; the staged file cleans itself up on every return below.
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    if let Err(e) = staged.write(&chunk) {
+                        return refuse(upload_status(&e), e, landed.len());
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return refuse(e.status(), e.body_text(), landed.len()),
             }
         }
         match staged.commit(directory.as_path(), &name) {
             Ok(path) => landed.push(path.display().to_string()),
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => return refuse(upload_status(&e), e, landed.len()),
         }
     }
 
     // No separate indexing path: the ordinary fs-watcher ingests what landed.
     (StatusCode::OK, Json(json!({ "uploaded": landed }))).into_response()
+}
+
+/// A refusal of an upload that says how many files had already landed.
+///
+/// Files received whole before the failure stay in the gallery, so the sender
+/// has to be told. Left to guess, it re-sends them and they land a second time
+/// as `name (2)`.
+fn refuse(status: StatusCode, why: impl std::fmt::Display, landed: usize) -> Response {
+    let files = if landed == 1 { "file" } else { "files" };
+    (status, format!("{why}; stopped after {landed} {files}")).into_response()
+}
+
+/// The status for an [`upload::UploadError`] that stopped a part: 507 for a disk
+/// below the free-space margin, 500 for anything else.
+fn upload_status(error: &upload::UploadError) -> StatusCode {
+    match error {
+        upload::UploadError::NoSpace => StatusCode::INSUFFICIENT_STORAGE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[cfg(test)]

@@ -660,6 +660,26 @@ fn multipart_frames(boundary: &str, files: &[(&str, &[u8])]) -> Vec<Bytes> {
     frames
 }
 
+/// A body that delivers `frames` one at a time, yielding to the executor between
+/// them, and then, if `then_fail`, dies with an I/O error.
+///
+/// The yield is the point. multer drains a stream that is always ready in a
+/// single poll and returns its error before the handler has been given any part,
+/// which is not what a network does: a phone's frames arrive over time, so the
+/// parts before a failure are processed first.
+fn paced_body(frames: Vec<Bytes>, then_fail: bool) -> Body {
+    use futures::StreamExt;
+    let delivered = futures::stream::iter(frames).then(|frame| async move {
+        tokio::task::yield_now().await;
+        Ok::<_, std::io::Error>(frame)
+    });
+    let ending = futures::stream::iter(then_fail.then_some(())).then(|()| async {
+        tokio::task::yield_now().await;
+        Err::<Bytes, _>(std::io::Error::other("connection reset"))
+    });
+    Body::from_stream(delivered.chain(ending))
+}
+
 /// `len` bytes that differ from one position to the next, so a file cut short
 /// can never compare equal to the whole one.
 fn payload(len: usize, seed: u8) -> Vec<u8> {
@@ -697,9 +717,7 @@ async fn an_upload_larger_than_the_framework_default_lands_whole() {
     let big = payload(3 * 1024 * 1024, 1);
     let small = payload(4096, 2);
     let frames = multipart_frames("lv-boundary", &[("big.jpg", &big), ("small.jpg", &small)]);
-    let body = Body::from_stream(futures::stream::iter(
-        frames.into_iter().map(Ok::<_, std::io::Error>),
-    ));
+    let body = paced_body(frames, false);
 
     let (status, text) = h.send(upload_request(&cookie, "lv-boundary", body)).await;
     assert_eq!(status, StatusCode::OK, "body: {text}");
@@ -728,15 +746,9 @@ async fn a_body_that_dies_mid_part_commits_nothing_and_says_so() {
     frames.pop(); // the closing boundary: this request never gets that far
     frames.push(Bytes::from(part_header("lv-boundary", "cut.jpg")));
     frames.push(Bytes::from(payload(10 * 1024, 4)));
-    let stream = futures::stream::iter(
-        frames
-            .into_iter()
-            .map(Ok::<_, std::io::Error>)
-            .chain(std::iter::once(Err(std::io::Error::other("connection reset")))),
-    );
 
     let (status, text) = h
-        .send(upload_request(&cookie, "lv-boundary", Body::from_stream(stream)))
+        .send(upload_request(&cookie, "lv-boundary", paced_body(frames, true)))
         .await;
     assert!(
         !status.is_success(),
