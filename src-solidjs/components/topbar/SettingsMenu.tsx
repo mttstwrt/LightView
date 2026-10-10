@@ -6,7 +6,7 @@
 // this used to carry let thirteen call sites each pick a magic number, four of
 // which collided, because nobody ever saw all thirteen at once.
 //
-// **Three sections, down from nine.** The ones that went are not a trim for
+// **Five sections, down from nine.** The ones that went are not a trim for
 // tidiness — each described a mechanism that no longer exists:
 //
 //   - *Remote Access* (a third of this file: the enable/disable toggle, port
@@ -511,6 +511,27 @@ export function SettingsMenu(props: { onRequestShow?: () => void }) {
                   Apply now
                 </button>
               </Show>
+            </Section>
+
+            {/* ── Copy Path ── committed on change (blur or Enter), not per
+                keystroke: every `setPrefs` re-runs the grid's layout memo,
+                which reads `prefs()`. */}
+            <Section label="Copy Path">
+              <input
+                type="text"
+                value={prefs().copy_path_prefix}
+                onChange={(e) => set("copy_path_prefix", e.currentTarget.value.trim())}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                placeholder="e.g. /mnt/photos"
+                class="w-full px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs text-neutral-200 placeholder-neutral-600 outline-none focus:border-neutral-500"
+              />
+              <Note>
+                Put in front of the gallery path when you Copy Path, so the copy
+                names the file where this device sees it. Saved in this browser
+                only. Leave it empty to copy the path within the gallery.
+              </Note>
             </Section>
 
             {/* ── Connection ── */}

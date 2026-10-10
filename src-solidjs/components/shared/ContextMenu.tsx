@@ -16,12 +16,12 @@
 import { Show, For, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { hasTouch } from "../../lib/runtime";
 import { rateItem, setItemColorLabel, colorLabelByPath } from "../../stores/galleryStore";
-import { api, mediaUrl } from "../../lib/ipc";
+import { api, mediaUrl, originalUrl } from "../../lib/ipc";
 import { COLOR_LABELS, COLOR_LABEL_HEX } from "../../lib/colorLabels";
 import { announceThumbRegenerated } from "../../lib/thumbRegeneration";
 import { isVideoPath } from "../../lib/mediaExts";
 import { plugins, loadPlugins } from "../../stores/activityStore";
-import { capabilities, isOwner } from "../../stores/settingsStore";
+import { capabilities, isOwner, prefs } from "../../stores/settingsStore";
 import { openViewer } from "../../stores/viewerStore";
 import { DirectoryPicker } from "./DirectoryPicker";
 
@@ -168,9 +168,15 @@ export function ContextMenu(props: ContextMenuProps) {
     }
   };
 
+  /** Copy the path as this device sees the file: the gallery-relative path
+   *  behind this browser's prefix, or bare when it has none. The prefix is
+   *  joined as plain text — it is a mount path, not a URL, so nothing is
+   *  percent-encoded. */
   const handleCopyPath = () => {
     if (!props.state) return;
-    navigator.clipboard.writeText(props.state.path).catch(() => {});
+    const prefix = prefs().copy_path_prefix;
+    const path = prefix ? `${prefix.replace(/\/+$/, "")}/${props.state.path}` : props.state.path;
+    navigator.clipboard.writeText(path).catch(() => {});
     props.onClose();
   };
 
@@ -251,6 +257,25 @@ export function ContextMenu(props: ContextMenuProps) {
     navigator.clipboard
       .write([new ClipboardItem({ "image/png": png })])
       .catch((err) => console.error("Failed to copy image to clipboard:", err));
+  };
+
+  /** Save the file itself, byte for byte and under its own name — the one way a
+   *  page can hand a file to the client's filesystem.
+   *
+   *  The menu closes *first*: `handleClickOutside` is a capture listener on
+   *  `window` that cancels any click outside the menu, the anchor's click
+   *  included, and closing detaches it synchronously. The anchor is attached
+   *  for the click because Firefox has ignored `click()` on a detached one. */
+  const handleDownload = () => {
+    if (!props.state) return;
+    const path = props.state.path;
+    props.onClose();
+    const a = document.createElement("a");
+    a.href = originalUrl(path);
+    a.download = path.slice(path.lastIndexOf("/") + 1);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   };
 
   const handleCopyToClipboard = async () => {
@@ -391,11 +416,16 @@ export function ContextMenu(props: ContextMenuProps) {
               <MenuItem label="Regenerate Thumbnail" onClick={handleRegenerateThumbnail} />
             </Show>
             <MenuItem label="Copy Path" onClick={handleCopyPath} />
-            {/* The image bitmap, through the browser's own clipboard. Works
-                anywhere; copying the *files* below needs a host to copy them
+            {/* The image bitmap, through the browser's own clipboard: a picture
+                for pasting into an app, with no name and no metadata — no page
+                can put a *file* on the clipboard. Download is the file itself.
+                Copying files to the clipboard below needs a host to copy them
                 on, which is the `Owner` half. */}
             <Show when={!isBatchContext() && !isVideoPath(props.state!.path)}>
               <MenuItem label="Copy Image" onClick={handleCopyImage} />
+            </Show>
+            <Show when={!isBatchContext()}>
+              <MenuItem label="Download" onClick={handleDownload} />
             </Show>
             {/* Everything below is `Owner`: it acts on the filesystem of the
                 machine the server runs on. A runtime question rather than a
