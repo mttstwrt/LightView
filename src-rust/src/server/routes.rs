@@ -5,7 +5,7 @@
 //! | `POST /api/invoke` | per command |
 //! | `GET /api/events` | `Device` — SSE, one channel, typed events |
 //! | `GET /thumb/{tier}/{*rel}` | `Device` — `js` · `j` · `jm` · `jh` |
-//! | `GET /media/{*rel}` | `Device` — Range/206, HEIC transcode, `?fit=` |
+//! | `GET /media/{*rel}` | `Device` — Range/206, HEIC transcode, `?fit=`, `?original=true` |
 //! | `POST /api/upload` | `Device` |
 //! | `GET /api/dirs?path=` | **`Owner`** — the picker |
 //! | `GET /healthz` · `GET /cert` | bootstrap |
@@ -557,10 +557,15 @@ struct MediaQuery {
     /// the same coalescer the tiers use.
     #[serde(default)]
     fit: Option<u32>,
+    /// The file's own bytes, past both transforms — for saving, not displaying.
+    #[serde(default)]
+    original: bool,
 }
 
 /// The original file, with Range support; a `?fit=` resize for a still; and a
-/// JPEG transcode for HEIC, which no browser renders.
+/// JPEG transcode for HEIC, which no browser renders. `?original=true` skips
+/// both, so a download is the file itself whatever its type — a HEIC saved
+/// through the transcode would arrive without its EXIF.
 async fn media(
     State(state): State<Arc<AppState>>,
     UrlPath(rel): UrlPath<String>,
@@ -580,6 +585,10 @@ async fn media(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+
+    if query.original {
+        return serve_file(resolved.as_path(), &extension, &headers).await;
+    }
 
     // `?fit=` applies to stills only. GIF and video fall back to the whole
     // file, because a still frame is not what either of them is for.

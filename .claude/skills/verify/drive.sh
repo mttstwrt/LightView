@@ -139,6 +139,13 @@ ETAG=$(curl -s -b "$J" -D - -o /dev/null "$BASE/thumb/j/tall.png" | grep -i '^et
 check "a matching ETag is 304" "$(code -b "$J" -H "if-none-match: $ETAG" "$BASE/thumb/j/tall.png")" "304"
 
 check "a range request is 206" "$(code -b "$J" -H 'range: bytes=0-9' "$BASE/media/tall.png")" "206"
+# `?original=true` is the file's own bytes, past every transform — asked for
+# alongside `?fit=`, it is still the PNG, which proves it is checked first.
+curl -s -b "$J" -o "$WORK/orig" "$BASE/media/tall.png?original=true&fit=200"
+cmp -s "$WORK/orig" "$G/tall.png" && ok "?original=true is the file byte for byte, ?fit= or not" \
+  || bad "?original=true served $(stat -c%s "$WORK/orig") bytes, not the file"
+check "?fit= without it is still the resize" \
+  "$(curl -s -b "$J" -o /dev/null -w '%{content_type}' "$BASE/media/tall.png?fit=200")" "image/webp"
 # `--path-as-is` is load-bearing: without it curl collapses the `..` segments
 # itself and sends `GET /etc/passwd`, which never reaches the media route at
 # all — so the check passed for years while testing nothing. Both spellings are
@@ -216,6 +223,22 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 check "the watcher ingested a new file" "$(inv get_items | jq '.items | length')" "4"
+
+# HEIC: a JPEG for viewing, the `.heic` itself with `?original=true` — the
+# transcode keeps no EXIF, so a download through it would lose the metadata.
+# After the counts above, which it would change; the media route reads the
+# disk, not the index, so it need not be ingested first. `heif-enc` is one of
+# libheif's examples, which a source build with `-DWITH_EXAMPLES=OFF` lacks.
+if command -v heif-enc >/dev/null; then
+  heif-enc -q 50 "$G/tall.png" -o "$G/photo.heic" >/dev/null 2>&1
+  check "a HEIC is served as JPEG for viewing" \
+    "$(curl -s -b "$J" -o /dev/null -w '%{content_type}' "$BASE/media/photo.heic")" "image/jpeg"
+  curl -s -b "$J" -o "$WORK/orig.heic" "$BASE/media/photo.heic?original=true"
+  cmp -s "$WORK/orig.heic" "$G/photo.heic" && ok "a HEIC with ?original=true is the .heic itself" \
+    || bad "?original=true on a HEIC served $(stat -c%s "$WORK/orig.heic") bytes, not the file"
+else
+  echo "  skip HEIC ?original: no heif-enc on this host"
+fi
 
 # A second launch opens the first one's window instead of refusing.
 SECOND=$("$BIN" "$G" --data-dir "$D" 2>/dev/null | head -1)
