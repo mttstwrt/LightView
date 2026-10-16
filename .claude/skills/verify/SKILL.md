@@ -29,7 +29,8 @@ it, not just the build. `npm run build` is the fix.
 
 `drive.sh` walks both serving modes. Local mode: the random `127.x.x.x` bind,
 the launch token redeemed once and refused twice, the dead-end 401 body, all
-four tiers as WebP, ETag/304, Range/206, traversal, the SPA fallback, a video
+four tiers as WebP, ETag/304, Range/206, `?original=true` on a PNG and (with
+`heif-enc` present) a HEIC, traversal, the SPA fallback, a video
 thumbnail, the companion round trip, `set::` and `user::` filters, a set's
 order (the `name::N` sidecar entry, the set view, a rename carrying it, a name
 refused, an empty order clearing it), the watcher, and a second launch finding
@@ -40,7 +41,8 @@ re-tags, `--filter` scoping, and two plugin names that are paths.
 
 `grid.mjs` covers what `tsc` cannot: cells placed by the justified layout,
 thumbnails that decoded, the viewer opening on a click, Escape closing it, a
-scroll, the settings sections, a plugin run started from the panel, a 390px
+scroll, the settings sections, a plugin run started from the panel, a Download
+compared byte for byte and by name, Copy Path bare and behind a prefix, a 390px
 relayout, and a set reordered by a real mouse drag, by Esc mid-drag, and by
 Reverse from the sort menu — asserting no console error and no failed request
 throughout.
@@ -56,6 +58,9 @@ park the grid a third of the way down a 600px-tall viewport for that reason.
   version wants is usually not the one the image ships — the default launch then
   fails telling you to run `npx playwright install`, which needs network.
   `grid.mjs` passes `executablePath: /opt/pw-browsers/chromium` instead.
+- **Chromium names a non-ASCII download `download` under a POSIX locale.** It
+  cannot express the name in the filesystem encoding, so it falls back.
+  `grid.mjs` launches it with `LANG=C.UTF-8`, as any desktop has.
 - **`curl` normalizes `..` out of a path before sending.** A traversal check
   without `--path-as-is` tests nothing; it never reaches the route.
 - **Never filter a failure out of the browser check** because it looks like

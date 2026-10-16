@@ -34,6 +34,9 @@ lightview tag ~/photos --plugin wd-tagger
 **Videos:** MP4 · WebM · MKV · MOV · AVI · M4V
 
 HEIC/HEIF is transcoded on the fly when served at full resolution.
+That JPEG is for viewing: **Download** saves the original file, byte for byte,
+whatever its type. (**Copy Image** puts a PNG of any image on the clipboard,
+without its name or metadata — no web page can put a file there.)
 
 ## Two ways to run it
 

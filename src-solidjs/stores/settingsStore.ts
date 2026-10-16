@@ -77,6 +77,11 @@ export interface DisplayPrefs {
   /** Open scrolled to the end of the grid rather than the start. Only changes
    *  where the view lands; the sort order itself is unaffected. */
   start_at_bottom: boolean;
+  /** Put in front of the gallery-relative path by Copy Path, so the copy names
+   *  the file as this device sees it — a share mounted at `/mnt/photos` here
+   *  is somewhere else on the server and on the next device. Empty copies the
+   *  bare relative path. */
+  copy_path_prefix: string;
 }
 
 const DEFAULT_PREFS: DisplayPrefs = {
@@ -95,6 +100,7 @@ const DEFAULT_PREFS: DisplayPrefs = {
   mobile_filter_sheet: "top",
   video_autoplay_viewer: true,
   start_at_bottom: false,
+  copy_path_prefix: "",
 };
 
 /** Merge stored preferences over the defaults.

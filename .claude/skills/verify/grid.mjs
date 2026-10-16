@@ -11,7 +11,7 @@
 // boot path under test is the real one.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,7 +67,17 @@ for (let i = 0; i < COUNT; i++) {
     join(gallery, "2026", `p${String(i).padStart(2, "0")}.png`),
   ]);
 }
-ok(`gallery built (${COUNT} files)`);
+// One more, named the way a URL round trip mangles: a space, a non-ASCII letter
+// and an upper-case extension. Its own picture, so a download of the wrong file
+// cannot match it byte for byte, and older than every `pNN`, so it is the last
+// cell and the order the checks below depend on is the sixty's alone.
+const ODD = "Café 01.PNG";
+execFileSync("ffmpeg", [
+  "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x480:duration=1",
+  "-frames:v", "1", "-f", "image2", "-c:v", "png", join(gallery, "2026", ODD),
+]);
+execFileSync("touch", ["-d", "2025-12-31 00:00:00", join(gallery, "2026", ODD)]);
+ok(`gallery built (${COUNT + 1} files)`);
 
 // Install the fixture tagger beside this script into this run's state
 // directory, so the plugin path is exercised from the UI as well as from
@@ -99,9 +109,13 @@ const launchUrl = await new Promise((resolve, reject) => {
 });
 ok(`server printed its launch URL`);
 
+// A UTF-8 locale, as every desktop has. Under the container's POSIX one,
+// Chromium cannot write a non-ASCII filename and saves any such download as
+// `download` — a failure of the harness, not of the page.
 const browser = await chromium.launch({
   executablePath: CHROMIUM,
   args: ["--no-sandbox", "--headless=new"],
+  env: { ...process.env, LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
 });
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 
@@ -185,7 +199,7 @@ try {
   // Settings: the trimmed panel opens and its sections are there.
   await page.keyboard.press("i");
   await page.waitForSelector("text=Settings", { timeout: 5000 });
-  for (const section of ["Display", "Thumbnails", "Default filter", "Connection"]) {
+  for (const section of ["Display", "Thumbnails", "Default filter", "Copy Path", "Connection"]) {
     check(`settings has a ${section} section`, (await page.locator(`text=${section}`).count()) > 0);
   }
   await page.keyboard.press("Escape");
@@ -306,6 +320,51 @@ try {
   } else {
     bad("the context menu had no copy-to entry, so the picker was unreachable");
   }
+
+  // Download: the file itself, byte for byte and under its own name. Through
+  // the menu, because the menu's outside-click listener cancels any click it
+  // does not own — an anchor clicked while the menu is still open never
+  // downloads. The odd fixture is the oldest, so the last cell.
+  await page.evaluate((sel) => { document.querySelector(sel).scrollTop = 1e9; }, ".hide-scrollbar.fixed.inset-0");
+  const odd = page.locator(`img[alt="${ODD}"]`);
+  await odd.waitFor({ timeout: 10_000 });
+  const menuItem = async (cell, label) => {
+    await cell.click({ button: "right" });
+    await page.waitForTimeout(300);
+    await page.locator(`text=/^${label}$/`).first().click();
+  };
+  const [download] = await Promise.all([
+    page.waitForEvent("download", { timeout: 15_000 }),
+    menuItem(odd, "Download"),
+  ]);
+  check(`Download keeps the file's name (${download.suggestedFilename()})`, download.suggestedFilename() === ODD);
+  const saved = join(work, "downloaded");
+  await download.saveAs(saved);
+  check(
+    "Download is the file byte for byte",
+    readFileSync(saved).equals(readFileSync(join(gallery, "2026", ODD))),
+  );
+
+  // Copy Path: bare by default, so nobody's existing copies change; behind
+  // this browser's prefix once one is set, trailing slash or not.
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+    origin: new URL(launchUrl).origin,
+  });
+  const copiedPath = async () => {
+    await menuItem(odd, "Copy Path");
+    await page.waitForTimeout(200);
+    return page.evaluate(() => navigator.clipboard.readText());
+  };
+  const bare = await copiedPath();
+  check(`Copy Path with no prefix is the gallery path (${bare})`, bare === `2026/${ODD}`);
+  await page.keyboard.press("i");
+  await page.waitForSelector("text=Settings", { timeout: 5000 });
+  await page.locator("input[placeholder='e.g. /mnt/photos']").fill("/mnt/photos/");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  const prefixed = await copiedPath();
+  check(`Copy Path puts the prefix in front (${prefixed})`, prefixed === `/mnt/photos/2026/${ODD}`);
 
   // A phone-width viewport, which is the layout most likely to break silently.
   await page.setViewportSize({ width: 390, height: 844 });

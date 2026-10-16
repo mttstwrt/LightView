@@ -60,6 +60,13 @@ export function mediaUrl(path: string, fit?: number): string {
   return fit ? `${base}?fit=${fit}` : base;
 }
 
+/** The URL of the file's own bytes, past the HEIC transcode and any resize.
+ *  For saving, not displaying: a HEIC from here is not something a browser
+ *  renders. */
+export function originalUrl(path: string): string {
+  return `/media/${encodePath(path)}?original=true`;
+}
+
 // ---------------------------------------------------------------------------
 // Auth interruptions
 // ---------------------------------------------------------------------------
