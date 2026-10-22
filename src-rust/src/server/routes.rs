@@ -580,6 +580,10 @@ struct MediaQuery {
 /// pointing outside is refused by [`crate::path::Root::resolve`]. Making one
 /// takes write access to the gallery, which already reads everything in it, and
 /// gating on the target instead would 404 a link the scan lists.
+///
+/// The gate is the extension alone: the scan also skips dot-directories, this
+/// route does not, so media in `.lightview/trash/` is still served to a device
+/// that names its path. Nothing in the client does.
 async fn media(
     State(state): State<Arc<AppState>>,
     UrlPath(rel): UrlPath<String>,
