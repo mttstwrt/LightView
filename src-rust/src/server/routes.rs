@@ -5,7 +5,7 @@
 //! | `POST /api/invoke` | per command |
 //! | `GET /api/events` | `Device` — SSE, one channel, typed events |
 //! | `GET /thumb/{tier}/{*rel}` | `Device` — `js` · `j` · `jm` · `jh` |
-//! | `GET /media/{*rel}` | `Device` — Range/206, HEIC transcode, `?fit=`, `?original=true` |
+//! | `GET /media/{*rel}` | `Device` — media extensions only; Range/206, HEIC transcode, `?fit=`, `?original=true` |
 //! | `POST /api/upload` | `Device` |
 //! | `GET /api/dirs?path=` | **`Owner`** — the picker |
 //! | `GET /healthz` · `GET /cert` | bootstrap |
@@ -42,6 +42,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::cache::tiers::ThumbTier;
+use crate::companion::schema::MediaType;
 use crate::path::RelPath;
 use crate::server::auth::{self, Trust, SESSION_COOKIE};
 use crate::server::commands::{self, CommandError};
@@ -566,6 +567,23 @@ struct MediaQuery {
 /// JPEG transcode for HEIC, which no browser renders. `?original=true` skips
 /// both, so a download is the file itself whatever its type — a HEIC saved
 /// through the transcode would arrive without its EXIF.
+///
+/// **Only a media extension is served** ([`MediaType::from_extension`], the same
+/// allowlist the scan and the upload use). Without it the route serves any file
+/// under the root: `notes.txt`, and the companion sidecars under `.lightview/`
+/// whose tags and notes are the gallery's only durable data. Refusal is 404,
+/// not 403, as everywhere a path is refused ([`crate::path::PathError`]).
+///
+/// The extension is read from the wire path, as the scan reads it from the
+/// directory entry, not from the file that gets opened. So a symlink named
+/// `x.jpg` inside the gallery serves whatever it points at within the root; one
+/// pointing outside is refused by [`crate::path::Root::resolve`]. Making one
+/// takes write access to the gallery, which already reads everything in it, and
+/// gating on the target instead would 404 a link the scan lists.
+///
+/// The gate is the extension alone: the scan also skips dot-directories, this
+/// route does not, so media in `.lightview/trash/` is still served to a device
+/// that names its path. Nothing in the client does.
 async fn media(
     State(state): State<Arc<AppState>>,
     UrlPath(rel): UrlPath<String>,
@@ -575,16 +593,22 @@ async fn media(
     let Ok(path) = RelPath::new(&rel) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    // The one canonicalize on this route, in the branch that opens a file.
-    let Ok(resolved) = state.gallery.root.resolve(&path) else {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    };
 
     let extension = std::path::Path::new(path.as_str())
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+
+    // Before the canonicalize below, so a refused path costs no syscall.
+    if MediaType::from_extension(&extension).is_none() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    // The one canonicalize on this route, in the branch that opens a file.
+    let Ok(resolved) = state.gallery.root.resolve(&path) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
 
     if query.original {
         return serve_file(resolved.as_path(), &extension, &headers).await;

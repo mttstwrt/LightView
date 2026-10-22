@@ -157,6 +157,19 @@ check "an encoded traversal is 404" \
   "$(code -b "$J" "$BASE/media/..%2f..%2f..%2f..%2fetc%2fpasswd")" "404"
 grep -q "root:" "$WORK/body" && bad "a traversal returned /etc/passwd" || ok "no host file came back"
 
+# A file that exists inside the root and is not media: the route answers from
+# the filesystem, not the index, so planting these after the scan is enough.
+# `.lightview/` is where the companion sidecars (tags, notes) live.
+mkdir -p "$G/.lightview"
+echo "private notes" > "$G/notes.txt"
+echo '{"tags":{"user":["secret"]}}' > "$G/.lightview/probe.json"
+check "a non-media file under the root is 404" "$(code -b "$J" "$BASE/media/notes.txt")" "404"
+check "?original=true does not make it servable" \
+  "$(code -b "$J" "$BASE/media/notes.txt?original=true")" "404"
+check "a file inside .lightview/ is 404" "$(code -b "$J" "$BASE/media/.lightview/probe.json")" "404"
+grep -qE "private notes|secret" "$WORK/body" && bad "a non-media file's bytes came back" || ok "no non-media bytes came back"
+rm -f "$G/notes.txt" "$G/.lightview/probe.json"
+
 # The SPA is embedded in the binary, so `/` serves the real app.
 check "the SPA is served at /" "$(code -b "$J" "$BASE/")" "200"
 grep -q '<div id="root">' "$WORK/body" && ok "/ is the built SPA, not a placeholder" || bad "/ served: $(head -c 120 "$WORK/body")"
