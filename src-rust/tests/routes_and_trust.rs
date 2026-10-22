@@ -471,6 +471,46 @@ async fn a_range_request_gets_a_real_206() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_media_route_serves_media_and_nothing_else_under_the_root() {
+    // A file that exists, inside the root, and is not media — `notes.txt` and
+    // the companion sidecar that holds the gallery's only durable data — must
+    // be a 404 on both transfer modes, not a 200 of its bytes.
+    let h = harness(Trust::Device, None).await;
+    let cookie = h.pair().await;
+
+    let root = h._gallery_dir.path();
+    std::fs::create_dir_all(root.join(".lightview/companions")).unwrap();
+    std::fs::write(root.join("notes.txt"), "private notes").unwrap();
+    std::fs::write(root.join("README"), "no extension").unwrap();
+    std::fs::write(
+        root.join(".lightview/companions/a.png.lightview.json"),
+        r#"{"tags":{"user":["secret"]}}"#,
+    )
+    .unwrap();
+
+    for refused in [
+        "/media/notes.txt",
+        "/media/notes.txt?original=true",
+        "/media/README",
+        "/media/.lightview/companions/a.png.lightview.json",
+        "/media/.lightview/companions/a.png.lightview.json?original=true",
+    ] {
+        let request = Harness::with_cookie(h.get(refused), DEVICE_COOKIE, &cookie);
+        let (status, body) = h.send(request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused} → {body}");
+        assert!(
+            !body.contains("private notes") && !body.contains("secret"),
+            "{refused} served a non-media file"
+        );
+    }
+
+    // The gate reads the extension case-insensitively, as the scan does.
+    std::fs::copy(root.join("2026/a.png"), root.join("2026/B.PNG")).unwrap();
+    let request = Harness::with_cookie(h.get("/media/2026/B.PNG"), DEVICE_COOKIE, &cookie);
+    assert_eq!(h.send_full(request).await.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_traversal_in_a_path_capture_is_404_not_a_file() {
     let h = harness(Trust::Device, None).await;
     let cookie = h.pair().await;

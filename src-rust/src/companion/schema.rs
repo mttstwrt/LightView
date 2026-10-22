@@ -174,11 +174,12 @@ pub enum MediaType {
 impl MediaType {
     /// Infer media type from a file extension.
     ///
-    /// This is also the upload allowlist. It admits no `.json`, `.svg` or
-    /// `.html`, so a paired device cannot land a companion file, anything
-    /// inside `.lightview/`, or a script-bearing type served from the gallery's
-    /// own origin. Adding an extension here widens that, so weigh it as a
-    /// security change rather than a format one.
+    /// This is also the upload allowlist and the `/media` allowlist. It admits
+    /// no `.json`, `.svg` or `.html`, so a paired device can neither land a
+    /// companion file, anything inside `.lightview/`, or a script-bearing type
+    /// served from the gallery's own origin, nor read a companion or any other
+    /// non-media file back out. Adding an extension here widens both, so weigh
+    /// it as a security change rather than a format one.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif" | "heic" | "heif"
