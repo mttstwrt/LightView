@@ -811,6 +811,70 @@ async fn a_body_that_dies_mid_part_commits_nothing_and_says_so() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uploads_date_part_dates_the_next_file_and_only_that_one() {
+    // An image saved from the web carries no capture time; the date the phone
+    // reports beside it is the only one there is. A file sent with no date of
+    // its own must not inherit the previous file's.
+    let h = harness(Trust::Device, None).await;
+    let cookie = h.pair().await;
+
+    let boundary = "lv-boundary";
+    let sent_millis: i64 = 1_762_709_673_250;
+    let mut frames = vec![Bytes::from(format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"last_modified\"\r\n\r\n\
+         {sent_millis}\r\n"
+    ))];
+    frames.extend(multipart_frames(
+        boundary,
+        &[("saved.png", &payload(2048, 5)), ("undated.png", &payload(2048, 6))],
+    ));
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let (status, text) = h
+        .send(upload_request(&cookie, boundary, paced_body(frames, false)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {text}");
+
+    let uploads = h._gallery_dir.path().join("Uploads");
+    let mtime = |name: &str| {
+        filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(uploads.join(name)).unwrap(),
+        )
+    };
+    assert_eq!(mtime("saved.png").unix_seconds(), sent_millis / 1000);
+    assert!(
+        mtime("undated.png").unix_seconds() >= before - 5,
+        "a file with no date part took another file's date"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upload_whose_date_part_is_not_a_date_is_refused() {
+    let h = harness(Trust::Device, None).await;
+    let cookie = h.pair().await;
+
+    let boundary = "lv-boundary";
+    let mut frames = vec![Bytes::from(format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"last_modified\"\r\n\r\n\
+         {}\r\n",
+        "9".repeat(4096)
+    ))];
+    frames.extend(multipart_frames(boundary, &[("a.png", &payload(64, 7))]));
+
+    let (status, text) = h
+        .send(upload_request(&cookie, boundary, paced_body(frames, false)))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {text}");
+    assert!(
+        !h._gallery_dir.path().join("Uploads/a.png").exists(),
+        "the file after a refused date part landed"
+    );
+}
+
 /// Minimal percent-encoding for a query value.
 fn urlencoding(raw: &str) -> String {
     raw.bytes()

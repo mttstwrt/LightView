@@ -20,10 +20,8 @@
 //!    `date_taken = <upload time>` — and because it is `INSERT OR IGNORE`,
 //!    nothing ever corrects them. The thumbnail self-heals; the metadata does
 //!    not, so size sort, `size>=10mb` and date sort are permanently wrong for
-//!    that file. The capture time is read from the staged file by `commit`
-//!    itself: it used to be a parameter, and the one caller passed `None` on
-//!    every upload, so this paragraph described something that was not
-//!    happening.
+//!    that file. What the mtime is stamped *with* is [`StagedUpload::commit`]'s
+//!    rule: the sender's own date for the file, else its capture time.
 //! 4. **`RENAME_NOREPLACE`.** The dedupe loop checked `!candidate.exists()` and
 //!    then renamed unconditionally; between those two steps, two phones
 //!    uploading `IMG_0001.jpg` clobber each other — the exact thing the loop's
@@ -40,9 +38,18 @@
 //!    half of. The handler commits only after the part ends cleanly, and any
 //!    error drops the [`StagedUpload`] instead — see [`crate::server::routes`].
 //!
+//! **A file's date travels beside it.** A browser knows a date for each file it
+//! sends (`File.lastModified`) that is often written nowhere in the bytes: an
+//! iPhone reports the Photos library date, which for an image saved from the
+//! web exists only in that library. The client sends it as a
+//! [`LAST_MODIFIED_FIELD`] text part immediately before the file part, and the
+//! route hands it to the next file part it sees. FormData cannot put a header
+//! on a part, which is why it is a part of its own.
+//!
 //! **Uploads are bounded by what can actually run out.** Each part streams to
-//! the temp file, so no part sits in RAM; the part count is capped
-//! ([`MAX_PARTS`]); and free space is checked when a part starts and again every
+//! the temp file, so no part sits in RAM; a date part is read only up to
+//! [`LAST_MODIFIED_MAX_LEN`]; the part count is capped ([`MAX_PARTS`]); and
+//! free space is checked when a part starts and again every
 //! [`RECHECK_EVERY`] bytes while it streams, so the [`FREE_SPACE_MARGIN`] holds
 //! for the cache and the sidecars that share the volume. There is deliberately
 //! **no cap on the request body**: axum's default is 2 MiB for the whole
@@ -52,13 +59,27 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use filetime::FileTime;
 
 use crate::companion::schema::MediaType;
 use crate::path::{GalleryPath, RelPath, Root};
 
-/// Parts per request. A phone's share sheet sends a handful; a hundred is
-/// generous and a thousand is an attack.
-pub const MAX_PARTS: usize = 100;
+/// Parts per request, a file's date part counting as one: a hundred files with
+/// their dates. A phone's share sheet sends a handful; a hundred is generous
+/// and a thousand is an attack.
+pub const MAX_PARTS: usize = 200;
+
+/// The name of the text part that carries the next file's date, as integer
+/// milliseconds since the Unix epoch — JavaScript's `File.lastModified`, sent
+/// unconverted so the client does no arithmetic on it.
+pub const LAST_MODIFIED_FIELD: &str = "last_modified";
+
+/// Bytes read from a date part before it is refused. An `i64` is at most twenty
+/// characters with its sign, and the body has no cap, so without this a date
+/// part is the one part that would be read into RAM unbounded.
+pub const LAST_MODIFIED_MAX_LEN: usize = 20;
 
 /// Refuse when the destination filesystem has less than this free.
 pub const FREE_SPACE_MARGIN: u64 = 512 * 1024 * 1024;
@@ -81,6 +102,8 @@ pub enum UploadError {
     TooManyParts,
     #[error("not enough free space")]
     NoSpace,
+    #[error("invalid last_modified field")]
+    BadDate,
 }
 
 /// Reduce a client-supplied name to a safe basename with a known media
@@ -129,6 +152,33 @@ pub fn sanitize_name(raw: &str) -> Result<String, UploadError> {
         Some(_) => Ok(cleaned),
         None => Err(UploadError::UnsupportedType),
     }
+}
+
+/// Parse a [`LAST_MODIFIED_FIELD`] part into the date to stamp, or `None` when
+/// the date is one the sender cannot have meant.
+///
+/// Strict on the wire and lenient on the value. Text that is not an integer is
+/// a broken client and is refused. A date after `now` is a wrong clock, and one
+/// at or before the epoch is a placeholder for no date at all; both are dropped
+/// rather than refused, so the file still lands and falls back to its capture
+/// time. Stamping a future date would sort the file above everything,
+/// permanently.
+pub fn sender_date(text: &[u8], now: SystemTime) -> Result<Option<FileTime>, UploadError> {
+    let millis: i64 = std::str::from_utf8(text)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .ok_or(UploadError::BadDate)?;
+    let now_millis = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if millis <= 0 || millis > now_millis {
+        return Ok(None);
+    }
+    Ok(Some(FileTime::from_unix_time(
+        millis.div_euclid(1000),
+        (millis.rem_euclid(1000) * 1_000_000) as u32,
+    )))
 }
 
 /// A temp file in the destination directory, cleaned up on every error path.
@@ -193,26 +243,44 @@ impl StagedUpload {
         Ok(())
     }
 
-    /// Flush, stamp the mtime from the photo's own capture time, and rename
-    /// into place.
+    /// Flush, stamp the mtime, and rename into place.
     ///
-    /// The mtime is stamped **before** the rename, or the indexer records the
-    /// upload time and every uploaded photo sorts as "today" forever.
+    /// **The mtime is the sender's date when it sent one, else the capture time
+    /// in the file's own EXIF, else the upload time.** The sender's date wins
+    /// because it is the only one of the three that exists nowhere else: the
+    /// capture time stays in the bytes, which are never altered, and the index
+    /// reads it into `date_taken` — which the grid sorts by in preference to the
+    /// mtime —
+    /// whatever the mtime says. So stamping the sender's date keeps both, where
+    /// stamping the capture time would keep one twice and drop the other. And a
+    /// sender whose date is merely the moment it picked the file costs nothing:
+    /// without a capture time the fallback would have been the upload time
+    /// anyway.
     ///
-    /// **The capture time is read here rather than passed in**, because this is
-    /// the only place that has the flushed bytes and a path to read them from.
-    /// The parameter it replaces was the bug: the one caller passed `None` on
-    /// every upload, so nothing was ever stamped and the module's own doc
-    /// comment described a fix that was not running. A photo with no EXIF date
-    /// — and every video — keeps the upload time, which is the best available
-    /// answer rather than a guess.
-    pub fn commit(mut self, destination_dir: &Path, name: &str) -> Result<PathBuf, UploadError> {
+    /// Stamped **before** the rename, or the indexer records the upload time
+    /// and every uploaded file sorts as "today" forever.
+    ///
+    /// `sent` comes from the route, the only place that holds the request. A
+    /// parameter that its one caller always passed as `None` once left this
+    /// stamp described and not running, so a router test
+    /// (`an_uploads_date_part_dates_the_next_file_and_only_that_one`) pins that
+    /// the route passes it.
+    pub fn commit(
+        mut self,
+        destination_dir: &Path,
+        name: &str,
+        sent: Option<FileTime>,
+    ) -> Result<PathBuf, UploadError> {
         if let Some(mut file) = self.file.take() {
             file.flush()?;
             file.sync_all()?;
         }
-        if let Some(taken) = crate::pipeline::exif::read(&self.temp).date_taken {
-            let stamp = filetime::FileTime::from_unix_time(taken, 0);
+        let stamp = sent.or_else(|| {
+            crate::pipeline::exif::read(&self.temp)
+                .date_taken
+                .map(|taken| FileTime::from_unix_time(taken, 0))
+        });
+        if let Some(stamp) = stamp {
             filetime::set_file_mtime(&self.temp, stamp)?;
         }
 
@@ -357,7 +425,7 @@ mod tests {
             crate::pipeline::exif::tests_support::jpeg_with_exif(Some("2020:09:13 12:26:40"), None);
         let mut staged = StagedUpload::create(d.path()).unwrap();
         staged.write(&jpeg).unwrap();
-        let landed = staged.commit(d.path(), "a.jpg").unwrap();
+        let landed = staged.commit(d.path(), "a.jpg", None).unwrap();
 
         assert_eq!(std::fs::read(&landed).unwrap(), jpeg);
         let mtime = filetime::FileTime::from_last_modification_time(
@@ -372,10 +440,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
     }
 
-    /// The regression that shipped: `commit` took the capture time as a
-    /// parameter and its one caller always passed `None`, so an upload filed
-    /// under "today" forever and the module doc above described a fix that was
-    /// not running.
     #[test]
     fn an_upload_with_no_capture_time_keeps_the_upload_time() {
         let d = tempfile::tempdir().unwrap();
@@ -385,7 +449,7 @@ mod tests {
             .as_secs() as i64;
         let mut staged = StagedUpload::create(d.path()).unwrap();
         staged.write(b"no exif here at all").unwrap();
-        let landed = staged.commit(d.path(), "a.jpg").unwrap();
+        let landed = staged.commit(d.path(), "a.jpg", None).unwrap();
 
         let mtime = filetime::FileTime::from_last_modification_time(
             &std::fs::metadata(&landed).unwrap(),
@@ -394,6 +458,63 @@ mod tests {
             mtime.unix_seconds() >= before - 5,
             "a file with no capture time should keep the upload time"
         );
+    }
+
+    #[test]
+    fn the_senders_date_is_stamped_over_the_capture_time() {
+        // The capture time stays in the bytes and reaches `date_taken`; the
+        // sender's date exists nowhere else, so it is the one the mtime keeps.
+        let d = tempfile::tempdir().unwrap();
+        let jpeg =
+            crate::pipeline::exif::tests_support::jpeg_with_exif(Some("2020:09:13 12:26:40"), None);
+        let sent = FileTime::from_unix_time(1_700_000_000, 250_000_000);
+        let mut staged = StagedUpload::create(d.path()).unwrap();
+        staged.write(&jpeg).unwrap();
+        let landed = staged.commit(d.path(), "a.jpg", Some(sent)).unwrap();
+
+        assert_eq!(std::fs::read(&landed).unwrap(), jpeg, "the bytes were altered");
+        let mtime = FileTime::from_last_modification_time(&std::fs::metadata(&landed).unwrap());
+        assert_eq!(mtime.unix_seconds(), 1_700_000_000);
+    }
+
+    #[test]
+    fn a_file_with_no_capture_time_takes_the_senders_date() {
+        // An image saved from the web: no EXIF date, and the Photos library
+        // date is the only one there is.
+        let d = tempfile::tempdir().unwrap();
+        let sent = FileTime::from_unix_time(1_762_709_673, 0);
+        let mut staged = StagedUpload::create(d.path()).unwrap();
+        staged.write(b"a png with no exif").unwrap();
+        let landed = staged.commit(d.path(), "saved.png", Some(sent)).unwrap();
+
+        let mtime = FileTime::from_last_modification_time(&std::fs::metadata(&landed).unwrap());
+        assert_eq!(mtime.unix_seconds(), 1_762_709_673);
+    }
+
+    #[test]
+    fn a_senders_date_is_milliseconds_and_keeps_its_fraction() {
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let date = sender_date(b"1762709673250", now).unwrap().unwrap();
+        assert_eq!(date.unix_seconds(), 1_762_709_673);
+        assert_eq!(date.nanoseconds(), 250_000_000);
+    }
+
+    #[test]
+    fn a_date_the_sender_cannot_have_meant_is_dropped_not_refused() {
+        // A wrong clock, or a browser with no answer: the file still lands and
+        // falls back to its capture time.
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        assert!(sender_date(b"0", now).unwrap().is_none());
+        assert!(sender_date(b"-5000", now).unwrap().is_none());
+        assert!(sender_date(b"1800000001000", now).unwrap().is_none(), "a future date was kept");
+    }
+
+    #[test]
+    fn a_date_part_that_is_not_an_integer_is_refused() {
+        let now = SystemTime::now();
+        for bad in [&b""[..], b"yesterday", b"1.5", b"\xff\xfe"] {
+            assert!(matches!(sender_date(bad, now), Err(UploadError::BadDate)), "{bad:?}");
+        }
     }
 
     #[test]
@@ -427,11 +548,11 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut first = StagedUpload::create(d.path()).unwrap();
         first.write(b"first").unwrap();
-        first.commit(d.path(), "IMG_0001.jpg").unwrap();
+        first.commit(d.path(), "IMG_0001.jpg", None).unwrap();
 
         let mut second = StagedUpload::create(d.path()).unwrap();
         second.write(b"second").unwrap();
-        let landed = second.commit(d.path(), "IMG_0001.jpg").unwrap();
+        let landed = second.commit(d.path(), "IMG_0001.jpg", None).unwrap();
 
         assert_eq!(landed.file_name().unwrap(), "IMG_0001 (2).jpg");
         assert_eq!(

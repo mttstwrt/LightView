@@ -11,7 +11,7 @@
 // boot path under test is the real one.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -701,6 +701,32 @@ try {
     `Reverse holds the scroll offset (${topBeforeReverse} -> ${topAfterReverse})`,
     Math.abs(topAfterReverse - topBeforeReverse) <= 1,
   );
+
+  // An upload keeps the date the browser reports for the file. An image saved
+  // from the web has no capture time, and on an iPhone `lastModified` is the
+  // Photos library date, the only date there is. Chromium reports a picked
+  // file's mtime as `lastModified`, so a backdated file stands in for it.
+  const pickedOnPhone = join(work, "IMG_4484.png");
+  execFileSync("ffmpeg", [
+    "-loglevel", "error", "-f", "lavfi", "-i", "color=c=orange:s=64x48",
+    "-frames:v", "1", pickedOnPhone,
+  ]);
+  execFileSync("touch", ["-d", "2026-11-09T13:41:22Z", pickedOnPhone]);
+  await page.keyboard.press("Escape");
+  await page.mouse.move(640, 4); // the top bar hides until the pointer nears it
+  await page.waitForTimeout(600);
+  await page.locator("button[title='Actions']:visible").click();
+  await page.locator("text=Upload photos").click();
+  await page.locator("input[type=file]").setInputFiles(pickedOnPhone);
+  const uploaded = page.waitForResponse((r) => r.url().endsWith("/api/upload"));
+  await page.locator("button", { hasText: /^Upload$/ }).click();
+  check("the upload sheet's upload answered 200", (await uploaded).status() === 200);
+  const landedAt = statSync(join(gallery, "Uploads", "IMG_4484.png")).mtime.toISOString();
+  check(
+    `an upload keeps the date the browser reported (${landedAt})`,
+    landedAt === "2026-11-09T13:41:22.000Z",
+  );
+  await page.keyboard.press("Escape");
 
   // Nothing is filtered out of either list. A 404 the page causes is a 404 a
   // user sees in their console, and "that one is fine" is how the missing
