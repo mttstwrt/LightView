@@ -43,8 +43,9 @@ re-tags, `--filter` scoping, and two plugin names that are paths.
 thumbnails that decoded, the viewer opening on a click, Escape closing it, a
 scroll, the settings sections, a plugin run started from the panel, a Download
 compared byte for byte and by name, Copy Path bare and behind a prefix, a 390px
-relayout, and a set reordered by a real mouse drag, by Esc mid-drag, and by
-Reverse from the sort menu — asserting no console error and no failed request
+relayout, a set reordered by a real mouse drag, by Esc mid-drag, and by
+Reverse from the sort menu, and an upload from the sheet keeping the date the
+browser reported for the file — asserting no console error and no failed request
 throughout.
 
 The two set checks that hold the scroll offset are only worth anything with

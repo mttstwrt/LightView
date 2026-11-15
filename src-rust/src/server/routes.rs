@@ -792,6 +792,11 @@ fn weak_etag(bytes: &[u8]) -> String {
 /// and return where each landed. Indexing is not done here: the watcher ingests
 /// what lands.
 ///
+/// **A [`upload::LAST_MODIFIED_FIELD`] part dates the next file part**, and only
+/// that one: it is taken when the file part starts, so a file sent without a
+/// date never inherits the previous file's. A second date before any file
+/// replaces the first.
+///
 /// **A part is committed only after its last byte arrived.** A read error is not
 /// an end of file: treating it as one renames the bytes received so far into the
 /// gallery as a finished photo, and that cut-off file is what the thumbnailer
@@ -813,6 +818,7 @@ async fn upload_route(State(state): State<Arc<AppState>>, mut multipart: axum::e
 
     let mut landed = Vec::new();
     let mut parts = 0usize;
+    let mut next_date: Option<filetime::FileTime> = None;
 
     loop {
         let mut field = match multipart.next_field().await {
@@ -824,9 +830,31 @@ async fn upload_route(State(state): State<Arc<AppState>>, mut multipart: axum::e
         if parts > upload::MAX_PARTS {
             return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too many files", landed.len());
         }
+        if field.file_name().is_none() && field.name() == Some(upload::LAST_MODIFIED_FIELD) {
+            let mut text = Vec::new();
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        text.extend_from_slice(&chunk);
+                        if text.len() > upload::LAST_MODIFIED_MAX_LEN {
+                            let e = upload::UploadError::BadDate;
+                            return refuse(StatusCode::BAD_REQUEST, e, landed.len());
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => return refuse(e.status(), e.body_text(), landed.len()),
+                }
+            }
+            next_date = match upload::sender_date(&text, std::time::SystemTime::now()) {
+                Ok(date) => date,
+                Err(e) => return refuse(StatusCode::BAD_REQUEST, e, landed.len()),
+            };
+            continue;
+        }
         let Some(raw_name) = field.file_name().map(str::to_string) else {
             continue;
         };
+        let sent = next_date.take();
         let name = match upload::sanitize_name(&raw_name) {
             Ok(n) => n,
             Err(e) => return refuse(StatusCode::BAD_REQUEST, e, landed.len()),
@@ -849,7 +877,7 @@ async fn upload_route(State(state): State<Arc<AppState>>, mut multipart: axum::e
                 Err(e) => return refuse(e.status(), e.body_text(), landed.len()),
             }
         }
-        match staged.commit(directory.as_path(), &name) {
+        match staged.commit(directory.as_path(), &name, sent) {
             Ok(path) => landed.push(path.display().to_string()),
             Err(e) => return refuse(upload_status(&e), e, landed.len()),
         }

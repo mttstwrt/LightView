@@ -400,6 +400,12 @@ export const api = {
 
 /** Upload files, reporting progress as a fraction.
  *
+ *  Each file goes with its `lastModified`, as a `last_modified` part just
+ *  before it, because that date is often written nowhere in the bytes: an
+ *  iPhone reports the Photos library date, which for an image saved from the
+ *  web is the only date it has. The server stamps it as the file's mtime; see
+ *  `server::upload`.
+ *
  *  The one `XMLHttpRequest` in the codebase, and it is here for a reason
  *  `fetch` cannot answer: `fetch` exposes no upload progress at all. The
  *  streaming-request alternative (`ReadableStream` body with `duplex: "half"`)
@@ -411,7 +417,10 @@ export function upload(
   onProgress?: (fraction: number) => void,
 ): Promise<string[]> {
   const form = new FormData();
-  for (const file of files) form.append("file", file, file.name);
+  for (const file of files) {
+    form.append("last_modified", String(file.lastModified));
+    form.append("file", file, file.name);
+  }
 
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
