@@ -63,6 +63,7 @@ import { createWheelScroll } from "../../lib/wheelScroll";
 import { prefs, setPrefs } from "../../stores/settingsStore";
 import { durationByPath, holdRefreshes, releaseRefreshes } from "../../stores/galleryStore";
 import { api, thumbUrl, mediaUrl } from "../../lib/ipc";
+import { armCarryOut, carryOut } from "../../lib/carryOut";
 import type { ThumbTier } from "../../lib/types";
 import { onThumbRegenerated } from "../../lib/thumbRegeneration";
 import type { CellMeta } from "../../stores/galleryStore";
@@ -362,10 +363,13 @@ export function JustifiedGrid(props: JustifiedGridProps) {
 
   // Shared pointer controls: Ctrl/Cmd-drag range select + click handling,
   // plain-drag reordering in a set view, and edge-scroll while either drags.
+  // Outside a set view a plain drag carries the file out instead
+  // (`lib/carryOut`); both read `reorderable`, so only one of them can own it.
   const { isDragging, effectiveSelected, handleDragStart, handleDragEnter, handleItemClick, handleBackgroundClick } =
     createDragSelect(props);
+  const reorderable = () => !!props.setView && !!props.onReorder;
   const reorder = createReorderDrag({
-    enabled: () => !!props.setView && !!props.onReorder,
+    enabled: reorderable,
     paths: () => props.paths,
     selectedPaths: () => props.selectedPaths,
     gapAt: (clientX, clientY) => {
@@ -1287,7 +1291,11 @@ export function JustifiedGrid(props: JustifiedGridProps) {
                       // repack every row under the pointer.
                       opacity: reorder.lifted()?.has(path) ? 0.35 : undefined,
                     }}
-                    onPointerDown={(e) => reorder.handlePointerDown(path, e)}
+                    onPointerDown={(e) => {
+                      armCarryOut(e.currentTarget, e, !reorderable());
+                      reorder.handlePointerDown(path, e);
+                    }}
+                    onDragStart={(e) => carryOut(e.dataTransfer!, path)}
                   >
                     <ThumbnailCell
                       path={path}

@@ -1,7 +1,9 @@
 // The full-resolution viewer: the overlay that opens over the grid.
 //
-// Owns pan/zoom, paging, the open/close flight animation, and the decoded-image
-// cache. Two things here are subtler than they look.
+// Owns pan/zoom, paging, the open/close flight animation, the decoded-image
+// cache, and starting a drag out of the window from what it shows (the rule is
+// `lib/carryOut`'s; on a zoomed photo the same drag pans). Two things here are
+// subtler than they look.
 //
 // The open transition measures the grid cell's on-screen rect and animates the
 // viewer from it, so the image appears to grow out of the thumbnail. That
@@ -48,11 +50,16 @@ import { hapticTick } from "../../lib/haptics";
 import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
 import { prefs } from "../../stores/settingsStore";
 import { api, mediaUrl, thumbUrl } from "../../lib/ipc";
+import { armCarryOut, carryOut } from "../../lib/carryOut";
 import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
 import { isVideoPath, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { InfoPanel } from "./InfoPanel";
 import { VideoPlayer } from "./VideoPlayer";
+
+/** What the viewer's own gestures leave alone: real controls, and anything
+ *  marked `data-gesture-exempt` (the video control bar, so it can scrub). */
+const GESTURE_EXEMPT = "button, input, a, [data-gesture-exempt]";
 
 interface MediaViewerProps {
   paths: string[];
@@ -77,6 +84,8 @@ export function MediaViewer(props: MediaViewerProps) {
 
   // Container ref for direct DOM image swapping
   let imageContainerRef: HTMLDivElement | undefined;
+  // The current slide: the source of a drag out of the window.
+  let slideRef: HTMLDivElement | undefined;
   // The horizontally-translating filmstrip track holding prev/current/next
   // slots. Only `dragX` (swipe-to-navigate) transforms this element.
   let trackRef: HTMLDivElement | undefined;
@@ -772,7 +781,7 @@ export function MediaViewer(props: MediaViewerProps) {
     // data-gesture-exempt, like the video scrubber) are left to them. The
     // video surface itself is NOT excluded — with custom controls it behaves
     // like a photo: tap toggles chrome, swipes navigate / dismiss / open info.
-    if (t.closest("button, input, a, [data-gesture-exempt]")) return;
+    if (t.closest(GESTURE_EXEMPT)) return;
     // If a swipe-navigation is still mid-flight, land it now so the new gesture
     // operates on the settled index rather than racing the pending commit.
     runNavCommit();
@@ -1189,7 +1198,14 @@ export function MediaViewer(props: MediaViewerProps) {
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onDblClick={handleDblClick}
-      onPointerDown={onPointerDown}
+      onPointerDown={(e) => {
+        // A zoomed photo pans, and controls keep their own drags (the video
+        // scrubber); otherwise a mouse drag carries the file out.
+        const free = zoom() <= 1 && !opening() && !closing() &&
+          !(e.target as HTMLElement).closest(GESTURE_EXEMPT);
+        armCarryOut(slideRef!, e, free);
+        onPointerDown(e);
+      }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerCancel}
@@ -1250,8 +1266,14 @@ export function MediaViewer(props: MediaViewerProps) {
           </div>
         </Show>
 
-        {/* Current slide */}
-        <div class="absolute inset-0 flex items-center justify-center">
+        {/* Current slide — and the source of a drag out (`lib/carryOut`),
+            armed by the root's pointerdown. The track is click-through, so
+            only a press on the media itself reaches it. */}
+        <div
+          ref={slideRef}
+          class="absolute inset-0 flex items-center justify-center"
+          onDragStart={(e) => carryOut(e.dataTransfer!, currentPath(), findCellImage(currentPath()))}
+        >
           <Show
             when={isVideo()}
             fallback={

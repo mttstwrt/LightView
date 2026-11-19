@@ -67,6 +67,13 @@ export function originalUrl(path: string): string {
   return `/media/${encodePath(path)}?original=true`;
 }
 
+/** The name a file is saved under when it leaves the gallery: its own
+ *  basename. Download and a drag out both name it here, so the two cannot
+ *  disagree. */
+export function fileName(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
 // ---------------------------------------------------------------------------
 // Auth interruptions
 // ---------------------------------------------------------------------------
@@ -398,7 +405,40 @@ export const api = {
 // Uploads
 // ---------------------------------------------------------------------------
 
-/** Upload files, reporting progress as a fraction.
+/** Files per upload request: the server's `MAX_PARTS`, at two parts per file.
+ *  `mediaExts.test.ts` reads the Rust constant and fails when they differ. */
+export const FILES_PER_REQUEST = 100;
+
+/** Upload files in requests of at most `FILES_PER_REQUEST`, one after
+ *  another, reporting progress across all of them as a fraction of the bytes.
+ *
+ *  **Batched because the server refuses a request with too many parts** and
+ *  keeps what landed before the refusal: one request of 150 files lands 100 and
+ *  loses the rest, which is what selecting a folder's contents in a file
+ *  manager and dropping them produces. `onLanded` reports each batch as it
+ *  lands, with its file count, so a caller can drop those from a retry; a
+ *  failed batch rejects, and the batches after it are not sent. */
+export async function upload(
+  files: File[],
+  onProgress?: (fraction: number) => void,
+  onLanded?: (count: number) => void,
+): Promise<string[]> {
+  const total = files.reduce((n, f) => n + f.size, 0) || 1;
+  const landed: string[] = [];
+  let sent = 0;
+  for (let i = 0; i < files.length; i += FILES_PER_REQUEST) {
+    const batch = files.slice(i, i + FILES_PER_REQUEST);
+    const bytes = batch.reduce((n, f) => n + f.size, 0);
+    landed.push(
+      ...(await uploadRequest(batch, (fraction) => onProgress?.((sent + fraction * bytes) / total))),
+    );
+    sent += bytes;
+    onLanded?.(batch.length);
+  }
+  return landed;
+}
+
+/** Send one request of files, reporting its progress as a fraction.
  *
  *  Each file goes with its `lastModified`, as a `last_modified` part just
  *  before it, because that date is often written nowhere in the bytes: an
@@ -412,9 +452,9 @@ export const api = {
  *  is Chromium-only and needs HTTP/2, so it is not an option for the phone this
  *  exists for — and a phone pushing a four-gigabyte clip over Wi-Fi with no
  *  indication of progress looks hung. */
-export function upload(
+function uploadRequest(
   files: File[],
-  onProgress?: (fraction: number) => void,
+  onProgress: (fraction: number) => void,
 ): Promise<string[]> {
   const form = new FormData();
   for (const file of files) {
@@ -426,7 +466,7 @@ export function upload(
     const request = new XMLHttpRequest();
     request.open("POST", "/api/upload");
     request.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress?.(e.loaded / e.total);
+      if (e.lengthComputable) onProgress(e.loaded / e.total);
     };
     request.onload = () => {
       if (request.status < 200 || request.status >= 300) {

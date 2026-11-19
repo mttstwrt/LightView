@@ -331,6 +331,22 @@ export function App() {
   window.addEventListener("keydown", handleKeyDown);
   onCleanup(() => window.removeEventListener("keydown", handleKeyDown));
 
+  // **A file dropped on the window never navigates the tab away.** A browser
+  // opens a dropped file in place of the page, which throws away the app —
+  // and a drop is an ordinary gesture here, since it is how the upload sheet
+  // takes files. That sheet is mounted only where uploading is available, so
+  // this holds for the rest: before capabilities arrive, with uploads off, and
+  // mid-upload. `dropEffect` is left alone so the sheet's "copy" stands.
+  const holdFileDrop = (e: DragEvent) => {
+    if (e.dataTransfer?.types.includes("Files")) e.preventDefault();
+  };
+  window.addEventListener("dragover", holdFileDrop);
+  window.addEventListener("drop", holdFileDrop);
+  onCleanup(() => {
+    window.removeEventListener("dragover", holdFileDrop);
+    window.removeEventListener("drop", holdFileDrop);
+  });
+
   // -------------------------------------------------------------------------
 
   return (
@@ -469,7 +485,11 @@ export function App() {
           <AutoTagPanel onClose={() => setAutoTagOpen(false)} />
         </Show>
         <Show when={capabilities().upload}>
-          <UploadSheet open={uploadOpen()} onClose={() => setUploadOpen(false)} />
+          <UploadSheet
+            open={uploadOpen()}
+            onOpen={() => setUploadOpen(true)}
+            onClose={() => setUploadOpen(false)}
+          />
         </Show>
       </Show>
 

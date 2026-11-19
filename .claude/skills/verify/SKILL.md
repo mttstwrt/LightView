@@ -48,6 +48,15 @@ Reverse from the sort menu, and an upload from the sheet keeping the date the
 browser reported for the file — asserting no console error and no failed request
 throughout.
 
+It also covers dragging files in and out of the window. Out, by real mouse drags
+that Playwright intercepts: a cell and the viewer at fit each carry Download's
+`DownloadURL`, a Ctrl-drag selects instead, a zoomed photo pans instead, and no
+drag in a set view starts one. Where such a drop *lands* needs a desktop and is
+not covered. In, by synthetic file drops: the overlay sits above an open sheet,
+names the server would refuse are skipped, 101 files go in two requests, and a
+drop mid-upload is ignored. A dropped *folder* cannot be built synthetically, so
+that path is not covered either.
+
 The two set checks that hold the scroll offset are only worth anything with
 room to scroll: at the end of the content the browser clamps a view that chased
 the dragged cell back to where it was, and they pass on the broken build. They

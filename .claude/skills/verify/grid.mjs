@@ -11,7 +11,7 @@
 // boot path under test is the real one.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -138,6 +138,17 @@ try {
   // The token is single-use and the app clears it before the first render.
   await page.waitForFunction(() => !window.location.search.includes("t="), { timeout: 15_000 });
   ok("the launch token was redeemed and cleared from the address bar");
+
+  // What every drag out the page starts carries. Bubble phase on the window,
+  // so it reads the data after the element's own handler has written it.
+  await page.evaluate(() => {
+    window.__carried = [];
+    window.addEventListener("dragstart", (e) =>
+      window.__carried.push(e.dataTransfer.getData("DownloadURL")),
+    );
+  });
+  /** The drags out since the last call. */
+  const carried = () => page.evaluate(() => window.__carried.splice(0));
 
   // Cells: the justified layout has run and placed something.
   await page.waitForSelector("img[src*='/thumb/']", { timeout: 30_000 });
@@ -344,6 +355,82 @@ try {
     "Download is the file byte for byte",
     readFileSync(saved).equals(readFileSync(join(gallery, "2026", ODD))),
   );
+
+  // ---- Dragging a file out ------------------------------------------------
+  //
+  // Real mouse drags. Playwright intercepts the drag in place of the desktop,
+  // so what this proves is that a drag starts and what it carries — where it
+  // lands is the desktop's business. It must be Download's file under
+  // Download's name: the original bytes, encoded per segment.
+  const origin = new URL(launchUrl).origin;
+  const carriesOdd =
+    `application/octet-stream:${ODD}:${origin}/media/2026/${encodeURIComponent(ODD)}?original=true`;
+  const dragFrom = async (x, y, modifier) => {
+    if (modifier) await page.keyboard.down(modifier);
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 30, y + 10, { steps: 5 });
+    await page.mouse.move(x + 120, y + 40, { steps: 5 });
+    await page.mouse.up();
+    if (modifier) await page.keyboard.up(modifier);
+    await page.waitForTimeout(300);
+  };
+  const viewerOpen = async () => (await page.locator("img[src*='/media/']").count()) > 0;
+
+  const oddBox = await odd.boundingBox();
+  const oddCentre = [oddBox.x + oddBox.width / 2, oddBox.y + oddBox.height / 2];
+  await dragFrom(...oddCentre);
+  const fromGrid = await carried();
+  check(
+    `a drag from a cell carries the file out (${fromGrid.join(" | ") || "nothing"})`,
+    fromGrid.length === 1 && fromGrid[0] === carriesOdd,
+  );
+  check("a drag out opens nothing", !(await viewerOpen()));
+
+  const outlined = () =>
+    page.evaluate(() =>
+      [...document.querySelectorAll(".thumb-cell")].filter((c) => c.style.outlineStyle === "solid").length,
+    );
+  await dragFrom(...oddCentre, "Control");
+  check("a Ctrl-drag carries nothing out", (await carried()).length === 0);
+  const ctrlSelected = await outlined();
+  check(`a Ctrl-drag still selects (${ctrlSelected} cells)`, ctrlSelected > 0);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(200);
+
+  // The viewer: at fit the photo carries out; zoomed in, the same drag pans.
+  await odd.click();
+  await page.waitForSelector("img[src*='/media/']", { timeout: 20_000 });
+  await page.waitForTimeout(800); // the open flight
+  const photo = await page.locator("img[src*='/media/']").first().boundingBox();
+  const photoCentre = [photo.x + photo.width / 2, photo.y + photo.height / 2];
+  await dragFrom(...photoCentre);
+  const fromViewer = await carried();
+  check(
+    `a drag from the viewer at fit carries the file out (${fromViewer.join(" | ") || "nothing"})`,
+    fromViewer.length === 1 && fromViewer[0] === carriesOdd,
+  );
+  check("the viewer is still open after a drag out", await viewerOpen());
+  // Ctrl+wheel, not a double-click: that zooms to 1:1, and this fixture is
+  // already shown at 1:1, so a double-click would leave it at fit.
+  await page.evaluate(([x, y]) => {
+    for (let i = 0; i < 6; i++) {
+      document.elementFromPoint(x, y).dispatchEvent(new WheelEvent("wheel", {
+        deltaY: -120, ctrlKey: true, clientX: x, clientY: y, bubbles: true, cancelable: true,
+      }));
+    }
+  }, photoCentre);
+  await page.waitForTimeout(500);
+  const zoomedBefore = await page.locator("img[src*='/media/']").first().boundingBox();
+  await dragFrom(...photoCentre);
+  const zoomedAfter = await page.locator("img[src*='/media/']").first().boundingBox();
+  check(
+    `a drag on a zoomed photo pans it (${Math.round(zoomedBefore.width)}px wide, moved ${Math.round(zoomedAfter.x - zoomedBefore.x)}px)`,
+    zoomedBefore.width > photo.width * 1.5 && Math.abs(zoomedAfter.x - zoomedBefore.x) > 50,
+  );
+  check("a drag on a zoomed photo carries nothing out", (await carried()).length === 0);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(800);
 
   // Copy Path: bare by default, so nobody's existing copies change; behind
   // this browser's prefix once one is set, trailing slash or not.
@@ -601,6 +688,7 @@ try {
   await filterInput.press("Enter");
   await page.waitForTimeout(1500);
   check("the sort button says the view is in the set's order", (await page.locator("text=Set order").count()) > 0);
+  await carried(); // only the set view's drags count below
 
   const scrollTopNow = () => page.evaluate((sel) => document.querySelector(sel).scrollTop, host);
 
@@ -683,6 +771,9 @@ try {
     check("a click after a drop still opens the viewer", (await page.locator("img[src*='/media/']").count()) > 0);
     await page.keyboard.press("Escape");
     await page.waitForTimeout(600);
+    // A set view is where a plain drag reorders, so none of the drags above
+    // may have started a drag out.
+    check("no drag in the set view carried a file out", (await carried()).length === 0);
   } else {
     bad("no top-anchor cell could be grabbed, so the drag went unchecked");
   }
@@ -727,6 +818,97 @@ try {
     landedAt === "2026-11-09T13:41:22.000Z",
   );
   await page.keyboard.press("Escape");
+
+  // ---- Dropping files in --------------------------------------------------
+  //
+  // Synthetic, because a drag from another application needs a desktop: a
+  // DataTransfer holding files, dispatched where the browser would — enter on
+  // whatever is under the pointer, then over and drop on whatever is on top
+  // there, which is the overlay once it shows.
+  const pngBytes = readFileSync(pickedOnPhone);
+  const dropFiles = (names) =>
+    page.evaluate(([names, png]) => {
+      const bytes = Uint8Array.from(atob(png), (c) => c.charCodeAt(0));
+      const dt = new DataTransfer();
+      for (const name of names) {
+        dt.items.add(new File([bytes], name, { type: name.endsWith(".txt") ? "text/plain" : "image/png" }));
+      }
+      const fire = (type) => {
+        const ev = new DragEvent(type, {
+          dataTransfer: dt, bubbles: true, cancelable: true, clientX: 640, clientY: 300,
+        });
+        document.elementFromPoint(640, 300).dispatchEvent(ev);
+        return ev.defaultPrevented;
+      };
+      fire("dragenter");
+      const overlay = !!document.querySelector("[data-upload-drop]");
+      const onTop = !!document.elementFromPoint(640, 300).closest("[data-upload-drop]");
+      fire("dragover");
+      const dropPrevented = fire("drop");
+      return { overlay, onTop, dropPrevented };
+    }, [names, pngBytes.toString("base64")]);
+  const uploadButton = page.locator("button", { hasText: /^Upload$/ });
+  const uploads = join(gallery, "Uploads");
+
+  // The sheet is still open from the upload above, which is the case that
+  // matters: the overlay has to be above it, or a drop lands on the sheet.
+  const mixed = await dropFiles(["dropped.png", "notes.txt", ".jpg"]);
+  check("a file drag over the window shows the drop overlay", mixed.overlay);
+  check("the overlay is on top of the open sheet, so the drop is its", mixed.onTop);
+  check("the drop overlay is gone after the drop", (await page.locator("[data-upload-drop]").count()) === 0);
+  await page.waitForSelector("text=Upload photos", { timeout: 5000 });
+  check("a drop opens the sheet with the file chosen", (await page.locator("text=dropped.png").count()) === 1);
+  const skippedLine = (await page.locator("[data-upload-skipped]").textContent().catch(() => "")) ?? "";
+  check(
+    `what the server would refuse is skipped, not chosen (${skippedLine.trim()})`,
+    skippedLine.includes("Skipped 2") && (await page.locator("text=1 file selected").count()) === 1,
+  );
+  const droppedUpload = page.waitForResponse((r) => r.url().endsWith("/api/upload"));
+  await uploadButton.click();
+  check("the dropped file's upload answered 200", (await droppedUpload).status() === 200);
+  check(
+    "the dropped file landed byte for byte",
+    readFileSync(join(uploads, "dropped.png")).equals(pngBytes),
+  );
+
+  // More files than one request may carry: they go in two, and every one
+  // lands once.
+  let uploadRequests = 0;
+  const countUploads = (r) => { if (r.url().endsWith("/api/upload")) uploadRequests++; };
+  page.on("request", countUploads);
+  const many = Array.from({ length: 101 }, (_, i) => `b${String(i).padStart(3, "0")}.png`);
+  await dropFiles(many);
+  await page.waitForSelector("text=101 files selected", { timeout: 5000 });
+  await uploadButton.click();
+  await page.waitForSelector("text=Uploaded 101 files.", { timeout: 60_000 }).catch(() => {});
+  page.off("request", countUploads);
+  const landedMany = readdirSync(uploads).filter((n) => n.startsWith("b"));
+  check(`101 dropped files go in two requests (${uploadRequests})`, uploadRequests === 2);
+  check(
+    `all 101 land, each once (${landedMany.length})`,
+    landedMany.length === 101 && landedMany.every((n) => many.includes(n)),
+  );
+
+  // While an upload runs, a drop is ignored — and still held from navigating.
+  let release;
+  const held = new Promise((r) => { release = r; });
+  await page.route("**/api/upload", async (route) => { await held; await route.continue(); });
+  await dropFiles(["held.png"]);
+  await page.waitForSelector("text=held.png", { timeout: 5000 });
+  await uploadButton.click();
+  await page.waitForSelector("text=Uploading…", { timeout: 5000 });
+  const busyDrop = await dropFiles(["intruder.png"]);
+  check("a drop while uploading shows no overlay", !busyDrop.overlay);
+  check("a drop while uploading is held from navigating", busyDrop.dropPrevented);
+  check(
+    "a drop while uploading leaves the list alone",
+    (await page.locator("text=intruder.png").count()) === 0 && (await page.locator("text=held.png").count()) === 1,
+  );
+  release();
+  await page.waitForSelector("text=Uploaded 1 file.", { timeout: 10_000 }).catch(() => {});
+  await page.unroute("**/api/upload");
+  check("the held upload still lands", existsSync(join(uploads, "held.png")));
+  await page.locator("button[aria-label='Close']").first().click();
 
   // Nothing is filtered out of either list. A 404 the page causes is a 404 a
   // user sees in their console, and "that one is fine" is how the missing
