@@ -49,13 +49,15 @@ browser reported for the file — asserting no console error and no failed reque
 throughout.
 
 It also covers dragging files in and out of the window. Out, by real mouse drags
-that Playwright intercepts: a cell and the viewer at fit each carry Download's
-`DownloadURL`, a Ctrl-drag selects instead, a zoomed photo pans instead, and no
-drag in a set view starts one. Where such a drop *lands* needs a desktop and is
-not covered. In, by synthetic file drops: the overlay sits above an open sheet,
-names the server would refuse are skipped, 101 files go in two requests, and a
-drop mid-upload is ignored. A dropped *folder* cannot be built synthetically, so
-that path is not covered either.
+that Playwright intercepts: the viewer's photo at fit leaves as one file item
+and nothing else, and that file is the one on disk byte for byte; a grid cell,
+a Ctrl-drag, a zoomed photo and a set view start no drag out. Where such a drop
+*lands* needs a desktop and is not covered. In, by synthetic file drops: the
+overlay sits above an open sheet, names the server would refuse are skipped,
+101 files go in two requests, a drop mid-upload is ignored, and a drag that
+started in the window is never taken as one — until its `dragend`, or the next
+pointer move. A dropped *folder* cannot be built synthetically, so that path is
+not covered either.
 
 The two set checks that hold the scroll offset are only worth anything with
 room to scroll: at the end of the content the browser clamps a view that chased

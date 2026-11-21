@@ -7,8 +7,9 @@ import { isUploadableName } from "../../lib/mediaExts";
  *  **Files are chosen two ways, and both pass through `choose`**: the picker,
  *  and a drop of files from another application anywhere on the window. A drop
  *  counts as picking — it opens the sheet with its files chosen, and Upload
- *  sends them — so a stray drop costs nothing. The command list's Upload entry
- *  is the other way the sheet opens.
+ *  sends them — so a stray drop costs nothing. A drag that started in this
+ *  window (the viewer's photo on its way out) is never taken as one. The
+ *  command list's Upload entry is the other way the sheet opens.
  *
  *  **The sheet holds only files the server will take.** The route stops a
  *  request at the first name it refuses, keeping the files before it and losing
@@ -71,8 +72,7 @@ export function UploadSheet(props: { open: boolean; onOpen: () => void; onClose:
   };
 
   // A drag that carries files shows the overlay while it is over the window;
-  // anything else — text, a link, a cell being carried out of this very window
-  // — passes untouched.
+  // anything else — text, a link — passes untouched.
   //
   // Over the window is counted, not inferred from the overlay's own leave: a
   // drag that brushes the window's edge can leave before the overlay has been
@@ -80,9 +80,28 @@ export function UploadSheet(props: { open: boolean; onOpen: () => void; onClose:
   // a drag enters it also leaves, so the count is back to zero exactly when the
   // drag is outside — and once the overlay is up nothing under it is entered,
   // so no recycled grid cell can take a leave with it.
+  //
+  // **A drag that started in this window is never an upload.** The viewer's
+  // photo leaves as an image drag carrying `Files`, so without this the overlay
+  // would cover the viewer as the drag began, and releasing over the window
+  // would stage the photo it came from. The note lasts one drag: it clears on
+  // that drag's `dragend` — listened for on its source node, which still
+  // receives it if the viewer swapped the photo out mid-drag — or on the next
+  // `pointermove` here, since a page receives none while a drag is under way.
+  // The second is what keeps a lost `dragend` from disabling drops for the
+  // rest of the session. A cancelled `dragstart` starts no drag and sends no
+  // `dragend`, so it leaves no note.
   onMount(() => {
     let depth = 0;
-    const carriesFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes("Files");
+    let fromHere = false;
+    const started = (e: DragEvent) => {
+      if (e.defaultPrevented) return;
+      fromHere = true;
+      e.target?.addEventListener("dragend", () => { fromHere = false; }, { once: true });
+    };
+    const over = () => { fromHere = false; };
+    const carriesFiles = (e: DragEvent) =>
+      !fromHere && !!e.dataTransfer?.types.includes("Files");
     const enter = (e: DragEvent) => {
       if (!carriesFiles(e)) return;
       depth += 1;
@@ -98,10 +117,14 @@ export function UploadSheet(props: { open: boolean; onOpen: () => void; onClose:
       depth = 0;
       setDropping(false);
     };
+    window.addEventListener("dragstart", started);
+    window.addEventListener("pointermove", over);
     window.addEventListener("dragenter", enter);
     window.addEventListener("dragleave", leave);
     window.addEventListener("drop", end);
     onCleanup(() => {
+      window.removeEventListener("dragstart", started);
+      window.removeEventListener("pointermove", over);
       window.removeEventListener("dragenter", enter);
       window.removeEventListener("dragleave", leave);
       window.removeEventListener("drop", end);

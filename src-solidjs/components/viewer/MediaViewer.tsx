@@ -1,9 +1,8 @@
 // The full-resolution viewer: the overlay that opens over the grid.
 //
 // Owns pan/zoom, paging, the open/close flight animation, the decoded-image
-// cache, and starting a drag out of the window from what it shows (the rule is
-// `lib/carryOut`'s; on a zoomed photo the same drag pans). Two things here are
-// subtler than they look.
+// cache, and dragging the shown photo out of the window (`armPhotoDrag`). Two
+// things here are subtler than they look.
 //
 // The open transition measures the grid cell's on-screen rect and animates the
 // viewer from it, so the image appears to grow out of the thumbnail. That
@@ -50,16 +49,11 @@ import { hapticTick } from "../../lib/haptics";
 import { infoPanelOpen, setInfoPanelOpen } from "../../stores/viewerStore";
 import { prefs } from "../../stores/settingsStore";
 import { api, mediaUrl, thumbUrl } from "../../lib/ipc";
-import { armCarryOut, carryOut } from "../../lib/carryOut";
 import { thumbhashDataUrl } from "../../lib/thumbhashPlaceholder";
 import { isVideoPath, PLAYABLE_VIDEO_EXTS } from "../../lib/mediaExts";
 import { ViewerImageCache } from "../../lib/viewerCache";
 import { InfoPanel } from "./InfoPanel";
 import { VideoPlayer } from "./VideoPlayer";
-
-/** What the viewer's own gestures leave alone: real controls, and anything
- *  marked `data-gesture-exempt` (the video control bar, so it can scrub). */
-const GESTURE_EXEMPT = "button, input, a, [data-gesture-exempt]";
 
 interface MediaViewerProps {
   paths: string[];
@@ -84,8 +78,6 @@ export function MediaViewer(props: MediaViewerProps) {
 
   // Container ref for direct DOM image swapping
   let imageContainerRef: HTMLDivElement | undefined;
-  // The current slide: the source of a drag out of the window.
-  let slideRef: HTMLDivElement | undefined;
   // The horizontally-translating filmstrip track holding prev/current/next
   // slots. Only `dragX` (swipe-to-navigate) transforms this element.
   let trackRef: HTMLDivElement | undefined;
@@ -578,6 +570,33 @@ export function MediaViewer(props: MediaViewerProps) {
     isDragging = false;
   };
 
+  /** Decide, at a press on the shown photo, whether this press may drag it out
+   *  of the window — as Chromium's own image drag, which carries the image's
+   *  bytes exactly as downloaded.
+   *
+   *  **The bytes it shows are the bytes it carries.** For anything a browser
+   *  renders that is the file itself, so EXIF and PNG text chunks (a ComfyUI
+   *  workflow) go with it; a HEIC goes as the JPEG it is shown as, without its
+   *  EXIF; a video carries nothing. A native image drag is the one way a page
+   *  can hand a Linux application a file: Chromium honours `DownloadURL` on
+   *  Windows alone, strips `file:` URLs from a page's drag, and keeps
+   *  script-built Files behind a test-only flag. The same limit is why the grid
+   *  carries nothing out — its cells are thumbnails.
+   *
+   *  A plain mouse drag moves what can move first, so a zoomed photo pans. The
+   *  photo must have finished loading, because Chromium attaches the bytes only
+   *  then; a drag before that would carry nothing. **Every press on the photo
+   *  decides, whatever its pointer**: the cache hands the same `<img>` back on a
+   *  revisit, and an answer left over from a mouse press would let a touch long
+   *  press lift the photo instead of opening the menu. A press anywhere else
+   *  cannot drag the photo, so it needs no answer. */
+  const armPhotoDrag = (e: PointerEvent) => {
+    const img = e.target;
+    if (!(img instanceof HTMLImageElement) || !imageContainerRef?.contains(img)) return;
+    img.draggable =
+      e.pointerType === "mouse" && e.button === 0 && zoom() <= 1 && loaded() && !opening() && !closing();
+  };
+
   // Timestamp of the last touch pointer lift, used to recognise the mouse
   // events the platform synthesizes from a touch gesture. Assigned by the
   // touch handlers further down.
@@ -781,7 +800,7 @@ export function MediaViewer(props: MediaViewerProps) {
     // data-gesture-exempt, like the video scrubber) are left to them. The
     // video surface itself is NOT excluded — with custom controls it behaves
     // like a photo: tap toggles chrome, swipes navigate / dismiss / open info.
-    if (t.closest(GESTURE_EXEMPT)) return;
+    if (t.closest("button, input, a, [data-gesture-exempt]")) return;
     // If a swipe-navigation is still mid-flight, land it now so the new gesture
     // operates on the settled index rather than racing the pending commit.
     runNavCommit();
@@ -1199,11 +1218,7 @@ export function MediaViewer(props: MediaViewerProps) {
       onMouseUp={handleMouseUp}
       onDblClick={handleDblClick}
       onPointerDown={(e) => {
-        // A zoomed photo pans, and controls keep their own drags (the video
-        // scrubber); otherwise a mouse drag carries the file out.
-        const free = zoom() <= 1 && !opening() && !closing() &&
-          !(e.target as HTMLElement).closest(GESTURE_EXEMPT);
-        armCarryOut(slideRef!, e, free);
+        armPhotoDrag(e);
         onPointerDown(e);
       }}
       onPointerMove={onPointerMove}
@@ -1266,13 +1281,15 @@ export function MediaViewer(props: MediaViewerProps) {
           </div>
         </Show>
 
-        {/* Current slide — and the source of a drag out (`lib/carryOut`),
-            armed by the root's pointerdown. The track is click-through, so
-            only a press on the media itself reaches it. */}
+        {/* Current slide. A drag out of the window starts from its photo
+            (`armPhotoDrag`), and here it is stripped to the file alone:
+            `clearData()` drops the link, HTML and text Chromium puts beside
+            an image's bytes, and by spec keeps file items. The link answers
+            401 to any application but this browser — a file manager offered
+            it (Dolphin) saves the error page under the photo's name. */}
         <div
-          ref={slideRef}
           class="absolute inset-0 flex items-center justify-center"
-          onDragStart={(e) => carryOut(e.dataTransfer!, currentPath(), findCellImage(currentPath()))}
+          onDragStart={(e) => e.dataTransfer!.clearData()}
         >
           <Show
             when={isVideo()}

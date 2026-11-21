@@ -139,16 +139,39 @@ try {
   await page.waitForFunction(() => !window.location.search.includes("t="), { timeout: 15_000 });
   ok("the launch token was redeemed and cleared from the address bar");
 
-  // What every drag out the page starts carries. Bubble phase on the window,
-  // so it reads the data after the element's own handler has written it.
+  // What every drag the page starts carries: each item's kind and type, and
+  // its first file, kept for a byte comparison. Bubble phase on the window, so
+  // it reads the drag after the page's own handlers have shaped it.
   await page.evaluate(() => {
-    window.__carried = [];
-    window.addEventListener("dragstart", (e) =>
-      window.__carried.push(e.dataTransfer.getData("DownloadURL")),
-    );
+    window.__drags = [];
+    window.addEventListener("dragstart", (e) => {
+      const dt = e.dataTransfer;
+      window.__drags.push({
+        items: Array.from({ length: dt.items.length }, (_, i) => `${dt.items[i].kind}:${dt.items[i].type}`),
+        file: dt.files[0] ?? null,
+      });
+    });
   });
-  /** The drags out since the last call. */
-  const carried = () => page.evaluate(() => window.__carried.splice(0));
+  /** The drags since the last call, as item lists; the last one's file is
+   *  kept as `window.__lastFile`. */
+  const drags = () =>
+    page.evaluate(() => {
+      const started = window.__drags.splice(0);
+      window.__lastFile = started.at(-1)?.file ?? null;
+      return started.map((d) => d.items);
+    });
+  /** The bytes of the last drag's file, or null when it had none. */
+  const lastDraggedFile = () =>
+    page.evaluate(async () => {
+      const file = window.__lastFile;
+      if (!file) return null;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      return { name: file.name, b64: btoa(binary) };
+    });
 
   // Cells: the justified layout has run and placed something.
   await page.waitForSelector("img[src*='/thumb/']", { timeout: 30_000 });
@@ -356,15 +379,13 @@ try {
     readFileSync(saved).equals(readFileSync(join(gallery, "2026", ODD))),
   );
 
-  // ---- Dragging a file out ------------------------------------------------
+  // ---- Dragging a photo out ---------------------------------------------
   //
   // Real mouse drags. Playwright intercepts the drag in place of the desktop,
-  // so what this proves is that a drag starts and what it carries — where it
-  // lands is the desktop's business. It must be Download's file under
-  // Download's name: the original bytes, encoded per segment.
-  const origin = new URL(launchUrl).origin;
-  const carriesOdd =
-    `application/octet-stream:${ODD}:${origin}/media/2026/${encodeURIComponent(ODD)}?original=true`;
+  // so what this proves is whether a drag starts and what it carries — where
+  // it lands is the desktop's business. Only the viewer's photo leaves, as
+  // Chromium's own image drag stripped to the file alone, and that file is the
+  // one on disk byte for byte: whatever metadata it embeds goes with it.
   const dragFrom = async (x, y, modifier) => {
     if (modifier) await page.keyboard.down(modifier);
     await page.mouse.move(x, y);
@@ -380,19 +401,19 @@ try {
   const oddBox = await odd.boundingBox();
   const oddCentre = [oddBox.x + oddBox.width / 2, oddBox.y + oddBox.height / 2];
   await dragFrom(...oddCentre);
-  const fromGrid = await carried();
-  check(
-    `a drag from a cell carries the file out (${fromGrid.join(" | ") || "nothing"})`,
-    fromGrid.length === 1 && fromGrid[0] === carriesOdd,
-  );
-  check("a drag out opens nothing", !(await viewerOpen()));
+  check("a drag on a grid cell starts no drag out — a cell is a thumbnail", (await drags()).length === 0);
+  // A release inside the pressed cell is a click, as it always was.
+  if (await viewerOpen()) {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(800);
+  }
 
   const outlined = () =>
     page.evaluate(() =>
       [...document.querySelectorAll(".thumb-cell")].filter((c) => c.style.outlineStyle === "solid").length,
     );
   await dragFrom(...oddCentre, "Control");
-  check("a Ctrl-drag carries nothing out", (await carried()).length === 0);
+  check("a Ctrl-drag starts no drag out", (await drags()).length === 0);
   const ctrlSelected = await outlined();
   check(`a Ctrl-drag still selects (${ctrlSelected} cells)`, ctrlSelected > 0);
   await page.keyboard.press("Escape");
@@ -405,10 +426,16 @@ try {
   const photo = await page.locator("img[src*='/media/']").first().boundingBox();
   const photoCentre = [photo.x + photo.width / 2, photo.y + photo.height / 2];
   await dragFrom(...photoCentre);
-  const fromViewer = await carried();
+  const fromViewer = await drags();
   check(
-    `a drag from the viewer at fit carries the file out (${fromViewer.join(" | ") || "nothing"})`,
-    fromViewer.length === 1 && fromViewer[0] === carriesOdd,
+    `a drag from the viewer at fit carries the photo as a file and nothing else (${JSON.stringify(fromViewer)})`,
+    fromViewer.length === 1 && fromViewer[0].length === 1 && fromViewer[0][0].startsWith("file:"),
+  );
+  const dragged = await lastDraggedFile();
+  check(
+    `the file it carries is the one on disk, byte for byte (${dragged ? dragged.name : "no file"})`,
+    dragged !== null &&
+      Buffer.from(dragged.b64, "base64").equals(readFileSync(join(gallery, "2026", ODD))),
   );
   check("the viewer is still open after a drag out", await viewerOpen());
   // Ctrl+wheel, not a double-click: that zooms to 1:1, and this fixture is
@@ -428,7 +455,7 @@ try {
     `a drag on a zoomed photo pans it (${Math.round(zoomedBefore.width)}px wide, moved ${Math.round(zoomedAfter.x - zoomedBefore.x)}px)`,
     zoomedBefore.width > photo.width * 1.5 && Math.abs(zoomedAfter.x - zoomedBefore.x) > 50,
   );
-  check("a drag on a zoomed photo carries nothing out", (await carried()).length === 0);
+  check("a drag on a zoomed photo starts no drag out", (await drags()).length === 0);
   await page.keyboard.press("Escape");
   await page.waitForTimeout(800);
 
@@ -688,7 +715,7 @@ try {
   await filterInput.press("Enter");
   await page.waitForTimeout(1500);
   check("the sort button says the view is in the set's order", (await page.locator("text=Set order").count()) > 0);
-  await carried(); // only the set view's drags count below
+  await drags(); // only the set view's drags count below
 
   const scrollTopNow = () => page.evaluate((sel) => document.querySelector(sel).scrollTop, host);
 
@@ -773,7 +800,7 @@ try {
     await page.waitForTimeout(600);
     // A set view is where a plain drag reorders, so none of the drags above
     // may have started a drag out.
-    check("no drag in the set view carried a file out", (await carried()).length === 0);
+    check("no drag in the set view starts a drag out", (await drags()).length === 0);
   } else {
     bad("no top-anchor cell could be grabbed, so the drag went unchecked");
   }
@@ -909,6 +936,47 @@ try {
   await page.unroute("**/api/upload");
   check("the held upload still lands", existsSync(join(uploads, "held.png")));
   await page.locator("button[aria-label='Close']").first().click();
+
+  // A drag that started in this window is never an upload, and the note that
+  // says so lasts one drag. Synthetic, because Playwright's replay of the
+  // viewer's real drag carries no file bytes back in, so an own-window check
+  // through it would pass with or without the rule. The detached source stands
+  // for a photo the viewer swapped out mid-drag.
+  const startedHere = await page.evaluate(() => {
+    const files = new DataTransfer();
+    files.items.add(new File(["x"], "x.png", { type: "image/png" }));
+    /** Whether a file drag entering the window shows the overlay; it leaves
+     *  again either way, so each probe starts from nothing. */
+    const overlayFor = () => {
+      document.body.dispatchEvent(new DragEvent("dragenter", { dataTransfer: files, bubbles: true }));
+      const shown = !!document.querySelector("[data-upload-drop]");
+      document.body.dispatchEvent(new DragEvent("dragleave", { dataTransfer: files, bubbles: true }));
+      return shown;
+    };
+    const startFrom = (cancelled) => {
+      const source = document.body.appendChild(document.createElement("div"));
+      if (cancelled) source.addEventListener("dragstart", (e) => e.preventDefault());
+      source.dispatchEvent(new DragEvent("dragstart", {
+        dataTransfer: new DataTransfer(), bubbles: true, cancelable: true,
+      }));
+      return source;
+    };
+    const source = startFrom(false);
+    const duringOwnDrag = overlayFor();
+    source.remove();
+    source.dispatchEvent(new DragEvent("dragend", { bubbles: true }));
+    const afterDetachedEnd = overlayFor();
+    startFrom(false).remove();
+    document.body.dispatchEvent(new PointerEvent("pointermove", { bubbles: true }));
+    const afterPointerMoves = overlayFor();
+    startFrom(true).remove();
+    const afterCancelledStart = overlayFor();
+    return { duringOwnDrag, afterDetachedEnd, afterPointerMoves, afterCancelledStart };
+  });
+  check("a file drag that started in this window shows no drop overlay", !startedHere.duringOwnDrag);
+  check("its dragend clears that, even on a source no longer in the page", startedHere.afterDetachedEnd);
+  check("so does the next pointer move, should the dragend be lost", startedHere.afterPointerMoves);
+  check("a cancelled dragstart leaves no note behind", startedHere.afterCancelledStart);
 
   // Nothing is filtered out of either list. A 404 the page causes is a 404 a
   // user sees in their console, and "that one is fine" is how the missing

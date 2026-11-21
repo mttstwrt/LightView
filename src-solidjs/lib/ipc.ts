@@ -66,14 +66,6 @@ export function mediaUrl(path: string, fit?: number): string {
 export function originalUrl(path: string): string {
   return `/media/${encodePath(path)}?original=true`;
 }
-
-/** The name a file is saved under when it leaves the gallery: its own
- *  basename. Download and a drag out both name it here, so the two cannot
- *  disagree. */
-export function fileName(path: string): string {
-  return path.slice(path.lastIndexOf("/") + 1);
-}
-
 // ---------------------------------------------------------------------------
 // Auth interruptions
 // ---------------------------------------------------------------------------

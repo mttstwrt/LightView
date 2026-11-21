@@ -16,7 +16,7 @@
 import { Show, For, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { hasTouch } from "../../lib/runtime";
 import { rateItem, setItemColorLabel, colorLabelByPath } from "../../stores/galleryStore";
-import { api, fileName, mediaUrl, originalUrl } from "../../lib/ipc";
+import { api, mediaUrl, originalUrl } from "../../lib/ipc";
 import { COLOR_LABELS, COLOR_LABEL_HEX } from "../../lib/colorLabels";
 import { announceThumbRegenerated } from "../../lib/thumbRegeneration";
 import { isVideoPath } from "../../lib/mediaExts";
@@ -272,7 +272,7 @@ export function ContextMenu(props: ContextMenuProps) {
     props.onClose();
     const a = document.createElement("a");
     a.href = originalUrl(path);
-    a.download = fileName(path);
+    a.download = path.slice(path.lastIndexOf("/") + 1);
     document.body.appendChild(a);
     a.click();
     a.remove();
